@@ -381,7 +381,6 @@ type recordingClient struct {
 
 	textChunks   []string
 	updates      []acp.SessionUpdate
-	commands     []acp.AvailableCommand
 	usageUpdates []acp.SessionUsageUpdate
 	permissions  []acp.RequestPermissionRequest
 	elicitations []acp.UnstableCreateElicitationRequest
@@ -442,8 +441,6 @@ func (c *recordingClient) SessionUpdate(_ context.Context, params acp.SessionNot
 	c.updates = append(c.updates, params.Update)
 
 	switch {
-	case params.Update.AvailableCommandsUpdate != nil:
-		c.commands = append(c.commands, params.Update.AvailableCommandsUpdate.AvailableCommands...)
 	case params.Update.UsageUpdate != nil:
 		c.usageUpdates = append(c.usageUpdates, *params.Update.UsageUpdate)
 	case params.Update.AgentMessageChunk != nil && params.Update.AgentMessageChunk.Content.Text != nil:

@@ -7,9 +7,9 @@ description: "Wire up telemetry and use it to diagnose turn failures and timeout
 
 Embedded hosts supply OpenTelemetry providers with `WithTracerProvider`,
 `WithMeterProvider`, and `WithTextMapPropagator`. The standalone binary
-configures exporters from environment variables when OpenTelemetry support is
-compiled in. Providers a host passes stay owned by the host, including
-`ForceFlush` and `Shutdown`.
+includes OpenTelemetry exporter support and configures traces, metrics, and
+logs from standard `OTEL_*` environment variables. Providers a host passes
+stay owned by the host, including `ForceFlush` and `Shutdown`.
 
 Logs go to stderr so stdout stays reserved for ACP frames; enable debug
 logging with `-debug` (`WithLogger` for a custom logger). Telemetry records

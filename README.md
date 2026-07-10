@@ -42,20 +42,28 @@ git clone https://github.com/savid/acp-go-pi && cd acp-go-pi
 Run a tiny local client against the agent:
 
 ```sh
-go run ./examples/minimal-client "Reply with a short hello from ACP."
+go run ./examples/minimal-client \
+  -auth-file "$HOME/.pi/agent/auth.json" \
+  "Reply with a short hello from ACP."
 ```
 
 Start an interactive session against the agent:
 
 ```sh
-go run ./examples/interactive-chat
+go run ./examples/interactive-chat -auth-file "$HOME/.pi/agent/auth.json"
 ```
 
 Load and resume a stored session transcript:
 
 ```sh
-go run ./examples/resume-from-file -file ./transcript.jsonl
+go run ./examples/resume-from-file \
+  -file ./transcript.jsonl \
+  -auth-file "$HOME/.pi/agent/auth.json"
 ```
+
+Each example copies the explicitly named credential file into its isolated pi
+agent directory. It never inherits ambient provider keys or reads the normal pi
+home implicitly.
 
 ## Embedded Go
 
@@ -104,10 +112,11 @@ storage, permissions, raw events, and OpenTelemetry providers.
 
 ## Slash Commands
 
-pi commands (extension commands, prompt templates, and skills discovered in
-the session's isolated agent directory) are projected into ACP
-`AvailableCommand` entries. A slash-prefixed prompt runs the corresponding pi
-command.
+The adapter projects only commands returned by pi's RPC command inventory.
+Ambient extensions, prompt templates, and skills are disabled for isolated
+sessions, and the shipped wrapper extensions register no slash commands, so a
+default session advertises an empty command set. Nothing is synthesized from
+the terminal UI's built-in commands.
 
 ## Docs
 

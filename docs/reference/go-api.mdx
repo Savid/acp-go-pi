@@ -21,6 +21,10 @@ err := piacp.Serve(ctx, input, output,
 )
 ```
 
+Hosts that need direct method access can construct `*Agent` with `NewAgent`;
+stream-based hosts normally use `Serve`. `Options` and `ConcurrencyLimits`
+are the exported configuration value types behind the functional options.
+
 ## Process options
 
 | Option | Purpose |
@@ -70,6 +74,7 @@ Request builders: `NewSessionRequest`, `LoadSessionRequest`,
 `SetModelRequest`, `DeleteSessionRequest`, `ListSessionsRequest`,
 `WithSessionMCPServers`, `WithSessionAdditionalDirectories`,
 `WithSessionMeta`, `WithSessionRawEvents`, `WithSessionOutputSchema`,
+`WithListSessionsCwd`, `WithListSessionsCursor`, `WithListSessionsMeta`,
 `StdioMCPServer`, `HTTPMCPServer`.
 
 Session-store surface: `SessionStore`, `SessionKey`, `SessionSummary`,

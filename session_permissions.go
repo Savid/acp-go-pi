@@ -18,6 +18,17 @@ const (
 	uiMethodConfirm = "confirm"
 	uiMethodInput   = "input"
 	uiMethodEditor  = "editor"
+
+	toolNameRead     = "read"
+	toolNameEdit     = "edit"
+	toolNameWrite    = "write"
+	toolNameBash     = "bash"
+	toolNameGrep     = "grep"
+	toolNameFind     = "find"
+	toolNameGlob     = "glob"
+	toolNameLs       = "ls"
+	toolNameFetch    = "fetch"
+	toolNameWebFetch = "web_fetch"
 )
 
 // handleUIDialog answers one blocking extension UI dialog. A dialog whose
@@ -160,15 +171,15 @@ func (s *agentSession) respondUIDialog(ctx context.Context, response pi.UIRespon
 
 func toolKindForName(toolName string) acp.ToolKind {
 	switch toolName {
-	case "read":
+	case toolNameRead:
 		return acp.ToolKindRead
-	case "edit", "write":
+	case toolNameEdit, toolNameWrite:
 		return acp.ToolKindEdit
-	case "bash":
+	case toolNameBash:
 		return acp.ToolKindExecute
-	case "grep", "find", "glob", "ls":
+	case toolNameGrep, toolNameFind, toolNameGlob, toolNameLs:
 		return acp.ToolKindSearch
-	case "fetch", "web_fetch":
+	case toolNameFetch, toolNameWebFetch:
 		return acp.ToolKindFetch
 	default:
 		return acp.ToolKindOther

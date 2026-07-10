@@ -46,10 +46,7 @@ func (a *Agent) handleForkSession(
 		return acp.UnstableForkSessionResponse{}, validationErr
 	}
 
-	mcpServers, err := stableMCPServers(params.McpServers)
-	if err != nil {
-		return acp.UnstableForkSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
-	}
+	mcpServers := stableMCPServers(params.McpServers)
 
 	if a.isDeleted(params.SessionId) {
 		return acp.UnstableForkSessionResponse{}, unknownSessionError()
@@ -112,7 +109,7 @@ func (a *Agent) handleForkSession(
 
 // stableMCPServers converts the fork request's unstable MCP declarations into
 // the stable shape shared by every session-start path.
-func stableMCPServers(servers []acp.UnstableMcpServer) ([]acp.McpServer, error) {
+func stableMCPServers(servers []acp.UnstableMcpServer) []acp.McpServer {
 	converted := make([]acp.McpServer, 0, len(servers))
 
 	for _, server := range servers {
@@ -148,5 +145,5 @@ func stableMCPServers(servers []acp.UnstableMcpServer) ([]acp.McpServer, error) 
 		}
 	}
 
-	return converted, nil
+	return converted
 }

@@ -10,6 +10,15 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
+const (
+	modelCapabilityReasoning = "reasoning"
+
+	modelInputImage = "image"
+	modelInputAudio = "audio"
+	modelInputPDF   = "pdf"
+	modelInputVideo = "video"
+)
+
 // SetSessionMode exists only because github.com/coder/acp-go-sdk's generated
 // Agent interface still requires it. Remove this when the upstream SDK drops
 // session/set_mode; the local ACP dispatcher intentionally does not route it.
@@ -315,19 +324,13 @@ func modelCapabilities(info *pi.Model) []string {
 	capabilities := make([]string, 0, len(info.Input)+1)
 
 	if info.Reasoning {
-		capabilities = append(capabilities, "reasoning")
+		capabilities = append(capabilities, modelCapabilityReasoning)
 	}
 
 	for _, input := range info.Input {
-		switch strings.ToLower(input) {
-		case "image":
-			capabilities = append(capabilities, "image")
-		case "audio":
-			capabilities = append(capabilities, "audio")
-		case "pdf":
-			capabilities = append(capabilities, "pdf")
-		case "video":
-			capabilities = append(capabilities, "video")
+		switch capability := strings.ToLower(input); capability {
+		case modelInputImage, modelInputAudio, modelInputPDF, modelInputVideo:
+			capabilities = append(capabilities, capability)
 		}
 	}
 

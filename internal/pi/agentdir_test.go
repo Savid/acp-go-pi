@@ -388,6 +388,14 @@ func TestWriteSeedFilesManagedReadFailure(t *testing.T) {
 	require.ErrorContains(t, writeSeedFiles(dir, map[string]string{"config.txt": "v2"}), "read managed seed file")
 }
 
+func TestWriteSeedFilesDirectoryFailure(t *testing.T) {
+	restoreAgentDirSeams(t)
+
+	fsMkdirAll = func(string, os.FileMode) error { return fmt.Errorf("disk gone") }
+
+	require.ErrorContains(t, writeSeedFiles(t.TempDir(), map[string]string{"nested/config.txt": "value"}), "create seed file directory")
+}
+
 func restoreAgentDirSeams(t *testing.T) {
 	t.Helper()
 

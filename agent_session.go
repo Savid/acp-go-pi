@@ -22,6 +22,8 @@ import (
 // rows; lifecycle methods map it to the uniform unknown-session error.
 var errUnknownStoredSession = errors.New("session not found in store")
 
+const modelFieldUnknown = "unknown"
+
 // NewSession creates and starts a pi RPC session.
 func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (resp acp.NewSessionResponse, err error) {
 	ctx, finish := a.observe.StartACP(ctx, params.Meta, "session/new")
@@ -168,10 +170,6 @@ func (a *Agent) restoreSession(
 
 	session, err := a.startSession(ctx, start)
 	if err != nil {
-		if errors.Is(err, errUnknownStoredSession) {
-			return nil, nil, false, unknownSessionError()
-		}
-
 		return nil, nil, false, err
 	}
 
@@ -862,7 +860,7 @@ func stateModelRef(state pi.SessionState) string {
 		return ""
 	}
 
-	if state.Model.Provider == "unknown" && state.Model.ID == "unknown" {
+	if state.Model.Provider == modelFieldUnknown && state.Model.ID == modelFieldUnknown {
 		return ""
 	}
 

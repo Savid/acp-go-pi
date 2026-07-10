@@ -33,24 +33,25 @@ Raw pi RPC events are not sent by default. A host opts in per session with
 
 Prompt content fails closed before the turn starts. An empty prompt (zero
 content blocks), an unsupported block type (audio or an unknown block), and an
-image block without usable data are rejected with an invalid-params
+image block without embedded base64 data are rejected with an invalid-params
 (`-32602`) error naming the offending field (`prompt` or `prompt.image`).
 Nothing is silently dropped and nothing is forwarded to pi. Image support is
 per model: a model whose catalog entry does not list image input fails the
-turn with the provider's own error.
+turn with the provider's own error. Image URIs are not fetched: resource links
+are forwarded as text, while embedded image resources must carry blob data.
 
 ## Slash commands
 
-pi discovers commands programmatically per session — extension commands,
-prompt templates, and skills found in the session's agent directory — and the
-adapter projects that set into ACP `available_commands` updates. A prompt
-whose first text block begins with `/name` runs that command as its turn;
-unrecognized `/text` stays ordinary prompt text.
+pi's RPC command inventory can describe extension commands, prompt templates,
+and skills, and the adapter projects any returned entries into ACP
+`available_commands` updates. A prompt whose first text block begins with
+`/name` runs that command as its turn; unrecognized `/text` stays ordinary
+prompt text.
 
-Because each session runs in an isolated agent directory, the advertised set
-is empty unless the operator seeds commands, skills, or extensions into it
-(for example with `WithSeedFiles`). Nothing is fabricated: only what pi itself
-reports is advertised.
+The launch disables ambient extension, skill, and prompt-template discovery;
+the shipped wrapper extensions register no slash commands. A default session
+therefore advertises an empty command set. Nothing is fabricated from pi's
+terminal-only built-ins.
 
 ## Turn resolution
 

@@ -11,8 +11,8 @@ a host to log into through ACP.
 ## No ACP auth methods
 
 ACP initialize reports an empty `authMethods` list. A host never calls
-`authenticate` against this adapter, and ACP `logout` clears only
-adapter-owned session state — it never touches provider credentials. An
+`authenticate` against this adapter, and ACP `logout` is a successful no-op —
+it never touches provider credentials. An
 authentication problem inside pi (a missing or refused provider key) surfaces
 as an ordinary turn failure with cause `provider`, not as an ACP auth
 challenge; see [ACP methods](/docs/reference/acp-methods).
@@ -49,6 +49,9 @@ err := piacp.Serve(ctx, input, output,
 	}),
 )
 ```
+
+The bundled clients expose the same deliberate path as
+`-auth-file <hostpath>` and forward it as an `auth.json` seed.
 
 Injected credentials are never written to the session store: `auth.json` and
 the other config files in the agent directory are excluded from mirroring, so

@@ -5,10 +5,11 @@ description: "Forward pi's user-facing dialogs to clients that opt in during ini
 
 When a pi extension needs to ask the user a question mid-turn — a confirm, an
 input box, or an editor dialog — the adapter can forward it to the host as an
-ACP elicitation request. In an unmodified session the only extensions present
-are the adapter's own, so elicitation traffic comes from the adapter's bridge
-and from any extensions the operator has seeded into the session's agent
-directory.
+ACP elicitation request. The adapter loads only its own wrapper extensions;
+ambient and seeded extensions are not discovered. The shipped extensions
+currently raise only permission dialogs, so a default session has no
+non-permission dialog producer even though the relay and capability descriptor
+are available.
 
 ## Capability gating
 

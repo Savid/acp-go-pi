@@ -26,17 +26,23 @@ git clone https://github.com/savid/acp-go-pi && cd acp-go-pi
 Send a single prompt:
 
 ```sh
-go run ./examples/minimal-client "Reply with ACP_EXAMPLE_OK"
+go run ./examples/minimal-client \
+  -auth-file "$HOME/.pi/agent/auth.json" \
+  "Reply with ACP_EXAMPLE_OK"
 ```
 
 Resume from a previously mirrored session file — point `-file` at a pi session
 JSONL you saved earlier:
 
 ```sh
-go run ./examples/resume-from-file -file ./transcript.jsonl
+go run ./examples/resume-from-file \
+  -file ./transcript.jsonl \
+  -auth-file "$HOME/.pi/agent/auth.json"
 ```
 
-`resume-from-file` also accepts `-session`, `-cwd`, and `-prompt` to override
-the session id, working directory, and follow-up prompt. See
+All three examples accept `-auth-file`, which explicitly seeds pi's
+`auth.json` into the isolated session. `resume-from-file` also accepts
+`-session`, `-cwd`, and `-prompt` to override the session id, working
+directory, and follow-up prompt. See
 [Session store](/docs/features/session-store) for how the rows are loaded
 back into a session.

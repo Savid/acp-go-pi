@@ -157,6 +157,29 @@ func TestStartProcessValidation(t *testing.T) {
 	require.ErrorContains(t, err, "start pi process")
 }
 
+func TestStartProcessPipeFailures(t *testing.T) {
+	realPipe := processPipe
+	t.Cleanup(func() { processPipe = realPipe })
+
+	processPipe = func() (*os.File, *os.File, error) {
+		return nil, nil, os.ErrPermission
+	}
+	_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/bin/sh"})
+	require.ErrorContains(t, err, "create stdin pipe")
+
+	calls := 0
+	processPipe = func() (*os.File, *os.File, error) {
+		calls++
+		if calls == 2 {
+			return nil, nil, os.ErrPermission
+		}
+
+		return realPipe()
+	}
+	_, err = StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/bin/sh"})
+	require.ErrorContains(t, err, "create stdout pipe")
+}
+
 func TestProcessStdinEOFExit(t *testing.T) {
 	t.Parallel()
 
@@ -235,6 +258,23 @@ func TestProcessShutdownLadderSigkill(t *testing.T) {
 	require.Error(t, process.WaitErr())
 }
 
+func TestProcessShutdownCanceled(t *testing.T) {
+	t.Parallel()
+
+	script := writeScript(t, `trap '' TERM; while :; do sleep 0.1; done`)
+	process := startScriptProcess(t, LaunchSpec{
+		ExecutablePath:      script,
+		AgentDir:            t.TempDir(),
+		ShutdownStepTimeout: time.Second,
+	})
+	t.Cleanup(func() { _ = process.Close() })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, process.Shutdown(ctx), context.Canceled)
+	<-process.Exited()
+}
+
 func TestProcessKill(t *testing.T) {
 	t.Parallel()
 
@@ -268,14 +308,14 @@ func TestProcessStderrTail(t *testing.T) {
 }
 
 func TestProcessEnvironmentIsScrubbed(t *testing.T) {
-	t.Setenv("ACP_GO_PI_TEST_AMBIENT", "leak")
+	t.Setenv("TEST_AMBIENT_SECRET", "leak")
 
 	script := writeScript(t, `env; exit 0`)
 
 	process := startScriptProcess(t, LaunchSpec{
 		ExecutablePath: script,
 		AgentDir:       t.TempDir(),
-		Env:            map[string]string{"ACP_GO_PI_TEST_EXPLICIT": "ok"},
+		Env:            map[string]string{"TEST_EXPLICIT_VALUE": "ok"},
 	})
 
 	t.Cleanup(func() { _ = process.Close() })
@@ -295,10 +335,10 @@ func TestProcessEnvironmentIsScrubbed(t *testing.T) {
 	<-process.Exited()
 
 	environ := string(output)
-	require.Contains(t, environ, "ACP_GO_PI_TEST_EXPLICIT=ok")
+	require.Contains(t, environ, "TEST_EXPLICIT_VALUE=ok")
 	require.Contains(t, environ, "PI_OFFLINE=1")
 	require.Contains(t, environ, "PI_CODING_AGENT_DIR=")
-	require.NotContains(t, environ, "ACP_GO_PI_TEST_AMBIENT")
+	require.NotContains(t, environ, "TEST_AMBIENT_SECRET")
 }
 
 func TestStartProcessCancelledContext(t *testing.T) {

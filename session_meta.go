@@ -19,6 +19,11 @@ const (
 	metaPermissionKey      = "permission"
 	metaRawEventKey        = "rawEvent"
 	metaRawEventEnabledKey = "enabled"
+
+	envKeyPath        = "PATH"
+	envKeyNodeOptions = "NODE_OPTIONS"
+	envKeyBashEnv     = "BASH_ENV"
+	envKeyEnv         = "ENV"
 )
 
 // PiOptions is the stable, supported pi-specific subset accepted at
@@ -288,7 +293,7 @@ func validEnvName(name string) bool {
 func blockedEnvKey(key string) bool {
 	upper := strings.ToUpper(key)
 	switch upper {
-	case "PATH", "NODE_OPTIONS", "BASH_ENV", "ENV":
+	case envKeyPath, envKeyNodeOptions, envKeyBashEnv, envKeyEnv:
 		return true
 	default:
 		return strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_")

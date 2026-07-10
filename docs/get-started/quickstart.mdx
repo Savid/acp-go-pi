@@ -31,22 +31,26 @@ This tutorial takes you from nothing to a streamed assistant reply over ACP.
     one prompt, and prints the streamed reply:
 
     ```sh
-    go run ./examples/minimal-client "Reply with a short hello from ACP."
+    go run ./examples/minimal-client \
+      -auth-file "$HOME/.pi/agent/auth.json" \
+      "Reply with a short hello from ACP."
     ```
   </Step>
   <Step title="Try an interactive session">
     The interactive client keeps a session open so you can send several prompts:
 
     ```sh
-    go run ./examples/interactive-chat
+    go run ./examples/interactive-chat -auth-file "$HOME/.pi/agent/auth.json"
     ```
   </Step>
 </Steps>
 
 ## Verify
 
-The example prints the streamed assistant reply to stdout and exits `0`. A
-greeting line derived from your prompt confirms the full path worked: agent
+`-auth-file` names the credential file to copy into the isolated session; the
+example does not inherit ambient provider keys or read the normal pi home
+implicitly. The example prints the streamed assistant reply to stdout and
+exits `0`. A greeting line derived from your prompt confirms the full path worked: agent
 initialization, session creation, the prompt turn, and streamed output back
 through ACP.
 
@@ -55,7 +59,11 @@ stdin waiting for JSON-RPC frames and writes ACP frames only to stdout; add
 `-debug` to send diagnostics to stderr:
 
 ```sh
-go run ./cmd/acp-go-pi -path "$(command -v pi)" -home /tmp/pi-home -debug
+go run ./cmd/acp-go-pi \
+  -path "$(command -v pi)" \
+  -home /tmp/pi-home \
+  -seed-file "auth.json=$HOME/.pi/agent/auth.json" \
+  -debug
 ```
 
 ## Next steps

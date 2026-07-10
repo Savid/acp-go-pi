@@ -56,6 +56,10 @@ Session-lifecycle requests accept options and the raw-event opt-in:
 
 ## Update metadata
 
+Model select values carry an informational `_meta.pi` object containing the
+model id and any context-window, maximum-output-token, and modality capability
+facts pi reported. The adapter omits unknown facts rather than inventing them.
+
 pi has no native delegated-agent concept — there are no subagents to tag — so
 session updates carry no `parentToolUseId` annotation: every update is
 main-agent activity. Usage is authoritative only through the ACP

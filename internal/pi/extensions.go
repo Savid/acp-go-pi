@@ -14,6 +14,8 @@ var bridgeExtensionSource []byte
 //go:embed ext/acp-mcp.ts
 var mcpExtensionSource []byte
 
+var marshalMCPConfig = json.MarshalIndent
+
 const (
 	// BridgeExtensionFileName is the wrapper-owned permission bridge
 	// extension written into each per-session agent directory.
@@ -117,7 +119,7 @@ type MCPConfig struct {
 // WriteMCPConfig writes the per-session MCP config into dir and returns its
 // path for EnvMCPConfig.
 func WriteMCPConfig(dir string, config MCPConfig) (string, error) {
-	encoded, err := json.MarshalIndent(config, "", "  ")
+	encoded, err := marshalMCPConfig(config, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("encode mcp config: %w", err)
 	}

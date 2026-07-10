@@ -26,6 +26,11 @@ The adapter validates thinking levels itself against the enum above: pi
 natively accepts an invalid level and silently coerces it, so the adapter
 rejects unknown levels up front instead of letting them mutate silently.
 
+Each advertised model value includes harness-reported `_meta.pi` details:
+`modelId`, `contextWindow`, `maxOutputTokens`, and the known capability names
+(`reasoning`, `image`, `audio`, `pdf`, or `video`). Missing values are omitted
+rather than filled with guessed zeroes.
+
 ## Choosing defaults and per-session values
 
 Set a default model for new sessions with `-model` (`WithDefaultModel`), or

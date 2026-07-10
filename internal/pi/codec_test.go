@@ -68,6 +68,15 @@ func TestLineReaderFraming(t *testing.T) {
 	}
 }
 
+func TestLineReaderRejectsOversizeRecord(t *testing.T) {
+	t.Parallel()
+
+	reader := NewLineReader(strings.NewReader(strings.Repeat("x", maxLineBytes+1)))
+	line, err := reader.Next()
+	require.Nil(t, line)
+	require.ErrorContains(t, err, "jsonl record exceeds")
+}
+
 func TestDecodeMessageClassification(t *testing.T) {
 	t.Parallel()
 

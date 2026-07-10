@@ -20,6 +20,7 @@ const stderrTailLimit = 8 << 10
 // inherits. Everything else is scrubbed: pi treats ambient provider API keys
 // as live auth, so credentials must flow through explicit env additions.
 var baseEnvironmentKeys = []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM"}
+var processPipe = os.Pipe
 
 // LaunchSpec describes one pi RPC-mode process launch.
 type LaunchSpec struct {
@@ -135,12 +136,12 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 		return nil, fmt.Errorf("pi executable path is required")
 	}
 
-	stdinRead, stdinWrite, err := os.Pipe()
+	stdinRead, stdinWrite, err := processPipe()
 	if err != nil {
 		return nil, fmt.Errorf("create stdin pipe: %w", err)
 	}
 
-	stdoutRead, stdoutWrite, err := os.Pipe()
+	stdoutRead, stdoutWrite, err := processPipe()
 	if err != nil {
 		closeQuietly(stdinRead, stdinWrite)
 

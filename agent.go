@@ -15,6 +15,11 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
+const (
+	metaCapabilityFork      = "fork"
+	elicitationScopeSession = "session"
+)
+
 var newServeAgent = NewAgent
 
 // piProcess is the process-control seam over one running pi child.
@@ -211,7 +216,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 		AgentCapabilities: acp.AgentCapabilities{
 			Meta: map[string]any{
 				piMetaKey: map[string]any{
-					"fork": map[string]any{
+					metaCapabilityFork: map[string]any{
 						"unstable": true,
 						"method":   ForkSessionMethod,
 						"request":  "acp.UnstableForkSessionRequest JSON payload only",
@@ -219,7 +224,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 					},
 					"elicitation": map[string]any{
 						"unstable": true,
-						"scope":    "session",
+						"scope":    elicitationScopeSession,
 						"tracks":   "in-progress ACP elicitation RFD",
 					},
 					"rawEvent": map[string]any{

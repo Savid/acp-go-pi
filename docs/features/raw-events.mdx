@@ -27,8 +27,8 @@ The helper `WithSessionRawEvents(true)` sets the same metadata.
 ## Notification shape
 
 Notifications arrive on `_pi/rawEvent` and carry `sessionId`, `sequence`,
-`source`, and `event` — the raw pi RPC event payload. The `sequence` is per
-session, starts at 1, and is strictly contiguous — every event consumes
+`source` (always `"pi"`), and `event` — the raw pi RPC event payload. The
+`sequence` is per session, starts at 1, and is strictly contiguous — every event consumes
 exactly one number, so a host can detect a dropped or replaced frame by
 watching for a gap.
 
@@ -40,7 +40,7 @@ event still consumes its sequence and is emitted with `event` replaced by a
 fixed marker:
 
 ```json
-{ "truncated": true, "reason": "oversize", "maxBytes": 65536, "sizeBytes": 0 }
+{ "truncated": true, "reason": "oversize", "maxBytes": 65536, "sizeBytes": 70000 }
 ```
 
 `sizeBytes` is the byte length of the original marshalled payload. An event

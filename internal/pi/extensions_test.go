@@ -164,3 +164,15 @@ func TestWriteMCPConfigWriteFailure(t *testing.T) {
 	_, err := WriteMCPConfig(t.TempDir(), MCPConfig{})
 	require.ErrorContains(t, err, "write mcp config")
 }
+
+func TestWriteMCPConfigEncodeFailure(t *testing.T) {
+	realMarshal := marshalMCPConfig
+	t.Cleanup(func() { marshalMCPConfig = realMarshal })
+
+	marshalMCPConfig = func(any, string, string) ([]byte, error) {
+		return nil, os.ErrInvalid
+	}
+
+	_, err := WriteMCPConfig(t.TempDir(), MCPConfig{})
+	require.ErrorContains(t, err, "encode mcp config")
+}
