@@ -1,6 +1,9 @@
 package piacp
 
 import (
+	"context"
+	"encoding/json"
+	"io"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -103,4 +106,27 @@ func TestMapAndOptionCloneHelpers(t *testing.T) {
 	cloned := clonePiOptions(options)
 	cloned.OutputSchema["changed"] = true
 	require.NotContains(t, options.OutputSchema, "changed")
+}
+
+func TestForkCallRejectsMalformedResponse(t *testing.T) {
+	clientToAgentReader, clientToAgentWriter := io.Pipe()
+	agentToClientReader, agentToClientWriter := io.Pipe()
+	t.Cleanup(func() {
+		_ = clientToAgentReader.Close()
+		_ = clientToAgentWriter.Close()
+		_ = agentToClientReader.Close()
+		_ = agentToClientWriter.Close()
+	})
+
+	_ = acp.NewConnection(
+		func(context.Context, string, json.RawMessage) (any, *acp.RequestError) {
+			return "not a fork response", nil
+		},
+		agentToClientWriter,
+		clientToAgentReader,
+	)
+	conn := acp.NewClientSideConnection(&conformanceClient{}, clientToAgentWriter, agentToClientReader)
+
+	_, err := CallForkSession(t.Context(), conn, forkParams(t))
+	require.Error(t, err)
 }

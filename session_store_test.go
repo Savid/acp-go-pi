@@ -121,3 +121,21 @@ func TestSessionStoreAndValidationHelpers(t *testing.T) {
 	require.Error(t, validateSessionStartPaths("/cwd", []string{"relative"}))
 	require.NoError(t, validateSessionStartPaths("/cwd", []string{"/also"}))
 }
+
+func TestListSessionsSortsByUpdatedTime(t *testing.T) {
+	store := &InMemorySessionStore{
+		entries: map[SessionKey][]SessionStoreEntry{
+			{SessionID: "older"}: {json.RawMessage(`{}`)},
+			{SessionID: "newer"}: {json.RawMessage(`{}`)},
+		},
+		updatedAt: map[SessionKey]int64{
+			{SessionID: "older"}: 1,
+			{SessionID: "newer"}: 2,
+		},
+		tombstone: map[SessionKey]struct{}{},
+	}
+
+	summaries, err := store.ListSessions(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "newer", summaries[0].SessionID)
+}

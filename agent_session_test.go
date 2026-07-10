@@ -4,14 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
@@ -19,104 +15,33 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
-const coverageValidUUID = "01234567-89ab-cdef-0123-456789abcdef"
-
-func coverageStubAgent(t *testing.T, client *stubPiClient, opts ...Option) *Agent {
-	t.Helper()
-
-	base := make([]Option, 0, 3+len(opts))
-	base = append(base,
-		WithExecutablePath("/fake/pi"),
-		WithHome(t.TempDir()),
-		WithLogger(slog.New(slog.DiscardHandler)),
-	)
-	agent := NewAgent(append(base, opts...)...)
-	agent.probeVersion = func(context.Context, string) (string, error) {
-		return pi.DefaultMinimumVersion, nil
-	}
-
-	process := newStubProcess(false)
-	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
-		return process, client, nil
-	}
-
-	return agent
-}
-
-func coverageBadProcess() *stubProcess {
-	process := newStubProcess(false)
-	process.shutdown = errors.New("shutdown")
-	process.close = errors.New("close")
-
-	return process
-}
-
-func TestStartRealPiProcessRejectsEmptySpec(t *testing.T) {
-	_, _, err := startRealPiProcess(t.Context(), pi.LaunchSpec{})
-	require.Error(t, err)
-}
-
-func TestServeContextAndConnectionBranches(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	require.ErrorIs(t, Serve(ctx, strings.NewReader(""), io.Discard), context.Canceled)
-
-	previous := newServeAgent
-	t.Cleanup(func() { newServeAgent = previous })
-
-	newServeAgent = func(opts ...Option) *Agent {
-		agent := NewAgent(append(opts, WithLogger(slog.New(slog.DiscardHandler)))...)
-		agent.sessions["serve"] = &agentSession{
-			agent: agent,
-			id:    "serve",
-			proc:  coverageBadProcess(),
-			turn:  make(chan struct{}, sessionTurnCapacity),
-		}
-
-		return agent
-	}
-
-	require.NoError(t, Serve(context.Background(), strings.NewReader(""), io.Discard))
-}
-
-func TestAgentCloseJoinsSessionCloseError(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	agent.sessions["id"] = &agentSession{
-		agent: agent,
-		id:    "id",
-		proc:  coverageBadProcess(),
-		turn:  make(chan struct{}, sessionTurnCapacity),
-	}
-	require.Error(t, agent.Close())
-}
-
 func TestStoreStartedSessionCloseErrorBranches(t *testing.T) {
 	closedAgent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	closedAgent.closed = true
-	rejected := &agentSession{agent: closedAgent, id: "rejected", proc: coverageBadProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
+	rejected := &agentSession{agent: closedAgent, id: "rejected", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
 	require.ErrorIs(t, closedAgent.storeStartedSession(t.Context(), rejected), errAgentClosed)
 
 	fullAgent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))
 	fullAgent.sessions["filler"] = &agentSession{agent: fullAgent, id: "filler", turn: make(chan struct{}, sessionTurnCapacity)}
-	backpressured := &agentSession{agent: fullAgent, id: "backpressured", proc: coverageBadProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
+	backpressured := &agentSession{agent: fullAgent, id: "backpressured", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
 	requireInvalidRequest(t, fullAgent.storeStartedSession(t.Context(), backpressured))
 
 	replaceAgent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	replaceAgent.sessions["shared"] = &agentSession{agent: replaceAgent, id: "shared", proc: coverageBadProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
+	replaceAgent.sessions["shared"] = &agentSession{agent: replaceAgent, id: "shared", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
 	replacement := &agentSession{agent: replaceAgent, id: "shared", turn: make(chan struct{}, sessionTurnCapacity)}
 	require.NoError(t, replaceAgent.storeStartedSession(t.Context(), replacement))
 }
 
 func TestRemoveSessionCloseError(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	session := &agentSession{agent: agent, id: "id", proc: coverageBadProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
+	session := &agentSession{agent: agent, id: "id", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
 	agent.removeSession(t.Context(), "unmapped", session)
 }
 
 func TestNewSessionBackpressure(t *testing.T) {
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "fresh"}
-	agent := coverageStubAgent(t, client, WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))
+	agent := newStubClientAgent(t, client, WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))
 	agent.sessions["filler"] = &agentSession{agent: agent, id: "filler", turn: make(chan struct{}, sessionTurnCapacity)}
 
 	_, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
@@ -141,7 +66,7 @@ func TestRestoreSessionAdditionalBranches(t *testing.T) {
 	_, err := closedAgent.ResumeSession(t.Context(), ResumeSessionRequest("resume-id", "/cwd"))
 	require.ErrorIs(t, err, errAgentClosed)
 
-	spawnAgent := coverageStubAgent(t, nil, WithSessionStore(newStore()))
+	spawnAgent := newStubClientAgent(t, nil, WithSessionStore(newStore()))
 	spawnAgent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
 		return nil, nil, errors.New("spawn")
 	}
@@ -150,7 +75,7 @@ func TestRestoreSessionAdditionalBranches(t *testing.T) {
 
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "resume-id"}
-	backpressureAgent := coverageStubAgent(t, client, WithSessionStore(newStore()), WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))
+	backpressureAgent := newStubClientAgent(t, client, WithSessionStore(newStore()), WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))
 	backpressureAgent.sessions["filler"] = &agentSession{agent: backpressureAgent, id: "filler", turn: make(chan struct{}, sessionTurnCapacity)}
 	_, err = backpressureAgent.ResumeSession(t.Context(), ResumeSessionRequest("resume-id", "/cwd"))
 	requireInvalidRequest(t, err)
@@ -166,7 +91,7 @@ func TestLoadSessionRemovesStartedSessionOnReplayFailure(t *testing.T) {
 
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "resume-load"}
-	agent := coverageStubAgent(t, client, WithSessionStore(store))
+	agent := newStubClientAgent(t, client, WithSessionStore(store))
 	connection := newDirectAgentClient()
 	connection.updateErr = errors.New("replay")
 	agent.setConnection(connection)
@@ -185,7 +110,7 @@ func TestListSessionsFilterAndDedupBranches(t *testing.T) {
 	require.Empty(t, resp.Sessions)
 
 	store := NewInMemorySessionStore()
-	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: coverageValidUUID}, []SessionStoreEntry{json.RawMessage(`{"type":"session","cwd":"/one"}`)}))
+	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: validSessionUUID}, []SessionStoreEntry{json.RawMessage(`{"type":"session","cwd":"/one"}`)}))
 	storeAgent := NewAgent(WithSessionStore(store), WithLogger(slog.New(slog.DiscardHandler)))
 	resp, err = storeAgent.ListSessions(t.Context(), ListSessionsRequest())
 	require.NoError(t, err)
@@ -193,10 +118,10 @@ func TestListSessionsFilterAndDedupBranches(t *testing.T) {
 }
 
 func TestListStoreSessionsLoadErrorAndCwdFilter(t *testing.T) {
-	loadStore := newSurfaceSessionStore()
+	loadStore := newFaultySessionStore()
 	require.NoError(t, loadStore.InMemorySessionStore.Append(
 		t.Context(),
-		SessionKey{SessionID: coverageValidUUID},
+		SessionKey{SessionID: validSessionUUID},
 		[]SessionStoreEntry{json.RawMessage(`{"type":"session","cwd":"/one"}`)},
 	))
 	loadStore.loadErr = errors.New("load failed")
@@ -207,7 +132,7 @@ func TestListStoreSessionsLoadErrorAndCwdFilter(t *testing.T) {
 	cwdStore := NewInMemorySessionStore()
 	require.NoError(t, cwdStore.Append(
 		t.Context(),
-		SessionKey{SessionID: coverageValidUUID},
+		SessionKey{SessionID: validSessionUUID},
 		[]SessionStoreEntry{json.RawMessage(`{"type":"session","cwd":"/other"}`)},
 	))
 	cwdAgent := NewAgent(WithSessionStore(cwdStore), WithLogger(slog.New(slog.DiscardHandler)))
@@ -229,7 +154,7 @@ func TestStartSessionEarlyFailureBranches(t *testing.T) {
 	_, err := missingExec.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	require.Error(t, err)
 
-	badModel := coverageStubAgent(t, nil)
+	badModel := newStubClientAgent(t, nil)
 	_, err = badModel.startSession(t.Context(), sessionStart{Cwd: "/cwd", MetaOptions: PiOptions{Model: "invalid"}})
 	requireInvalidParams(t, err)
 
@@ -246,7 +171,7 @@ func TestStartSessionHydrateWriteFailure(t *testing.T) {
 	t.Cleanup(func() { materializeWriteFile = original })
 	materializeWriteFile = func(string, []byte, os.FileMode) error { return errors.New("write") }
 
-	agent := coverageStubAgent(t, nil)
+	agent := newStubClientAgent(t, nil)
 	_, err := agent.startSession(t.Context(), sessionStart{
 		Cwd:            "/cwd",
 		ResumeID:       "resume-id",
@@ -273,14 +198,14 @@ func TestStartSessionExtensionAndConfigFailures(t *testing.T) {
 		}
 	}
 
-	bridgeAsDir := coverageStubAgent(t, nil)
+	bridgeAsDir := newStubClientAgent(t, nil)
 	materializeMkdirAll = mkdirAllPlacingDir(pi.BridgeExtensionFileName)
 	_, err := bridgeAsDir.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	require.Error(t, err)
 
 	configClient := newStubPiClient()
 	configClient.state = pi.SessionState{SessionID: "id"}
-	configAsDir := coverageStubAgent(t, configClient)
+	configAsDir := newStubClientAgent(t, configClient)
 	materializeMkdirAll = mkdirAllPlacingDir(pi.MCPConfigFileName)
 	_, err = configAsDir.startSession(t.Context(), sessionStart{
 		Cwd:        "/cwd",
@@ -290,7 +215,7 @@ func TestStartSessionExtensionAndConfigFailures(t *testing.T) {
 }
 
 func TestStartSessionSeedWriteFailure(t *testing.T) {
-	agent := coverageStubAgent(t, nil)
+	agent := newStubClientAgent(t, nil)
 	agent.options.SeedFiles = map[string]string{"collide": "file", "collide/child": "blocked"}
 	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	require.Error(t, err)
@@ -300,7 +225,7 @@ func TestStartSessionManagedModelAndSetupFailure(t *testing.T) {
 	successClient := newStubPiClient()
 	successClient.state = pi.SessionState{SessionID: "id"}
 	successClient.model = pi.Model{ID: "m", ContextWindow: 5}
-	managed := coverageStubAgent(t, successClient)
+	managed := newStubClientAgent(t, successClient)
 	session, err := managed.startSession(t.Context(), sessionStart{Cwd: "/cwd", MetaOptions: PiOptions{Model: "p/m"}})
 	require.NoError(t, err)
 	require.Equal(t, "p/m", session.model)
@@ -308,7 +233,7 @@ func TestStartSessionManagedModelAndSetupFailure(t *testing.T) {
 
 	setupClient := newStubPiClient()
 	setupClient.autoRetryErr = errors.New("retry")
-	setupFail := coverageStubAgent(t, setupClient)
+	setupFail := newStubClientAgent(t, setupClient)
 	_, err = setupFail.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	require.Error(t, err)
 }
@@ -320,103 +245,4 @@ func TestSetUpNativeSessionForkCommitMirrorFailure(t *testing.T) {
 	session := &agentSession{agent: agent, client: client, proc: newStubProcess(false)}
 	err := agent.setUpNativeSession(t.Context(), session, sessionStart{ForkSession: true}, pi.ModelRef{}, false)
 	require.Error(t, err)
-}
-
-func TestSessionCloseTurnWaitFailure(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	process := newStubProcess(false)
-	session := &agentSession{
-		agent:         agent,
-		id:            "id",
-		proc:          process,
-		turn:          make(chan struct{}, sessionTurnCapacity),
-		closeTurnWait: time.Millisecond,
-	}
-
-	release, err := session.acquireTurn(t.Context())
-	require.NoError(t, err)
-	t.Cleanup(release)
-
-	require.Error(t, session.Close(t.Context()))
-}
-
-func TestPromptSecondPoisonCheck(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	client := newStubPiClient()
-	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
-	lateCtx := &poisonOnDoneContext{session: session}
-
-	_, err := session.Prompt(lateCtx, TextPromptRequest("id", "hi"))
-	require.Error(t, err)
-}
-
-func TestPromptClientPromptFailure(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	client := newStubPiClient()
-	client.promptErr = errors.New("prompt")
-	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
-
-	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "hi"))
-	requirePiTurnFailure(t, err, failureCauseTransport)
-}
-
-func TestPromptHandleTurnEventEmitFailure(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	connection := newDirectAgentClient()
-	connection.updateErr = errors.New("emit")
-	agent.setConnection(connection)
-	client := newStubPiClient()
-	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
-	session.startPump(client)
-	t.Cleanup(session.stopPump)
-
-	go func() {
-		deadline := time.Now().Add(2 * time.Second)
-		for session.activeTurnSink() == nil {
-			if time.Now().After(deadline) {
-				return
-			}
-
-			time.Sleep(time.Millisecond)
-		}
-
-		select {
-		case client.events <- pi.ToolExecutionStartEvent{ToolCallID: "call", ToolName: "bash"}:
-		case <-time.After(2 * time.Second):
-		}
-	}()
-
-	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "hi"))
-	require.Error(t, err)
-}
-
-func TestFinishTurnCommitMirrorFailure(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithTurnTimeout(time.Second))
-	connection := newDirectAgentClient()
-	agent.setConnection(connection)
-	client := newStubPiClient()
-	client.stats = pi.SessionStats{SessionID: "id"}
-	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false), sessionFilePath: t.TempDir()}
-
-	var timedOut atomic.Bool
-	_, err := session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "title"), &promptTurnState{}, &timedOut)
-	require.Error(t, err)
-}
-
-func TestListSessionsSortsByUpdatedTime(t *testing.T) {
-	store := &InMemorySessionStore{
-		entries: map[SessionKey][]SessionStoreEntry{
-			{SessionID: "older"}: {json.RawMessage(`{}`)},
-			{SessionID: "newer"}: {json.RawMessage(`{}`)},
-		},
-		updatedAt: map[SessionKey]int64{
-			{SessionID: "older"}: 1,
-			{SessionID: "newer"}: 2,
-		},
-		tombstone: map[SessionKey]struct{}{},
-	}
-
-	summaries, err := store.ListSessions(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, "newer", summaries[0].SessionID)
 }

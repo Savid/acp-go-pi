@@ -1165,3 +1165,42 @@ func TestRemainingStoreReplayAndUpdateBranches(t *testing.T) {
 	require.Error(t, session.poison(t.Context(), "broken"))
 	require.Equal(t, "text", liveSessionTitleFromPrompt([]acp.ContentBlock{{}, acp.TextBlock("text")}))
 }
+
+func TestStartRealPiProcessRejectsEmptySpec(t *testing.T) {
+	_, _, err := startRealPiProcess(t.Context(), pi.LaunchSpec{})
+	require.Error(t, err)
+}
+
+func TestServeContextAndConnectionBranches(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, Serve(ctx, strings.NewReader(""), io.Discard), context.Canceled)
+
+	previous := newServeAgent
+	t.Cleanup(func() { newServeAgent = previous })
+
+	newServeAgent = func(opts ...Option) *Agent {
+		agent := NewAgent(append(opts, WithLogger(slog.New(slog.DiscardHandler)))...)
+		agent.sessions["serve"] = &agentSession{
+			agent: agent,
+			id:    "serve",
+			proc:  newFailingCloseProcess(),
+			turn:  make(chan struct{}, sessionTurnCapacity),
+		}
+
+		return agent
+	}
+
+	require.NoError(t, Serve(context.Background(), strings.NewReader(""), io.Discard))
+}
+
+func TestAgentCloseJoinsSessionCloseError(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	agent.sessions["id"] = &agentSession{
+		agent: agent,
+		id:    "id",
+		proc:  newFailingCloseProcess(),
+		turn:  make(chan struct{}, sessionTurnCapacity),
+	}
+	require.Error(t, agent.Close())
+}
