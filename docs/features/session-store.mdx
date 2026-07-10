@@ -1,0 +1,69 @@
+---
+title: "Session Store"
+description: "Wire a durable store so pi sessions survive beyond their isolated session directories"
+---
+
+By default a session's pi session file lives only in that session's isolated
+directory. Provide a `SessionStore` when the host needs sessions to resume
+from its own storage — for example a database or object store on a different
+machine.
+
+## Wiring a store
+
+Install a store with `WithSessionStore`; bound the reads used during resume
+with `WithSessionStoreLoadTimeout`. A ready-made in-memory implementation
+ships for tests and small hosts:
+
+```go
+store := piacp.NewInMemorySessionStore()
+
+err := piacp.Serve(ctx, input, output,
+	piacp.WithSessionStore(store),
+	piacp.WithSessionStoreLoadTimeout(5*time.Second),
+)
+```
+
+After each settled turn the adapter appends the session file's new JSONL rows
+to the store verbatim — the raw native bytes, header row first — backs
+`session/list` from the store, and hydrates stored rows back into an isolated
+session directory when the local file is missing. Because the ACP session id
+is pi's own session UUID (it lives in the header row), a restored session
+keeps its id and full history.
+
+## The store contract
+
+The format constant and key type are stable public identifiers:
+
+```go
+const SessionStoreFormat = "pi-session-jsonl-v1"
+
+type SessionKey struct {
+	SessionID string
+	Subpath   string
+}
+```
+
+A store implements six methods:
+
+| Method | Role |
+| --- | --- |
+| `Append` | Append session JSONL rows for a key. |
+| `Load` | Read all rows for a key. |
+| `Replace` | Atomically replace a full generation of a session's files. |
+| `Delete` | Remove a key (and its subkeys for the main key). |
+| `ListSessions` | Enumerate sessions for `session/list`. |
+| `ListSubkeys` | Enumerate a session's non-main subpaths. |
+
+The main entry log uses the empty subpath (`SessionStoreMainSubpath`).
+`Replace` MUST include the main key exactly once. Session summaries report
+`UpdatedAtUnixMilli` in Unix milliseconds.
+
+Only conversation rows are durable. Credential and config files in the agent
+directory — `auth.json`, `settings.json`, trust state — are wrapper-authored
+or injected at hydrate time and are never mirrored into the store.
+
+<Note>
+`WithSessionStoreLoadTimeout` bounds load and list operations during resume.
+Set it when your store can hang (network round-trips), or a slow backend will
+stall `session/load` and `session/resume`.
+</Note>

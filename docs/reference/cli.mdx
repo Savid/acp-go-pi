@@ -1,0 +1,28 @@
+---
+title: "CLI"
+description: "Every flag the acp-go-pi binary accepts and what it maps to"
+---
+
+`acp-go-pi` speaks ACP over stdin/stdout. Flags use Go's single-dash syntax.
+
+```sh
+acp-go-pi -path /usr/local/bin/pi -home /tmp/pi-home -model openai/gpt-4o
+```
+
+## Flags
+
+| Flag | Purpose |
+| --- | --- |
+| `-path` | pi CLI executable (default: search `PATH`). |
+| `-home` | Parent root under which each session gets an isolated pi agent directory. |
+| `-model` | Default model for new sessions, as `"provider/id"`. |
+| `-seed-file` | Write a host file into each session's agent directory as `<relpath>=<hostpath>`; repeatable. |
+| `-debug` | Emit debug logs to stderr. |
+| `-version` | Print adapter version and exit. |
+
+<Note>
+Not every embedded option has a flag. Turn timeouts, concurrency limits,
+credential env injection, OpenTelemetry providers, and the session store are
+embedded-Go only — configure them with the [Go API](/docs/reference/go-api)
+options such as `WithTurnTimeout`, `WithEnv`, and `WithSessionStore`.
+</Note>

@@ -1,0 +1,70 @@
+---
+title: "Prompt Streaming"
+description: "How a pi turn becomes ACP updates, and how commands and failures resolve"
+---
+
+A prompt is one pi turn. The adapter sends the prompt as a pi RPC command and
+reads pi's JSONL event stream line by line, translating each event into an ACP
+session update, so the host sees assistant text, reasoning, and tool activity
+as it happens rather than after the turn finishes.
+
+## From RPC events to updates
+
+pi RPC events map to ACP session updates for assistant text, thoughts, tool
+calls, tool results, and usage counters. The full mapping table lives in
+[Updates](/docs/reference/updates). pi emits a single settle event exactly
+once per accepted prompt, which is the adapter's fence for finishing the turn
+and committing the store mirror.
+
+Two interactive flows are layered on top of the stream:
+
+- **Permission requests** are surfaced as ACP permission prompts through the
+  adapter's own pi bridge extension — see
+  [Permissions](/docs/features/permissions).
+- **User-facing questions** raised by pi extension dialogs are forwarded
+  through ACP elicitation, but only when the initialized client advertised
+  elicitation support. Without it, the dialog is cancelled deterministically
+  and the turn proceeds — see [Elicitation](/docs/features/elicitation).
+
+Raw pi RPC events are not sent by default. A host opts in per session with
+`_meta.pi.rawEvent.enabled`; see [Raw events](/docs/features/raw-events).
+
+## Prompt content validation
+
+Prompt content fails closed before the turn starts. An empty prompt (zero
+content blocks), an unsupported block type (audio or an unknown block), and an
+image block without usable data are rejected with an invalid-params
+(`-32602`) error naming the offending field (`prompt` or `prompt.image`).
+Nothing is silently dropped and nothing is forwarded to pi. Image support is
+per model: a model whose catalog entry does not list image input fails the
+turn with the provider's own error.
+
+## Slash commands
+
+pi discovers commands programmatically per session — extension commands,
+prompt templates, and skills found in the session's agent directory — and the
+adapter projects that set into ACP `available_commands` updates. A prompt
+whose first text block begins with `/name` runs that command as its turn;
+unrecognized `/text` stays ordinary prompt text.
+
+Because each session runs in an isolated agent directory, the advertised set
+is empty unless the operator seeds commands, skills, or extensions into it
+(for example with `WithSeedFiles`). Nothing is fabricated: only what pi itself
+reports is advertised.
+
+## Turn resolution
+
+A turn resolves one of three ways:
+
+- **Success** — pi reports a terminal stop and the prompt returns an ACP
+  `StopReason`.
+- **Cancelled** — the host cancels; the adapter aborts the native turn and the
+  prompt resolves as a successful `cancelled` response, never an error. A user
+  cancel wins even if a turn timeout fires at the same instant. pi keeps the
+  aborted partial assistant message in the session context, so a later prompt
+  may continue from it — that is native behavior, not a replay bug.
+- **Failure** — a process exit, transport break, provider error, or
+  `WithTurnTimeout` expiry ends the prompt with a `pi_turn_failed` JSON-RPC
+  error. Failures are never reported as a stop reason. The
+  [ACP methods](/docs/reference/acp-methods) reference documents the error
+  code and cause vocabulary.

@@ -1,0 +1,47 @@
+---
+title: "Security"
+description: "The trust boundaries an operator relies on when running the adapter"
+---
+
+## Credential boundary
+
+Provider credentials reach a session only by explicit injection — environment
+options or seeded files — into that session's isolated pi agent directory.
+They are never mirrored into the session store, never logged, and never read
+from the operator's real pi home. By default the adapter does not log secrets,
+prompt text, tool payloads, or raw pi event bodies.
+
+## Environment scrubbing
+
+Every pi child runs with a scrubbed environment: ambient shell variables are
+not inherited. pi treats ambient provider keys as live authentication, so
+without scrubbing an exported `OPENAI_API_KEY` would silently become a
+session's identity. Scrubbing makes every credential path deliberate. Each
+session also runs with pi's phone-home behavior pinned off (`PI_OFFLINE=1`),
+so no update checks or telemetry leave the machine from the pi child.
+
+## Permission enforcement
+
+The adapter's bridge extension is the session's permission system — pi ships
+none natively — and it is deterministically the only extension loaded besides
+the adapter's MCP client. In the default `ask` mode every gated tool call
+requires an ACP permission decision, a cancelled dialog fails closed as a
+deny, and `allow` mode is only ever explicit per session — see
+[Permissions](/docs/features/permissions).
+
+## Process isolation
+
+Each session's pi process runs in its own isolated agent directory under the
+`WithHome` parent root, so sessions share no config, auth, or session files.
+The adapter shuts children down by closing stdin — which pi honors by exiting
+immediately — escalating to signals only when needed, so a crashed or killed
+adapter does not leave orphaned pi processes behind.
+
+## Input validation
+
+MCP server declarations are validated before pi launches; unsupported
+transports and invalid names are rejected up front and never reach the CLI
+(see [MCP](/docs/features/mcp)). Seed-file paths are confined to the session's
+agent directory — absolute paths and `..` escapes fail closed — and prompt
+content that the adapter cannot forward is rejected before the turn starts
+(see [Prompt streaming](/docs/core/prompt-streaming)).

@@ -1,0 +1,77 @@
+---
+title: "Go API"
+description: "The public package entry point, options, and helpers at a glance"
+---
+
+The full, authoritative API — signatures, types, and doc comments — is on
+[pkg.go.dev](https://pkg.go.dev/github.com/savid/acp-go-pi). This page indexes
+the public surface; it does not restate godoc.
+
+## Entry point
+
+`Serve(ctx, input, output, opts...)` runs the agent over a pair of JSON-RPC
+streams:
+
+```go
+err := piacp.Serve(ctx, input, output,
+	piacp.WithExecutablePath("/usr/local/bin/pi"),
+	piacp.WithHome("/tmp/pi-home"),
+	piacp.WithDefaultModel("openai/gpt-4o"),
+	piacp.WithSessionStore(store),
+)
+```
+
+## Process options
+
+| Option | Purpose |
+| --- | --- |
+| `WithExecutablePath` | Set the pi CLI path (default: search `PATH`). |
+| `WithHome` | Parent root under which each session gets an isolated pi agent directory. |
+| `WithDefaultModel` | Default model for new sessions, as `"provider/id"`. |
+| `WithEnv` | Add environment variables to every pi child (children run with a scrubbed environment). |
+| `WithSeedFiles` | Write files into each session's isolated agent directory before launch. |
+| `WithSessionStore` | Install durable session storage. |
+| `WithSessionStoreLoadTimeout` | Bound store load/list operations used during resume. |
+| `WithConcurrencyLimits` | Cap active sessions and concurrent client calls. |
+| `WithTurnTimeout` | Bound one prompt turn; expiry fails the turn with cause `timeout` (default: no deadline). |
+
+## Pi-specific options
+
+| Option | Purpose |
+| --- | --- |
+| `WithPiMinimumVersion` | Override the minimum `pi --version` accepted at startup (default: the version the adapter was verified against). |
+
+## Per-session options
+
+`PiOptions` is the typed builder for `_meta.pi.options`; construct it with
+`NewPiOptions` and attach it with `WithSessionPiOptions`:
+
+| Option | Purpose |
+| --- | --- |
+| `WithPiModel` | Session model as `"provider/id"`. |
+| `WithPiEnv` | Extra environment variables for this session's pi process. |
+| `WithPiThinkingLevel` | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
+| `WithPiPermission` | Permission mode: `ask` (default) or `allow`. |
+| `WithPiOutputSchema` | Reserved for API symmetry; pi has no native structured-output surface, so setting it fails closed at session start. |
+
+## Identity and observability options
+
+| Option | Purpose |
+| --- | --- |
+| `WithAgentName`, `WithAgentTitle`, `WithAgentVersion` | Values advertised during ACP initialize. |
+| `WithLogger` | Structured diagnostic logger. |
+| `WithTracerProvider`, `WithMeterProvider`, `WithTextMapPropagator` | OpenTelemetry wiring (see [Observability](/docs/operations/observability)). |
+
+## Request helpers and store types
+
+Request builders: `NewSessionRequest`, `LoadSessionRequest`,
+`ResumeSessionRequest`, `ForkSessionRequest`, `CallForkSession`,
+`PromptRequest`, `TextPromptRequest`, `SetConfigOptionRequest`,
+`SetModelRequest`, `DeleteSessionRequest`, `ListSessionsRequest`,
+`WithSessionMCPServers`, `WithSessionAdditionalDirectories`,
+`WithSessionMeta`, `WithSessionRawEvents`, `WithSessionOutputSchema`,
+`StdioMCPServer`, `HTTPMCPServer`.
+
+Session-store surface: `SessionStore`, `SessionKey`, `SessionSummary`,
+`SessionStoreReplacement`, `InMemorySessionStore`, and the constants
+`SessionStoreFormat` and `SessionStoreMainSubpath`.

@@ -1,0 +1,42 @@
+---
+title: "Examples"
+description: "Run the bundled reference clients that exercise the adapter end to end"
+---
+
+Three runnable reference clients live under `examples/`. Each is a real ACP
+client, not a stub, and each drives the adapter through a full initialize →
+session → prompt flow.
+
+## Available examples
+
+| Example | What it does |
+| --- | --- |
+| `examples/minimal-client` | Starts the adapter, sends one prompt, prints the streamed reply. |
+| `examples/interactive-chat` | A small interactive terminal client for multi-prompt sessions. |
+| `examples/resume-from-file` | Loads pi session JSONL rows into a `SessionStore`, restores the session, and prompts it. |
+
+## Running them
+
+The examples are repo-relative, so clone the repository first:
+
+```sh
+git clone https://github.com/savid/acp-go-pi && cd acp-go-pi
+```
+
+Send a single prompt:
+
+```sh
+go run ./examples/minimal-client "Reply with ACP_EXAMPLE_OK"
+```
+
+Resume from a previously mirrored session file — point `-file` at a pi session
+JSONL you saved earlier:
+
+```sh
+go run ./examples/resume-from-file -file ./transcript.jsonl
+```
+
+`resume-from-file` also accepts `-session`, `-cwd`, and `-prompt` to override
+the session id, working directory, and follow-up prompt. See
+[Session store](/docs/features/session-store) for how the rows are loaded
+back into a session.

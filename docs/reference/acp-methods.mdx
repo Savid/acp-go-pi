@@ -1,0 +1,69 @@
+---
+title: "ACP Methods"
+description: "The implemented ACP methods, extensions, and the turn-failure error contract"
+---
+
+## Methods
+
+Core methods handled through the ACP SDK connection: initialize, session
+create/load/resume/list/delete, prompt, cancel, close, authenticate, logout,
+and the session configuration methods. Unsupported methods return a uniform
+JSON-RPC method-not-found error.
+
+## Extensions
+
+| Method | Direction |
+| --- | --- |
+| `_pi/session/fork` | client to agent |
+| `_pi/rawEvent` | agent to client |
+
+### `_pi/session/fork`
+
+Forks a session by duplicating the parent's active branch into a new pi
+session with a fresh session id; the parent linkage is recorded in the new
+session's header. Params and result reuse the SDK's fork payload shapes, built
+with `ForkSessionRequest` and called through `CallForkSession`. Stable
+`session/fork` is not routed — it returns method-not-found; the extension
+method is the only fork route. Forking a session that has no conversation
+entries yet is rejected with a structured invalid-params error, because pi
+cannot duplicate an empty branch.
+
+### No `_pi/rateLimits`
+
+pi is bring-your-own-key across many providers and exposes no
+subscription-usage source, so this adapter does not implement a
+`_pi/rateLimits` extension; a call returns the uniform JSON-RPC
+method-not-found error.
+
+## Turn-failure contract
+
+A native turn failure terminates `session/prompt` with a JSON-RPC error and no
+`PromptResponse`; it is never reported as an ACP stop reason. Every failure
+uses one uniform shape so a host can classify it without vendor parsing. The
+error is JSON-RPC code **`-32603`** with a `data` object:
+
+| Field | Value |
+| --- | --- |
+| `error` | `pi_turn_failed` |
+| `cause` | one of the causes below |
+| `message` | the real native cause text (never a placeholder) |
+
+The `cause` vocabulary:
+
+| Cause | Meaning |
+| --- | --- |
+| `process_exit` | The pi process died mid-turn; `message` carries the real exit status and a stderr tail. |
+| `transport` | pi's stdout closed or the event stream broke mid-turn. |
+| `provider` | pi reported a provider error for the turn (bad key, quota, upstream failure); `message` carries pi's error text verbatim. |
+| `timeout` | A `WithTurnTimeout` deadline expired; the native turn was aborted. |
+
+A provider failure leaves the session addressable: the next `session/prompt`
+re-drives the turn. A single malformed native line is skipped and counted, not
+escalated into a dead session.
+
+<Note>
+This adapter advertises no ACP auth methods, so an authentication failure is a
+`provider` failure under `-32603` — it never emits the `-32000` auth-required
+variant. A user cancel that races a timeout resolves as a successful
+`cancelled` response, not a failure.
+</Note>

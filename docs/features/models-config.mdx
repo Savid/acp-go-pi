@@ -1,0 +1,69 @@
+---
+title: "Models And Config"
+description: "Select the model and thinking level per session, and seed pi settings safely"
+---
+
+pi is multi-provider: models are addressed as `"provider/id"` (for example
+`openai/gpt-4o`), and the adapter validates selections against
+pi's own model catalog rather than a static list.
+
+## Model and thinking-level options
+
+Session configuration uses typed select option categories:
+
+| Category | Option id | Values |
+| --- | --- | --- |
+| `model` | `model` | pi's model catalog, as `"provider/id"` |
+| `thought_level` | `thought_level` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+
+Use `session/set_config_option` with a selected option value id (the
+`SetModelRequest` helper builds the model form). Boolean payloads, unknown
+option ids, and unknown values are rejected with an invalid-params error
+naming the offending field. A model that pi's catalog does not know fails with
+pi's own error text.
+
+The adapter validates thinking levels itself against the enum above: pi
+natively accepts an invalid level and silently coerces it, so the adapter
+rejects unknown levels up front instead of letting them mutate silently.
+
+## Choosing defaults and per-session values
+
+Set a default model for new sessions with `-model` (`WithDefaultModel`), or
+per session through the typed options:
+
+```go
+req := piacp.NewSessionRequest(cwd,
+	piacp.WithSessionPiOptions(piacp.NewPiOptions(
+		piacp.WithPiModel("openai/gpt-4o"),
+		piacp.WithPiThinkingLevel("medium"),
+	)),
+)
+```
+
+The same values travel on the wire as `_meta.pi.options.model` and
+`_meta.pi.options.thinkingLevel`; see [Metadata](/docs/reference/meta).
+
+## Seeding pi settings
+
+`WithSeedFiles` (CLI: `-seed-file`) writes files into each session's isolated
+pi agent directory before the pi process launches, so the CLI reads them as
+its own config. Because every session gets a fresh isolated directory, seeds
+never touch the operator's real pi home.
+
+`settings.json` is special: the adapter authors it to pin session behavior, so
+a seeded `settings.json` is deep-merged **under** the adapter's managed keys —
+the adapter wins for keys it owns, the seed supplies everything else. All
+other filenames are written verbatim. Paths are confined to the agent
+directory: absolute paths, `..` escapes, and empty keys fail closed at session
+start.
+
+```go
+err := piacp.Serve(ctx, input, output,
+	piacp.WithSeedFiles(map[string]string{
+		"settings.json": `{"defaultProvider":"anthropic"}`,
+	}),
+)
+```
+
+Keep secrets in `WithEnv` rather than in seeded files; see
+[Authentication](/docs/features/authentication) for the credential paths.

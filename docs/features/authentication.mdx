@@ -1,0 +1,58 @@
+---
+title: "Authentication"
+description: "Why the adapter advertises no auth methods and how to inject pi provider credentials"
+---
+
+The adapter does not broker provider accounts. pi is bring-your-own-key across
+many providers and owns authentication natively — through provider environment
+variables and an `auth.json` in its agent directory — so there is nothing for
+a host to log into through ACP.
+
+## No ACP auth methods
+
+ACP initialize reports an empty `authMethods` list. A host never calls
+`authenticate` against this adapter, and ACP `logout` clears only
+adapter-owned session state — it never touches provider credentials. An
+authentication problem inside pi (a missing or refused provider key) surfaces
+as an ordinary turn failure with cause `provider`, not as an ACP auth
+challenge; see [ACP methods](/docs/reference/acp-methods).
+
+## Scrubbed environment
+
+Every pi session runs in an isolated per-session agent directory with a
+scrubbed environment. Ambient shell variables — including provider API keys
+exported in the operator's shell — are **not** inherited by the pi child, so a
+stray `OPENAI_API_KEY` can never silently become a session's identity.
+Credentials reach a session only when the host injects them explicitly.
+
+## Injecting credentials
+
+Pass provider environment variables with `WithEnv` (all sessions) or
+`WithPiEnv` (one session) — pi reads standard provider variables such as
+`ANTHROPIC_API_KEY` and `OPENAI_API_KEY`:
+
+```go
+err := piacp.Serve(ctx, input, output,
+	piacp.WithEnv(map[string]string{
+		"ANTHROPIC_API_KEY": "sk-ant-...",
+	}),
+)
+```
+
+Alternatively, seed a pi `auth.json` into each session's isolated agent
+directory with `WithSeedFiles` (CLI: `-seed-file auth.json=<hostpath>`):
+
+```go
+err := piacp.Serve(ctx, input, output,
+	piacp.WithSeedFiles(map[string]string{
+		"auth.json": authJSON,
+	}),
+)
+```
+
+Injected credentials are never written to the session store: `auth.json` and
+the other config files in the agent directory are excluded from mirroring, so
+durable session state carries conversation rows only — see
+[Session store](/docs/features/session-store). Keep secrets in environment
+options wherever possible and prefer seeding `auth.json` only when a provider
+requires pi's own credential file format.

@@ -1,0 +1,32 @@
+---
+title: "Elicitation"
+description: "Forward pi's user-facing dialogs to clients that opt in during initialize"
+---
+
+When a pi extension needs to ask the user a question mid-turn — a confirm, an
+input box, or an editor dialog — the adapter can forward it to the host as an
+ACP elicitation request. In an unmodified session the only extensions present
+are the adapter's own, so elicitation traffic comes from the adapter's bridge
+and from any extensions the operator has seeded into the session's agent
+directory.
+
+## Capability gating
+
+Elicitation is only used when the client advertised elicitation support during
+ACP initialize. The adapter checks that capability before sending anything, so
+a client that never opted in is never handed an elicitation request it cannot
+render.
+
+| Client elicitation capability | Adapter behavior |
+| --- | --- |
+| Advertised | The pi dialog is forwarded as an ACP elicitation request. |
+| Absent | No request is sent; the dialog is cancelled deterministically and the turn continues per pi's own logic. |
+
+<Note>
+Elicitation is not the permission channel. Tool-access approvals always use
+[permission prompts](/docs/features/permissions); elicitation carries
+free-form questions only.
+</Note>
+
+Because behavior depends on the client's advertised capability, test both
+paths: a client that supports elicitation and one that does not.

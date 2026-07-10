@@ -1,0 +1,56 @@
+---
+title: "Sessions"
+description: "The session lifecycle model and how pi session files map to durable keys"
+---
+
+An ACP session maps one-to-one to a long-lived `pi --mode rpc` process. The
+adapter creates that process on demand inside an isolated per-session agent
+directory, keeps it alive across prompt turns, and tears it down when the
+session closes.
+
+## Lifecycle
+
+The adapter implements the full ACP session surface: create, load, resume,
+list, prompt, cancel, close, and delete. The ACP session id **is** pi's own
+session UUID — it comes from the header row of pi's session file, survives a
+store restore, and stays the durable store key, so a host can address the same
+session across restarts. Forking an existing session is exposed only through
+the `_pi/session/fork` extension method — there is no separate fork ACP
+method. A fork duplicates the parent's active branch into a new session with a
+fresh session id; forking a session with no conversation yet is rejected with
+a structured error.
+
+Loading and resuming a session rehydrate pi's own session file. When the local
+file is gone but a host-provided [session store](/docs/features/session-store)
+holds the rows, the adapter materializes them into the session's isolated
+directory so pi can continue from them.
+
+pi creates its session file lazily: a brand-new session has no file (and
+nothing to mirror) until the first conversation entry lands. Listing sessions
+right after `session/new` therefore reflects the store, not a native file.
+
+## Store keys and subpaths
+
+Durable storage is keyed by session id plus a subpath:
+
+```go
+type SessionKey struct {
+	SessionID string
+	Subpath   string
+}
+```
+
+The main entry log uses the empty subpath (`SessionStoreMainSubpath`) and
+carries the raw pi session JSONL rows verbatim — the header row first, then
+the tree entries appended after each settled turn.
+
+## Turn bounds and failures
+
+Each prompt is a *turn*. A turn ends with an ACP `StopReason`, a user cancel,
+or a native failure. Cancelling a turn resolves as a successful `cancelled`
+response, not an error. A turn that never terminates can be bounded with
+`WithTurnTimeout`; on expiry the native turn is aborted and the prompt fails
+with a `pi_turn_failed` error whose cause is `timeout`. See
+[Prompt streaming](/docs/core/prompt-streaming) for how turn output is
+delivered and [ACP methods](/docs/reference/acp-methods) for the failure
+contract.

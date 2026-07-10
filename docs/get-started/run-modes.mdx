@@ -1,0 +1,47 @@
+---
+title: "Run Modes"
+description: "Choose between the standalone binary and embedding the adapter directly in your Go host"
+---
+
+The adapter offers the same behavior through two entry points. Pick by where the
+ACP transport lives: use the standalone binary when an editor or host spawns a
+subprocess and pipes JSON-RPC over stdio, and embed `Serve` when your host owns
+the reader/writer streams directly.
+
+## Standalone
+
+`acp-go-pi` is launched by an ACP client, which drives it over stdin/stdout.
+stdout carries ACP JSON-RPC only; diagnostics go to stderr (and `-debug` when
+present).
+
+```sh
+acp-go-pi -path /usr/local/bin/pi -home /tmp/pi-home -model openai/gpt-4o
+```
+
+## Embedded
+
+`Serve` runs the agent against reader/writer streams you supply, so your host
+can back the transport with any pipe, socket, or in-memory buffer:
+
+```go
+err := piacp.Serve(ctx, input, output,
+	piacp.WithExecutablePath("/usr/local/bin/pi"),
+	piacp.WithHome("/tmp/pi-home"),
+	piacp.WithDefaultModel("openai/gpt-4o"),
+)
+```
+
+Every serve-mode flag has an option equivalent:
+
+| Flag | Option |
+| --- | --- |
+| `-path` | `WithExecutablePath` |
+| `-home` | `WithHome` |
+| `-model` | `WithDefaultModel` |
+| `-seed-file` | `WithSeedFiles` |
+
+Embed-only options carry no flag. Use `WithSessionStore` when the host wants
+durable session storage, plus `WithEnv` for credential injection,
+`WithTurnTimeout`, `WithConcurrencyLimits`, `WithPiMinimumVersion`, and the
+OpenTelemetry providers. See the [Go API reference](/docs/reference/go-api)
+for the full catalog.

@@ -1,0 +1,65 @@
+---
+title: "Quickstart"
+description: "Get a first successful ACP turn against pi in a few steps"
+---
+
+This tutorial takes you from nothing to a streamed assistant reply over ACP.
+
+## Prerequisites
+
+- A local pi CLI (`pi`) on `PATH`, **version 0.80.6 or newer**. The adapter
+  probes `pi --version` at startup and fails fast on anything older.
+- Provider credentials for at least one pi provider. pi is bring-your-own-key,
+  and the adapter launches pi with a scrubbed environment, so credentials are
+  injected explicitly rather than inherited from your shell — see
+  [Authentication](/docs/features/authentication) for the injection options.
+- A Go toolchain to build and run the example clients.
+
+## Steps
+
+<Steps>
+  <Step title="Clone the repository">
+    The example programs are repo-relative (`go run ./examples/...`), so start
+    from a checkout:
+
+    ```sh
+    git clone https://github.com/savid/acp-go-pi && cd acp-go-pi
+    ```
+  </Step>
+  <Step title="Run a single-prompt turn">
+    The minimal client starts the adapter, initializes, opens a session, sends
+    one prompt, and prints the streamed reply:
+
+    ```sh
+    go run ./examples/minimal-client "Reply with a short hello from ACP."
+    ```
+  </Step>
+  <Step title="Try an interactive session">
+    The interactive client keeps a session open so you can send several prompts:
+
+    ```sh
+    go run ./examples/interactive-chat
+    ```
+  </Step>
+</Steps>
+
+## Verify
+
+The example prints the streamed assistant reply to stdout and exits `0`. A
+greeting line derived from your prompt confirms the full path worked: agent
+initialization, session creation, the prompt turn, and streamed output back
+through ACP.
+
+If you instead launch the raw command for an ACP host to drive, it blocks on
+stdin waiting for JSON-RPC frames and writes ACP frames only to stdout; add
+`-debug` to send diagnostics to stderr:
+
+```sh
+go run ./cmd/acp-go-pi -path "$(command -v pi)" -home /tmp/pi-home -debug
+```
+
+## Next steps
+
+- [Run modes](/docs/get-started/run-modes) — standalone binary versus embedded `Serve`.
+- [Examples](/docs/get-started/examples) — the interactive-chat and resume-from-file clients.
+- [Sessions](/docs/core/sessions) — the session lifecycle behind that first turn.

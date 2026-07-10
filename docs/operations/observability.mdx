@@ -1,0 +1,36 @@
+---
+title: "Observability"
+description: "Wire up telemetry and use it to diagnose turn failures and timeouts"
+---
+
+## Telemetry wiring
+
+Embedded hosts supply OpenTelemetry providers with `WithTracerProvider`,
+`WithMeterProvider`, and `WithTextMapPropagator`. The standalone binary
+configures exporters from environment variables when OpenTelemetry support is
+compiled in. Providers a host passes stay owned by the host, including
+`ForceFlush` and `Shutdown`.
+
+Logs go to stderr so stdout stays reserved for ACP frames; enable debug
+logging with `-debug` (`WithLogger` for a custom logger). Telemetry records
+lifecycle timing, request outcomes, and counters, and by default avoids
+recording prompt text, tool inputs, tool outputs, and raw pi event bodies.
+
+## Diagnosing turn failures
+
+A failed prompt returns a `pi_turn_failed` error whose `cause` tells you where
+to look. The [failure contract](/docs/reference/acp-methods) defines the full
+shape; use the `cause` to route the investigation:
+
+| Cause | First thing to check |
+| --- | --- |
+| `process_exit` | The `message` carries the real exit status and a stderr tail — inspect it; confirm the `pi` CLI is installed and is version 0.80.6+. |
+| `transport` | A stream broke mid-turn; check for client disconnects or a pi process killed out from under the adapter. |
+| `provider` | pi reported a provider error verbatim — a missing or refused key, quota, or an upstream failure; check that credentials were injected for the session (ambient shell keys are scrubbed). |
+| `timeout` | A `WithTurnTimeout` deadline expired; raise the bound or investigate why the turn ran long. |
+
+<Note>
+A user cancel that coincides with a `WithTurnTimeout` expiry resolves as a
+successful `cancelled` response, not a `timeout` failure. If you expect
+timeouts but see cancellations, the client is cancelling first.
+</Note>

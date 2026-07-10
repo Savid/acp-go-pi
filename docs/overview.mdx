@@ -1,0 +1,66 @@
+---
+title: "Overview"
+description: "What the pi ACP adapter does and where its responsibility ends"
+---
+
+`acp-go-pi` runs the pi coding agent behind an Agent Client Protocol (ACP)
+JSON-RPC connection. A host either launches the `acp-go-pi` binary and speaks
+ACP over stdio, or embeds the Go package and calls `piacp.Serve`. Either way
+the host drives pi through standard ACP methods instead of the interactive
+terminal UI.
+
+## What the adapter owns
+
+The adapter is a thin translation layer between ACP and the local `pi` CLI in
+RPC mode. It owns:
+
+- ACP protocol mapping and the pi subprocess lifecycle (one long-lived
+  `pi --mode rpc` process per ACP session, each in an isolated per-session
+  agent directory with a scrubbed environment).
+- Streaming pi's JSONL RPC events into ACP session updates.
+- The permission and elicitation dialogs themselves — pi deliberately ships no
+  built-in permission system, so the adapter supplies one through a
+  wrapper-owned pi extension.
+- The MCP client — pi deliberately ships no built-in MCP support, so the
+  adapter supplies a dependency-free pi extension that connects the session's
+  declared MCP servers.
+- Model configuration, slash-command projection, optional raw events, and
+  optional durable session storage.
+
+## What the adapter does not own
+
+Provider authentication stays with pi. pi is bring-your-own-key across many
+providers, and the adapter only injects credentials into each session's
+isolated agent directory — through environment options or seeded files — and
+never logs in, brokers, or persists them. ACP initialize reports no auth
+methods; see [Authentication](/docs/features/authentication).
+
+## Extension surface
+
+Public extension methods are intentionally narrow, and all pi-specific
+metadata lives under the `_meta.pi` namespace:
+
+| Method | Purpose |
+| --- | --- |
+| `_pi/session/fork` | Fork a stored or active session. |
+| `_pi/rawEvent` | Emit opt-in, bounded raw pi RPC events. |
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" href="/docs/get-started/quickstart">
+    Run your first ACP turn against pi.
+  </Card>
+  <Card title="Run modes" href="/docs/get-started/run-modes">
+    Standalone subprocess versus embedding `Serve` in your Go host.
+  </Card>
+  <Card title="Sessions" href="/docs/core/sessions">
+    The session lifecycle and durable-store model.
+  </Card>
+  <Card title="Permissions" href="/docs/features/permissions">
+    How tool-permission decisions flow through ACP.
+  </Card>
+  <Card title="Go API" href="/docs/reference/go-api">
+    Embed the adapter with `Serve` and its options.
+  </Card>
+</CardGroup>
