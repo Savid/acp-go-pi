@@ -1,0 +1,355 @@
+package piacp
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"github.com/coder/acp-go-sdk"
+
+	"github.com/savid/acp-go-pi/internal/pi"
+)
+
+// SetSessionMode exists only because github.com/coder/acp-go-sdk's generated
+// Agent interface still requires it. Remove this when the upstream SDK drops
+// session/set_mode; the local ACP dispatcher intentionally does not route it.
+func (a *Agent) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
+}
+
+// SetSessionConfigOption handles supported configuration changes.
+func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
+	switch {
+	case params.ValueId != nil:
+		return a.setSessionConfigValue(ctx, params.ValueId)
+	case params.Boolean != nil:
+		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{
+			jsonFieldError: validationUnsupported,
+			jsonFieldField: "boolean",
+		})
+	default:
+		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{acpFieldConfig: validationRequired})
+	}
+}
+
+func (a *Agent) setSessionConfigValue(
+	ctx context.Context,
+	params *acp.SetSessionConfigOptionValueId,
+) (acp.SetSessionConfigOptionResponse, error) {
+	session, err := a.session(params.SessionId)
+	if err != nil {
+		return acp.SetSessionConfigOptionResponse{}, err
+	}
+
+	if poisonErr := session.poisonedError(); poisonErr != nil {
+		return acp.SetSessionConfigOptionResponse{}, poisonErr
+	}
+
+	switch params.ConfigId {
+	case configModel, configThoughtLevel:
+	default:
+		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{acpFieldConfig: "unsupported option"})
+	}
+
+	releaseTurn, err := session.acquireTurn(ctx)
+	if err != nil {
+		return acp.SetSessionConfigOptionResponse{}, err
+	}
+	defer releaseTurn()
+
+	if poisonErr := session.poisonedError(); poisonErr != nil {
+		return acp.SetSessionConfigOptionResponse{}, poisonErr
+	}
+
+	switch params.ConfigId {
+	case configModel:
+		if err := session.applyModelSelection(ctx, string(params.Value)); err != nil {
+			return acp.SetSessionConfigOptionResponse{}, err
+		}
+	case configThoughtLevel:
+		if err := session.applyThinkingLevelSelection(ctx, string(params.Value)); err != nil {
+			return acp.SetSessionConfigOptionResponse{}, err
+		}
+	}
+
+	options := sessionConfigOptions(session)
+	updates := []acp.SessionUpdate{{ConfigOptionUpdate: &acp.SessionConfigOptionUpdate{ConfigOptions: options}}}
+
+	if err := session.emitOptionalUpdates(ctx, updates); err != nil {
+		return acp.SetSessionConfigOptionResponse{}, err
+	}
+
+	return acp.SetSessionConfigOptionResponse{ConfigOptions: options}, nil
+}
+
+func (s *agentSession) applyModelSelection(ctx context.Context, value string) error {
+	ref, err := pi.ParseModelRef(value)
+	if err != nil {
+		return acp.NewInvalidParams(map[string]any{acpFieldValue: err.Error()})
+	}
+
+	selected, err := s.currentClient().SetModel(ctx, ref.Provider, ref.ID)
+	if err != nil {
+		var commandErr *pi.CommandError
+		if errors.As(err, &commandErr) {
+			return acp.NewInvalidParams(map[string]any{acpFieldValue: commandErr.Message})
+		}
+
+		return err
+	}
+
+	s.mu.Lock()
+	s.model = ref.Provider + "/" + selected.ID
+	s.contextWindowSize = selected.ContextWindow
+	s.mu.Unlock()
+
+	return nil
+}
+
+func (s *agentSession) applyThinkingLevelSelection(ctx context.Context, value string) error {
+	// pi accepts invalid levels with success and silently coerces them, so
+	// the wrapper validates the enum itself.
+	if !pi.IsValidThinkingLevel(value) {
+		return acp.NewInvalidParams(map[string]any{acpFieldValue: "unsupported thought level: " + value})
+	}
+
+	if err := s.currentClient().SetThinkingLevel(ctx, value); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.thinkingLevel = value
+	s.mu.Unlock()
+
+	return nil
+}
+
+func sessionConfigOptions(session *agentSession) []acp.SessionConfigOption {
+	session.mu.Lock()
+	model := session.model
+	available := append([]pi.Model(nil), session.availableModels...)
+	thinkingLevel := session.thinkingLevel
+	session.mu.Unlock()
+
+	options := make([]acp.SessionConfigOption, 0, 2)
+
+	if model != "" {
+		if values := modelSelectOptions(model, available); len(values) > 0 {
+			options = append(options, acp.SessionConfigOption{
+				Select: &acp.SessionConfigOptionSelect{
+					Id:           configModel,
+					Name:         "Model",
+					Category:     configCategory(acp.SessionConfigOptionCategoryModel),
+					CurrentValue: acp.SessionConfigValueId(model),
+					Options: acp.SessionConfigSelectOptions{
+						Ungrouped: &values,
+					},
+				},
+			})
+		}
+	}
+
+	if thinkingLevel != "" {
+		values := thinkingLevelSelectOptions()
+		options = append(options, acp.SessionConfigOption{
+			Select: &acp.SessionConfigOptionSelect{
+				Id:           configThoughtLevel,
+				Name:         "Thought Level",
+				Category:     configCategory(acp.SessionConfigOptionCategoryThoughtLevel),
+				CurrentValue: acp.SessionConfigValueId(thinkingLevel),
+				Options: acp.SessionConfigSelectOptions{
+					Ungrouped: &values,
+				},
+			},
+		})
+	}
+
+	return options
+}
+
+func sessionUnstableConfigOptions(session *agentSession) []acp.UnstableSessionConfigOption {
+	session.mu.Lock()
+	model := session.model
+	available := append([]pi.Model(nil), session.availableModels...)
+	thinkingLevel := session.thinkingLevel
+	session.mu.Unlock()
+
+	options := make([]acp.UnstableSessionConfigOption, 0, 2)
+
+	if model != "" {
+		if values := modelSelectOptions(model, available); len(values) > 0 {
+			options = append(options, acp.UnstableSessionConfigOption{
+				Select: &acp.UnstableSessionConfigOptionSelect{
+					Id:           configModel,
+					Name:         "Model",
+					Type:         configTypeSelect,
+					Category:     configCategory(acp.SessionConfigOptionCategoryModel),
+					CurrentValue: acp.SessionConfigValueId(model),
+					Options: acp.SessionConfigSelectOptions{
+						Ungrouped: &values,
+					},
+				},
+			})
+		}
+	}
+
+	if thinkingLevel != "" {
+		values := thinkingLevelSelectOptions()
+		options = append(options, acp.UnstableSessionConfigOption{
+			Select: &acp.UnstableSessionConfigOptionSelect{
+				Id:           configThoughtLevel,
+				Name:         "Thought Level",
+				Type:         configTypeSelect,
+				Category:     configCategory(acp.SessionConfigOptionCategoryThoughtLevel),
+				CurrentValue: acp.SessionConfigValueId(thinkingLevel),
+				Options: acp.SessionConfigSelectOptions{
+					Ungrouped: &values,
+				},
+			},
+		})
+	}
+
+	return options
+}
+
+func modelSelectOptions(model string, available []pi.Model) acp.SessionConfigSelectOptionsUngrouped {
+	values := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(available)+1)
+	seen := make(map[string]struct{}, len(available)+1)
+
+	for index := range available {
+		info := &available[index]
+
+		ref := info.Provider + "/" + info.ID
+		if info.Provider == "" || info.ID == "" {
+			continue
+		}
+
+		if _, ok := seen[ref]; ok {
+			continue
+		}
+
+		values = append(values, acp.SessionConfigSelectOption{
+			Name:  modelDisplayName(info),
+			Value: acp.SessionConfigValueId(ref),
+			Meta:  piModelInfoMeta(info),
+		})
+		seen[ref] = struct{}{}
+	}
+
+	if _, ok := seen[model]; !ok {
+		values = append(values, acp.SessionConfigSelectOption{
+			Name:  model,
+			Value: acp.SessionConfigValueId(model),
+		})
+	}
+
+	return values
+}
+
+func thinkingLevelSelectOptions() acp.SessionConfigSelectOptionsUngrouped {
+	levels := pi.ThinkingLevels()
+	values := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(levels))
+
+	for _, level := range levels {
+		values = append(values, acp.SessionConfigSelectOption{
+			Name:  thinkingLevelDisplayName(level),
+			Value: acp.SessionConfigValueId(level),
+		})
+	}
+
+	return values
+}
+
+func thinkingLevelDisplayName(level string) string {
+	switch level {
+	case pi.ThinkingLevelOff:
+		return "Off"
+	case pi.ThinkingLevelMinimal:
+		return "Minimal"
+	case pi.ThinkingLevelLow:
+		return "Low"
+	case pi.ThinkingLevelMedium:
+		return "Medium"
+	case pi.ThinkingLevelHigh:
+		return "High"
+	case pi.ThinkingLevelXHigh:
+		return "Extra High"
+	case pi.ThinkingLevelMax:
+		return "Max"
+	default:
+		return level
+	}
+}
+
+func modelDisplayName(info *pi.Model) string {
+	if info.Name != "" {
+		return info.Name
+	}
+
+	return info.Provider + "/" + info.ID
+}
+
+// piModelInfoMeta attaches harness-reported model metadata under the model
+// select value's _meta.pi; absent metadata is omitted, never zero-filled.
+func piModelInfoMeta(info *pi.Model) map[string]any {
+	piMeta := make(map[string]any, 4)
+
+	piMeta["modelId"] = info.Provider + "/" + info.ID
+
+	if info.ContextWindow > 0 {
+		piMeta["contextWindow"] = info.ContextWindow
+	}
+
+	if info.MaxTokens > 0 {
+		piMeta["maxOutputTokens"] = info.MaxTokens
+	}
+
+	if capabilities := modelCapabilities(info); len(capabilities) > 0 {
+		piMeta["capabilities"] = capabilities
+	}
+
+	return map[string]any{piMetaKey: piMeta}
+}
+
+func modelCapabilities(info *pi.Model) []string {
+	capabilities := make([]string, 0, len(info.Input)+1)
+
+	if info.Reasoning {
+		capabilities = append(capabilities, "reasoning")
+	}
+
+	for _, input := range info.Input {
+		switch strings.ToLower(input) {
+		case "image":
+			capabilities = append(capabilities, "image")
+		case "audio":
+			capabilities = append(capabilities, "audio")
+		case "pdf":
+			capabilities = append(capabilities, "pdf")
+		case "video":
+			capabilities = append(capabilities, "video")
+		}
+	}
+
+	return capabilities
+}
+
+func configCategory(category acp.SessionConfigOptionCategory) *acp.SessionConfigOptionCategory {
+	return &category
+}
+
+func selectPositionEncoding(encodings []acp.PositionEncodingKind) acp.PositionEncodingKind {
+	for _, encoding := range encodings {
+		if encoding == acp.PositionEncodingKindUtf8 {
+			return acp.PositionEncodingKindUtf8
+		}
+	}
+
+	for _, encoding := range encodings {
+		if encoding == acp.PositionEncodingKindUtf16 {
+			return acp.PositionEncodingKindUtf16
+		}
+	}
+
+	return acp.PositionEncodingKindUtf16
+}

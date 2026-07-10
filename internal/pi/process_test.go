@@ -2,9 +2,11 @@ package pi
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -122,6 +124,29 @@ func writeScript(t *testing.T, body string) string {
 	return path
 }
 
+// startScriptProcess retries ETXTBSY: a concurrently forked child of a
+// parallel test can inherit the just-written script's write descriptor across
+// its own fork/exec window, making this exec transiently fail with
+// "text file busy".
+func startScriptProcess(t *testing.T, spec LaunchSpec) *Process {
+	t.Helper()
+
+	for attempt := 0; ; attempt++ {
+		process, err := StartProcess(t.Context(), spec)
+		if err == nil {
+			return process
+		}
+
+		if attempt < 50 && errors.Is(err, syscall.ETXTBSY) {
+			time.Sleep(10 * time.Millisecond)
+
+			continue
+		}
+
+		require.NoError(t, err)
+	}
+}
+
 func TestStartProcessValidation(t *testing.T) {
 	t.Parallel()
 
@@ -137,14 +162,13 @@ func TestProcessStdinEOFExit(t *testing.T) {
 
 	script := writeScript(t, `cat >/dev/null; echo done; exit 0`)
 
-	process, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir()})
-	require.NoError(t, err)
+	process := startScriptProcess(t, LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir()})
 
 	t.Cleanup(func() { _ = process.Close() })
 
 	require.ErrorContains(t, process.WaitErr(), "still running")
 
-	_, err = process.Stdin().Write([]byte("swallowed by cat\n"))
+	_, err := process.Stdin().Write([]byte("swallowed by cat\n"))
 	require.NoError(t, err)
 
 	require.NoError(t, process.CloseStdin())
@@ -168,8 +192,7 @@ func TestProcessShutdownLadderStdinEOF(t *testing.T) {
 
 	script := writeScript(t, `cat >/dev/null; exit 0`)
 
-	process, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir()})
-	require.NoError(t, err)
+	process := startScriptProcess(t, LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir()})
 
 	t.Cleanup(func() { _ = process.Close() })
 
@@ -183,12 +206,11 @@ func TestProcessShutdownLadderSigterm(t *testing.T) {
 	// Ignores stdin EOF, exits on TERM.
 	script := writeScript(t, `trap 'exit 0' TERM; while :; do sleep 0.1; done`)
 
-	process, err := StartProcess(t.Context(), LaunchSpec{
+	process := startScriptProcess(t, LaunchSpec{
 		ExecutablePath:      script,
 		AgentDir:            t.TempDir(),
 		ShutdownStepTimeout: 200 * time.Millisecond,
 	})
-	require.NoError(t, err)
 
 	t.Cleanup(func() { _ = process.Close() })
 
@@ -201,12 +223,11 @@ func TestProcessShutdownLadderSigkill(t *testing.T) {
 	// Ignores stdin EOF and TERM; only KILL works.
 	script := writeScript(t, `trap '' TERM; while :; do sleep 0.1; done`)
 
-	process, err := StartProcess(t.Context(), LaunchSpec{
+	process := startScriptProcess(t, LaunchSpec{
 		ExecutablePath:      script,
 		AgentDir:            t.TempDir(),
 		ShutdownStepTimeout: 200 * time.Millisecond,
 	})
-	require.NoError(t, err)
 
 	t.Cleanup(func() { _ = process.Close() })
 
@@ -219,8 +240,7 @@ func TestProcessKill(t *testing.T) {
 
 	script := writeScript(t, `while :; do sleep 0.1; done`)
 
-	process, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir()})
-	require.NoError(t, err)
+	process := startScriptProcess(t, LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir()})
 
 	t.Cleanup(func() { _ = process.Close() })
 
@@ -238,8 +258,7 @@ func TestProcessStderrTail(t *testing.T) {
 
 	script := writeScript(t, `echo "boom: real cause" >&2; exit 3`)
 
-	process, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir()})
-	require.NoError(t, err)
+	process := startScriptProcess(t, LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir()})
 
 	t.Cleanup(func() { _ = process.Close() })
 
@@ -253,12 +272,11 @@ func TestProcessEnvironmentIsScrubbed(t *testing.T) {
 
 	script := writeScript(t, `env; exit 0`)
 
-	process, err := StartProcess(t.Context(), LaunchSpec{
+	process := startScriptProcess(t, LaunchSpec{
 		ExecutablePath: script,
 		AgentDir:       t.TempDir(),
 		Env:            map[string]string{"ACP_GO_PI_TEST_EXPLICIT": "ok"},
 	})
-	require.NoError(t, err)
 
 	t.Cleanup(func() { _ = process.Close() })
 

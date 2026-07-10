@@ -224,68 +224,6 @@ func WithPiMinimumVersion(version string) Option {
 	}
 }
 
-const (
-	piMetaKey              = "pi"
-	metaOptionsKey         = "options"
-	metaModelKey           = "model"
-	metaEnvKey             = "env"
-	metaOutputSchemaKey    = "outputSchema"
-	metaThinkingLevelKey   = "thinkingLevel"
-	metaPermissionKey      = "permission"
-	metaRawEventKey        = "rawEvent"
-	metaRawEventEnabledKey = "enabled"
-)
-
-// PiOptions is the stable, supported pi-specific subset accepted at
-// _meta.pi.options. The JSON field names below are part of this package's
-// wire contract; unsupported option keys are rejected.
-type PiOptions struct {
-	// Model selects the pi model for this session as "provider/id".
-	Model string `json:"model,omitempty"`
-	// Env adds environment variables for this pi session's process.
-	Env map[string]string `json:"env,omitempty"`
-	// OutputSchema requests JSON Schema structured output. pi has no native
-	// structured-output surface, so setting it fails closed at session start.
-	OutputSchema map[string]any `json:"outputSchema,omitempty"`
-	// ThinkingLevel selects the pi reasoning level for this session:
-	// off, minimal, low, medium, high, xhigh, or max.
-	ThinkingLevel string `json:"thinkingLevel,omitempty"`
-	// Permission selects the adapter permission mode for this session:
-	// "ask" (deny-by-default dialog, the default) or "allow" (auto-allow).
-	Permission string `json:"permission,omitempty"`
-}
-
-// Meta returns an ACP _meta object for the supported pi-specific options.
-func (options PiOptions) Meta() map[string]any {
-	values := map[string]any{}
-
-	if options.Model != "" {
-		values[metaModelKey] = options.Model
-	}
-
-	if len(options.Env) > 0 {
-		values[metaEnvKey] = cloneStringMap(options.Env)
-	}
-
-	if len(options.OutputSchema) > 0 {
-		values[metaOutputSchemaKey] = cloneAnyMap(options.OutputSchema)
-	}
-
-	if options.ThinkingLevel != "" {
-		values[metaThinkingLevelKey] = options.ThinkingLevel
-	}
-
-	if options.Permission != "" {
-		values[metaPermissionKey] = options.Permission
-	}
-
-	return map[string]any{
-		piMetaKey: map[string]any{
-			metaOptionsKey: values,
-		},
-	}
-}
-
 func cloneStringMap(values map[string]string) map[string]string {
 	if values == nil {
 		return nil
