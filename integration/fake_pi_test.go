@@ -33,10 +33,12 @@ const (
 
 const fakePiVersion = "0.80.6"
 
-// Exact native strings observed live from pi 0.80.6.
+// Native strings observed live from pi 0.80.6.
 const (
 	fakeBusyError = "Agent is already processing. " +
 		"Specify streamingBehavior ('steer' or 'followUp') to queue the message."
+	// pi appends installation-specific documentation paths after this text, so
+	// only the stable prefix is reproduced here.
 	fakeNoAPIKeyError = "No API key found for the selected model.\n\n" +
 		"Use /login to log into a provider via OAuth or API key."
 	fakeAbortedErrorMessage = "This operation was aborted"
