@@ -96,32 +96,6 @@ func TestInMemorySessionStoreNilAndContextErrors(t *testing.T) {
 	require.Nil(t, loaded[0])
 }
 
-func TestSessionStoreAndValidationHelpers(t *testing.T) {
-	require.True(t, validUUIDShape("01234567-89ab-cdef-0123-456789ABCDEF"))
-	require.False(t, validUUIDShape("short"))
-	require.False(t, validUUIDShape("01234567x89ab-cdef-0123-456789abcdef"))
-	require.False(t, validUUIDShape("01234567-89ab-cdef-0123-456789abcdeg"))
-	require.Equal(t, "second", firstNonEmptyString("", "second", "third"))
-	require.Empty(t, firstNonEmptyString("", ""))
-
-	require.Error(t, validateRequiredAbsolutePath("cwd", ""))
-	require.Error(t, validateRequiredAbsolutePath("cwd", "relative"))
-	require.NoError(t, validateRequiredAbsolutePath("cwd", "/absolute"))
-	require.NoError(t, validateOptionalAbsolutePath("cwd", nil))
-	empty := ""
-	require.NoError(t, validateOptionalAbsolutePath("cwd", &empty))
-	relative := "relative"
-	require.Error(t, validateOptionalAbsolutePath("cwd", &relative))
-	absolute := "/absolute"
-	require.NoError(t, validateOptionalAbsolutePath("cwd", &absolute))
-	require.Error(t, validateAbsolutePaths("paths", []string{""}))
-	require.Error(t, validateAbsolutePaths("paths", []string{"relative"}))
-	require.NoError(t, validateAbsolutePaths("paths", []string{"/one", "/two"}))
-	require.Error(t, validateSessionStartPaths("", nil))
-	require.Error(t, validateSessionStartPaths("/cwd", []string{"relative"}))
-	require.NoError(t, validateSessionStartPaths("/cwd", []string{"/also"}))
-}
-
 func TestListSessionsSortsByUpdatedTime(t *testing.T) {
 	store := &InMemorySessionStore{
 		entries: map[SessionKey][]SessionStoreEntry{
@@ -138,4 +112,18 @@ func TestListSessionsSortsByUpdatedTime(t *testing.T) {
 	summaries, err := store.ListSessions(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, "newer", summaries[0].SessionID)
+}
+
+func TestListSessionsFallsBackToSessionIDOrder(t *testing.T) {
+	store := &InMemorySessionStore{
+		entries: map[SessionKey][]SessionStoreEntry{
+			{SessionID: "b"}: {json.RawMessage(`{}`)},
+			{SessionID: "a"}: {json.RawMessage(`{}`)},
+		},
+		updatedAt: map[SessionKey]int64{},
+		tombstone: map[SessionKey]struct{}{},
+	}
+	summaries, err := store.ListSessions(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "a", summaries[0].SessionID)
 }

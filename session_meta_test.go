@@ -78,25 +78,66 @@ func TestEnvironmentValidation(t *testing.T) {
 	}
 }
 
-func TestRawMessageConfigAndMarkers(t *testing.T) {
-	require.False(t, rawMessageConfigFromMeta(nil).Enabled())
-	require.False(t, rawMessageConfigFromMeta(map[string]any{piMetaKey: "bad"}).Enabled())
-	require.False(t, rawMessageConfigFromMeta(map[string]any{piMetaKey: map[string]any{metaRawEventKey: true}}).Enabled())
-	require.True(t, rawMessageConfigFromMeta(map[string]any{piMetaKey: map[string]any{
-		metaRawEventKey: map[string]any{metaRawEventEnabledKey: true},
-	}}).Enabled())
+func TestPiOptionsMeta(t *testing.T) {
+	t.Parallel()
 
-	marker, marked := rawEventMarker(map[string]any{"value": "small"})
-	require.False(t, marked)
-	require.Nil(t, marker)
+	tests := []struct {
+		name    string
+		options PiOptions
+		want    map[string]any
+	}{
+		{
+			name:    "empty options",
+			options: PiOptions{},
+			want:    map[string]any{"pi": map[string]any{"options": map[string]any{}}},
+		},
+		{
+			name: "all supported fields",
+			options: PiOptions{
+				Model:         "openai/gpt-4o",
+				Env:           map[string]string{"K": "V"},
+				OutputSchema:  map[string]any{"type": "object"},
+				ThinkingLevel: "high",
+				Permission:    "allow",
+			},
+			want: map[string]any{"pi": map[string]any{"options": map[string]any{
+				"model":         "openai/gpt-4o",
+				"env":           map[string]string{"K": "V"},
+				"outputSchema":  map[string]any{"type": "object"},
+				"thinkingLevel": "high",
+				"permission":    "allow",
+			}}},
+		},
+	}
 
-	marker, marked = rawEventMarker(map[string]any{"value": make(chan int)})
-	require.True(t, marked)
-	require.Equal(t, rawEventReasonUnserializable, marker[rawEventFieldReason])
-	require.NotContains(t, marker, rawEventFieldSizeBytes)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 
-	marker, marked = rawEventMarker(map[string]any{"value": string(make([]byte, rawEventMaxBytes))})
-	require.True(t, marked)
-	require.Equal(t, rawEventReasonOversize, marker[rawEventFieldReason])
-	require.Greater(t, marker[rawEventFieldSizeBytes], rawEventMaxBytes)
+			require.Equal(t, test.want, test.options.Meta())
+		})
+	}
+}
+
+func TestPiOptionsMetaClonesMaps(t *testing.T) {
+	t.Parallel()
+
+	options := PiOptions{
+		Env:          map[string]string{"K": "V"},
+		OutputSchema: map[string]any{"type": "object"},
+	}
+
+	meta := options.Meta()
+
+	piMeta, ok := meta["pi"].(map[string]any)
+	require.True(t, ok)
+
+	values, ok := piMeta["options"].(map[string]any)
+	require.True(t, ok)
+
+	envClone, ok := values["env"].(map[string]string)
+	require.True(t, ok)
+
+	envClone["K"] = "mutated"
+	require.Equal(t, "V", options.Env["K"])
 }

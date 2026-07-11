@@ -176,3 +176,170 @@ func messageRow(t *testing.T, message pi.AgentMessage) SessionStoreEntry {
 
 	return row
 }
+
+type stubProcess struct {
+	exited   chan struct{}
+	waitErr  error
+	stderr   string
+	shutdown error
+	kill     error
+	close    error
+}
+
+func newStubProcess(exited bool) *stubProcess {
+	process := &stubProcess{exited: make(chan struct{})}
+	if exited {
+		close(process.exited)
+	}
+
+	return process
+}
+
+func (*stubProcess) CloseStdin() error                { return nil }
+func (p *stubProcess) Exited() <-chan struct{}        { return p.exited }
+func (p *stubProcess) WaitErr() error                 { return p.waitErr }
+func (p *stubProcess) StderrTail() string             { return p.stderr }
+func (p *stubProcess) Shutdown(context.Context) error { return p.shutdown }
+func (p *stubProcess) Kill() error                    { return p.kill }
+func (p *stubProcess) Close() error                   { return p.close }
+
+type directAgentClient struct {
+	done      chan struct{}
+	notifyErr error
+	updateErr error
+	notified  []map[string]any
+	updates   []acp.SessionUpdate
+}
+
+func newDirectAgentClient() *directAgentClient {
+	return &directAgentClient{done: make(chan struct{})}
+}
+
+func (c *directAgentClient) Done() <-chan struct{} { return c.done }
+func (*directAgentClient) CreateElicitation(
+	context.Context,
+	acp.UnstableCreateElicitationRequest,
+	elicitationScope,
+) (acp.UnstableCreateElicitationResponse, error) {
+	return acp.UnstableCreateElicitationResponse{}, nil
+}
+func (*directAgentClient) RequestPermission(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
+}
+func (c *directAgentClient) SessionUpdate(_ context.Context, notification acp.SessionNotification) error {
+	c.updates = append(c.updates, notification.Update)
+
+	return c.updateErr
+}
+func (c *directAgentClient) NotifyExtension(_ context.Context, _ string, value any) error {
+	if payload, ok := value.(map[string]any); ok {
+		c.notified = append(c.notified, payload)
+	}
+
+	return c.notifyErr
+}
+
+type appendControlledStore struct {
+	SessionStore
+	mu       sync.Mutex
+	failures int
+	calls    int
+	err      error
+}
+
+func (s *appendControlledStore) Append(ctx context.Context, key SessionKey, entries []SessionStoreEntry) error {
+	s.mu.Lock()
+	s.calls++
+	if s.failures > 0 {
+		s.failures--
+		err := s.err
+		s.mu.Unlock()
+
+		return err
+	}
+	s.mu.Unlock()
+
+	return s.SessionStore.Append(ctx, key, entries)
+}
+
+type errorSessionStore struct {
+	SessionStore
+	loadErr   error
+	listErr   error
+	deleteErr error
+}
+
+func (s *errorSessionStore) Load(context.Context, SessionKey) ([]SessionStoreEntry, error) {
+	return nil, s.loadErr
+}
+
+func (s *errorSessionStore) ListSessions(context.Context) ([]SessionSummary, error) {
+	return nil, s.listErr
+}
+
+func (s *errorSessionStore) Delete(context.Context, SessionKey) error {
+	return s.deleteErr
+}
+
+type stubPiClient struct {
+	events       chan pi.Event
+	uiRequests   chan pi.UIRequest
+	done         chan struct{}
+	err          error
+	abortErr     error
+	promptErr    error
+	respondErr   error
+	stats        pi.SessionStats
+	statsErr     error
+	model        pi.Model
+	setModelErr  error
+	thinkingErr  error
+	startErr     error
+	cloneCancel  bool
+	cloneErr     error
+	autoRetryErr error
+	state        pi.SessionState
+	stateErr     error
+	models       []pi.Model
+	modelsErr    error
+	commands     []pi.SlashCommand
+	commandsErr  error
+}
+
+func newStubPiClient() *stubPiClient {
+	return &stubPiClient{events: make(chan pi.Event), uiRequests: make(chan pi.UIRequest), done: make(chan struct{})}
+}
+
+func (c *stubPiClient) Start(context.Context) error                             { return c.startErr }
+func (c *stubPiClient) Events() <-chan pi.Event                                 { return c.events }
+func (c *stubPiClient) UIRequests() <-chan pi.UIRequest                         { return c.uiRequests }
+func (c *stubPiClient) Done() <-chan struct{}                                   { return c.done }
+func (c *stubPiClient) Err() error                                              { return c.err }
+func (c *stubPiClient) RespondUI(pi.UIResponse) error                           { return c.respondErr }
+func (c *stubPiClient) Prompt(context.Context, string, []pi.ImageContent) error { return c.promptErr }
+func (c *stubPiClient) Abort(context.Context) error                             { return c.abortErr }
+func (c *stubPiClient) Clone(context.Context) (bool, error)                     { return c.cloneCancel, c.cloneErr }
+func (c *stubPiClient) GetState(context.Context) (pi.SessionState, error) {
+	return c.state, c.stateErr
+}
+func (c *stubPiClient) GetAvailableModels(context.Context) ([]pi.Model, error) {
+	return c.models, c.modelsErr
+}
+func (c *stubPiClient) SetModel(context.Context, string, string) (pi.Model, error) {
+	return c.model, c.setModelErr
+}
+func (c *stubPiClient) SetThinkingLevel(context.Context, string) error { return c.thinkingErr }
+func (c *stubPiClient) SetAutoRetry(context.Context, bool) error       { return c.autoRetryErr }
+func (c *stubPiClient) GetSessionStats(context.Context) (pi.SessionStats, error) {
+	return c.stats, c.statsErr
+}
+func (c *stubPiClient) GetCommands(context.Context) ([]pi.SlashCommand, error) {
+	return c.commands, c.commandsErr
+}
+
+func requireInvalidRequest(t *testing.T, err error) {
+	t.Helper()
+	var requestError *acp.RequestError
+	require.ErrorAs(t, err, &requestError)
+	require.Equal(t, -32600, requestError.Code)
+}

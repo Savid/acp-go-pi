@@ -1,6 +1,8 @@
 package piacp
 
 import (
+	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -40,4 +42,102 @@ func TestLiveSessionTitleNormalization(t *testing.T) {
 	prompt := []acp.ContentBlock{acp.TextBlock(" first "), acp.TextBlock("second")}
 	require.Equal(t, "first", liveSessionTitleFromPrompt(prompt))
 	require.Empty(t, liveSessionTitleFromPrompt(nil))
+}
+
+func TestRawEventSixCases(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	client := newDirectAgentClient()
+	agent.setConnection(client)
+	first := &agentSession{agent: agent, id: "first", rawMessages: rawMessageConfig{All: true}}
+	second := &agentSession{agent: agent, id: "second", rawMessages: rawMessageConfig{All: true}}
+
+	first.emitRawPiEvent(t.Context(), []byte(`{"type":"one"}`))
+	first.emitRawPiEvent(t.Context(), []byte(`{"type":"two"}`))
+	second.emitRawPiEvent(t.Context(), []byte(`{"type":"one"}`))
+	require.Len(t, client.notified, 3)
+	require.EqualValues(t, 1, client.notified[0][rawEventFieldSequence])
+	require.EqualValues(t, 2, client.notified[1][rawEventFieldSequence])
+	require.EqualValues(t, 1, client.notified[2][rawEventFieldSequence])
+
+	first.emitRawPiEvent(t.Context(), []byte(`{"value":"`+strings.Repeat("x", rawEventMaxBytes)+`"}`))
+	require.Equal(t, rawEventReasonOversize, anyMap(t, client.notified[3][rawEventFieldEvent])[rawEventFieldReason])
+	first.emitRawPiEvent(t.Context(), []byte(`not-json`))
+	require.Equal(t, rawEventReasonUnserializable, anyMap(t, client.notified[4][rawEventFieldEvent])[rawEventFieldReason])
+
+	client.notifyErr = errors.New("emit")
+	first.emitRawPiEvent(t.Context(), []byte(`{"type":"still-success"}`))
+	disabled := &agentSession{agent: agent, id: "disabled"}
+	disabled.emitRawPiEvent(t.Context(), []byte(`{"type":"off"}`))
+	first.emitRawPiEvent(t.Context(), nil)
+	require.Len(t, client.notified, 6)
+
+	agent.conn = nil
+	first.emitRawPiEvent(t.Context(), []byte(`{"type":"no-client"}`))
+	agent.conn = client
+	agent.closed = true
+	first.emitRawPiEvent(t.Context(), []byte(`{"type":"closed"}`))
+}
+
+func TestSessionUpdateEmissionAndPoisoning(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	client := newDirectAgentClient()
+	agent.setConnection(client)
+	session := &agentSession{
+		agent:             agent,
+		id:                "id",
+		availableCommands: []pi.SlashCommand{{Name: "one", Description: "first"}},
+	}
+	require.NoError(t, session.emitUpdates(t.Context(), nil))
+	require.NoError(t, session.emitOptionalUpdates(t.Context(), nil))
+	require.NoError(t, session.emitAvailableCommandsUpdate(t.Context(), false))
+	require.Len(t, client.updates, 1)
+	require.NoError(t, session.emitAvailableCommandsUpdate(t.Context(), false))
+	require.Len(t, client.updates, 1)
+	require.NoError(t, session.emitAvailableCommandsUpdate(t.Context(), true))
+	require.Len(t, client.updates, 2)
+
+	session.availableCommands = nil
+	require.NoError(t, session.emitAvailableCommandsUpdate(t.Context(), false))
+	require.Len(t, client.updates, 3)
+	require.NoError(t, session.emitClearAvailableCommandsUpdate(t.Context()))
+	require.Len(t, client.updates, 3)
+	session.advertisedCommands = []acp.AvailableCommand{{Name: "one"}}
+	require.NoError(t, session.emitClearAvailableCommandsUpdate(t.Context()))
+	require.Len(t, client.updates, 4)
+	require.Len(t, emptyAvailableCommandsUpdate(), 1)
+
+	client.updateErr = errors.New("update")
+	require.Error(t, session.emitUpdates(t.Context(), []acp.SessionUpdate{{}}))
+	require.Error(t, session.emitOptionalUpdates(t.Context(), []acp.SessionUpdate{{}}))
+	client.updateErr = nil
+	agent.conn = nil
+	require.ErrorIs(t, session.emitUpdates(t.Context(), []acp.SessionUpdate{{}}), errACPConnectionNotAttached)
+	require.NoError(t, session.emitOptionalUpdates(t.Context(), []acp.SessionUpdate{{}}))
+	agent.conn = client
+	agent.closed = true
+	require.ErrorIs(t, session.emitUpdates(t.Context(), []acp.SessionUpdate{{}}), errAgentClosed)
+	require.NoError(t, session.emitOptionalUpdates(t.Context(), []acp.SessionUpdate{{}}))
+	agent.closed = false
+
+	cancelled := false
+	session.cancel = func() { cancelled = true }
+	session.advertisedCommands = []acp.AvailableCommand{{Name: "one"}}
+	require.Error(t, session.poison(t.Context(), "broken"))
+	require.True(t, cancelled)
+	require.Error(t, session.poisonedError())
+	require.Error(t, session.poison(t.Context(), "other"))
+	require.Error(t, poisonedSessionError("broken"))
+	nilAgent := &agentSession{}
+	require.Error(t, nilAgent.poison(t.Context(), "broken"))
+}
+
+func TestClearCommandsAndPoisonEmitFailures(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	client := newDirectAgentClient()
+	agent.setConnection(client)
+	session := &agentSession{agent: agent, id: "id", advertisedCommands: []acp.AvailableCommand{{Name: "one"}}}
+	client.updateErr = errors.New("clear")
+	require.Error(t, session.emitClearAvailableCommandsUpdate(t.Context()))
+	require.Error(t, session.poison(t.Context(), "broken"))
+	require.Equal(t, "text", liveSessionTitleFromPrompt([]acp.ContentBlock{{}, acp.TextBlock("text")}))
 }

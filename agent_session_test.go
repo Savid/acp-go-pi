@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -245,4 +246,333 @@ func TestSetUpNativeSessionForkCommitMirrorFailure(t *testing.T) {
 	session := &agentSession{agent: agent, client: client, proc: newStubProcess(false)}
 	err := agent.setUpNativeSession(t.Context(), session, sessionStart{ForkSession: true}, pi.ModelRef{}, false)
 	require.Error(t, err)
+}
+
+func TestSessionInfoAndAgentBookkeeping(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))
+	client := newDirectAgentClient()
+	agent.setConnection(client)
+	session := &agentSession{agent: agent, id: "id", cwd: "/cwd", additionalDirectories: []string{"/extra"}, turn: make(chan struct{}, 1)}
+	session.fingerprint = sessionStartFingerprint(sessionStart{})
+	require.NoError(t, agent.storeStartedSession(t.Context(), session))
+	require.Same(t, session, agent.activeSessionForStart("id", sessionStart{Cwd: ""}))
+	require.Nil(t, agent.activeSessionForStart("missing", sessionStart{}))
+	require.Equal(t, "", session.currentProvider())
+	session.model = "provider/model"
+	require.Equal(t, "provider", session.currentProvider())
+
+	info := session.sessionInfo("id")
+	require.Equal(t, "/cwd", info.Cwd)
+	require.Equal(t, "id", *info.Title)
+	require.NoError(t, session.emitLiveSessionInfoUpdate(t.Context(), []acp.ContentBlock{acp.TextBlock(" title ")}))
+	info = session.sessionInfo("id")
+	require.Equal(t, "title", *info.Title)
+	require.NotNil(t, info.UpdatedAt)
+
+	other := &agentSession{agent: agent, id: "other", turn: make(chan struct{}, 1)}
+	err := agent.storeStartedSession(t.Context(), other)
+	requireInvalidRequest(t, err)
+	require.NoError(t, agent.storeStartedSession(t.Context(), session))
+	agent.removeSession(t.Context(), "missing", nil)
+	agent.removeSession(t.Context(), "id", session)
+	require.Nil(t, agent.sessions["id"])
+
+	agent.closed = true
+	closedSession := &agentSession{agent: agent, id: "closed", turn: make(chan struct{}, 1)}
+	require.ErrorIs(t, agent.storeStartedSession(t.Context(), closedSession), errAgentClosed)
+}
+
+func TestSessionFingerprintAndMCPNames(t *testing.T) {
+	servers := []acp.McpServer{
+		HTTPMCPServer("http", "http://example.test", nil),
+		{Sse: &acp.McpServerSseInline{Name: "sse"}},
+		{Acp: &acp.McpServerAcpInline{Name: "acp"}},
+		StdioMCPServer("stdio", "cmd", nil, nil),
+		{},
+	}
+	for index, want := range []string{"http", "sse", "acp", "stdio", ""} {
+		require.Equal(t, want, mcpServerName(servers[index]))
+	}
+	left := sessionStart{Cwd: "/cwd", McpServers: servers}
+	right := sessionStart{Cwd: "/cwd", McpServers: []acp.McpServer{servers[4], servers[3], servers[2], servers[1], servers[0]}}
+	require.Equal(t, sessionStartFingerprint(left), sessionStartFingerprint(right))
+}
+
+func TestNativeSessionSetupBranches(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	newSession := func(client *stubPiClient) *agentSession {
+		return &agentSession{agent: agent, client: client, proc: newStubProcess(false)}
+	}
+	baseClient := func() *stubPiClient {
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "id", SessionFile: "/session", ThinkingLevel: "off"}
+
+		return client
+	}
+
+	client := baseClient()
+	session := newSession(client)
+	require.NoError(t, agent.setUpNativeSession(t.Context(), session, sessionStart{}, pi.ModelRef{}, false))
+	require.Equal(t, acp.SessionId("id"), session.id)
+
+	client = baseClient()
+	client.cloneErr = &pi.CommandError{Message: "Entry null not found"}
+	requireInvalidParams(t, agent.setUpNativeSession(t.Context(), newSession(client), sessionStart{ForkSession: true}, pi.ModelRef{}, false))
+	client = baseClient()
+	client.cloneErr = errors.New("clone")
+	require.Error(t, agent.setUpNativeSession(t.Context(), newSession(client), sessionStart{ForkSession: true}, pi.ModelRef{}, false))
+	client = baseClient()
+	client.cloneCancel = true
+	require.Error(t, agent.setUpNativeSession(t.Context(), newSession(client), sessionStart{ForkSession: true}, pi.ModelRef{}, false))
+
+	for _, configure := range []func(*stubPiClient){
+		func(c *stubPiClient) { c.autoRetryErr = errors.New("retry") },
+		func(c *stubPiClient) { c.stateErr = errors.New("state") },
+		func(c *stubPiClient) { c.thinkingErr = errors.New("thinking") },
+		func(c *stubPiClient) { c.modelsErr = errors.New("models") },
+		func(c *stubPiClient) { c.commandsErr = errors.New("commands") },
+	} {
+		client = baseClient()
+		configure(client)
+		start := sessionStart{}
+		if client.thinkingErr != nil {
+			start.MetaOptions.ThinkingLevel = "high"
+		}
+		require.Error(t, agent.setUpNativeSession(t.Context(), newSession(client), start, pi.ModelRef{}, false))
+	}
+
+	client = baseClient()
+	client.state.SessionID = "different"
+	require.Error(t, agent.setUpNativeSession(t.Context(), newSession(client), sessionStart{ResumeID: "expected", HydrateEntries: []SessionStoreEntry{json.RawMessage(`{}`)}}, pi.ModelRef{}, false))
+
+	client = baseClient()
+	client.setModelErr = &pi.CommandError{Message: "missing model"}
+	requireInvalidParams(t, agent.setUpNativeSession(t.Context(), newSession(client), sessionStart{}, pi.ModelRef{Provider: "p", ID: "m"}, true))
+	client = baseClient()
+	client.setModelErr = errors.New("set model")
+	require.Error(t, agent.setUpNativeSession(t.Context(), newSession(client), sessionStart{}, pi.ModelRef{Provider: "p", ID: "m"}, true))
+
+	client = baseClient()
+	client.state.Model = &pi.Model{Provider: "p", ID: "state", ContextWindow: 10}
+	client.model = pi.Model{ID: "selected", ContextWindow: 20}
+	client.models = []pi.Model{{Provider: "p", ID: "selected"}}
+	client.commands = []pi.SlashCommand{{Name: "command"}}
+	session = newSession(client)
+	require.NoError(t, agent.setUpNativeSession(t.Context(), session, sessionStart{MetaOptions: PiOptions{ThinkingLevel: "high"}}, pi.ModelRef{Provider: "p", ID: "requested"}, true))
+	require.Equal(t, "p/selected", session.model)
+	require.EqualValues(t, 20, session.contextWindowSize)
+	require.Len(t, session.availableModels, 1)
+	require.Len(t, session.availableCommands, 1)
+
+	require.Empty(t, stateModelRef(pi.SessionState{}))
+	require.Empty(t, stateModelRef(pi.SessionState{Model: &pi.Model{Provider: "", ID: "id"}}))
+	require.Empty(t, stateModelRef(pi.SessionState{Model: &pi.Model{Provider: "unknown", ID: "unknown"}}))
+	require.Equal(t, "p/m", stateModelRef(pi.SessionState{Model: &pi.Model{Provider: "p", ID: "m"}}))
+
+	ref, has, err := agent.resolveInitialModel(PiOptions{})
+	require.NoError(t, err)
+	require.False(t, has)
+	require.Empty(t, ref)
+	defaultAgent := NewAgent(WithDefaultModel("p/default"))
+	ref, has, err = defaultAgent.resolveInitialModel(PiOptions{})
+	require.NoError(t, err)
+	require.True(t, has)
+	require.Equal(t, "p/default", ref.String())
+	_, _, err = agent.resolveInitialModel(PiOptions{Model: "invalid"})
+	requireInvalidParams(t, err)
+}
+
+func TestCurrentUsageAndListPaginationHelpers(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	connection := newDirectAgentClient()
+	agent.setConnection(connection)
+	client := newStubPiClient()
+	session := &agentSession{agent: agent, id: "id", client: client}
+
+	client.statsErr = errors.New("stats")
+	session.emitCurrentUsageUpdate(t.Context())
+	client.statsErr = nil
+	client.stats = pi.SessionStats{}
+	session.emitCurrentUsageUpdate(t.Context())
+	client.stats.ContextUsage = &pi.ContextUsage{}
+	session.emitCurrentUsageUpdate(t.Context())
+	tokens := int64(3)
+	client.stats.ContextUsage = &pi.ContextUsage{Tokens: &tokens, ContextWindow: 100}
+	session.emitCurrentUsageUpdate(t.Context())
+	require.EqualValues(t, 100, session.contextWindowSize)
+	require.NotEmpty(t, connection.updates)
+
+	infos := make([]acp.SessionInfo, 51)
+	for index := range infos {
+		infos[index] = acp.SessionInfo{SessionId: acp.SessionId(fmt.Sprintf("id-%02d", index))}
+	}
+	page, cursor, err := paginateSessionInfos(infos, nil)
+	require.NoError(t, err)
+	require.Len(t, page, listSessionsPageSize)
+	require.NotNil(t, cursor)
+	decoded, err := decodeListCursor(cursor)
+	require.NoError(t, err)
+	require.Equal(t, listSessionsPageSize, decoded)
+	page, cursor, err = paginateSessionInfos(infos, cursor)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	require.Nil(t, cursor)
+	past := encodeListCursor(len(infos) + 1)
+	_, _, err = paginateSessionInfos(infos, &past)
+	requireInvalidParams(t, err)
+	decoded, err = decodeListCursor(acp.Ptr(""))
+	require.NoError(t, err)
+	require.Zero(t, decoded)
+	_, err = decodeListCursor(acp.Ptr("%%%"))
+	require.Error(t, err)
+}
+
+func TestStartSessionFailureBranches(t *testing.T) {
+	baseAgent := func() *Agent {
+		agent := NewAgent(WithExecutablePath("/fake/pi"), WithHome(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
+		agent.probeVersion = func(context.Context, string) (string, error) { return pi.DefaultMinimumVersion, nil }
+
+		return agent
+	}
+
+	agent := baseAgent()
+	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd", ResumeID: "id"})
+	require.ErrorIs(t, err, errUnknownStoredSession)
+
+	agent = baseAgent()
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		return nil, nil, errors.New("spawn")
+	}
+	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	require.Error(t, err)
+
+	agent = baseAgent()
+	client := newStubPiClient()
+	client.startErr = errors.New("client start")
+	process := newStubProcess(false)
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		return process, client, nil
+	}
+	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	require.Error(t, err)
+
+	agent = baseAgent()
+	agent.options.SeedFiles = map[string]string{"../bad": "value"}
+	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	requireInvalidParams(t, err)
+
+	agent = baseAgent()
+	client = newStubPiClient()
+	client.state = pi.SessionState{SessionID: "id", SessionFile: filepath.Join(t.TempDir(), "native.jsonl")}
+	process = newStubProcess(false)
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		return process, client, nil
+	}
+	session, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd", MetaOptions: PiOptions{Permission: pi.PermissionModeAllow, Env: map[string]string{"KEY": "VALUE"}}})
+	require.NoError(t, err)
+	require.Equal(t, pi.PermissionModeAllow, session.permissionMode)
+	require.NoError(t, session.Close(t.Context()))
+}
+
+func TestAgentSessionLifecycleErrorBranches(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	_, err := agent.NewSession(t.Context(), acp.NewSessionRequest{Cwd: "/cwd", Meta: map[string]any{piMetaKey: "bad"}})
+	requireInvalidParams(t, err)
+	_, err = agent.NewSession(t.Context(), acp.NewSessionRequest{Cwd: "relative"})
+	requireInvalidParams(t, err)
+	agent.closed = true
+	_, err = agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+	require.ErrorIs(t, err, errAgentClosed)
+	agent.closed = false
+
+	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: "missing"})
+	requireInvalidParams(t, err)
+	err = agent.Cancel(t.Context(), acp.CancelNotification{SessionId: "missing"})
+	requireInvalidParams(t, err)
+
+	storeErr := errors.New("store")
+	errorStore := &errorSessionStore{SessionStore: NewInMemorySessionStore(), loadErr: storeErr, listErr: storeErr, deleteErr: storeErr}
+	agent.options.SessionStore = errorStore
+	_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("id", "/cwd"))
+	require.Error(t, err)
+	_, err = agent.ListSessions(t.Context(), ListSessionsRequest())
+	require.Error(t, err)
+	_, err = agent.UnstableDeleteSession(t.Context(), DeleteSessionRequest("id"))
+	require.Error(t, err)
+
+	agent.options.SessionStore = NewInMemorySessionStore()
+	_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("id", "relative"))
+	requireInvalidParams(t, err)
+	_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("id", "/cwd", WithSessionMeta(map[string]any{piMetaKey: "bad"})))
+	requireInvalidParams(t, err)
+	_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("id", "/cwd"))
+	requireInvalidParams(t, err)
+	agent.deleted["deleted"] = struct{}{}
+	_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("deleted", "/cwd"))
+	requireInvalidParams(t, err)
+
+	_, err = agent.ListSessions(t.Context(), ListSessionsRequest(WithListSessionsCwd("relative")))
+	requireInvalidParams(t, err)
+}
+
+func TestRestoreActiveAndCleanupBranches(t *testing.T) {
+	store := NewInMemorySessionStore()
+	id := acp.SessionId("01234567-89ab-cdef-0123-456789abcdef")
+	entries := []SessionStoreEntry{
+		json.RawMessage(`{"type":"session","id":"01234567-89ab-cdef-0123-456789abcdef","cwd":"/cwd"}`),
+		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`[{"type":"text","text":"history"}]`)}),
+	}
+	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: string(id)}, entries))
+	agent := NewAgent(WithSessionStore(store), WithLogger(slog.New(slog.DiscardHandler)))
+	start := sessionStart{Cwd: "/cwd", ResumeID: string(id)}
+	active := &agentSession{agent: agent, id: id, cwd: "/cwd", fingerprint: sessionStartFingerprint(start), turn: make(chan struct{}, 1)}
+	agent.sessions[id] = active
+
+	session, loaded, started, err := agent.restoreSession(t.Context(), id, start, nil)
+	require.NoError(t, err)
+	require.Same(t, active, session)
+	require.Equal(t, entries, loaded)
+	require.False(t, started)
+
+	connection := newDirectAgentClient()
+	connection.updateErr = errors.New("replay")
+	agent.setConnection(connection)
+	_, err = agent.LoadSession(t.Context(), LoadSessionRequest(id, "/cwd"))
+	require.Error(t, err)
+	require.Contains(t, agent.sessions, id)
+
+	process := newStubProcess(false)
+	process.shutdown = errors.New("shutdown")
+	active.proc = process
+	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: id})
+	require.Error(t, err)
+	require.NotContains(t, agent.sessions, id)
+
+	cleanup := &agentSession{agent: agent, id: id, proc: process, turn: make(chan struct{}, 1)}
+	agent.sessions[id] = cleanup
+	agent.options.SessionStore = store
+	_, err = agent.UnstableDeleteSession(t.Context(), DeleteSessionRequest(id))
+	require.Error(t, err)
+}
+
+func TestListStoredSessionFiltering(t *testing.T) {
+	store := NewInMemorySessionStore()
+	valid := "01234567-89ab-cdef-0123-456789abcdef"
+	other := "11234567-89ab-cdef-0123-456789abcdef"
+	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: valid}, []SessionStoreEntry{json.RawMessage(`{"type":"session","cwd":"/one"}`)}))
+	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: other}, []SessionStoreEntry{json.RawMessage(`{"type":"session","cwd":"/two"}`)}))
+	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: "invalid"}, []SessionStoreEntry{json.RawMessage(`{}`)}))
+	agent := NewAgent(WithSessionStore(store), WithLogger(slog.New(slog.DiscardHandler)))
+	agent.deleted[acp.SessionId(other)] = struct{}{}
+	cwd := "/one"
+	infos, err := agent.listStoreSessions(t.Context(), acp.ListSessionsRequest{Cwd: &cwd})
+	require.NoError(t, err)
+	require.Len(t, infos, 1)
+	require.Equal(t, acp.SessionId(valid), infos[0].SessionId)
+
+	active := &agentSession{agent: agent, id: acp.SessionId(valid), cwd: "/one"}
+	agent.sessions[acp.SessionId(valid)] = active
+	response, err := agent.ListSessions(t.Context(), ListSessionsRequest())
+	require.NoError(t, err)
+	require.Len(t, response.Sessions, 1)
 }

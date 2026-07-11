@@ -37,3 +37,22 @@ func TestReplayMappingsAndStoreMetadata(t *testing.T) {
 	_, ok := decodeStoreRow(json.RawMessage(`bad`))
 	require.False(t, ok)
 }
+
+func TestReplayInvalidMetadataRows(t *testing.T) {
+	rows := []SessionStoreEntry{
+		json.RawMessage(`{"type":"message","message":"bad"}`),
+		messageRow(t, pi.AgentMessage{Role: messageRoleAssistant, Content: json.RawMessage(`[]`)}),
+		json.RawMessage(`{"type":"message","message":{"role":"user","content":{}}}`),
+	}
+	require.Empty(t, replayUpdates(rows))
+	require.Equal(t, "fallback", storeSessionTitle("fallback", rows))
+}
+
+func TestStoreSessionTitleRoleFallbacks(t *testing.T) {
+	rows := []SessionStoreEntry{
+		json.RawMessage(`{"type":"message","message":{"role":"assistant","content":[]}}`),
+		json.RawMessage(`{"type":"message","message":{"role":"user","content":{}}}`),
+		json.RawMessage(`{"type":"message","message":{"role":"tool","content":[]}}`),
+	}
+	require.Equal(t, "fallback", storeSessionTitle("fallback", rows))
+}

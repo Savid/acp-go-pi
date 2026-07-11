@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"sync/atomic"
@@ -135,4 +136,167 @@ func TestFinishTurnCommitMirrorFailure(t *testing.T) {
 	var timedOut atomic.Bool
 	_, err := session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "title"), &promptTurnState{}, &timedOut)
 	require.Error(t, err)
+}
+
+func TestTurnEventAndUsageBranches(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	connection := newDirectAgentClient()
+	agent.setConnection(connection)
+	client := newStubPiClient()
+	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false), contextWindowSize: 123}
+	state := &promptTurnState{}
+
+	settled, err := session.handleTurnEvent(t.Context(), pi.AgentSettledEvent{}, state)
+	require.NoError(t, err)
+	require.True(t, settled)
+	_, err = session.handleTurnEvent(t.Context(), pi.MessageStartEvent{Message: pi.AgentMessage{Role: messageRoleAssistant, Model: "m", Provider: "p"}}, state)
+	require.NoError(t, err)
+	require.Equal(t, "m", state.model)
+
+	for _, delta := range []pi.AssistantMessageEvent{
+		{Type: assistantEventTextDelta, Delta: "text"},
+		{Type: assistantEventTextDelta},
+		{Type: assistantEventThinkingDelta, Delta: "thought"},
+		{Type: assistantEventThinkingDelta},
+		{Type: "unknown", Delta: "ignored"},
+	} {
+		_, err = session.handleTurnEvent(t.Context(), pi.MessageUpdateEvent{AssistantMessageEvent: delta}, state)
+		require.NoError(t, err)
+	}
+
+	usage := &pi.Usage{Input: 1, Output: 2, CacheRead: 3, CacheWrite: 4, Cost: &pi.UsageCost{Total: 0.5}}
+	_, err = session.handleTurnEvent(t.Context(), pi.MessageEndEvent{Message: pi.AgentMessage{
+		Role: messageRoleAssistant, Model: "model", Provider: "provider", StopReason: stopReasonStop,
+		ErrorMessage: "error", Usage: usage,
+	}}, state)
+	require.NoError(t, err)
+	require.Equal(t, 10, state.usage.TotalTokens)
+	mergeTurnUsage(state.usage, nil)
+	mergeTurnUsage(state.usage, &pi.Usage{Input: 2})
+	require.Equal(t, 12, state.usage.TotalTokens)
+
+	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionStartEvent{ToolCallID: "call", ToolName: "bash", Args: json.RawMessage(`{"x":true}`)}, state)
+	require.NoError(t, err)
+	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionUpdateEvent{ToolCallID: "call"}, state)
+	require.NoError(t, err)
+	result := &pi.ToolResult{Content: []pi.ContentBlock{{Type: contentBlockTypeText, Text: "output"}}}
+	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionUpdateEvent{ToolCallID: "call", PartialResult: result}, state)
+	require.NoError(t, err)
+	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionEndEvent{ToolCallID: "call", IsError: true, Result: result}, state)
+	require.NoError(t, err)
+	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionEndEvent{ToolCallID: "call"}, state)
+	require.NoError(t, err)
+	_, err = session.handleTurnEvent(t.Context(), pi.AgentStartEvent{}, state)
+	require.NoError(t, err)
+
+	require.EqualValues(t, 123, session.currentModelContextWindow())
+	client.statsErr = errors.New("stats")
+	require.Nil(t, session.settledSessionStats(t.Context()))
+	client.statsErr = nil
+	tokens := int64(7)
+	client.stats = pi.SessionStats{ContextUsage: &pi.ContextUsage{Tokens: &tokens, ContextWindow: 456}}
+	require.NotNil(t, session.settledSessionStats(t.Context()))
+	session.emitTurnUsageUpdate(t.Context(), &promptTurnState{}, nil)
+	session.emitTurnUsageUpdate(t.Context(), state, &client.stats)
+	require.NotEmpty(t, connection.updates)
+}
+
+func TestTurnTerminationBranches(t *testing.T) {
+	previousGrace := processExitClassifyGrace
+	processExitClassifyGrace = time.Millisecond
+	t.Cleanup(func() { processExitClassifyGrace = previousGrace })
+
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithTurnTimeout(time.Second))
+	client := newStubPiClient()
+	session := &agentSession{agent: agent, client: client, proc: newStubProcess(false)}
+	var timedOut atomic.Bool
+	messageID := "message"
+
+	response, err := session.transportEndedTurn(&messageID, &timedOut)
+	requirePiTurnFailure(t, err, failureCauseTransport)
+	require.Empty(t, response.StopReason)
+	client.err = errors.New("native stream")
+	_, err = session.transportEndedTurn(&messageID, &timedOut)
+	requirePiTurnFailure(t, err, failureCauseTransport)
+
+	timedOut.Store(true)
+	_, err = session.transportEndedTurn(&messageID, &timedOut)
+	requirePiTurnFailure(t, err, failureCauseTimeout)
+	_, err = session.contextEndedTurn(&messageID, &timedOut)
+	requirePiTurnFailure(t, err, failureCauseTimeout)
+	timedOut.Store(false)
+	response, err = session.contextEndedTurn(&messageID, &timedOut)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
+
+	session.turnCancelled = true
+	response, err = session.transportEndedTurn(&messageID, &timedOut)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
+	response, err = session.contextEndedTurn(&messageID, &timedOut)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
+
+	session.turnCancelled = false
+	session.proc = newStubProcess(true)
+	_, err = session.transportEndedTurn(&messageID, &timedOut)
+	requirePiTurnFailure(t, err, failureCauseProcessExit)
+
+	original := errors.New("emit")
+	require.ErrorIs(t, session.abortAfterEmitError(t.Context(), original), original)
+	session.client = nil
+	require.ErrorIs(t, session.abortAfterEmitError(t.Context(), original), original)
+}
+
+func TestPromptAndFinishTurnErrorBranches(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithTurnTimeout(time.Second))
+	connection := newDirectAgentClient()
+	agent.setConnection(connection)
+	client := newStubPiClient()
+	client.stats = pi.SessionStats{SessionID: "id"}
+	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
+
+	session.poisonCause = "poisoned"
+	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "hello"))
+	require.Error(t, err)
+	session.poisonCause = ""
+	release, err := session.acquireTurn(t.Context())
+	require.NoError(t, err)
+	_, err = session.Prompt(t.Context(), TextPromptRequest("id", "hello"))
+	requireInvalidRequest(t, err)
+	release()
+	_, err = session.Prompt(t.Context(), PromptRequest("id"))
+	requireInvalidParams(t, err)
+	session.proc = nil
+	_, err = session.Prompt(t.Context(), TextPromptRequest("id", "hello"))
+	requirePiTurnFailure(t, err, failureCauseTransport)
+
+	finish := func(state *promptTurnState, timedOut bool) (acp.PromptResponse, error) {
+		var timeout atomic.Bool
+		timeout.Store(timedOut)
+
+		return session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "title"), state, &timeout)
+	}
+	session.proc = newStubProcess(false)
+	client.stats = pi.SessionStats{SessionID: "other"}
+	_, err = finish(&promptTurnState{}, false)
+	require.Error(t, err)
+	session.poisonCause = ""
+	client.stats = pi.SessionStats{SessionID: "id"}
+	connection.updateErr = errors.New("update")
+	_, err = finish(&promptTurnState{}, false)
+	require.Error(t, err)
+	connection.updateErr = nil
+	session.turnCancelled = true
+	response, err := finish(&promptTurnState{}, false)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
+	session.turnCancelled = false
+	_, err = finish(&promptTurnState{}, true)
+	requirePiTurnFailure(t, err, failureCauseTimeout)
+	_, err = finish(&promptTurnState{stopReason: stopReasonError, errorMessage: "provider"}, false)
+	requirePiTurnFailure(t, err, failureCauseProvider)
+	response, err = finish(&promptTurnState{stopReason: stopReasonStop}, false)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
 }
