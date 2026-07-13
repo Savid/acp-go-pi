@@ -12,7 +12,8 @@
  *   ]}
  *
  * Connects to every server at factory time (pi awaits async factories before
- * session_start), lists tools, and registers each as `mcp_<server>_<tool>`.
+ * session_start), lists tools, and registers each as `mcp__<server>__<tool>`
+ * (the double-underscore MCP naming convention hosts already parse).
  * A server that fails to connect throws, which makes pi exit at startup with
  * the real cause on stderr; the Go wrapper maps that to a structured
  * session/new failure. MCP tool errors (isError) are re-thrown because pi
@@ -250,7 +251,7 @@ export default async function (pi: ExtensionAPI) {
           ? Type.Unsafe(tool.inputSchema)
           : Type.Object({});
       pi.registerTool({
-        name: `mcp_${server.name}_${tool.name}`,
+        name: `mcp__${server.name}__${tool.name}`,
         label: `MCP ${server.name}/${tool.name}`,
         description: tool.description || `MCP tool ${tool.name} from ${server.name}`,
         parameters: schema as any,

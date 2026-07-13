@@ -41,7 +41,7 @@ servers := []acp.McpServer{
 The adapter writes a per-session MCP config into the session's isolated agent
 directory and loads its MCP extension alongside the bridge extension. The
 extension connects to every declared server before the session starts and
-registers each discovered tool under the name `mcp_<server>_<tool>`, so tool
+registers each discovered tool under the name `mcp__<server>__<tool>`, so tool
 names are stable and provider-safe. Declared env vars are forwarded to stdio
 children and declared headers to HTTP servers. MCP tool calls run under the
 same [permission gate](/docs/features/permissions) as built-in tools, and an

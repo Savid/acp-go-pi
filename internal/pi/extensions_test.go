@@ -45,7 +45,7 @@ func TestWriteExtensions(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, mcpExtensionSource, mcp)
 		require.Contains(t, string(mcp), EnvMCPConfig)
-		require.Contains(t, string(mcp), "mcp_${server.name}_${tool.name}")
+		require.Contains(t, string(mcp), "mcp__${server.name}__${tool.name}")
 	})
 }
 
