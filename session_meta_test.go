@@ -12,6 +12,7 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 		WithPiEnv(map[string]string{"TOKEN": "value"}),
 		WithPiThinkingLevel("high"),
 		WithPiPermission("ask"),
+		WithPiAutoRetry(true),
 	)
 	meta := options.Meta()
 	parsed, err := piOptionsFromMeta(meta)
@@ -29,6 +30,7 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 		{piMetaKey: map[string]any{metaRawEventKey: map[string]any{metaRawEventEnabledKey: true}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]string{"A": "b"}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"A": "b"}}}},
+		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaAutoRetryKey: false}}},
 	}
 	for _, value := range valid {
 		_, err := piOptionsFromMeta(value)
@@ -56,6 +58,7 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaThinkingLevelKey: "bad"}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: true}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: "bad"}}},
+		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaAutoRetryKey: "yes"}}},
 	}
 	for _, value := range invalid {
 		_, err := piOptionsFromMeta(value)
@@ -99,6 +102,7 @@ func TestPiOptionsMeta(t *testing.T) {
 				OutputSchema:  map[string]any{"type": "object"},
 				ThinkingLevel: "high",
 				Permission:    "allow",
+				AutoRetry:     true,
 			},
 			want: map[string]any{"pi": map[string]any{"options": map[string]any{
 				"model":         "openai/gpt-4o",
@@ -106,6 +110,7 @@ func TestPiOptionsMeta(t *testing.T) {
 				"outputSchema":  map[string]any{"type": "object"},
 				"thinkingLevel": "high",
 				"permission":    "allow",
+				"autoRetry":     true,
 			}}},
 		},
 	}

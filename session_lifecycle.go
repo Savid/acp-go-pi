@@ -110,7 +110,7 @@ func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
 
 	s.startPump(client)
 
-	if retryErr := client.SetAutoRetry(ctx, false); retryErr != nil {
+	if retryErr := client.SetAutoRetry(ctx, s.autoRetry); retryErr != nil {
 		return retryErr
 	}
 

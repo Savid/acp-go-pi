@@ -56,6 +56,7 @@ are the exported configuration value types behind the functional options.
 | `WithPiEnv` | Extra environment variables for this session's pi process. |
 | `WithPiThinkingLevel` | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
 | `WithPiPermission` | Permission mode: `ask` (default) or `allow`. |
+| `WithPiAutoRetry` | Opt in to pi's native automatic retry of transient provider errors (5xx, timeouts). Default `false`: a native failure surfaces once, immediately, with the real cause. |
 | `WithPiOutputSchema` | Reserved for API symmetry; pi has no native structured-output surface, so setting it fails closed at session start. |
 
 ## Identity and observability options

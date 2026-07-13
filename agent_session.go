@@ -695,6 +695,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		launch:                spec,
 		sessionRoot:           dirs.Root,
 		permissionMode:        permission,
+		autoRetry:             start.MetaOptions.AutoRetry,
 		proc:                  proc,
 		client:                client,
 		turn:                  make(chan struct{}, sessionTurnCapacity),
@@ -761,9 +762,10 @@ func (a *Agent) setUpNativeSession(
 		}
 	}
 
-	// Auto-retry is disabled so native failures surface once, immediately,
-	// with the real cause instead of being smeared across retries.
-	if err := client.SetAutoRetry(ctx, false); err != nil {
+	// Auto-retry is off unless the session opted in via _meta.pi.options, so
+	// native failures surface once, immediately, with the real cause by
+	// default; opted-in sessions let pi absorb transient provider errors.
+	if err := client.SetAutoRetry(ctx, start.MetaOptions.AutoRetry); err != nil {
 		return spawnFailureError(err, proc)
 	}
 

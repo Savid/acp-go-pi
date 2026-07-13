@@ -468,9 +468,11 @@ func TestStartSessionFailureBranches(t *testing.T) {
 	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
 		return process, client, nil
 	}
-	session, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd", MetaOptions: PiOptions{Permission: pi.PermissionModeAllow, Env: map[string]string{"KEY": "VALUE"}}})
+	session, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd", MetaOptions: PiOptions{Permission: pi.PermissionModeAllow, Env: map[string]string{"KEY": "VALUE"}, AutoRetry: true}})
 	require.NoError(t, err)
 	require.Equal(t, pi.PermissionModeAllow, session.permissionMode)
+	require.True(t, session.autoRetry)
+	require.Equal(t, []bool{true}, client.autoRetrySet)
 	require.NoError(t, session.Close(t.Context()))
 }
 

@@ -341,6 +341,15 @@ func WithPiPermission(mode string) PiOption {
 	}
 }
 
+// WithPiAutoRetry opts the session in to pi's native automatic retry of
+// transient provider errors. Off by default: without it a native failure
+// surfaces once, immediately, with the real cause.
+func WithPiAutoRetry(enabled bool) PiOption {
+	return func(options *PiOptions) {
+		options.AutoRetry = enabled
+	}
+}
+
 func clonePiOptions(options PiOptions) PiOptions {
 	cloned := options
 	cloned.Env = cloneStringMap(options.Env)

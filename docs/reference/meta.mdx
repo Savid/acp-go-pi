@@ -36,7 +36,8 @@ Session-lifecycle requests accept options and the raw-event opt-in:
         "model": "openai/gpt-4o",
         "env": { "ANTHROPIC_API_KEY": "sk-ant-..." },
         "thinkingLevel": "medium",
-        "permission": "ask"
+        "permission": "ask",
+        "autoRetry": true
       },
       "rawEvent": {
         "enabled": true
@@ -52,6 +53,7 @@ Session-lifecycle requests accept options and the raw-event opt-in:
 | `env` | Extra environment variables for this session's pi process. |
 | `thinkingLevel` | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; adapter-validated. |
 | `permission` | Permission mode: `ask` (default) or `allow`. |
+| `autoRetry` | Opt in to pi's native automatic retry of transient provider errors (5xx, timeouts). Default `false`: a native failure surfaces once, immediately, with the real cause. |
 | `outputSchema` | Accepted in the struct for API symmetry only; any value fails the session start with the uniform unsupported error. |
 
 ## Update metadata

@@ -17,6 +17,7 @@ const (
 	metaOutputSchemaKey    = "outputSchema"
 	metaThinkingLevelKey   = "thinkingLevel"
 	metaPermissionKey      = "permission"
+	metaAutoRetryKey       = "autoRetry"
 	metaRawEventKey        = "rawEvent"
 	metaRawEventEnabledKey = "enabled"
 
@@ -43,6 +44,11 @@ type PiOptions struct {
 	// Permission selects the adapter permission mode for this session:
 	// "ask" (deny-by-default dialog, the default) or "allow" (auto-allow).
 	Permission string `json:"permission,omitempty"`
+	// AutoRetry opts this session in to pi's native automatic retry of
+	// transient provider errors (5xx, timeouts). Off by default so a native
+	// failure surfaces once, immediately, with the real cause; when enabled,
+	// the final error after exhausted retries still carries the last cause.
+	AutoRetry bool `json:"autoRetry,omitempty"`
 }
 
 // Meta returns an ACP _meta object for the supported pi-specific options.
@@ -67,6 +73,10 @@ func (options PiOptions) Meta() map[string]any {
 
 	if options.Permission != "" {
 		values[metaPermissionKey] = options.Permission
+	}
+
+	if options.AutoRetry {
+		values[metaAutoRetryKey] = true
 	}
 
 	return map[string]any{
@@ -192,6 +202,13 @@ func parsePiOptions(value any) (PiOptions, error) {
 			}
 
 			options.Permission = permission
+		case metaAutoRetryKey:
+			enabled, ok := item.(bool)
+			if !ok {
+				return PiOptions{}, unsupportedField(metaOptionPath(key))
+			}
+
+			options.AutoRetry = enabled
 		default:
 			return PiOptions{}, unsupportedField(metaOptionPath(key))
 		}

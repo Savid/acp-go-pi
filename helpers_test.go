@@ -298,6 +298,7 @@ type stubPiClient struct {
 	cloneCancel  bool
 	cloneErr     error
 	autoRetryErr error
+	autoRetrySet []bool
 	state        pi.SessionState
 	stateErr     error
 	models       []pi.Model
@@ -329,7 +330,11 @@ func (c *stubPiClient) SetModel(context.Context, string, string) (pi.Model, erro
 	return c.model, c.setModelErr
 }
 func (c *stubPiClient) SetThinkingLevel(context.Context, string) error { return c.thinkingErr }
-func (c *stubPiClient) SetAutoRetry(context.Context, bool) error       { return c.autoRetryErr }
+func (c *stubPiClient) SetAutoRetry(_ context.Context, enabled bool) error {
+	c.autoRetrySet = append(c.autoRetrySet, enabled)
+
+	return c.autoRetryErr
+}
 func (c *stubPiClient) GetSessionStats(context.Context) (pi.SessionStats, error) {
 	return c.stats, c.statsErr
 }

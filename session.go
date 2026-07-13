@@ -55,6 +55,10 @@ type agentSession struct {
 	sessionFilePath string
 	permissionMode  string
 
+	// autoRetry is the session's native auto-retry election, re-applied on
+	// every lazy relaunch so the retry posture survives process death.
+	autoRetry bool
+
 	proc   piProcess
 	client piClient
 
