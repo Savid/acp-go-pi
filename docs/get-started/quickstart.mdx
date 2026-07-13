@@ -61,7 +61,7 @@ stdin waiting for JSON-RPC frames and writes ACP frames only to stdout; add
 ```sh
 go run ./cmd/acp-go-pi \
   -path "$(command -v pi)" \
-  -home /tmp/pi-home \
+  -scratch-dir /tmp/pi-scratch \
   -seed-file "auth.json=$HOME/.pi/agent/auth.json" \
   -debug
 ```

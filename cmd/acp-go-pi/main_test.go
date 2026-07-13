@@ -123,6 +123,7 @@ func TestRunOptionsCancellationAndSignal(t *testing.T) {
 		require.Equal(t, "1.0.0", options.AgentVersion)
 		require.Equal(t, "/custom/pi", options.ExecutablePath)
 		require.Equal(t, "/agent/home", options.Home)
+		require.Equal(t, "/agent/scratch", options.ScratchDir)
 		require.Equal(t, "provider/model", options.DefaultModel)
 		require.Equal(t, `{"theme":"dark"}`, options.SeedFiles["settings.json"])
 		require.NotNil(t, options.Logger)
@@ -136,6 +137,7 @@ func TestRunOptionsCancellationAndSignal(t *testing.T) {
 		"-debug",
 		"-path", "/custom/pi",
 		"-home", "/agent/home",
+		"-scratch-dir", "/agent/scratch",
 		"-model", "provider/model",
 		"-seed-file", "settings.json=" + seedPath,
 	}, bytes.NewReader(nil), io.Discard, &stderr)

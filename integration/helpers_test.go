@@ -220,7 +220,7 @@ func formElicitationInit() acp.InitializeRequest {
 }
 
 // connectFakeAgentForTest serves the wrapper in-process against a fake pi
-// harness scenario, on an isolated home.
+// harness scenario, on an isolated scratch parent.
 func connectFakeAgentForTest(
 	t *testing.T,
 	ctx context.Context,
@@ -232,7 +232,7 @@ func connectFakeAgentForTest(
 
 	options := append([]piacp.Option{
 		piacp.WithExecutablePath(fakePiExecutable(t, scenario)),
-		piacp.WithHome(t.TempDir()),
+		piacp.WithScratchDir(t.TempDir()),
 	}, opts...)
 
 	return connectAgentForTest(t, ctx, client, options...)

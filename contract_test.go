@@ -282,7 +282,7 @@ func connectConformanceAgent(
 
 	options := append([]Option{
 		WithExecutablePath(unitFakeExecutable(t, scenario)),
-		WithHome(t.TempDir()),
+		WithScratchDir(t.TempDir()),
 		WithLogger(slog.New(slog.DiscardHandler)),
 	}, opts...)
 	go func() { done <- Serve(serveCtx, c2aR, a2cW, options...) }()

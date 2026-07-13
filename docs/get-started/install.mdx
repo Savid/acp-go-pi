@@ -33,9 +33,11 @@ go build ./cmd/acp-go-pi
 ## Locating the pi CLI
 
 The adapter launches `pi` from `PATH` unless a host provides `-path`
-(`WithExecutablePath`). Use `-home` (`WithHome`) to choose the parent root
-under which the adapter creates one isolated pi agent directory per session —
-it never shares a mutable native home such as `~/.pi`. The launched CLI must
+(`WithExecutablePath`). Use `-scratch-dir` (`WithScratchDir`) to choose the
+parent directory under which the adapter creates one isolated pi agent
+directory per session — it never shares a mutable native home such as `~/.pi`.
+pi has no native config or auth root, so a configured home (`-home` /
+`WithHome`) is rejected at session start. The launched CLI must
 be pi **0.80.6 or newer**; the adapter probes `pi --version` at startup and
 fails fast on older builds. Install pi itself from npm:
 

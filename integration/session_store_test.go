@@ -26,13 +26,13 @@ func TestPiACPFakeStoreResumeAfterNativeDeletion(t *testing.T) {
 
 	store := piacp.NewInMemorySessionStore()
 	fakePath := fakePiExecutable(t, fakeTurnScenario())
-	home := t.TempDir()
+	scratchDir := t.TempDir()
 	cwd := t.TempDir()
 
 	client := &recordingClient{}
 	conn := connectAgentForTest(t, ctx, client,
 		piacp.WithExecutablePath(fakePath),
-		piacp.WithHome(home),
+		piacp.WithScratchDir(scratchDir),
 		piacp.WithSessionStore(store),
 	)
 
@@ -50,13 +50,13 @@ func TestPiACPFakeStoreResumeAfterNativeDeletion(t *testing.T) {
 	_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
 	require.NoError(t, err)
 
-	// Wipe all native state; only the store survives.
-	require.NoError(t, os.RemoveAll(home))
+	// Wipe all ephemeral scratch state; only the store survives.
+	require.NoError(t, os.RemoveAll(scratchDir))
 
 	resumeClient := &recordingClient{}
 	resumeConn := connectAgentForTest(t, ctx, resumeClient,
 		piacp.WithExecutablePath(fakePath),
-		piacp.WithHome(t.TempDir()),
+		piacp.WithScratchDir(t.TempDir()),
 		piacp.WithSessionStore(store),
 	)
 
@@ -85,7 +85,7 @@ func TestPiACPFakeStoreLoadReplaysHistory(t *testing.T) {
 	client := &recordingClient{}
 	conn := connectAgentForTest(t, ctx, client,
 		piacp.WithExecutablePath(fakePath),
-		piacp.WithHome(t.TempDir()),
+		piacp.WithScratchDir(t.TempDir()),
 		piacp.WithSessionStore(store),
 	)
 
@@ -101,7 +101,7 @@ func TestPiACPFakeStoreLoadReplaysHistory(t *testing.T) {
 	loadClient := &recordingClient{}
 	loadConn := connectAgentForTest(t, ctx, loadClient,
 		piacp.WithExecutablePath(fakePath),
-		piacp.WithHome(t.TempDir()),
+		piacp.WithScratchDir(t.TempDir()),
 		piacp.WithSessionStore(store),
 	)
 
@@ -133,11 +133,11 @@ func TestPiACPLiveStoreResume(t *testing.T) {
 	defer cancel()
 
 	store := piacp.NewInMemorySessionStore()
-	home := t.TempDir()
+	scratchDir := t.TempDir()
 	cwd := t.TempDir()
 
 	options := append(livePiOptions(t), piacp.WithSessionStore(store))
-	options = append(options, piacp.WithHome(home))
+	options = append(options, piacp.WithScratchDir(scratchDir))
 
 	client := &recordingClient{}
 	conn := connectAgentForTest(t, ctx, client, options...)
@@ -153,7 +153,7 @@ func TestPiACPLiveStoreResume(t *testing.T) {
 	_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
 	require.NoError(t, err)
 
-	require.NoError(t, os.RemoveAll(home))
+	require.NoError(t, os.RemoveAll(scratchDir))
 
 	resumeOptions := append(livePiOptions(t), piacp.WithSessionStore(store))
 

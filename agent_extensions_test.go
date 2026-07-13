@@ -117,7 +117,7 @@ func TestForkExtensionStoreLimitAfterNativeClone(t *testing.T) {
 
 	agent := NewAgent(
 		WithExecutablePath("/fake/pi"),
-		WithHome(t.TempDir()),
+		WithScratchDir(t.TempDir()),
 		WithSessionStore(store),
 		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}),
 		WithLogger(slog.New(slog.DiscardHandler)),

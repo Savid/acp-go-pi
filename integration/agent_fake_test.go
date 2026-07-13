@@ -254,7 +254,7 @@ func TestAgentFakeElicitationRelay(t *testing.T) {
 	client := &recordingClient{elicitationValue: "ELICIT_VALUE_SENTINEL"}
 	conn := connectAgentWithInitForTest(t, ctx, client, formElicitationInit(),
 		piacp.WithExecutablePath(fakePiExecutable(t, scenario)),
-		piacp.WithHome(t.TempDir()),
+		piacp.WithScratchDir(t.TempDir()),
 	)
 	sessionID := newFakeSession(t, ctx, conn)
 

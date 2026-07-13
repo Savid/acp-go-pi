@@ -23,6 +23,8 @@ const (
 	acpFieldSessionID = "sessionId"
 	acpFieldValue     = "value"
 
+	optionFieldHome = "home"
+
 	validationRequired    = "required"
 	validationUnsupported = "unsupported"
 	validationDuplicate   = "duplicate"

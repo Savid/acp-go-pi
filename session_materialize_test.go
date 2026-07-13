@@ -12,7 +12,7 @@ import (
 )
 
 func TestSessionFilesystemHelpers(t *testing.T) {
-	agent := NewAgent(WithHome(t.TempDir()))
+	agent := NewAgent(WithScratchDir(t.TempDir()))
 	session := &agentSession{agent: agent, id: "01234567-89ab-cdef-0123-456789abcdef"}
 	dirs, err := agent.createSessionDirs()
 	require.NoError(t, err)
@@ -32,7 +32,7 @@ func TestSessionFilesystemHelpers(t *testing.T) {
 
 	file := filepath.Join(t.TempDir(), "file")
 	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
-	_, err = NewAgent(WithHome(file)).createSessionDirs()
+	_, err = NewAgent(WithScratchDir(file)).createSessionDirs()
 	require.Error(t, err)
 }
 
@@ -48,7 +48,7 @@ func TestMaterializeFaultBranches(t *testing.T) {
 		materializeWriteFile = originalWriteFile
 	})
 
-	agent := NewAgent(WithHome(t.TempDir()))
+	agent := NewAgent(WithScratchDir(t.TempDir()))
 	materializeMkdirAll = func(string, os.FileMode) error { return errors.New("mkdir") }
 	_, err := agent.createSessionDirs()
 	require.Error(t, err)

@@ -16,14 +16,14 @@ import (
 const liveTurnTimeout = 3 * time.Minute
 
 // livePiOptions builds the token-spending launch posture: the real pi
-// binary against a hermetic temp home, with copied portable auth seeded
-// into each session's agent directory.
+// binary against a hermetic temp scratch parent, with copied portable auth
+// seeded into each session's agent directory.
 func livePiOptions(t *testing.T) []piacp.Option {
 	t.Helper()
 
 	options := []piacp.Option{
 		piacp.WithExecutablePath(livePiPath(t)),
-		piacp.WithHome(t.TempDir()),
+		piacp.WithScratchDir(t.TempDir()),
 		livePiAuthSeed(t),
 	}
 

@@ -29,13 +29,11 @@ type sessionDirs struct {
 }
 
 // createSessionDirs creates a fresh isolated per-session root under the
-// configured parent, or under the system temp directory when no Home is set.
+// scratch parent (ScratchDir, or the system temp directory when unset).
 func (a *Agent) createSessionDirs() (sessionDirs, error) {
-	parent := a.options.Home
-	if parent != "" {
-		if err := materializeMkdirAll(parent, 0o700); err != nil {
-			return sessionDirs{}, fmt.Errorf("create session parent root: %w", err)
-		}
+	parent, err := ensureScratchParent(a.options.ScratchDir)
+	if err != nil {
+		return sessionDirs{}, err
 	}
 
 	root, err := materializeMkdirTemp(parent, "acp-go-pi-session-*")

@@ -6,7 +6,7 @@ description: "Every flag the acp-go-pi binary accepts and what it maps to"
 `acp-go-pi` speaks ACP over stdin/stdout. Flags use Go's single-dash syntax.
 
 ```sh
-acp-go-pi -path /usr/local/bin/pi -home /tmp/pi-home -model openai/gpt-4o
+acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt-4o
 ```
 
 ## Flags
@@ -14,7 +14,8 @@ acp-go-pi -path /usr/local/bin/pi -home /tmp/pi-home -model openai/gpt-4o
 | Flag | Purpose |
 | --- | --- |
 | `-path` | pi CLI executable (default: search `PATH`). |
-| `-home` | Parent root under which each session gets an isolated pi agent directory. |
+| `-scratch-dir` | Parent directory for all ephemeral per-session scratch (isolated agent and session directories, hydration temp files). Empty means the system temp directory. |
+| `-home` | Unsupported: pi has no native config or auth root. A non-empty value fails session start. Use `-scratch-dir` instead. |
 | `-model` | Default model for new sessions, as `"provider/id"`. |
 | `-seed-file` | Write a host file into each session's agent directory as `<relpath>=<hostpath>`; repeatable. |
 | `-debug` | Emit debug logs to stderr. |

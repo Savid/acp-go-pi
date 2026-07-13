@@ -32,7 +32,7 @@ deny, and `allow` mode is only ever explicit per session — see
 ## Process isolation
 
 Each session's pi process runs in its own isolated agent directory under the
-`WithHome` parent root, so sessions share no config, auth, or session files.
+`WithScratchDir` parent, so sessions share no config, auth, or session files.
 The adapter shuts children down by closing stdin — which pi honors by exiting
 immediately — escalating to signals only when needed, so a crashed or killed
 adapter does not leave orphaned pi processes behind.

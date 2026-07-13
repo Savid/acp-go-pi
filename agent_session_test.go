@@ -149,7 +149,7 @@ func TestValidateMCPServersRejectionBranches(t *testing.T) {
 }
 
 func TestStartSessionEarlyFailureBranches(t *testing.T) {
-	missingExec := NewAgent(WithHome(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
+	missingExec := NewAgent(WithScratchDir(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
 	missingExec.versionChecked = true
 	missingExec.lookPath = func(string) (string, error) { return "", errors.New("missing") }
 	_, err := missingExec.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
@@ -161,10 +161,21 @@ func TestStartSessionEarlyFailureBranches(t *testing.T) {
 
 	dirFile := filepath.Join(t.TempDir(), "not-a-dir")
 	require.NoError(t, os.WriteFile(dirFile, []byte("x"), 0o600))
-	badHome := NewAgent(WithExecutablePath("/fake/pi"), WithHome(dirFile), WithLogger(slog.New(slog.DiscardHandler)))
-	badHome.versionChecked = true
-	_, err = badHome.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	badScratch := NewAgent(WithExecutablePath("/fake/pi"), WithScratchDir(dirFile), WithLogger(slog.New(slog.DiscardHandler)))
+	badScratch.versionChecked = true
+	_, err = badScratch.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	require.Error(t, err)
+}
+
+// TestStartSessionRejectsHome pins the isolation contract: pi has no native
+// config or auth root, so a configured Home fails at session start with the
+// unsupported-option error for field "home" on every establishing path.
+func TestStartSessionRejectsHome(t *testing.T) {
+	agent := NewAgent(WithExecutablePath("/fake/pi"), WithHome(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
+	agent.versionChecked = true
+
+	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	requireInvalidParams(t, err)
 }
 
 func TestStartSessionHydrateWriteFailure(t *testing.T) {
@@ -429,7 +440,7 @@ func TestCurrentUsageAndListPaginationHelpers(t *testing.T) {
 
 func TestStartSessionFailureBranches(t *testing.T) {
 	baseAgent := func() *Agent {
-		agent := NewAgent(WithExecutablePath("/fake/pi"), WithHome(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
+		agent := NewAgent(WithExecutablePath("/fake/pi"), WithScratchDir(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
 		agent.probeVersion = func(context.Context, string) (string, error) { return pi.DefaultMinimumVersion, nil }
 
 		return agent

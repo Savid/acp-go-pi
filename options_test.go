@@ -24,6 +24,7 @@ func TestApplyOptionsDefaults(t *testing.T) {
 	require.Equal(t, pi.DefaultMinimumVersion, options.MinimumVersion)
 	require.Empty(t, options.ExecutablePath)
 	require.Empty(t, options.Home)
+	require.Empty(t, options.ScratchDir)
 	require.Empty(t, options.DefaultModel)
 	require.Nil(t, options.Env)
 	require.Nil(t, options.SessionStore)
@@ -51,6 +52,7 @@ func TestApplyOptionsSetters(t *testing.T) {
 		WithAgentVersion("9.9.9"),
 		WithExecutablePath("/usr/bin/pi"),
 		WithHome("/srv/pi-homes"),
+		WithScratchDir("/srv/pi-scratch"),
 		WithDefaultModel("openai/gpt-4o"),
 		WithEnv(env),
 		WithTracerProvider(tracerProvider),
@@ -70,6 +72,7 @@ func TestApplyOptionsSetters(t *testing.T) {
 	require.Equal(t, "9.9.9", options.AgentVersion)
 	require.Equal(t, "/usr/bin/pi", options.ExecutablePath)
 	require.Equal(t, "/srv/pi-homes", options.Home)
+	require.Equal(t, "/srv/pi-scratch", options.ScratchDir)
 	require.Equal(t, "openai/gpt-4o", options.DefaultModel)
 	require.Equal(t, env, options.Env)
 	require.Equal(t, tracerProvider, options.TracerProvider)

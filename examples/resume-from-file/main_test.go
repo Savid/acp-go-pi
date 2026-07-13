@@ -51,14 +51,14 @@ func TestRunUsesInferredValuesAndLoadedSession(t *testing.T) {
 	expectedCwd := cwd
 	expectedPrompt := "prompt"
 	expectedPath := "/bin/pi"
-	expectedHome := "/home/pi"
+	expectedScratch := "/scratch/pi"
 	expectedAuth := `{"provider":"token"}`
-	runLoaded = func(_ context.Context, store piacp.SessionStore, sessionID string, gotCwd string, prompt string, piPath string, piHome string, authJSON string, stdout io.Writer) error {
+	runLoaded = func(_ context.Context, store piacp.SessionStore, sessionID string, gotCwd string, prompt string, piPath string, scratchDir string, authJSON string, stdout io.Writer) error {
 		require.Equal(t, expectedSessionID, sessionID)
 		require.Equal(t, expectedCwd, gotCwd)
 		require.Equal(t, expectedPrompt, prompt)
 		require.Equal(t, expectedPath, piPath)
-		require.Equal(t, expectedHome, piHome)
+		require.Equal(t, expectedScratch, scratchDir)
 		require.Equal(t, expectedAuth, authJSON)
 		entries, err := store.Load(context.Background(), piacp.SessionKey{SessionID: sessionID})
 		require.NoError(t, err)
@@ -70,7 +70,7 @@ func TestRunUsesInferredValuesAndLoadedSession(t *testing.T) {
 	t.Cleanup(func() { runLoaded = previousRunLoaded })
 
 	var stdout bytes.Buffer
-	err := run(context.Background(), []string{"-file", path, "-prompt", "prompt", "-path", "/bin/pi", "-home", "/home/pi", "-auth-file", authFile}, &stdout, io.Discard)
+	err := run(context.Background(), []string{"-file", path, "-prompt", "prompt", "-path", "/bin/pi", "-scratch-dir", "/scratch/pi", "-auth-file", authFile}, &stdout, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, "loaded", stdout.String())
 
@@ -78,7 +78,7 @@ func TestRunUsesInferredValuesAndLoadedSession(t *testing.T) {
 	expectedSessionID = "explicit"
 	expectedPrompt = defaultPrompt
 	expectedPath = ""
-	expectedHome = ""
+	expectedScratch = ""
 	expectedAuth = ""
 	err = run(context.Background(), []string{"-file", path, "-session", "explicit", "-cwd", cwd}, &stdout, io.Discard)
 	require.NoError(t, err)

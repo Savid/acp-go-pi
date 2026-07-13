@@ -78,7 +78,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	flags.SetOutput(stderr)
 
 	piPath := flags.String("path", "", "path to pi CLI")
-	piHome := flags.String("home", "", "parent root for isolated per-session pi agent directories")
+	piHome := flags.String("home", "", "unsupported: pi has no native config root; a non-empty value fails session start")
+	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
 	model := flags.String("model", "", "default pi model as provider/id")
 	seedFiles := &seedFileFlag{}
 	flags.Var(seedFiles, "seed-file", "seed file written into each session's pi agent dir as <relpath>=<hostpath>; repeatable")
@@ -121,12 +122,13 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	ctx, stop := signal.NotifyContext(ctx, signals...)
 	defer stop()
 
-	serveOptions := make([]piacp.Option, 0, 6+len(telemetry.options))
+	serveOptions := make([]piacp.Option, 0, 7+len(telemetry.options))
 
 	serveOptions = append(serveOptions,
 		piacp.WithAgentVersion(version),
 		piacp.WithExecutablePath(*piPath),
 		piacp.WithHome(*piHome),
+		piacp.WithScratchDir(*scratchDir),
 		piacp.WithDefaultModel(*model),
 		piacp.WithLogger(logger),
 	)

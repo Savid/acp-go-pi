@@ -15,7 +15,7 @@ streams:
 ```go
 err := piacp.Serve(ctx, input, output,
 	piacp.WithExecutablePath("/usr/local/bin/pi"),
-	piacp.WithHome("/tmp/pi-home"),
+	piacp.WithScratchDir("/tmp/pi-scratch"),
 	piacp.WithDefaultModel("openai/gpt-4o"),
 	piacp.WithSessionStore(store),
 )
@@ -30,7 +30,8 @@ are the exported configuration value types behind the functional options.
 | Option | Purpose |
 | --- | --- |
 | `WithExecutablePath` | Set the pi CLI path (default: search `PATH`). |
-| `WithHome` | Parent root under which each session gets an isolated pi agent directory. |
+| `WithScratchDir` | Parent directory for all ephemeral on-disk state (isolated per-session agent and session directories, hydration temp files, probe dirs). Empty means the system temp directory; created `0700` when missing. |
+| `WithHome` | Unsupported: pi has no native config or auth root. A non-empty value is rejected at session start (`session/new`, load, resume, and fork) with the unsupported-option error for field `home`. Use `WithScratchDir` for per-session scratch. |
 | `WithDefaultModel` | Default model for new sessions, as `"provider/id"`. |
 | `WithEnv` | Add environment variables to every pi child (children run with a scrubbed environment). |
 | `WithSeedFiles` | Write files into each session's isolated agent directory before launch. |

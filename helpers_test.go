@@ -30,7 +30,7 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 	base := make([]Option, 0, 3+len(opts))
 	base = append(base,
 		WithExecutablePath("/fake/pi"),
-		WithHome(t.TempDir()),
+		WithScratchDir(t.TempDir()),
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
 	agent := NewAgent(append(base, opts...)...)

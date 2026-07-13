@@ -117,7 +117,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	cwd := flags.String("cwd", "", "session cwd; defaults to the JSONL cwd or current directory")
 	prompt := flags.String("prompt", defaultPrompt, "prompt to send after loading history")
 	piPath := flags.String("path", "", "path to pi CLI")
-	piHome := flags.String("home", "", "parent root for isolated pi session state")
+	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
 	authFile := flags.String("auth-file", "", "pi auth.json file to seed into the isolated session")
 
 	if err := flags.Parse(args); err != nil {
@@ -167,7 +167,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		return err
 	}
 
-	return runLoaded(ctx, store, *sessionID, *cwd, *prompt, *piPath, *piHome, authJSON, stdout)
+	return runLoaded(ctx, store, *sessionID, *cwd, *prompt, *piPath, *scratchDir, authJSON, stdout)
 }
 
 func runLoadedSession(
@@ -177,7 +177,7 @@ func runLoadedSession(
 	cwd string,
 	prompt string,
 	piPath string,
-	piHome string,
+	scratchDir string,
 	authJSON string,
 	stdout io.Writer,
 ) error {
@@ -199,7 +199,7 @@ func runLoadedSession(
 	go func() {
 		options := []piacp.Option{
 			piacp.WithExecutablePath(piPath),
-			piacp.WithHome(piHome),
+			piacp.WithScratchDir(scratchDir),
 			piacp.WithSessionStore(store),
 			piacp.WithLogger(slog.New(slog.DiscardHandler)),
 		}

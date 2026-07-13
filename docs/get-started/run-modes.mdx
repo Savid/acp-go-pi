@@ -15,7 +15,7 @@ stdout carries ACP JSON-RPC only; diagnostics go to stderr (and `-debug` when
 present).
 
 ```sh
-acp-go-pi -path /usr/local/bin/pi -home /tmp/pi-home -model openai/gpt-4o
+acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt-4o
 ```
 
 ## Embedded
@@ -26,7 +26,7 @@ can back the transport with any pipe, socket, or in-memory buffer:
 ```go
 err := piacp.Serve(ctx, input, output,
 	piacp.WithExecutablePath("/usr/local/bin/pi"),
-	piacp.WithHome("/tmp/pi-home"),
+	piacp.WithScratchDir("/tmp/pi-scratch"),
 	piacp.WithDefaultModel("openai/gpt-4o"),
 )
 ```
@@ -36,7 +36,7 @@ Every serve-mode flag has an option equivalent:
 | Flag | Option |
 | --- | --- |
 | `-path` | `WithExecutablePath` |
-| `-home` | `WithHome` |
+| `-scratch-dir` | `WithScratchDir` |
 | `-model` | `WithDefaultModel` |
 | `-seed-file` | `WithSeedFiles` |
 

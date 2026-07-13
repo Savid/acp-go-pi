@@ -27,7 +27,7 @@ func TestPiACPAgentBinaryClosedInput(t *testing.T) {
 
 	cmd := agentCommand(t, ctx,
 		"-path", fakePiExecutable(t, fakeScenario{}),
-		"-home", t.TempDir(),
+		"-scratch-dir", t.TempDir(),
 	)
 	cmd.Stdin = strings.NewReader("")
 
@@ -64,7 +64,7 @@ func TestPiACPAgentBinaryFakeConversation(t *testing.T) {
 
 	agent := startAgentBinary(t, ctx,
 		"-path", fakePiExecutable(t, fakeTurnScenario()),
-		"-home", t.TempDir(),
+		"-scratch-dir", t.TempDir(),
 	)
 
 	client := &recordingClient{}
@@ -103,13 +103,13 @@ func TestPiACPAgentBinaryOrphanReapOnCrash(t *testing.T) {
 	scenario.ToolName = "bash"
 	scenario.ToolArgs = map[string]any{"command": "echo orphan-probe"}
 
-	// The wrapper home path appears in the child's --session-dir argv, so it
+	// The scratch path appears in the child's --session-dir argv, so it
 	// doubles as a unique process-search marker.
-	home := t.TempDir()
+	scratchDir := t.TempDir()
 
 	agent := startAgentBinary(t, ctx,
 		"-path", fakePiExecutable(t, scenario),
-		"-home", home,
+		"-scratch-dir", scratchDir,
 	)
 
 	client := newBlockingPermissionClient()
@@ -131,12 +131,12 @@ func TestPiACPAgentBinaryOrphanReapOnCrash(t *testing.T) {
 		t.Fatalf("no permission request observed; stderr: %s", agent.stderrString())
 	}
 
-	require.NotEmpty(t, pgrepChildren(t, home), "expected a running pi child while the permission is pending")
+	require.NotEmpty(t, pgrepChildren(t, scratchDir), "expected a running pi child while the permission is pending")
 
 	require.NoError(t, agent.cmd.Process.Kill())
 
 	require.Eventually(t, func() bool {
-		return len(pgrepChildren(t, home)) == 0
+		return len(pgrepChildren(t, scratchDir)) == 0
 	}, 15*time.Second, 100*time.Millisecond, "pi child survived the wrapper crash")
 }
 
@@ -172,7 +172,7 @@ func TestPiACPAgentBinaryLiveConversation(t *testing.T) {
 
 	args := []string{
 		"-path", livePiPath(t),
-		"-home", t.TempDir(),
+		"-scratch-dir", t.TempDir(),
 		"-seed-file", "auth.json=" + authPath,
 	}
 	if model := os.Getenv(envPiModel); model != "" {

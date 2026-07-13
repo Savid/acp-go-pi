@@ -26,10 +26,16 @@ type Options struct {
 
 	// ExecutablePath is the pi CLI executable path. If empty, PATH is searched.
 	ExecutablePath string
-	// Home is the parent root under which the adapter creates one isolated pi
-	// agent directory per session. It never means "share this mutable native
-	// home"; if empty, a temporary parent root is used.
+	// Home is rejected: pi has no native config or auth root for the adapter
+	// to point at. When non-empty, every session-establishing method
+	// (session/new, load, resume, fork) fails with an unsupported-option
+	// error for field "home". Use ScratchDir to place per-session scratch.
 	Home string
+	// ScratchDir is the parent directory for all ephemeral on-disk
+	// materialization (per-session roots, hydration temp files, probe dirs).
+	// Empty means the system temp directory. The directory is created 0700
+	// when missing.
+	ScratchDir string
 	// DefaultModel selects the model for newly created pi sessions when
 	// non-empty, as "provider/id" (for example "openai/gpt-4o").
 	DefaultModel string
@@ -124,11 +130,23 @@ func WithExecutablePath(path string) Option {
 	}
 }
 
-// WithHome sets the parent root under which the adapter creates one isolated
-// pi agent directory per session.
+// WithHome sets Options.Home. pi has no native config or auth root, so a
+// non-empty value is an unsupported option: every session-establishing
+// method fails at session start. Use WithScratchDir to place per-session
+// scratch.
 func WithHome(path string) Option {
 	return func(options *Options) {
 		options.Home = path
+	}
+}
+
+// WithScratchDir sets the parent directory for all ephemeral on-disk
+// materialization (per-session roots, hydration temp files, probe dirs).
+// Empty means the system temp directory. The directory is created 0700
+// when missing.
+func WithScratchDir(dir string) Option {
+	return func(options *Options) {
+		options.ScratchDir = dir
 	}
 }
 

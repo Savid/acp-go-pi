@@ -89,8 +89,10 @@ func main() {
 ```
 
 See the [Go API reference](https://pkg.go.dev/github.com/savid/acp-go-pi) for
-options such as the pi executable path, home root, default model, session
-storage, permissions, raw events, and OpenTelemetry providers.
+options such as the pi executable path, scratch directory, default model,
+session storage, permissions, raw events, and OpenTelemetry providers. pi has
+no native config or auth root, so a configured home is rejected at session
+start; use the scratch directory to place per-session on-disk state.
 
 ## What It Provides
 
