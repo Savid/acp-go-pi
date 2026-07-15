@@ -202,3 +202,30 @@ func (t *processTree) terminateAndWait(timeout time.Duration) error {
 		}
 	}
 }
+
+func (t *processTree) descendantCount() (int, bool) {
+	if t == nil {
+		return 0, false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.job == 0 {
+		return 0, true
+	}
+
+	var info jobBasicAccountingInformation
+	err := windows.QueryInformationJobObject(
+		t.job,
+		windows.JobObjectBasicAccountingInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+		nil,
+	)
+	if err != nil {
+		return 0, false
+	}
+
+	return int(info.ActiveProcesses), true
+}

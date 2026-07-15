@@ -176,6 +176,17 @@ type Process struct {
 	waitErr error
 }
 
+// ProviderDescendantCount returns the absolute number of processes in the
+// native containment boundary when that boundary provides authoritative
+// inventory. A false result means no observation may be inferred.
+func (p *Process) ProviderDescendantCount() (int, bool) {
+	if p == nil || p.tree == nil {
+		return 0, false
+	}
+
+	return p.tree.descendantCount()
+}
+
 // StartProcess launches pi per spec with a scrubbed environment, its own
 // process group, and parent-death enforcement where the platform supports it.
 func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {

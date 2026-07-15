@@ -325,6 +325,19 @@ func TestStartSessionSeedWriteFailure(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestStartSessionExplicitResourcesFailure(t *testing.T) {
+	agent := newStubClientAgent(t, nil)
+	wantErr := errors.New("explicit resources")
+	previous := agentDirExplicitResources
+	agentDirExplicitResources = func(pi.AgentDir) (pi.ExplicitResources, error) {
+		return pi.ExplicitResources{}, wantErr
+	}
+	t.Cleanup(func() { agentDirExplicitResources = previous })
+
+	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	require.ErrorIs(t, err, wantErr)
+}
+
 func TestStartSessionManagedModelAndSetupFailure(t *testing.T) {
 	successClient := newStubPiClient()
 	successClient.state = pi.SessionState{SessionID: "id"}

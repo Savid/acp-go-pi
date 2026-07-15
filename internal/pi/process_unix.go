@@ -64,6 +64,12 @@ func (t *processTree) terminateAndWait(timeout time.Duration) error {
 	}
 }
 
+func (*processTree) descendantCount() (int, bool) {
+	// A process-group existence probe proves quiescence, but it cannot
+	// enumerate an authoritative nonzero membership count.
+	return 0, false
+}
+
 var (
 	signalOSProcess = func(process *os.Process, signal os.Signal) error {
 		return process.Signal(signal)

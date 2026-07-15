@@ -105,7 +105,10 @@ func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
 
 	s.stopPump()
 
-	if closeErr := proc.Close(); closeErr != nil {
+	closeErr := proc.Close()
+	s.retireProviderProcess(context.WithoutCancel(ctx), closeErr)
+
+	if closeErr != nil {
 		s.recordNativeQuiescence(closeErr)
 
 		return closeErr
@@ -143,6 +146,7 @@ func (s *agentSession) refreshMCPTools(ctx context.Context) error {
 
 	closeErr := proc.Close()
 	quiescenceErr := errors.Join(shutdownErr, closeErr)
+	s.retireProviderProcess(context.WithoutCancel(ctx), closeErr)
 	s.recordNativeQuiescence(quiescenceErr)
 
 	if !pi.ProcessTreeQuiescent(quiescenceErr) {
@@ -181,7 +185,7 @@ func (s *agentSession) relaunchProcess(ctx context.Context) error {
 	// past the prompt request that triggered it.
 	startCtx, finishStart := s.agent.observe.StartPiProcess(context.WithoutCancel(ctx), "relaunch")
 	spawnStarted := time.Now()
-	relaunched, client, err := s.agent.startPiProcess(startCtx, spec)
+	relaunched, client, processRoot, err := s.agent.startTrackedPiProcess(startCtx, spec)
 	observeRuntimeStartupStage(startCtx, s.agent.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSpawn, spawnStarted, err)
 
 	finishStart(err)
@@ -199,6 +203,7 @@ func (s *agentSession) relaunchProcess(ctx context.Context) error {
 		killErr := relaunched.Kill()
 		closeErr := relaunched.Close()
 		cleanupErr := errors.Join(killErr, closeErr)
+		processRoot.retire(context.WithoutCancel(ctx), providerProcessTreeProven(closeErr))
 		s.recordNativeQuiescence(cleanupErr)
 
 		return errors.Join(startErr, cleanupErr)
@@ -209,7 +214,9 @@ func (s *agentSession) relaunchProcess(ctx context.Context) error {
 	s.mu.Lock()
 	s.proc = relaunched
 	s.client = client
+	s.providerProcessRoot = processRoot
 	s.mu.Unlock()
+	processRoot.observe(ctx, relaunched)
 
 	s.startPump(client)
 
@@ -249,6 +256,7 @@ func (s *agentSession) cleanupFailedRelaunch(proc piProcess, cause error) error 
 	killErr := proc.Kill()
 	closeErr := proc.Close()
 	cleanupErr := errors.Join(killErr, closeErr)
+	s.retireProviderProcess(context.Background(), closeErr)
 	s.recordNativeQuiescence(cleanupErr)
 
 	return errors.Join(cause, cleanupErr)
@@ -387,6 +395,7 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 		closeErr := proc.Close()
 
 		err = errors.Join(err, closeErr)
+		s.retireProviderProcess(context.WithoutCancel(ctx), closeErr)
 		s.recordNativeQuiescence(closeErr)
 
 		quiescenceErr := s.nativeQuiescenceError()
@@ -411,6 +420,33 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 	}
 
 	return err
+}
+
+func (s *agentSession) retireProviderProcess(ctx context.Context, err error) {
+	proven := providerProcessTreeProven(err)
+
+	s.mu.Lock()
+
+	root := s.providerProcessRoot
+	if proven {
+		s.providerProcessRoot = nil
+	}
+	s.mu.Unlock()
+
+	if root != nil {
+		root.retire(ctx, proven)
+	}
+}
+
+func (s *agentSession) observeProviderProcess(ctx context.Context) {
+	s.mu.Lock()
+	root := s.providerProcessRoot
+	process := s.proc
+	s.mu.Unlock()
+
+	if root != nil {
+		root.observe(ctx, process)
+	}
 }
 
 func (s *agentSession) recordNativeQuiescence(err error) {

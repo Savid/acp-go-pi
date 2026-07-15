@@ -182,6 +182,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	if err := s.refreshMCPTools(ctx); err != nil {
 		return acp.PromptResponse{}, s.nativeTurnFailure(err)
 	}
+	defer s.observeProviderProcess(context.WithoutCancel(ctx))
 
 	turnCtx, cancel := context.WithCancel(ctx)
 	turnCtx = withTurnRoute(turnCtx, route.turnNonce)

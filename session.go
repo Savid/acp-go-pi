@@ -104,6 +104,7 @@ type agentSession struct {
 	nativeRootRelease   func()
 	scratchRootRelease  func()
 	nativeQuiescenceErr error
+	providerProcessRoot *providerProcessRoot
 }
 
 // dialogCancel tracks one pending extension UI dialog so session/cancel and

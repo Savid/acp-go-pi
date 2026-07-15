@@ -129,6 +129,11 @@ func TestLaunchSpecEnviron(t *testing.T) {
 	require.IsIncreasing(t, environ)
 }
 
+func TestSafeExplicitEnvKeyBoundary(t *testing.T) {
+	require.False(t, safeExplicitEnvKey(""))
+	require.True(t, safeExplicitEnvKey("A1"))
+}
+
 func writeScript(t *testing.T, body string) string {
 	t.Helper()
 

@@ -74,6 +74,7 @@ type Agent struct {
 	clientCapabilities acp.ClientCapabilities
 	positionEncoding   acp.PositionEncodingKind
 	activeLimitErr     error
+	processes          *providerProcessTracker
 
 	versionMu      sync.Mutex
 	versionChecked bool
@@ -106,7 +107,7 @@ func NewAgent(opts ...Option) *Agent {
 	})
 	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe)
 
-	return &Agent{
+	agent := &Agent{
 		options:          options,
 		log:              log,
 		observe:          observe,
@@ -119,6 +120,28 @@ func NewAgent(opts ...Option) *Agent {
 		probeVersion:     pi.ProbeVersion,
 		lookPath:         exec.LookPath,
 	}
+	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
+
+	return agent
+}
+
+func (a *Agent) startTrackedPiProcess(
+	ctx context.Context,
+	spec pi.LaunchSpec,
+) (piProcess, piClient, *providerProcessRoot, error) {
+	process, client, err := a.startPiProcess(ctx, spec)
+	if err != nil {
+		if !providerProcessTreeProven(err) {
+			a.processes.register()
+		}
+
+		return nil, nil, nil, err
+	}
+
+	root := a.processes.register()
+	root.observe(ctx, process)
+
+	return process, client, root, nil
 }
 
 func startRealPiProcess(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {

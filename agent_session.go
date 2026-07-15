@@ -22,6 +22,10 @@ import (
 // rows; lifecycle methods map it to the uniform unknown-session error.
 var errUnknownStoredSession = errors.New("session not found in store")
 
+var agentDirExplicitResources = func(dir pi.AgentDir) (pi.ExplicitResources, error) {
+	return dir.ExplicitResources()
+}
+
 const modelFieldUnknown = "unknown"
 
 // NewSession creates and starts a pi RPC session.
@@ -718,7 +722,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		return nil, writeErr
 	}
 
-	seededResources, err := agentDir.ExplicitResources()
+	seededResources, err := agentDirExplicitResources(agentDir)
 	if err != nil {
 		return nil, err
 	}
@@ -753,7 +757,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	}
 
 	spawnStarted := time.Now()
-	proc, client, err := a.startPiProcess(startCtx, spec)
+	proc, client, processRoot, err := a.startTrackedPiProcess(startCtx, spec)
 	observeRuntimeStartupStage(startCtx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSpawn, spawnStarted, err)
 
 	finishStart(err)
@@ -778,6 +782,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		rawMessages:           start.RawMessages,
 		nativeRootRelease:     nativeRelease,
 		scratchRootRelease:    scratchRelease,
+		providerProcessRoot:   processRoot,
 	}
 
 	// The cleanup defer must hold its own reference: failure paths return a
@@ -796,6 +801,8 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 
 			closeErr := proc.Close()
 			cleanupErr := errors.Join(shutdownErr, closeErr)
+			created.retireProviderProcess(context.Background(), closeErr)
+
 			err = errors.Join(err, cleanupErr)
 		}
 	}()
@@ -820,6 +827,8 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 
 	started = false
 	keepScratch = true
+
+	processRoot.observe(ctx, proc)
 
 	return session, nil
 }
