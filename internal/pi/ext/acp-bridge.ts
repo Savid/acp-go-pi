@@ -14,10 +14,35 @@
  */
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 const PERMISSION_MARKER = "acp-go-pi:permission:";
+const QUESTION_TOOL = "question";
 
 export default function (pi: ExtensionAPI) {
+	pi.registerTool({
+		name: QUESTION_TOOL,
+		label: "Question",
+		description: "Ask the user one question and wait for their response.",
+		parameters: Type.Object({
+			question: Type.String(),
+			options: Type.Optional(Type.Array(Type.String())),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			if (signal?.aborted) throw new Error("Question cancelled");
+
+			const answer = params.options?.length
+				? await ctx.ui.select(params.question, params.options)
+				: await ctx.ui.input(params.question, "Type your answer");
+			if (answer === undefined) throw new Error("Question declined by ACP client");
+
+			return {
+				content: [{ type: "text", text: answer }],
+				details: { answer },
+			};
+		},
+	});
+
   // pi creates its session-entry id after message_end listeners run, so that
   // id is not present on the RPC event. Stamp a UUID on the finalized
   // assistant message before pi persists it instead. The Go adapter exposes
@@ -44,6 +69,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("tool_call", async (event, ctx) => {
+	// The wrapper-owned question tool is already mediated by ACP elicitation.
+	// It never performs a side effect and must not open a second permission UI.
+	if (event.toolName === QUESTION_TOOL) return;
+
     let payload: string;
     try {
       payload = JSON.stringify({

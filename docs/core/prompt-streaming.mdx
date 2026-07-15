@@ -27,8 +27,9 @@ Two interactive flows are layered on top of the stream:
 - **Permission requests** are surfaced as ACP permission prompts through the
   adapter's own pi bridge extension — see
   [Permissions](/docs/features/permissions).
-- **User-facing questions** raised by pi extension dialogs are forwarded
-  through ACP elicitation, but only when the initialized client advertised
+- **User-facing questions** raised by the wrapper-owned `question` tool or an
+  explicitly seeded extension dialog are forwarded through ACP elicitation,
+  but only when the initialized client advertised
   elicitation support. Without it, the dialog is cancelled deterministically
   and the turn proceeds — see [Elicitation](/docs/features/elicitation).
 
@@ -54,10 +55,11 @@ and skills, and the adapter projects any returned entries into ACP
 `/name` runs that command as its turn; unrecognized `/text` stays ordinary
 prompt text.
 
-The launch disables ambient extension, skill, and prompt-template discovery;
-the shipped wrapper extensions register no slash commands. A default session
-therefore advertises an empty command set. Nothing is fabricated from pi's
-terminal-only built-ins.
+The launch disables ambient extension, skill, and prompt-template discovery.
+Explicit seeds under `extensions/`, `prompts/`, and `skills/**/SKILL.md` are
+loaded by exact path, so their commands remain reachable. The shipped wrapper
+extensions register no slash commands; a default session therefore advertises
+an empty command set. Nothing is fabricated from pi's terminal-only built-ins.
 
 ## Turn resolution
 
@@ -75,3 +77,7 @@ A turn resolves one of three ways:
   error. Failures are never reported as a stop reason. The
   [ACP methods](/docs/reference/acp-methods) reference documents the error
   code and cause vocabulary.
+
+Only turns that cross pi's native `agent_settled` fence are mirrored. This
+includes settled cancellations and settled provider errors; transport or
+process failures before that fence never commit partial state.

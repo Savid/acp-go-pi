@@ -220,6 +220,56 @@ func TestStartSessionRejectsHome(t *testing.T) {
 	requireInvalidParams(t, err)
 }
 
+func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
+	for _, key := range []string{"PATH", "NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BAD-NAME"} {
+		t.Run(key, func(t *testing.T) {
+			client := newStubPiClient()
+			agent := newStubClientAgent(t, client, WithEnv(map[string]string{key: "unsafe"}))
+			starts := 0
+			agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+				starts++
+
+				return newStubProcess(false), client, nil
+			}
+
+			_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+			requireInvalidParams(t, err)
+			require.Zero(t, starts)
+		})
+	}
+}
+
+func TestStartSessionLoadsExplicitSeedResourcesAndProviderEnv(t *testing.T) {
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: "id"}
+	agent := newStubClientAgent(t, client,
+		WithEnv(map[string]string{"OPENAI_API_KEY": "explicit-key"}),
+		WithSeedFiles(map[string]string{
+			"extensions/command.ts":  "extension",
+			"skills/review/SKILL.md": "skill",
+			"prompts/review.md":      "prompt",
+		}),
+	)
+
+	var launched pi.LaunchSpec
+	agent.startPiProcess = func(_ context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
+		launched = spec
+
+		return newStubProcess(false), client, nil
+	}
+
+	session, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, session.Close(t.Context())) })
+
+	require.Equal(t, "explicit-key", launched.Env["OPENAI_API_KEY"])
+	require.Len(t, launched.ExtensionPaths, 2)
+	require.Contains(t, filepath.ToSlash(launched.ExtensionPaths[0]), "/extensions/command.ts")
+	require.Equal(t, filepath.Join(launched.AgentDir, pi.BridgeExtensionFileName), launched.ExtensionPaths[1])
+	require.Equal(t, []string{filepath.Join(launched.AgentDir, "skills", "review", "SKILL.md")}, launched.SkillPaths)
+	require.Equal(t, []string{filepath.Join(launched.AgentDir, "prompts", "review.md")}, launched.PromptTemplatePaths)
+}
+
 func TestStartSessionHydrateWriteFailure(t *testing.T) {
 	original := materializeWriteFile
 	t.Cleanup(func() { materializeWriteFile = original })

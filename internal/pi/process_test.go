@@ -20,16 +20,21 @@ func TestLaunchSpecArgs(t *testing.T) {
 		t.Parallel()
 
 		spec := LaunchSpec{
-			AgentDir:       "/agent",
-			SessionDir:     "/sessions",
-			SessionPath:    "/sessions/restored.jsonl",
-			ExtensionPaths: []string{"/agent/acp-bridge.ts", "/agent/acp-mcp.ts"},
+			AgentDir:            "/agent",
+			SessionDir:          "/sessions",
+			SessionPath:         "/sessions/restored.jsonl",
+			ExtensionPaths:      []string{"/agent/extensions/seed.ts", "/agent/acp-bridge.ts", "/agent/acp-mcp.ts"},
+			SkillPaths:          []string{"/agent/skills/review/SKILL.md"},
+			PromptTemplatePaths: []string{"/agent/prompts/review.md"},
 		}
 
 		require.Equal(t, []string{
 			"--mode", "rpc", "--no-extensions",
+			"-e", "/agent/extensions/seed.ts",
 			"-e", "/agent/acp-bridge.ts",
 			"-e", "/agent/acp-mcp.ts",
+			"--skill", "/agent/skills/review/SKILL.md",
+			"--prompt-template", "/agent/prompts/review.md",
 			"--no-skills", "--no-prompt-templates", "--no-themes",
 			"--session-dir", "/sessions",
 			"--no-approve",
@@ -92,6 +97,11 @@ func TestLaunchSpecEnviron(t *testing.T) {
 		AgentDir: "/agent",
 		Env: map[string]string{
 			"ANTHROPIC_API_KEY": "explicit-key",
+			"OPENAI_API_KEY":    "explicit-openai-key",
+			"NODE_OPTIONS":      "--require=/tmp/hijack.js",
+			"LD_PRELOAD":        "/tmp/hijack.so",
+			"BAD-NAME":          "bad",
+			"PATH":              "/tmp/hijack-bin",
 			"PI_OFFLINE":        "0", // managed keys always win
 		},
 	}
@@ -108,9 +118,13 @@ func TestLaunchSpecEnviron(t *testing.T) {
 	require.Equal(t, "/usr/bin", env["PATH"])
 	require.Equal(t, "/home/user", env["HOME"])
 	require.Equal(t, "explicit-key", env["ANTHROPIC_API_KEY"])
+	require.Equal(t, "explicit-openai-key", env["OPENAI_API_KEY"])
 	require.Equal(t, "1", env["PI_OFFLINE"])
 	require.Equal(t, "/agent", env["PI_CODING_AGENT_DIR"])
-	require.NotContains(t, env, "OPENAI_API_KEY")
+	require.NotContains(t, env, "NODE_OPTIONS")
+	require.NotContains(t, env, "LD_PRELOAD")
+	require.NotContains(t, env, "BAD-NAME")
+	require.Equal(t, "/usr/bin", env["PATH"])
 	require.NotContains(t, env, "TMPDIR")
 	require.IsIncreasing(t, environ)
 }

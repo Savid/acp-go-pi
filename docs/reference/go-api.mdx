@@ -40,8 +40,8 @@ reach.
 | `WithScratchDir` | Parent directory for all ephemeral on-disk state (isolated per-session agent and session directories, hydration temp files, probe dirs). Empty means the system temp directory; created `0700` when missing. |
 | `WithHome` | Unsupported: pi has no native config or auth root. A non-empty value is rejected at session start (`session/new`, load, resume, and fork) with the unsupported-option error for field `home`. Use `WithScratchDir` for per-session scratch. |
 | `WithDefaultModel` | Default model for new sessions, as `"provider/id"`. |
-| `WithEnv` | Add environment variables to every pi child (children run with a scrubbed environment). |
-| `WithSeedFiles` | Write files into each session's isolated agent directory before launch. |
+| `WithEnv` | Add environment variables to every pi child. Invalid names plus `PATH`, `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `LD_*`, and `DYLD_*` are rejected; ambient credentials are scrubbed. |
+| `WithSeedFiles` | Write files into each isolated agent directory. Seeded extensions, prompts, and skills in their conventional subdirectories are loaded by exact path. |
 | `WithSessionStore` | Install durable session storage. |
 | `WithSessionStoreLoadTimeout` | Bound store load/list operations used during resume. |
 | `WithConcurrencyLimits` | Cap active sessions and concurrent client calls. |

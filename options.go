@@ -75,7 +75,8 @@ type Options struct {
 	DefaultModel string
 	// Env is added to every launched pi process environment. pi children run
 	// with a scrubbed environment, so provider API keys must travel here (or
-	// per session) rather than relying on ambient variables.
+	// per session) rather than relying on ambient variables. Process-loader,
+	// shell-loader, PATH, and Node loader keys are rejected at session start.
 	Env map[string]string
 
 	// Logger receives structured diagnostic logs. If nil, the default logger is used.
@@ -198,6 +199,8 @@ func WithDefaultModel(model string) Option {
 
 // WithEnv adds environment variables to every launched pi process. pi children
 // run with a scrubbed environment, so provider API keys must travel here.
+// PATH, NODE_OPTIONS, BASH_ENV, ENV, LD_*, DYLD_*, and invalid names are
+// rejected at session start.
 func WithEnv(env map[string]string) Option {
 	return func(options *Options) {
 		options.Env = cloneStringMap(env)

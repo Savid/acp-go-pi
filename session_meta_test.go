@@ -53,6 +53,7 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"1BAD": "x"}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"PATH": "x"}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: true}}},
+		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{"type": "object"}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaThinkingLevelKey: true}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaThinkingLevelKey: "bad"}}},
@@ -93,6 +94,13 @@ func TestPiOptionsMeta(t *testing.T) {
 			name:    "empty options",
 			options: PiOptions{},
 			want:    map[string]any{"pi": map[string]any{"options": map[string]any{}}},
+		},
+		{
+			name:    "present empty output schema",
+			options: PiOptions{OutputSchema: map[string]any{}},
+			want: map[string]any{"pi": map[string]any{"options": map[string]any{
+				"outputSchema": map[string]any{},
+			}}},
 		},
 		{
 			name: "all supported fields",

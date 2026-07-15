@@ -87,7 +87,8 @@ func TestAgentFakeCancelDuringStream(t *testing.T) {
 	scenario.StreamDelayMs = 250
 
 	client := &recordingClient{}
-	conn := connectFakeAgentForTest(t, ctx, client, scenario)
+	store := piacp.NewInMemorySessionStore()
+	conn := connectFakeAgentForTest(t, ctx, client, scenario, piacp.WithSessionStore(store))
 	sessionID := newFakeSession(t, ctx, conn)
 
 	promptDone := make(chan acp.PromptResponse, 1)
@@ -116,6 +117,10 @@ func TestAgentFakeCancelDuringStream(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("prompt did not return after cancel")
 	}
+
+	entries, err := store.Load(ctx, piacp.SessionKey{SessionID: string(sessionID)})
+	require.NoError(t, err)
+	require.NotEmpty(t, entries, "a cancelled turn is mirrored only after its native settle fence")
 }
 
 func TestAgentFakeProviderErrorTurnFailure(t *testing.T) {
@@ -130,11 +135,15 @@ func TestAgentFakeProviderErrorTurnFailure(t *testing.T) {
 	scenario.ProviderError = "429 rate limited by fake provider"
 
 	client := &recordingClient{}
-	conn := connectFakeAgentForTest(t, ctx, client, scenario)
+	store := piacp.NewInMemorySessionStore()
+	conn := connectFakeAgentForTest(t, ctx, client, scenario, piacp.WithSessionStore(store))
 	sessionID := newFakeSession(t, ctx, conn)
 
 	_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "fail please"))
 	requireTurnFailure(t, err, "provider")
+	entries, loadErr := store.Load(ctx, piacp.SessionKey{SessionID: string(sessionID)})
+	require.NoError(t, loadErr)
+	require.NotEmpty(t, entries, "a provider error is mirrored only after its native settle fence")
 
 	// A provider failure leaves the session addressable.
 	_, err = conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "again"))
@@ -152,11 +161,15 @@ func TestAgentFakeProcessDeathTurnFailure(t *testing.T) {
 	scenario.PromptBehavior = fakeBehaviorDie
 
 	client := &recordingClient{}
-	conn := connectFakeAgentForTest(t, ctx, client, scenario)
+	store := piacp.NewInMemorySessionStore()
+	conn := connectFakeAgentForTest(t, ctx, client, scenario, piacp.WithSessionStore(store))
 	sessionID := newFakeSession(t, ctx, conn)
 
 	_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "die mid turn"))
 	requireTurnFailure(t, err, "process_exit")
+	entries, loadErr := store.Load(ctx, piacp.SessionKey{SessionID: string(sessionID)})
+	require.NoError(t, loadErr)
+	require.Empty(t, entries, "a transport/process failure before agent_settled must never be mirrored")
 }
 
 func TestAgentFakeTurnTimeout(t *testing.T) {

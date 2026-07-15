@@ -4,6 +4,9 @@ package integration
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -23,6 +26,71 @@ func TestPiCLIVersionProbe(t *testing.T) {
 	require.NotEmpty(t, version)
 	require.NoError(t, pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion),
 		"installed pi %s is older than the supported minimum %s", version, pi.DefaultMinimumVersion)
+}
+
+// TestPiCLIExplicitSeedResources proves the real CLI honors exact seeded
+// extension, skill, and prompt-template paths while ambient discovery stays
+// disabled. This is the native reachability contract behind slash commands.
+func TestPiCLIExplicitSeedResources(t *testing.T) {
+	path := smokePiPath(t)
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	root := t.TempDir()
+	agentDir := filepath.Join(root, "agent")
+	sessionDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o700))
+
+	seed := pi.AgentDir{Root: agentDir, SeedFiles: map[string]string{
+		"extensions/seed-command.ts": `import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+export default function (pi: ExtensionAPI) {
+  pi.registerCommand("seed-command", { description: "Seed command", handler: async () => {} });
+}`,
+		"skills/seed-skill/SKILL.md": `---
+name: seed-skill
+description: Deterministic seeded skill
+---
+Use the deterministic seeded skill.
+`,
+		"prompts/seed-prompt.md": "Run the deterministic seeded prompt.\n",
+	}}
+	require.NoError(t, seed.Write())
+	resources, err := seed.ExplicitResources()
+	require.NoError(t, err)
+	wrapper, err := pi.WriteExtensions(agentDir, false)
+	require.NoError(t, err)
+
+	process, err := pi.StartProcess(ctx, pi.LaunchSpec{
+		ExecutablePath:      path,
+		AgentDir:            agentDir,
+		SessionDir:          sessionDir,
+		ExtensionPaths:      append(resources.Extensions, wrapper...),
+		SkillPaths:          resources.Skills,
+		PromptTemplatePaths: resources.PromptTemplates,
+		Cwd:                 root,
+	})
+	require.NoError(t, err)
+	client := pi.NewClient(process.Stdin(), process.Stdout())
+	require.NoError(t, client.Start(ctx))
+	t.Cleanup(func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		_ = process.Shutdown(shutdownCtx)
+		_ = process.Close()
+		_ = client.Stop()
+	})
+
+	commands, err := client.GetCommands(ctx)
+	require.NoError(t, err)
+	names := make([]string, 0, len(commands))
+	for _, command := range commands {
+		names = append(names, command.Name)
+	}
+	slices.Sort(names)
+	require.Equal(t, []string{"seed-command", "seed-prompt", "skill:seed-skill"}, names)
+	require.Empty(t, process.StderrTail())
 }
 
 // TestPiCLIBridgeExtensionLoads proves the wrapper-owned bridge extension

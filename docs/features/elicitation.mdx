@@ -3,13 +3,12 @@ title: "Elicitation"
 description: "Forward pi's user-facing dialogs to clients that opt in during initialize"
 ---
 
-When a pi extension needs to ask the user a question mid-turn — a confirm, an
-input box, or an editor dialog — the adapter can forward it to the host as an
-ACP elicitation request. The adapter loads only its own wrapper extensions;
-ambient and seeded extensions are not discovered. The shipped extensions
-currently raise only permission dialogs, so a default session has no
-non-permission dialog producer even though the relay and capability descriptor
-are available.
+The wrapper ships a `question` tool that a model can call to ask the user a
+free-form or multiple-choice question mid-turn. Its real pi extension UI
+dialog is forwarded to the host as an ACP elicitation request, and the answer
+returns to the same tool call. Explicitly seeded extensions can use pi's
+select, confirm, input, or editor dialogs through the same relay. Ambient
+extensions are never discovered.
 
 ## Capability gating
 
@@ -24,9 +23,10 @@ render.
 | Absent | No request is sent; the dialog is cancelled deterministically and the turn continues per pi's own logic. |
 
 <Note>
-Elicitation is not the permission channel. Tool-access approvals always use
-[permission prompts](/docs/features/permissions); elicitation carries
-free-form questions only.
+Elicitation is not the permission channel. The wrapper's non-side-effecting
+`question` tool goes directly to elicitation and does not open a second tool
+permission prompt. All other tool-access approvals use
+[permission prompts](/docs/features/permissions).
 </Note>
 
 Because behavior depends on the client's advertised capability, test both

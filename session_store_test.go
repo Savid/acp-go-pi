@@ -38,7 +38,8 @@ func TestInMemorySessionStoreCompleteSemantics(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, summaries, 2)
 
-	require.Error(t, store.Replace(ctx, SessionKey{}, nil))
+	require.EqualError(t, store.Replace(ctx, SessionKey{}, nil), "session id is required")
+	require.EqualError(t, store.Replace(ctx, SessionKey{SessionID: "id", Subpath: "not-main"}, nil), "main key must use the main subpath")
 	require.Error(t, store.Replace(ctx, main, nil))
 	require.Error(t, store.Replace(ctx, main, []SessionStoreReplacement{{Key: other}}))
 	require.Error(t, store.Replace(ctx, main, []SessionStoreReplacement{{Key: main}, {Key: main}}))

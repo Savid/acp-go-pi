@@ -70,6 +70,48 @@ type AgentDir struct {
 	AuthJSON []byte
 }
 
+// ExplicitResources are seeded native resources that must be passed to pi by
+// exact path because ambient discovery stays disabled.
+type ExplicitResources struct {
+	Extensions      []string
+	Skills          []string
+	PromptTemplates []string
+}
+
+// ExplicitResources resolves the supported seeded resource conventions into
+// deterministic absolute launch paths. Other seed files remain ordinary pi
+// config/data and are not discovered implicitly.
+func (d AgentDir) ExplicitResources() (ExplicitResources, error) {
+	resources := ExplicitResources{}
+
+	names := make([]string, 0, len(d.SeedFiles))
+	for name := range d.SeedFiles {
+		names = append(names, name)
+	}
+
+	slices.Sort(names)
+
+	for _, name := range names {
+		resolved, err := resolveSeedFilePath(d.Root, name)
+		if err != nil {
+			return ExplicitResources{}, err
+		}
+
+		canonical := filepath.ToSlash(name)
+		switch {
+		case strings.HasPrefix(canonical, "extensions/") &&
+			(strings.HasSuffix(canonical, ".ts") || strings.HasSuffix(canonical, ".js")):
+			resources.Extensions = append(resources.Extensions, resolved)
+		case strings.HasPrefix(canonical, "skills/") && filepath.Base(resolved) == "SKILL.md":
+			resources.Skills = append(resources.Skills, resolved)
+		case strings.HasPrefix(canonical, "prompts/") && strings.HasSuffix(canonical, ".md"):
+			resources.PromptTemplates = append(resources.PromptTemplates, resolved)
+		}
+	}
+
+	return resources, nil
+}
+
 // Write materializes the agent directory: validates seed paths, deep-merges
 // settings.json, writes every seeded file under a provenance manifest, and
 // injects auth.json.

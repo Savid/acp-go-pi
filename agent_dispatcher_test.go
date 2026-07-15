@@ -89,6 +89,29 @@ func TestLocalAgentConnectionDispatchValidation(t *testing.T) {
 	require.Equal(t, -32601, reqErr.Code)
 }
 
+func TestLocalAgentConnectionDispatchFailsClosedAfterAgentClose(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	conn := &localAgentConnection{agent: agent, hooks: &postResponseHooks{}}
+	conn.initialized.Store(true)
+
+	agent.mu.Lock()
+	agent.closed = true
+	agent.mu.Unlock()
+
+	for _, test := range []struct {
+		method string
+		params json.RawMessage
+	}{
+		{method: "unknown/method", params: json.RawMessage(`{}`)},
+		{method: acp.AgentMethodSessionPrompt, params: json.RawMessage(`{`)},
+		{method: "_pi/unknown", params: json.RawMessage(`{`)},
+	} {
+		result, reqErr := conn.handle(t.Context(), test.method, test.params)
+		require.Nil(t, result)
+		require.Equal(t, -32600, reqErr.Code)
+	}
+}
+
 func TestLocalAgentHandlersDecodeAndCallErrors(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	response := localResponse(func(_ *Agent, _ context.Context, params dispatcherParams) (string, error) {

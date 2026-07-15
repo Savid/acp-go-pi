@@ -58,9 +58,13 @@ never touch the operator's real pi home.
 `settings.json` is special: the adapter authors it to pin session behavior, so
 a seeded `settings.json` is deep-merged **under** the adapter's managed keys —
 the adapter wins for keys it owns, the seed supplies everything else. All
-other filenames are written verbatim. Paths are confined to the agent
-directory: absolute paths, `..` escapes, and empty keys fail closed at session
-start.
+other filenames are written verbatim. Seeded resources under
+`extensions/*.ts` or `extensions/*.js`, `prompts/*.md`, and
+`skills/**/SKILL.md` are additionally passed to pi by exact path. This keeps
+ambient and project discovery disabled while making the operator's explicit
+resources reachable, including their slash commands. Paths are confined to
+the agent directory: absolute paths, `..` escapes, and empty keys fail closed
+at session start.
 
 ```go
 err := piacp.Serve(ctx, input, output,

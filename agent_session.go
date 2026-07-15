@@ -585,6 +585,13 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		return nil, unsupportedField(optionFieldHome)
 	}
 
+	if envErr := validateEnvironment(a.options.Env, "env"); envErr != nil {
+		return nil, acp.NewInvalidParams(map[string]any{
+			jsonFieldError: envErr.Error(),
+			jsonFieldField: "env",
+		})
+	}
+
 	discoveryRelease, err := acquireNativeRoot(ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery)
 	if err != nil {
 		return nil, err
@@ -711,16 +718,28 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		return nil, writeErr
 	}
 
+	seededResources, err := agentDir.ExplicitResources()
+	if err != nil {
+		return nil, err
+	}
+
+	// Load operator-seeded extensions before wrapper-owned extensions so the
+	// wrapper's reserved question tool and correlation hooks cannot be
+	// replaced by a seed with the same registration name.
+	extensionPaths = append(seededResources.Extensions, extensionPaths...)
+
 	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, nil)
 
 	spec := pi.LaunchSpec{
-		ExecutablePath: executable,
-		AgentDir:       dirs.AgentDir,
-		SessionDir:     dirs.SessionDir,
-		SessionPath:    hydratedPath,
-		ExtensionPaths: extensionPaths,
-		Env:            env,
-		Cwd:            start.Cwd,
+		ExecutablePath:      executable,
+		AgentDir:            dirs.AgentDir,
+		SessionDir:          dirs.SessionDir,
+		SessionPath:         hydratedPath,
+		ExtensionPaths:      extensionPaths,
+		SkillPaths:          seededResources.Skills,
+		PromptTemplatePaths: seededResources.PromptTemplates,
+		Env:                 env,
+		Cwd:                 start.Cwd,
 	}
 
 	// The pi child must outlive the lifecycle request that spawns it: its

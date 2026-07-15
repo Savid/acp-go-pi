@@ -138,8 +138,12 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 		return fmt.Errorf("nil InMemorySessionStore")
 	}
 
-	if main.SessionID == "" || main.Subpath != SessionStoreMainSubpath {
-		return fmt.Errorf("main key must use a session id and the main subpath")
+	if main.SessionID == "" {
+		return fmt.Errorf("session id is required")
+	}
+
+	if main.Subpath != SessionStoreMainSubpath {
+		return fmt.Errorf("main key must use the main subpath")
 	}
 
 	now := time.Now().UnixMilli()

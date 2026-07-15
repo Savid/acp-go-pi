@@ -24,6 +24,10 @@ scrubbed environment. Ambient shell variables — including provider API keys
 exported in the operator's shell — are **not** inherited by the pi child, so a
 stray `OPENAI_API_KEY` can never silently become a session's identity.
 Credentials reach a session only when the host injects them explicitly.
+Explicit environment maps accept ordinary provider variables but reject
+invalid names and process-hijack keys: `PATH`, `NODE_OPTIONS`, `BASH_ENV`,
+`ENV`, every `LD_*`, and every `DYLD_*`. The child-launch boundary scrubs the
+same keys again as defense in depth.
 
 ## Injecting credentials
 

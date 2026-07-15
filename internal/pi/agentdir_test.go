@@ -125,6 +125,38 @@ func TestAgentDirWriteAuthInjection(t *testing.T) {
 	require.NotContains(t, string(manifest), AuthFileName)
 }
 
+func TestAgentDirExplicitResources(t *testing.T) {
+	t.Parallel()
+
+	root := filepath.Join(t.TempDir(), "agent")
+	dir := AgentDir{Root: root, SeedFiles: map[string]string{
+		"extensions/z.js":         "z",
+		"extensions/a.ts":         "a",
+		"extensions/ignored.txt":  "x",
+		"skills/review/SKILL.md":  "skill",
+		"skills/review/notes.md":  "notes",
+		"prompts/review.md":       "prompt",
+		"prompts/nested/other.md": "prompt",
+		"settings.json":           `{}`,
+	}}
+
+	resources, err := dir.ExplicitResources()
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		filepath.Join(root, "extensions", "a.ts"),
+		filepath.Join(root, "extensions", "z.js"),
+	}, resources.Extensions)
+	require.Equal(t, []string{filepath.Join(root, "skills", "review", "SKILL.md")}, resources.Skills)
+	require.Equal(t, []string{
+		filepath.Join(root, "prompts", "nested", "other.md"),
+		filepath.Join(root, "prompts", "review.md"),
+	}, resources.PromptTemplates)
+
+	_, err = (AgentDir{Root: root, SeedFiles: map[string]string{"../escape.ts": "x"}}).ExplicitResources()
+	var seedErr *SeedFileError
+	require.ErrorAs(t, err, &seedErr)
+}
+
 func TestWriteSeedFilesPathValidation(t *testing.T) {
 	t.Parallel()
 

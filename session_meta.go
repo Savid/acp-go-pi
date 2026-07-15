@@ -64,7 +64,7 @@ func (options PiOptions) Meta() map[string]any {
 		values[metaEnvKey] = cloneStringMap(options.Env)
 	}
 
-	if len(options.OutputSchema) > 0 {
+	if options.OutputSchema != nil {
 		values[metaOutputSchemaKey] = cloneAnyMap(options.OutputSchema)
 	}
 
@@ -219,7 +219,7 @@ func parsePiOptions(value any) (PiOptions, error) {
 }
 
 func validatePiOptions(options PiOptions) (PiOptions, error) {
-	if len(options.OutputSchema) > 0 {
+	if options.OutputSchema != nil {
 		return PiOptions{}, unsupportedField(metaOptionPath(metaOutputSchemaKey))
 	}
 
@@ -241,17 +241,25 @@ func validatePiOptions(options PiOptions) (PiOptions, error) {
 		return PiOptions{}, fmt.Errorf("%s must be %q or %q", metaOptionPath(metaPermissionKey), pi.PermissionModeAsk, pi.PermissionModeAllow)
 	}
 
-	for key := range options.Env {
-		if !validEnvName(key) {
-			return PiOptions{}, fmt.Errorf("%s.%s is not a valid environment variable name", metaOptionPath(metaEnvKey), key)
-		}
-
-		if blockedEnvKey(key) {
-			return PiOptions{}, fmt.Errorf("%s.%s is not allowed", metaOptionPath(metaEnvKey), key)
-		}
+	if err := validateEnvironment(options.Env, metaOptionPath(metaEnvKey)); err != nil {
+		return PiOptions{}, err
 	}
 
 	return options, nil
+}
+
+func validateEnvironment(env map[string]string, path string) error {
+	for key := range env {
+		if !validEnvName(key) {
+			return fmt.Errorf("%s.%s is not a valid environment variable name", path, key)
+		}
+
+		if blockedEnvKey(key) {
+			return fmt.Errorf("%s.%s is not allowed", path, key)
+		}
+	}
+
+	return nil
 }
 
 func unsupportedField(path string) error {

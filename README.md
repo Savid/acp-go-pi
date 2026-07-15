@@ -104,7 +104,8 @@ start; use the scratch directory to place per-session on-disk state.
   and session metadata.
 - Permission prompts through a wrapper-owned pi bridge extension with
   ask/allow modes.
-- Elicitation bridging for pi extension dialogs.
+- Elicitation bridging through the wrapper-owned `question` tool and any
+  explicitly seeded extension dialogs.
 - MCP stdio and HTTP server declarations through a wrapper-owned,
   dependency-free pi MCP client extension.
 - Optional durable mirroring through a host-provided `SessionStore`.
@@ -116,8 +117,10 @@ start; use the scratch directory to place per-session on-disk state.
 
 The adapter projects only commands returned by pi's RPC command inventory.
 Ambient extensions, prompt templates, and skills are disabled for isolated
-sessions, and the shipped wrapper extensions register no slash commands, so a
-default session advertises an empty command set. Nothing is synthesized from
+sessions. Explicit `WithSeedFiles` entries under `extensions/`, `prompts/`,
+and `skills/**/SKILL.md` are loaded by exact path and therefore are reachable;
+the shipped wrapper extensions register no slash commands, so a default
+session still advertises an empty command set. Nothing is synthesized from
 the terminal UI's built-in commands.
 
 ## Docs

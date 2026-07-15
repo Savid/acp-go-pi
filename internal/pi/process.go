@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,10 +20,17 @@ const defaultProcessTreeWait = 5 * time.Second
 // stderrTailLimit bounds the retained stderr tail used for error reporting.
 const stderrTailLimit = 8 << 10
 
+const (
+	envPath        = "PATH"
+	envNodeOptions = "NODE_OPTIONS"
+	envBashEnv     = "BASH_ENV"
+	envShellEnv    = "ENV"
+)
+
 // baseEnvironmentKeys are the only parent environment variables a pi child
 // inherits. Everything else is scrubbed: pi treats ambient provider API keys
 // as live auth, so credentials must flow through explicit env additions.
-var baseEnvironmentKeys = []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM"}
+var baseEnvironmentKeys = []string{envPath, "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM"}
 var processPipe = os.Pipe
 
 // LaunchSpec describes one pi RPC-mode process launch.
@@ -37,8 +45,12 @@ type LaunchSpec struct {
 	SessionPath string
 	// SessionID selects an exact session id, creating it if missing (--session-id).
 	SessionID string
-	// ExtensionPaths are wrapper-owned extension files loaded with -e, in order.
+	// ExtensionPaths are explicit seed and wrapper-owned extension files loaded with -e, in order.
 	ExtensionPaths []string
+	// SkillPaths are explicitly seeded skill files loaded despite disabled discovery.
+	SkillPaths []string
+	// PromptTemplatePaths are explicitly seeded prompt templates loaded despite disabled discovery.
+	PromptTemplatePaths []string
 	// Env is added to the scrubbed base environment. Wrapper-managed keys
 	// (PI_CODING_AGENT_DIR, PI_OFFLINE) always win.
 	Env map[string]string
@@ -50,13 +62,21 @@ type LaunchSpec struct {
 }
 
 // Args returns the pi CLI argument list for the launch: RPC mode with all
-// ambient resource discovery disabled, only wrapper-owned extensions loaded,
-// project-local resources ignored, and per-session session storage.
+// ambient resource discovery disabled, only explicit seed and wrapper-owned
+// resources loaded, project-local resources ignored, and per-session storage.
 func (spec LaunchSpec) Args() []string {
 	args := []string{"--mode", "rpc", "--no-extensions"}
 
 	for _, path := range spec.ExtensionPaths {
 		args = append(args, "-e", path)
+	}
+
+	for _, path := range spec.SkillPaths {
+		args = append(args, "--skill", path)
+	}
+
+	for _, path := range spec.PromptTemplatePaths {
+		args = append(args, "--prompt-template", path)
 	}
 
 	args = append(args,
@@ -90,7 +110,9 @@ func (spec LaunchSpec) Environ() []string {
 	}
 
 	for key, value := range spec.Env {
-		env[key] = value
+		if safeExplicitEnvKey(key) {
+			env[key] = value
+		}
 	}
 
 	env["PI_OFFLINE"] = "1"
@@ -109,6 +131,31 @@ func (spec LaunchSpec) Environ() []string {
 	}
 
 	return environ
+}
+
+// safeExplicitEnvKey is defense in depth for internal LaunchSpec callers.
+// Public options reject these keys before launch; this boundary also drops
+// malformed names and loader, shell, PATH, and Node injection vectors.
+func safeExplicitEnvKey(key string) bool {
+	if key == "" {
+		return false
+	}
+
+	for index, r := range key {
+		switch {
+		case r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'):
+		case r >= '0' && r <= '9' && index > 0:
+		default:
+			return false
+		}
+	}
+
+	upper := strings.ToUpper(key)
+	if upper == envPath || upper == envNodeOptions || upper == envBashEnv || upper == envShellEnv {
+		return false
+	}
+
+	return !strings.HasPrefix(upper, "LD_") && !strings.HasPrefix(upper, "DYLD_")
 }
 
 // Process is one running pi RPC-mode child process.

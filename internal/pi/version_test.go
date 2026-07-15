@@ -2,8 +2,10 @@ package pi
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,7 +21,7 @@ func TestProbeVersion(t *testing.T) {
 		script := filepath.Join(t.TempDir(), "fake-pi")
 		require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\necho ' 0.80.6 '\n"), 0o700))
 
-		version, err := ProbeVersion(t.Context(), script)
+		version, err := probeVersionTestScript(t, t.Context(), script)
 		require.NoError(t, err)
 		require.Equal(t, "0.80.6", version)
 	})
@@ -30,7 +32,7 @@ func TestProbeVersion(t *testing.T) {
 		script := filepath.Join(t.TempDir(), "fake-pi")
 		require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o700))
 
-		_, err := ProbeVersion(t.Context(), script)
+		_, err := probeVersionTestScript(t, t.Context(), script)
 		require.ErrorContains(t, err, "empty output")
 	})
 
@@ -50,9 +52,26 @@ func TestProbeVersion(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 		defer cancel()
 
-		_, err := ProbeVersion(ctx, script)
+		_, err := probeVersionTestScript(t, ctx, script)
 		require.Error(t, err)
 	})
+}
+
+// probeVersionTestScript retries ETXTBSY: a concurrently forked child of a
+// parallel test can transiently inherit the just-written script's descriptor
+// across its own fork/exec window. Installed pi binaries do not have this
+// freshly-created-file race.
+func probeVersionTestScript(t *testing.T, ctx context.Context, script string) (string, error) {
+	t.Helper()
+
+	for attempt := 0; ; attempt++ {
+		version, err := ProbeVersion(ctx, script)
+		if err == nil || attempt >= 50 || !errors.Is(err, syscall.ETXTBSY) {
+			return version, err
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func TestCheckMinimumVersion(t *testing.T) {

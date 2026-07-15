@@ -34,6 +34,8 @@ func TestSessionRequestBuildersAndCloning(t *testing.T) {
 
 	output := NewSessionRequest("/cwd", WithSessionOutputSchema(map[string]any{"type": "object"}))
 	require.NotEmpty(t, output.Meta)
+	emptyOutput := NewSessionRequest("/cwd", WithSessionOutputSchema(map[string]any{}))
+	require.Equal(t, map[string]any{}, anyMap(t, anyMap(t, emptyOutput.Meta[piMetaKey])[metaOptionsKey])[metaOutputSchemaKey])
 
 	prompt := PromptRequest("id", "turn-1", acp.TextBlock("text"))
 	require.Len(t, prompt.Prompt, 1)
