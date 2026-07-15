@@ -179,7 +179,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		return acp.PromptResponse{}, err
 	}
 
-	if err := s.ensureProcessAlive(ctx); err != nil {
+	if err := s.refreshMCPTools(ctx); err != nil {
 		return acp.PromptResponse{}, s.nativeTurnFailure(err)
 	}
 

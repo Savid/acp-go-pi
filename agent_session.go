@@ -744,6 +744,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		sessionRoot:           dirs.Root,
 		permissionMode:        permission,
 		autoRetry:             start.MetaOptions.AutoRetry,
+		mcpRefreshPending:     includeMCP,
 		proc:                  proc,
 		client:                client,
 		turn:                  make(chan struct{}, sessionTurnCapacity),

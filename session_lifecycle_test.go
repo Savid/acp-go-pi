@@ -150,3 +150,70 @@ func TestRelaunchProcessBranches(t *testing.T) {
 	require.NoError(t, session.ensureProcessAlive(t.Context()))
 	require.Equal(t, "/hydrated", session.sessionFilePath)
 }
+
+func TestRefreshMCPToolsRebuildsRegistryOnFirstTurn(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	old := newStubProcess(false)
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: "id", SessionFile: "/refreshed"}
+	relaunched := newStubProcess(false)
+
+	sessionFile := filepath.Join(t.TempDir(), "session.jsonl")
+	require.NoError(t, os.WriteFile(sessionFile, []byte(`{}`), 0o600))
+
+	var launched pi.LaunchSpec
+	starts := 0
+	agent.startPiProcess = func(_ context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
+		starts++
+		launched = spec
+
+		return relaunched, client, nil
+	}
+
+	session := &agentSession{
+		agent:             agent,
+		id:                "id",
+		launch:            pi.LaunchSpec{SessionDir: "/sessions"},
+		sessionFilePath:   sessionFile,
+		mcpRefreshPending: true,
+		proc:              old,
+		client:            newStubPiClient(),
+	}
+	t.Cleanup(session.stopPump)
+
+	require.NoError(t, session.refreshMCPTools(t.Context()))
+	require.Equal(t, 1, starts)
+	require.Equal(t, sessionFile, launched.SessionPath)
+	require.Empty(t, launched.SessionID)
+	require.Same(t, relaunched, session.proc)
+	require.Same(t, client, session.client)
+	require.Equal(t, "/refreshed", session.sessionFilePath)
+	require.False(t, session.mcpRefreshPending)
+
+	require.NoError(t, session.refreshMCPTools(t.Context()))
+	require.Equal(t, 1, starts, "the fixed registry is refreshed only once")
+}
+
+func TestRefreshMCPToolsKeepsRetryPendingAfterFailedRelaunch(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		return nil, nil, errors.New("relaunch")
+	}
+	session := &agentSession{
+		agent:             agent,
+		id:                "id",
+		mcpRefreshPending: true,
+		proc:              newStubProcess(false),
+		client:            newStubPiClient(),
+	}
+
+	require.ErrorContains(t, session.refreshMCPTools(t.Context()), "relaunch")
+	require.True(t, session.mcpRefreshPending)
+
+	unproven := newStubProcess(false)
+	unproven.close = pi.ErrProcessTreeNotQuiescent
+	session.proc = unproven
+	session.nativeQuiescenceErr = nil
+	require.ErrorIs(t, session.refreshMCPTools(t.Context()), pi.ErrProcessTreeNotQuiescent)
+	require.True(t, session.mcpRefreshPending)
+}

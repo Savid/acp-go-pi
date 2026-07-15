@@ -379,12 +379,13 @@ type recordingClient struct {
 	permissionChoice string
 	elicitationValue string
 
-	textChunks   []string
-	updates      []acp.SessionUpdate
-	usageUpdates []acp.SessionUsageUpdate
-	permissions  []acp.RequestPermissionRequest
-	elicitations []acp.UnstableCreateElicitationRequest
-	extensions   []recordedExtension
+	textChunks    []string
+	updates       []acp.SessionUpdate
+	notifications []acp.SessionNotification
+	usageUpdates  []acp.SessionUsageUpdate
+	permissions   []acp.RequestPermissionRequest
+	elicitations  []acp.UnstableCreateElicitationRequest
+	extensions    []recordedExtension
 }
 
 var _ acp.Client = (*recordingClient)(nil)
@@ -439,6 +440,7 @@ func (c *recordingClient) SessionUpdate(_ context.Context, params acp.SessionNot
 	defer c.mu.Unlock()
 
 	c.updates = append(c.updates, params.Update)
+	c.notifications = append(c.notifications, params)
 
 	switch {
 	case params.Update.UsageUpdate != nil:
@@ -527,6 +529,13 @@ func (c *recordingClient) text() string {
 	defer c.mu.Unlock()
 
 	return strings.Join(c.textChunks, "")
+}
+
+func (c *recordingClient) notificationSnapshot() []acp.SessionNotification {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return append([]acp.SessionNotification(nil), c.notifications...)
 }
 
 func (c *recordingClient) permissionCount() int {

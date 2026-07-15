@@ -41,12 +41,19 @@ servers := []acp.McpServer{
 The adapter writes a per-session MCP config into the session's isolated agent
 directory with mode `0600` and loads its MCP extension alongside the bridge
 extension. It is removed with that session directory. The
-extension connects to every declared server before the session starts and
-registers each discovered tool under the name `mcp__<server>__<tool>`, so tool
-names are stable and provider-safe. Declared env vars are forwarded to stdio
-children and declared headers to HTTP servers. MCP tool calls run under the
-same [permission gate](/docs/features/permissions) as built-in tools, and an
-aborted turn cancels an in-flight MCP call promptly.
+extension connects to every declared server during lifecycle establishment.
+Because some hosts deliberately expose only a side-effect-free readiness
+surface until an operation is authorized, the adapter rebuilds pi's fixed
+extension-tool registry once more at the first user turn. Every tool then
+available is registered under `mcp__<server>__<tool>`, so a provisional
+readiness list cannot replace the real session tools. The same refresh runs
+after `session/load`; a later native-process relaunch already occurs inside an
+authorized turn and discovers the active surface directly.
+
+Declared env vars are forwarded to stdio children and declared headers to HTTP
+servers. MCP tool calls run under the same
+[permission gate](/docs/features/permissions) as built-in tools, and an aborted
+turn cancels an in-flight MCP call promptly.
 
 A server that fails to connect at session start — an unreachable command, an
 HTTP 401 — fails the session request loudly with the real cause; the adapter
@@ -54,13 +61,13 @@ never starts a session with a silently missing server.
 
 ## Scope
 
-Forwarding is tools-only, established at session start:
+Forwarding is tools-only, with one fixed registry established for user turns:
 
 - MCP **resources** and **prompts** are not projected into the session.
 - **Server-initiated requests** (sampling, server-side elicitation, roots) are
   not answered; a server that sends them will see them time out on its side.
-- **Tool-list change notifications** are ignored, so the tool set is fixed at
-  session start.
+- **Tool-list change notifications** are ignored. After the first authorized
+  refresh, the tool set remains fixed for that native process.
 
 <Note>
 Plan around request/response-style MCP servers: the client answers only

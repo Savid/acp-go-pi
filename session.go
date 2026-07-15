@@ -63,6 +63,13 @@ type agentSession struct {
 	// every lazy relaunch so the retry posture survives process death.
 	autoRetry bool
 
+	// mcpRefreshPending forces the first user turn to rebuild pi's fixed
+	// extension-tool registry while that turn's MCP authority is active.
+	// Session establishment may intentionally expose only a side-effect-free
+	// readiness surface; retaining that provisional snapshot would hide the
+	// operation's real tools for the lifetime of the native process.
+	mcpRefreshPending bool
+
 	proc   piProcess
 	client piClient
 

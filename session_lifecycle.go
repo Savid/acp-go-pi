@@ -111,6 +111,59 @@ func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
 		return closeErr
 	}
 
+	return s.relaunchProcess(ctx)
+}
+
+// refreshMCPTools rebuilds pi's fixed extension-tool registry on the first
+// user turn. MCP lifecycle establishment can occur before operation authority
+// is armed, in which case a server may deliberately expose only a local
+// readiness surface. Restarting the otherwise-idle native process here makes
+// discovery run under the real turn authority and prevents that provisional
+// tool list from becoming the session's permanent registry.
+func (s *agentSession) refreshMCPTools(ctx context.Context) error {
+	if err := s.ensureProcessAlive(ctx); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	pending := s.mcpRefreshPending
+	proc := s.proc
+	s.mu.Unlock()
+
+	if !pending {
+		return nil
+	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
+	shutdownErr := proc.Shutdown(shutdownCtx)
+
+	cancelShutdown()
+
+	s.stopPump()
+
+	closeErr := proc.Close()
+	quiescenceErr := errors.Join(shutdownErr, closeErr)
+	s.recordNativeQuiescence(quiescenceErr)
+
+	if !pi.ProcessTreeQuiescent(quiescenceErr) {
+		return quiescenceErr
+	}
+
+	if err := s.relaunchProcess(ctx); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.mcpRefreshPending = false
+	s.mu.Unlock()
+
+	return nil
+}
+
+// relaunchProcess starts the same logical pi session after the previous
+// process has been proven quiescent. Its extension factories run again, so
+// their fixed tool registry is rebuilt from the MCP server's current view.
+func (s *agentSession) relaunchProcess(ctx context.Context) error {
 	s.mu.Lock()
 	lastSessionFile := s.sessionFilePath
 	s.mu.Unlock()
