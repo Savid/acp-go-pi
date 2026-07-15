@@ -23,7 +23,12 @@ a structured error.
 Loading and resuming a session rehydrate pi's own session file. When the local
 file is gone but a host-provided [session store](/docs/features/session-store)
 holds the rows, the adapter materializes them into the session's isolated
-directory so pi can continue from them.
+directory so pi can continue from them. `session/resume` does not replay
+transcript content, but it publishes one identity-only session update carrying
+the final assistant row's durable `_meta.pi.messageId`. A persistent host can
+therefore reconcile its committed turn checkpoint before publishing the
+restored route. `session/load` replays the stored content and carries the same
+identity on the final assistant updates.
 
 pi creates its session file lazily: a brand-new session has no file (and
 nothing to mirror) until the first conversation entry lands. Listing sessions

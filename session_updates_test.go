@@ -20,6 +20,8 @@ func TestNativeMessageNotificationMetaPreservesTurnRoute(t *testing.T) {
 	require.Equal(t, "turn-1", anyMap(t, meta[routeMetaKey])[routeFieldTurn])
 	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675",
 		anyMap(t, meta[piMetaKey])[jsonFieldMessageID])
+	require.Nil(t, nativeMessageResponseMeta(""))
+	require.NoError(t, (&agentSession{}).emitNativeMessageIdentity(t.Context(), ""))
 }
 
 func TestAvailableCommandsMapping(t *testing.T) {

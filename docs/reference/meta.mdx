@@ -34,11 +34,13 @@ updates remain outside a turn epoch and omit the envelope.
 When an assistant message finalizes, the wrapper bridge stamps a UUID into the
 native pi transcript before persistence. The corresponding checkpoint update
 and terminal prompt response expose that durable identity as
-`_meta.pi.messageId`. `session/load` replays the same value on its notification
-envelope (and as the ACP `messageId` on replayed assistant text and thought
-chunks), so a host can compare the live terminal message with restored native
-history without inventing an identity. This field is output-only; lifecycle
-requests remain strict and reject it as an input option.
+`_meta.pi.messageId`. `session/resume` publishes the final stored value on an
+identity-only notification without replaying content. `session/load` replays
+the same value on its notification envelope (and as the ACP `messageId` on
+replayed assistant text and thought chunks), so a host can compare the live
+terminal message with restored native history without inventing an identity.
+This field is output-only; lifecycle requests remain strict and reject it as an
+input option.
 
 Outbound form elicitation preserves native metadata and adds `version`,
 `sessionId`, `turnNonce`, and exactly one of `toolCallId` or `requestId` under
@@ -89,7 +91,8 @@ facts pi reported. The adapter omits unknown facts rather than inventing them.
 
 Finalized live and replayed assistant messages carry the wrapper-persisted
 `_meta.pi.messageId` correlation described above. It is a UUID and remains
-stable across store mirroring, process replacement, and `session/load`.
+stable across store mirroring, process replacement, `session/resume`, and
+`session/load`.
 
 pi has no native delegated-agent concept — there are no subagents to tag — so
 session updates carry no `parentToolUseId` annotation: every update is

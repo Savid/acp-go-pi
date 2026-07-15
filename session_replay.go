@@ -80,6 +80,29 @@ func replayUpdates(entries []SessionStoreEntry) []acp.SessionUpdate {
 	return updates
 }
 
+// terminalAssistantMessageID returns the durable identity on the final
+// assistant row. Resume does not replay transcript content, but persistent
+// hosts still need this identity-only checkpoint to reconcile the native
+// transcript before publishing the restored route. A final assistant row
+// without an identity returns empty rather than falling back to an older turn.
+func terminalAssistantMessageID(entries []SessionStoreEntry) string {
+	for index := len(entries) - 1; index >= 0; index-- {
+		row, ok := decodeStoreRow(entries[index])
+		if !ok || row.Type != storeRowTypeMessage {
+			continue
+		}
+
+		var message pi.AgentMessage
+		if json.Unmarshal(row.Message, &message) != nil || message.Role != messageRoleAssistant {
+			continue
+		}
+
+		return message.ACPMessageID
+	}
+
+	return ""
+}
+
 func messageReplayUpdates(message pi.AgentMessage) []acp.SessionUpdate {
 	blocks, err := message.ContentBlocks()
 	if err != nil {

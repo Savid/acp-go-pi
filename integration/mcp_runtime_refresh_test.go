@@ -97,15 +97,15 @@ func TestPiACPRuntimeMCPRefresh(t *testing.T) {
 		"the terminal live UUID must be the final mirrored assistant UUID")
 
 	// Closing the adapter process leaves its external store intact. A new
-	// adapter instance must load the exact transcript, replay the same terminal
-	// identity, refresh its provisional MCP snapshot on the next authorized
-	// turn, and continue the native session.
+	// adapter instance must resume the exact transcript, publish the same
+	// terminal identity without replaying content, refresh its provisional MCP
+	// snapshot on the next authorized turn, and continue the native session.
 	stopFirst()
 	mcp.armed.Store(false)
 	loadedClient := &recordingClient{}
 	loadedConn, stopLoaded := connectControlledAgent(t, ctx, loadedClient, options...)
 	t.Cleanup(stopLoaded)
-	_, err = loadedConn.LoadSession(ctx, piacp.LoadSessionRequest(session.SessionId, cwd,
+	_, err = loadedConn.ResumeSession(ctx, piacp.ResumeSessionRequest(session.SessionId, cwd,
 		piacp.WithSessionMCPServers(
 			piacp.HTTPMCPServer("runtime", mcp.server.URL, nil),
 		),
@@ -114,9 +114,11 @@ func TestPiACPRuntimeMCPRefresh(t *testing.T) {
 		)),
 	))
 	require.NoError(t, err)
-	require.Equal(t, liveMessageID, lastNotificationMessageID(loadedClient.notificationSnapshot()))
+	loadedNotifications := loadedClient.notificationSnapshot()
+	require.Equal(t, liveMessageID, lastNotificationMessageID(loadedNotifications))
+	require.Empty(t, loadedClient.text(), "session/resume must publish identity without replaying transcript text")
 	require.Equal(t, int64(2), mcp.readinessLists.Load(),
-		"session/load must also establish against the provisional surface")
+		"session/resume must also establish against the provisional surface")
 
 	mcp.armed.Store(true)
 	continued, err := loadedConn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
@@ -125,7 +127,7 @@ func TestPiACPRuntimeMCPRefresh(t *testing.T) {
 	require.Equal(t, acp.StopReasonEndTurn, continued.StopReason)
 	require.NotEmpty(t, piMessageID(continued.Meta))
 	require.GreaterOrEqual(t, mcp.activeLists.Load(), int64(2),
-		"the loaded process must refresh its fixed registry before continuing")
+		"the resumed process must refresh its fixed registry before continuing")
 }
 
 type runtimeMCPHarness struct {

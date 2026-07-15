@@ -25,6 +25,7 @@ func TestReplayMappingsAndStoreMetadata(t *testing.T) {
 	require.Equal(t, "Named", storeSessionTitle("fallback", rows))
 	require.Equal(t, "/cwd", storeSessionCwd(rows))
 	require.True(t, storeSessionHasContent(rows))
+	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675", terminalAssistantMessageID(rows))
 
 	require.Equal(t, "hello", storeSessionTitle("fallback", []SessionStoreEntry{rows[0], rows[1], rows[3]}))
 	require.Equal(t, "fallback", storeSessionTitle("fallback", nil))
@@ -33,6 +34,10 @@ func TestReplayMappingsAndStoreMetadata(t *testing.T) {
 	require.Nil(t, messageReplayUpdates(pi.AgentMessage{Role: "unknown", Content: json.RawMessage(`[]`)}))
 	require.Nil(t, messageReplayUpdates(pi.AgentMessage{Role: messageRoleToolResult, Content: json.RawMessage(`[]`)}))
 	require.Nil(t, messageReplayUpdates(pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`bad`)}))
+	require.Empty(t, terminalAssistantMessageID(nil))
+	require.Empty(t, terminalAssistantMessageID([]SessionStoreEntry{
+		json.RawMessage(`bad`), json.RawMessage(`{"type":"session"}`),
+	}))
 
 	content := toolCallContent([]pi.ContentBlock{{Type: contentBlockTypeText}, {Type: contentBlockTypeImage}, {Type: "other"}})
 	require.Empty(t, content)
@@ -54,6 +59,14 @@ func TestReplayInvalidMetadataRows(t *testing.T) {
 	agent.setConnection(connection)
 	require.NoError(t, (&agentSession{agent: agent, id: "session"}).replayStoredSession(t.Context(), rows))
 	require.Empty(t, connection.notifications)
+	require.Empty(t, terminalAssistantMessageID(rows))
+	require.Empty(t, terminalAssistantMessageID([]SessionStoreEntry{
+		messageRow(t, pi.AgentMessage{Role: messageRoleAssistant, Content: json.RawMessage(`[]`)}),
+		messageRow(t, pi.AgentMessage{
+			Role: messageRoleAssistant, ACPMessageID: "older", Content: json.RawMessage(`[]`),
+		}),
+		messageRow(t, pi.AgentMessage{Role: messageRoleAssistant, Content: json.RawMessage(`[]`)}),
+	}))
 }
 
 func TestReplayStoredSessionPublishesDurableNativeIdentity(t *testing.T) {

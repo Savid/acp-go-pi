@@ -82,6 +82,48 @@ func TestRestoreSessionAdditionalBranches(t *testing.T) {
 	requireInvalidRequest(t, err)
 }
 
+func TestResumeSessionPublishesTerminalNativeIdentityWithoutHistory(t *testing.T) {
+	messageID := "018f47ad-839d-7f70-b7f7-c01d6d97b675"
+	entries := []SessionStoreEntry{
+		json.RawMessage(`{"type":"session","id":"resume-id","cwd":"/cwd"}`),
+		messageRow(t, pi.AgentMessage{
+			Role: messageRoleAssistant, ACPMessageID: messageID,
+			Content: json.RawMessage(`[{"type":"text","text":"answer"}]`),
+		}),
+	}
+	store := NewInMemorySessionStore()
+	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: "resume-id"}, entries))
+
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: "resume-id"}
+	agent := newStubClientAgent(t, client, WithSessionStore(store))
+	t.Cleanup(func() { require.NoError(t, agent.Close()) })
+	connection := newDirectAgentClient()
+	agent.setConnection(connection)
+
+	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest("resume-id", "/cwd"))
+	require.NoError(t, err)
+	require.Len(t, connection.notifications, 1)
+	require.NotNil(t, connection.notifications[0].Update.SessionInfoUpdate)
+	require.Equal(t, messageID,
+		anyMap(t, connection.notifications[0].Meta[piMetaKey])[jsonFieldMessageID])
+
+	connection.updateErr = errors.New("identity")
+	_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("resume-id", "/cwd"))
+	require.ErrorContains(t, err, "identity")
+
+	failingClient := newStubPiClient()
+	failingClient.state = pi.SessionState{SessionID: "resume-id"}
+	failingAgent := newStubClientAgent(t, failingClient, WithSessionStore(store))
+	failingConnection := newDirectAgentClient()
+	failingConnection.updateErr = errors.New("identity")
+	failingAgent.setConnection(failingConnection)
+
+	_, err = failingAgent.ResumeSession(t.Context(), ResumeSessionRequest("resume-id", "/cwd"))
+	require.ErrorContains(t, err, "identity")
+	require.NotContains(t, failingAgent.sessions, acp.SessionId("resume-id"))
+}
+
 func TestLoadSessionRemovesStartedSessionOnReplayFailure(t *testing.T) {
 	entries := []SessionStoreEntry{
 		json.RawMessage(`{"type":"session","id":"resume-load","cwd":"/cwd"}`),

@@ -71,7 +71,7 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 	ctx, finish := a.observe.StartACP(ctx, params.Meta, "session/resume")
 	defer func() { finish(observer.ACPResult{Err: err}) }()
 
-	session, _, _, err := a.restoreSession(ctx, params.SessionId, sessionStart{
+	session, entries, started, err := a.restoreSession(ctx, params.SessionId, sessionStart{
 		Cwd:                   params.Cwd,
 		AdditionalDirectories: sessionAdditionalDirectories(params.AdditionalDirectories),
 		McpServers:            params.McpServers,
@@ -80,6 +80,14 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 	}, params.Meta)
 	if err != nil {
 		return acp.ResumeSessionResponse{}, err
+	}
+
+	if emitErr := session.emitNativeMessageIdentity(ctx, terminalAssistantMessageID(entries)); emitErr != nil {
+		if started {
+			a.removeSession(ctx, params.SessionId, session)
+		}
+
+		return acp.ResumeSessionResponse{}, emitErr
 	}
 
 	session.emitCurrentUsageUpdate(ctx)
