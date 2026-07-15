@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
@@ -11,6 +12,15 @@ import (
 
 	"github.com/savid/acp-go-pi/internal/pi"
 )
+
+func TestNativeMessageNotificationMetaPreservesTurnRoute(t *testing.T) {
+	ctx := withTurnRoute(context.Background(), "turn-1")
+	meta := nativeMessageNotificationMeta(ctx, "018f47ad-839d-7f70-b7f7-c01d6d97b675")
+
+	require.Equal(t, "turn-1", anyMap(t, meta[routeMetaKey])[routeFieldTurn])
+	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675",
+		anyMap(t, meta[piMetaKey])[jsonFieldMessageID])
+}
 
 func TestAvailableCommandsMapping(t *testing.T) {
 	commands := availableCommandsFromNative([]pi.SlashCommand{

@@ -64,12 +64,14 @@ func TestDecodeEventTypes(t *testing.T) {
 
 		end, ok := decodeEventLine(t,
 			`{"type":"message_end","message":{"role":"assistant",`+
+				`"acpMessageId":"018f47ad-839d-7f70-b7f7-c01d6d97b675",`+
 				`"content":[{"type":"text","text":"Hi"}],"provider":"openai","model":"gpt-4o",`+
 				`"usage":{"input":100,"output":50,"cacheRead":1,"cacheWrite":2,`+
 				`"cost":{"input":0.1,"output":0.2,"cacheRead":0,"cacheWrite":0,"total":0.3}},`+
 				`"stopReason":"stop","timestamp":1733234567890}}`,
 		).(MessageEndEvent)
 		require.True(t, ok)
+		require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675", end.Message.ACPMessageID)
 		require.Equal(t, "stop", end.Message.StopReason)
 		require.NotNil(t, end.Message.Usage)
 		require.Equal(t, int64(100), end.Message.Usage.Input)

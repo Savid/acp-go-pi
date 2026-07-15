@@ -107,10 +107,11 @@ type dialogCancel struct {
 
 // promptTurnState accumulates per-turn results while streaming events.
 type promptTurnState struct {
-	usage        *acp.Usage
-	cost         *pi.UsageCost
-	stopReason   string
-	errorMessage string
-	model        string
-	provider     string
+	usage           *acp.Usage
+	cost            *pi.UsageCost
+	stopReason      string
+	errorMessage    string
+	model           string
+	provider        string
+	nativeMessageID string
 }

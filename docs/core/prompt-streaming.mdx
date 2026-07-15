@@ -16,6 +16,12 @@ calls, tool results, and usage counters. The full mapping table lives in
 once per accepted prompt, which is the adapter's fence for finishing the turn
 and committing the store mirror.
 
+The wrapper bridge assigns each finalized assistant message a UUID before pi
+persists it. The adapter publishes that durable message identity immediately,
+returns it in terminal response metadata, and reuses it during history replay.
+This gives persistent hosts one native correlation across live delivery,
+mirror commit, process replacement, and `session/load`.
+
 Two interactive flows are layered on top of the stream:
 
 - **Permission requests** are surfaced as ACP permission prompts through the

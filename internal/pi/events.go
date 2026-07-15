@@ -81,6 +81,7 @@ type ContentBlock struct {
 // populated: assistant messages carry usage/stopReason/errorMessage, tool
 // result messages carry toolCallId/toolName/isError.
 type AgentMessage struct {
+	ACPMessageID string          `json:"acpMessageId,omitempty"`
 	Role         string          `json:"role"`
 	Content      json.RawMessage `json:"content,omitempty"`
 	Provider     string          `json:"provider,omitempty"`

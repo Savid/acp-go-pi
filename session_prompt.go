@@ -284,6 +284,10 @@ func (s *agentSession) handleTurnEvent(ctx context.Context, event pi.Event, stat
 	case pi.MessageEndEvent:
 		if typed.Message.Role == messageRoleAssistant {
 			observeAssistantMessageEnd(typed.Message, state)
+
+			if err := s.emitNativeMessageIdentity(ctx, typed.Message.ACPMessageID); err != nil {
+				return false, err
+			}
 		}
 
 		return false, nil
@@ -348,6 +352,10 @@ func (s *agentSession) emitAssistantDelta(ctx context.Context, delta pi.Assistan
 }
 
 func observeAssistantMessageEnd(message pi.AgentMessage, state *promptTurnState) {
+	if message.ACPMessageID != "" {
+		state.nativeMessageID = message.ACPMessageID
+	}
+
 	if message.Model != "" {
 		state.model = message.Model
 	}
@@ -439,6 +447,7 @@ func (s *agentSession) finishTurn(
 	}
 
 	return acp.PromptResponse{
+		Meta:          nativeMessageResponseMeta(state.nativeMessageID),
 		StopReason:    acpStopReason(s, state),
 		Usage:         state.usage,
 		UserMessageId: params.MessageId,

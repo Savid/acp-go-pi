@@ -29,6 +29,7 @@ func TestSessionFilesystemHelpers(t *testing.T) {
 	require.False(t, session.sessionFileExists())
 	require.NoError(t, session.removeSessionRoot())
 	require.NoError(t, session.removeSessionRoot())
+	require.NoError(t, (&agentSession{}).removeSessionRoot())
 
 	file := filepath.Join(t.TempDir(), "file")
 	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))

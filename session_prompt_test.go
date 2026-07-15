@@ -125,6 +125,19 @@ func TestPromptHandleTurnEventEmitFailure(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestMessageEndIdentityEmitFailure(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	connection := newDirectAgentClient()
+	connection.updateErr = errors.New("emit identity")
+	agent.setConnection(connection)
+	session := &agentSession{agent: agent, id: "id"}
+
+	_, err := session.handleTurnEvent(t.Context(), pi.MessageEndEvent{Message: pi.AgentMessage{
+		Role: messageRoleAssistant, ACPMessageID: "018f47ad-839d-7f70-b7f7-c01d6d97b675",
+	}}, &promptTurnState{})
+	require.ErrorContains(t, err, "emit identity")
+}
+
 func TestFinishTurnCommitMirrorFailure(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithTurnTimeout(time.Second))
 	connection := newDirectAgentClient()
@@ -167,10 +180,13 @@ func TestTurnEventAndUsageBranches(t *testing.T) {
 	usage := &pi.Usage{Input: 1, Output: 2, CacheRead: 3, CacheWrite: 4, Cost: &pi.UsageCost{Total: 0.5}}
 	_, err = session.handleTurnEvent(t.Context(), pi.MessageEndEvent{Message: pi.AgentMessage{
 		Role: messageRoleAssistant, Model: "model", Provider: "provider", StopReason: stopReasonStop,
-		ErrorMessage: "error", Usage: usage,
+		ErrorMessage: "error", Usage: usage, ACPMessageID: "018f47ad-839d-7f70-b7f7-c01d6d97b675",
 	}}, state)
 	require.NoError(t, err)
 	require.Equal(t, 10, state.usage.TotalTokens)
+	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675", state.nativeMessageID)
+	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675",
+		anyMap(t, connection.notifications[len(connection.notifications)-1].Meta[piMetaKey])[jsonFieldMessageID])
 	mergeTurnUsage(state.usage, nil)
 	mergeTurnUsage(state.usage, &pi.Usage{Input: 2})
 	require.Equal(t, 12, state.usage.TotalTokens)
@@ -296,7 +312,11 @@ func TestPromptAndFinishTurnErrorBranches(t *testing.T) {
 	requirePiTurnFailure(t, err, failureCauseTimeout)
 	_, err = finish(&promptTurnState{stopReason: stopReasonError, errorMessage: "provider"}, false)
 	requirePiTurnFailure(t, err, failureCauseProvider)
-	response, err = finish(&promptTurnState{stopReason: stopReasonStop}, false)
+	response, err = finish(&promptTurnState{
+		stopReason: stopReasonStop, nativeMessageID: "018f47ad-839d-7f70-b7f7-c01d6d97b675",
+	}, false)
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675",
+		anyMap(t, response.Meta[piMetaKey])[jsonFieldMessageID])
 }

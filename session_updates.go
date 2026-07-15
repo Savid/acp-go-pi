@@ -23,6 +23,17 @@ var (
 const liveSessionTitleMaxRunes = 256
 
 func (s *agentSession) emitUpdates(ctx context.Context, updates []acp.SessionUpdate) error {
+	return s.emitUpdatesWithNativeMessageID(ctx, updates, "")
+}
+
+// emitUpdatesWithNativeMessageID stamps the wrapper-persisted assistant
+// message identity onto the notification envelope. The id lives in pi's
+// native transcript and is replayed unchanged by session/load.
+func (s *agentSession) emitUpdatesWithNativeMessageID(
+	ctx context.Context,
+	updates []acp.SessionUpdate,
+	messageID string,
+) error {
 	if len(updates) == 0 {
 		return nil
 	}
@@ -45,7 +56,7 @@ func (s *agentSession) emitUpdates(ctx context.Context, updates []acp.SessionUpd
 
 	for _, update := range updates {
 		if err := conn.SessionUpdate(ctx, acp.SessionNotification{
-			Meta:      turnRouteMetaFromContext(ctx),
+			Meta:      nativeMessageNotificationMeta(ctx, messageID),
 			SessionId: s.id,
 			Update:    update,
 		}); err != nil {
@@ -54,6 +65,56 @@ func (s *agentSession) emitUpdates(ctx context.Context, updates []acp.SessionUpd
 	}
 
 	return nil
+}
+
+func nativeMessageNotificationMeta(ctx context.Context, messageID string) map[string]any {
+	meta := turnRouteMetaFromContext(ctx)
+	if messageID == "" {
+		return meta
+	}
+
+	if meta == nil {
+		meta = make(map[string]any, 1)
+	} else {
+		meta = cloneAnyMap(meta)
+	}
+
+	piMeta, _ := meta[piMetaKey].(map[string]any)
+
+	piMeta = cloneAnyMap(piMeta)
+	if piMeta == nil {
+		piMeta = make(map[string]any, 1)
+	}
+
+	piMeta[jsonFieldMessageID] = messageID
+	meta[piMetaKey] = piMeta
+
+	return meta
+}
+
+func nativeMessageResponseMeta(messageID string) map[string]any {
+	if messageID == "" {
+		return nil
+	}
+
+	return map[string]any{
+		piMetaKey: map[string]any{jsonFieldMessageID: messageID},
+	}
+}
+
+// emitNativeMessageIdentity publishes a checkpointable update as soon as a
+// finalized assistant message reaches the wrapper. The session-info payload
+// is intentionally empty: the durable correlation belongs to the
+// notification envelope, while ordinary title/time updates remain fenced by
+// agent_settled.
+func (s *agentSession) emitNativeMessageIdentity(ctx context.Context, messageID string) error {
+	if messageID == "" {
+		return nil
+	}
+
+	return s.emitUpdatesWithNativeMessageID(ctx, []acp.SessionUpdate{{
+		SessionInfoUpdate: &acp.SessionSessionInfoUpdate{},
+	}}, messageID)
 }
 
 func (s *agentSession) emitOptionalUpdates(ctx context.Context, updates []acp.SessionUpdate) error {

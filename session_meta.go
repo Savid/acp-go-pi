@@ -11,6 +11,7 @@ import (
 
 const (
 	piMetaKey              = "pi"
+	jsonFieldMessageID     = "messageId"
 	metaOptionsKey         = "options"
 	metaModelKey           = "model"
 	metaEnvKey             = "env"

@@ -64,6 +64,9 @@ func TestAgentFakePromptTurn(t *testing.T) {
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "hello"))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
+	piMeta, ok := resp.Meta["pi"].(map[string]any)
+	require.True(t, ok)
+	require.Regexp(t, `^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`, piMeta["messageId"])
 	require.Contains(t, client.text(), fakeDefaultReply)
 	require.Positive(t, client.usageUpdateCount(),
 		"a settled turn with harness-reported usage must emit a usage update")

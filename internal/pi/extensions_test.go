@@ -26,6 +26,8 @@ func TestWriteExtensions(t *testing.T) {
 		require.Equal(t, bridgeExtensionSource, bridge)
 		require.Contains(t, string(bridge), PermissionTitleMarker)
 		require.Contains(t, string(bridge), EnvPermissionMode)
+		require.Contains(t, string(bridge), `pi.on("message_end"`)
+		require.Contains(t, string(bridge), "acpMessageId: randomUUID()")
 		require.NoFileExists(t, filepath.Join(dir, MCPExtensionFileName))
 	})
 

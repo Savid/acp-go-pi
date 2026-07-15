@@ -369,6 +369,7 @@ func (s *fakePiServer) assistantMessageJSON(content []any, stopReason string, er
 	s.mu.Unlock()
 
 	return mustJSON(fakeAssistantMessage{
+		ACPMessageID: fakeUUID(),
 		Role:         "assistant",
 		Content:      content,
 		API:          "fake-api",

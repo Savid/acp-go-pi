@@ -12,11 +12,33 @@
  * Mode comes from ACP_GO_PI_PERMISSION: "allow" auto-allows every tool call
  * (no dialog); any other value (including unset) asks per call.
  */
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PERMISSION_MARKER = "acp-go-pi:permission:";
 
 export default function (pi: ExtensionAPI) {
+  // pi creates its session-entry id after message_end listeners run, so that
+  // id is not present on the RPC event. Stamp a UUID on the finalized
+  // assistant message before pi persists it instead. The Go adapter exposes
+  // this durable id as ACP correlation metadata and replays the same id after
+  // session/load, which lets a host reconcile crash-window turn checkpoints.
+  pi.on("message_end", (event) => {
+    if (event.message.role !== "assistant") return;
+
+    const message = event.message as typeof event.message & {
+      acpMessageId?: string;
+    };
+    if (message.acpMessageId) return;
+
+    return {
+      message: {
+        ...message,
+        acpMessageId: randomUUID(),
+      } as typeof event.message,
+    };
+  });
+
   if (process.env.ACP_GO_PI_PERMISSION === "allow") {
     return;
   }

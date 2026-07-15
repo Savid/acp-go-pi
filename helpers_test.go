@@ -204,11 +204,12 @@ func (p *stubProcess) Kill() error                    { return p.kill }
 func (p *stubProcess) Close() error                   { return p.close }
 
 type directAgentClient struct {
-	done      chan struct{}
-	notifyErr error
-	updateErr error
-	notified  []map[string]any
-	updates   []acp.SessionUpdate
+	done          chan struct{}
+	notifyErr     error
+	updateErr     error
+	notified      []map[string]any
+	updates       []acp.SessionUpdate
+	notifications []acp.SessionNotification
 }
 
 func newDirectAgentClient() *directAgentClient {
@@ -228,6 +229,7 @@ func (*directAgentClient) RequestPermission(context.Context, acp.RequestPermissi
 }
 func (c *directAgentClient) SessionUpdate(_ context.Context, notification acp.SessionNotification) error {
 	c.updates = append(c.updates, notification.Update)
+	c.notifications = append(c.notifications, notification)
 
 	return c.updateErr
 }

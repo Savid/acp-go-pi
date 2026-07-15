@@ -357,6 +357,7 @@ type fakeUserMessage struct {
 }
 
 type fakeAssistantMessage struct {
+	ACPMessageID string    `json:"acpMessageId"`
 	Role         string    `json:"role"`
 	Content      []any     `json:"content"`
 	API          string    `json:"api"`

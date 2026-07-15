@@ -36,9 +36,28 @@ type storeRow struct {
 // replayStoredSession replays mirrored native rows as ACP session updates in
 // append order for session/load.
 func (s *agentSession) replayStoredSession(ctx context.Context, entries []SessionStoreEntry) error {
-	updates := replayUpdates(entries)
+	for _, entry := range entries {
+		row, ok := decodeStoreRow(entry)
+		if !ok || row.Type != storeRowTypeMessage {
+			continue
+		}
 
-	return s.emitUpdates(ctx, updates)
+		var message pi.AgentMessage
+		if err := json.Unmarshal(row.Message, &message); err != nil {
+			continue
+		}
+
+		updates := messageReplayUpdates(message)
+		if message.Role == messageRoleAssistant && len(updates) == 0 && message.ACPMessageID != "" {
+			updates = []acp.SessionUpdate{{SessionInfoUpdate: &acp.SessionSessionInfoUpdate{}}}
+		}
+
+		if err := s.emitUpdatesWithNativeMessageID(ctx, updates, message.ACPMessageID); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func replayUpdates(entries []SessionStoreEntry) []acp.SessionUpdate {
@@ -89,6 +108,12 @@ func messageReplayUpdates(message pi.AgentMessage) []acp.SessionUpdate {
 		return updates
 	case messageRoleAssistant:
 		updates := make([]acp.SessionUpdate, 0, len(blocks))
+		messageID := message.ACPMessageID
+
+		var messageIDPtr *string
+		if messageID != "" {
+			messageIDPtr = &messageID
+		}
 
 		for index := range blocks {
 			block := &blocks[index]
@@ -96,11 +121,15 @@ func messageReplayUpdates(message pi.AgentMessage) []acp.SessionUpdate {
 			switch block.Type {
 			case contentBlockTypeText:
 				if block.Text != "" {
-					updates = append(updates, acp.UpdateAgentMessageText(block.Text))
+					updates = append(updates, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+						Content: acp.TextBlock(block.Text), MessageId: messageIDPtr,
+					}})
 				}
 			case contentBlockTypeThinking:
 				if block.Thinking != "" {
-					updates = append(updates, acp.UpdateAgentThoughtText(block.Thinking))
+					updates = append(updates, acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+						Content: acp.TextBlock(block.Thinking), MessageId: messageIDPtr,
+					}})
 				}
 			case contentBlockTypeToolCall:
 				updates = append(updates, replayToolCallUpdate(block))
