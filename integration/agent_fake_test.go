@@ -61,7 +61,7 @@ func TestAgentFakePromptTurn(t *testing.T) {
 	conn := connectFakeAgentForTest(t, ctx, client, fakeTurnScenario())
 	sessionID := newFakeSession(t, ctx, conn)
 
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "hello"))
+	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "hello"))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 	require.Contains(t, client.text(), fakeDefaultReply)
@@ -90,7 +90,7 @@ func TestAgentFakeCancelDuringStream(t *testing.T) {
 	promptDone := make(chan acp.PromptResponse, 1)
 	promptErr := make(chan error, 1)
 	go func() {
-		resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "count slowly"))
+		resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "count slowly"))
 		if err != nil {
 			promptErr <- err
 
@@ -102,7 +102,7 @@ func TestAgentFakeCancelDuringStream(t *testing.T) {
 	require.Eventually(t, func() bool { return client.text() != "" },
 		30*time.Second, 20*time.Millisecond, "no streamed chunk before cancel")
 
-	require.NoError(t, conn.Cancel(ctx, acp.CancelNotification{SessionId: sessionID}))
+	require.NoError(t, conn.Cancel(ctx, piacp.CancelRequest(sessionID, "test-turn")))
 
 	select {
 	case resp := <-promptDone:
@@ -130,11 +130,11 @@ func TestAgentFakeProviderErrorTurnFailure(t *testing.T) {
 	conn := connectFakeAgentForTest(t, ctx, client, scenario)
 	sessionID := newFakeSession(t, ctx, conn)
 
-	_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "fail please"))
+	_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "fail please"))
 	requireTurnFailure(t, err, "provider")
 
 	// A provider failure leaves the session addressable.
-	_, err = conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "again"))
+	_, err = conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "again"))
 	requireTurnFailure(t, err, "provider")
 }
 
@@ -152,7 +152,7 @@ func TestAgentFakeProcessDeathTurnFailure(t *testing.T) {
 	conn := connectFakeAgentForTest(t, ctx, client, scenario)
 	sessionID := newFakeSession(t, ctx, conn)
 
-	_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "die mid turn"))
+	_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "die mid turn"))
 	requireTurnFailure(t, err, "process_exit")
 }
 
@@ -170,7 +170,7 @@ func TestAgentFakeTurnTimeout(t *testing.T) {
 	conn := connectFakeAgentForTest(t, ctx, client, scenario, piacp.WithTurnTimeout(3*time.Second))
 	sessionID := newFakeSession(t, ctx, conn)
 
-	_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "hang forever"))
+	_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "hang forever"))
 	requireTurnFailure(t, err, "timeout")
 }
 
@@ -192,7 +192,7 @@ func TestAgentFakeGarbageBurstSurvival(t *testing.T) {
 
 	// Malformed stdout records mid-turn are skipped, not fatal: the turn
 	// still completes.
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "burst"))
+	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "burst"))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 	require.Contains(t, client.text(), "third")
@@ -228,7 +228,7 @@ func TestAgentFakePermissionOutcomes(t *testing.T) {
 
 			// A denied or cancelled dialog fails the tool call closed; the
 			// turn itself still completes.
-			resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "use the tool"))
+			resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "use the tool"))
 			require.NoError(t, err)
 			require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 			require.Equal(t, 1, client.permissionCount())
@@ -260,7 +260,7 @@ func TestAgentFakeElicitationRelay(t *testing.T) {
 
 	// The dialog answer travels back to pi and shapes the reply, pinning the
 	// full relay round trip.
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "ask me something"))
+	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "ask me something"))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 	require.Contains(t, client.text(), "ELICIT_VALUE_SENTINEL")
@@ -289,7 +289,7 @@ func TestAgentFakeElicitationWithoutCapabilityFailsClosed(t *testing.T) {
 
 	// Without the form elicitation capability the dialog is auto-cancelled;
 	// the turn itself still completes.
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "ask me something"))
+	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "ask me something"))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 	require.Empty(t, client.elicitationSnapshot())
@@ -307,7 +307,7 @@ func TestAgentFakeRawEventsOptIn(t *testing.T) {
 	conn := connectFakeAgentForTest(t, ctx, client, fakeTurnScenario())
 	sessionID := newFakeSession(t, ctx, conn, piacp.WithSessionRawEvents(true))
 
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "raw events please"))
+	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "raw events please"))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 	require.Positive(t, client.rawEventCount(), "raw-event opt-in must forward native event lines")
@@ -388,7 +388,7 @@ func TestAgentFakeCloseAndDeleteDeterministic(t *testing.T) {
 	conn := connectFakeAgentForTest(t, ctx, client, fakeTurnScenario(), piacp.WithSessionStore(store))
 	sessionID := newFakeSession(t, ctx, conn)
 
-	_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "persist me"))
+	_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "persist me"))
 	require.NoError(t, err)
 
 	_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: sessionID})
@@ -399,7 +399,7 @@ func TestAgentFakeCloseAndDeleteDeterministic(t *testing.T) {
 
 	// A deleted session is tombstoned: session-scoped requests return the
 	// uniform invalid-params error.
-	_, err = conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "gone"))
+	_, err = conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "gone"))
 	var reqErr *acp.RequestError
 	require.ErrorAs(t, err, &reqErr)
 	require.Equal(t, -32602, reqErr.Code)

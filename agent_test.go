@@ -58,23 +58,39 @@ func TestServeContextAndConnectionBranches(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	require.ErrorIs(t, Serve(ctx, strings.NewReader(""), io.Discard), context.Canceled)
+	require.NoError(t, Serve(context.Background(), strings.NewReader(""), io.Discard))
 
 	previous := newServeAgent
 	t.Cleanup(func() { newServeAgent = previous })
 
+	started := make(chan struct{})
 	newServeAgent = func(opts ...Option) *Agent {
+		defer close(started)
+
 		agent := NewAgent(append(opts, WithLogger(slog.New(slog.DiscardHandler)))...)
+		process := newFailingCloseProcess()
+		process.close = ErrProcessTreeUnproven
 		agent.sessions["serve"] = &agentSession{
 			agent: agent,
 			id:    "serve",
-			proc:  newFailingCloseProcess(),
+			proc:  process,
 			turn:  make(chan struct{}, sessionTurnCapacity),
 		}
 
 		return agent
 	}
 
-	require.NoError(t, Serve(context.Background(), strings.NewReader(""), io.Discard))
+	ctx, cancel = context.WithCancel(context.Background())
+	input, inputWriter := io.Pipe()
+	t.Cleanup(func() {
+		require.NoError(t, input.Close())
+		require.NoError(t, inputWriter.Close())
+	})
+	errCh := make(chan error, 1)
+	go func() { errCh <- Serve(ctx, input, io.Discard) }()
+	<-started
+	cancel()
+	require.ErrorIs(t, <-errCh, ErrProcessTreeUnproven)
 }
 
 func TestAgentCloseJoinsSessionCloseError(t *testing.T) {

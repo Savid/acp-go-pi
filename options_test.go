@@ -9,8 +9,6 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
-
-	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 func TestApplyOptionsDefaults(t *testing.T) {
@@ -21,7 +19,6 @@ func TestApplyOptionsDefaults(t *testing.T) {
 	require.Equal(t, "acp-go-pi", options.AgentName)
 	require.Equal(t, "acp-go-pi", options.AgentTitle)
 	require.Equal(t, "0.1.0", options.AgentVersion)
-	require.Equal(t, pi.DefaultMinimumVersion, options.MinimumVersion)
 	require.Empty(t, options.ExecutablePath)
 	require.Empty(t, options.Home)
 	require.Empty(t, options.ScratchDir)
@@ -63,7 +60,6 @@ func TestApplyOptionsSetters(t *testing.T) {
 		WithTurnTimeout(time.Minute),
 		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 4, MaxConcurrentClientCalls: 2}),
 		WithSeedFiles(seeds),
-		WithPiMinimumVersion("0.90.0"),
 	})
 
 	require.Equal(t, logger, options.Logger)
@@ -83,7 +79,6 @@ func TestApplyOptionsSetters(t *testing.T) {
 	require.Equal(t, time.Minute, options.TurnTimeout)
 	require.Equal(t, ConcurrencyLimits{MaxActiveSessions: 4, MaxConcurrentClientCalls: 2}, options.ConcurrencyLimits)
 	require.Equal(t, seeds, options.SeedFiles)
-	require.Equal(t, "0.90.0", options.MinimumVersion)
 
 	// Env and seed maps are cloned, not aliased.
 	env["ANTHROPIC_API_KEY"] = "mutated"

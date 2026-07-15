@@ -351,6 +351,24 @@ func TestStartProcessCancelledContext(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
+func TestStartProcessCancellationTerminatesContainedProcess(t *testing.T) {
+	t.Parallel()
+
+	script := writeScript(t, `trap '' TERM; while :; do sleep 0.1; done`)
+	ctx, cancel := context.WithCancel(t.Context())
+	process, err := StartProcess(ctx, LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = process.Close() })
+
+	cancel()
+
+	select {
+	case <-process.Exited():
+	case <-time.After(5 * time.Second):
+		t.Fatal("contained process did not exit after launch-context cancellation")
+	}
+}
+
 func TestTailBufferBounds(t *testing.T) {
 	t.Parallel()
 

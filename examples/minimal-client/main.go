@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"io"
@@ -319,7 +320,9 @@ func runConversation(
 		_, _ = conn.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: session.SessionId})
 	}()
 
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, prompt))
+	turnNonce := newTurnNonce()
+
+	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, turnNonce, prompt))
 	if err != nil {
 		return err
 	}
@@ -327,6 +330,10 @@ func runConversation(
 	fmt.Fprintf(stdout, "\n\nstop reason: %s\n", resp.StopReason)
 
 	return nil
+}
+
+func newTurnNonce() string {
+	return rand.Text()
 }
 
 func printError(stderr io.Writer, err error) {

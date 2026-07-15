@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -1417,6 +1418,7 @@ func runInteractiveLoop(
 	queue := make([]string, 0, 1)
 	inputDone := false
 	running := false
+	activeTurnNonce := ""
 
 	var done <-chan promptResult
 
@@ -1450,6 +1452,8 @@ func runInteractiveLoop(
 		if !running && len(queue) > 0 {
 			prompt := queue[0]
 			queue = queue[1:]
+			turnNonce := newTurnNonce()
+			activeTurnNonce = turnNonce
 			running = true
 
 			result := make(chan promptResult, 1)
@@ -1457,9 +1461,9 @@ func runInteractiveLoop(
 
 			ticks.start()
 
-			go func() {
-				result <- promptResult{err: runPrompt(ctx, conn, ui, sessionID, prompt)}
-			}()
+			go func(nonce string) {
+				result <- promptResult{err: runPrompt(ctx, conn, ui, sessionID, prompt, nonce)}
+			}(turnNonce)
 
 			continue
 		}
@@ -1477,7 +1481,7 @@ func runInteractiveLoop(
 				continue
 			}
 
-			control := handleInputEvent(ctx, conn, ui, sessionID, event, running, enqueue)
+			control := handleInputEvent(ctx, conn, ui, sessionID, event, running, enqueue, activeTurnNonce)
 			if control.err != nil {
 				return control.err
 			}
@@ -1492,6 +1496,7 @@ func runInteractiveLoop(
 			}
 		case result := <-done:
 			running = false
+			activeTurnNonce = ""
 			done = nil
 
 			ticks.stop()
@@ -1511,7 +1516,7 @@ func runInteractiveLoop(
 			ui.tick()
 		case <-ctx.Done():
 			if running {
-				_ = conn.Cancel(context.Background(), acp.CancelNotification{SessionId: sessionID})
+				_ = conn.Cancel(context.Background(), piacp.CancelRequest(sessionID, activeTurnNonce))
 			}
 
 			return nil
@@ -1527,13 +1532,19 @@ func handleInputEvent(
 	event inputEvent,
 	running bool,
 	enqueue func(string, bool),
+	turnNonces ...string,
 ) inputControl {
+	turnNonce := ""
+	if len(turnNonces) > 0 {
+		turnNonce = turnNonces[0]
+	}
+
 	switch event.kind {
 	case inputPrompt:
 		prompt := strings.TrimSpace(event.text)
 		if quitCommand(prompt) {
 			if running {
-				_ = conn.Cancel(context.Background(), acp.CancelNotification{SessionId: sessionID})
+				_ = conn.Cancel(context.Background(), piacp.CancelRequest(sessionID, turnNonce))
 			}
 
 			return inputControl{exit: true}
@@ -1547,14 +1558,14 @@ func handleInputEvent(
 			return inputControl{}
 		}
 
-		if err := conn.Cancel(ctx, acp.CancelNotification{SessionId: sessionID}); err != nil {
+		if err := conn.Cancel(ctx, piacp.CancelRequest(sessionID, turnNonce)); err != nil {
 			return inputControl{err: err}
 		}
 
 		ui.writeNotice("interrupt", "requested")
 	case inputExit:
 		if running {
-			_ = conn.Cancel(context.Background(), acp.CancelNotification{SessionId: sessionID})
+			_ = conn.Cancel(context.Background(), piacp.CancelRequest(sessionID, turnNonce))
 		}
 
 		return inputControl{exit: true}
@@ -1741,10 +1752,18 @@ func runPrompt(
 	ui *chatUI,
 	sessionID acp.SessionId,
 	prompt string,
+	turnNonces ...string,
 ) error {
 	ui.beginAgentTurn(prompt)
 
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, prompt))
+	turnNonce := ""
+	if len(turnNonces) > 0 {
+		turnNonce = turnNonces[0]
+	} else {
+		turnNonce = newTurnNonce()
+	}
+
+	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, turnNonce, prompt))
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			ui.endAgentTurn(acp.StopReasonCancelled)
@@ -1756,6 +1775,10 @@ func runPrompt(
 	ui.endAgentTurn(resp.StopReason)
 
 	return nil
+}
+
+func newTurnNonce() string {
+	return rand.Text()
 }
 
 func quitCommand(prompt string) bool {

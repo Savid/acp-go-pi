@@ -35,10 +35,11 @@ func TestSessionRequestBuildersAndCloning(t *testing.T) {
 	output := NewSessionRequest("/cwd", WithSessionOutputSchema(map[string]any{"type": "object"}))
 	require.NotEmpty(t, output.Meta)
 
-	prompt := PromptRequest("id", acp.TextBlock("text"))
+	prompt := PromptRequest("id", "turn-1", acp.TextBlock("text"))
 	require.Len(t, prompt.Prompt, 1)
-	require.Len(t, TextPromptRequest("id", "text").Prompt, 1)
-	require.NotNil(t, PromptRequest("id").Prompt)
+	require.Len(t, TextPromptRequest("id", "test-turn", "text").Prompt, 1)
+	require.NotNil(t, PromptRequest("id", "turn-2").Prompt)
+	require.Equal(t, turnRouteMeta("turn-cancel"), CancelRequest("id", "turn-cancel").Meta)
 
 	config := SetConfigOptionRequest("id", "custom", "value")
 	require.NotNil(t, config.ValueId)

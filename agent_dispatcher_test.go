@@ -308,7 +308,9 @@ func TestLocalAgentConnectionClientCallErrors(t *testing.T) {
 		Message: "message",
 		Mode:    elicitationModeForm,
 	}
-	_, err = conn.CreateElicitation(t.Context(), acp.UnstableCreateElicitationRequest{Form: form}, elicitationScope{})
+	_, err = conn.CreateElicitation(t.Context(), acp.UnstableCreateElicitationRequest{Form: form}, elicitationScope{
+		SessionID: "session", TurnNonce: "turn", RequestID: "req",
+	})
 	require.Error(t, err)
 	_, err = conn.RequestPermission(t.Context(), acp.RequestPermissionRequest{})
 	require.Error(t, err)

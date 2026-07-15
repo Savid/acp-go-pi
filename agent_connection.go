@@ -18,33 +18,46 @@ type agentClient interface {
 
 type elicitationScope struct {
 	SessionID  acp.SessionId
+	TurnNonce  string
 	ToolCallID acp.ToolCallId
+	RequestID  string
 }
 
 func scopedElicitationParams(
 	params acp.UnstableCreateElicitationRequest,
 	scope elicitationScope,
 ) (json.RawMessage, error) {
-	if params.Form == nil {
-		return nil, errors.New("elicitation request must include form")
+	var (
+		payload map[string]any
+		meta    map[string]any
+	)
+
+	switch {
+	case params.Form != nil:
+		payload = map[string]any{
+			jsonFieldMessage:  params.Form.Message,
+			jsonFieldMode:     params.Form.Mode,
+			"requestedSchema": params.Form.RequestedSchema,
+		}
+		meta = params.Form.Meta
+	case params.Url != nil:
+		payload = map[string]any{
+			"elicitationId":  params.Url.ElicitationId,
+			jsonFieldMessage: params.Url.Message,
+			jsonFieldMode:    params.Url.Mode,
+			jsonFieldURL:     params.Url.Url,
+		}
+		meta = params.Url.Meta
+	default:
+		return nil, errors.New("elicitation request must include form or url")
 	}
 
-	payload := map[string]any{
-		jsonFieldMessage:  params.Form.Message,
-		"mode":            params.Form.Mode,
-		"requestedSchema": params.Form.RequestedSchema,
-	}
-	if len(params.Form.Meta) > 0 {
-		payload["_meta"] = params.Form.Meta
+	stamped, err := stampRouteMeta(meta, scope)
+	if err != nil {
+		return nil, err
 	}
 
-	if scope.SessionID != "" {
-		payload[acpFieldSessionID] = scope.SessionID
-	}
-
-	if scope.ToolCallID != "" {
-		payload["toolCallId"] = scope.ToolCallID
-	}
+	payload["_meta"] = stamped
 
 	return json.Marshal(payload)
 }

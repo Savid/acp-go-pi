@@ -45,6 +45,7 @@ func (s *agentSession) emitUpdates(ctx context.Context, updates []acp.SessionUpd
 
 	for _, update := range updates {
 		if err := conn.SessionUpdate(ctx, acp.SessionNotification{
+			Meta:      turnRouteMetaFromContext(ctx),
 			SessionId: s.id,
 			Update:    update,
 		}); err != nil {
@@ -361,6 +362,9 @@ func (s *agentSession) emitRawPiEvent(ctx context.Context, raw []byte) {
 		rawEventFieldSequence: sequence,
 		rawEventFieldSource:   rawEventSourceValue,
 		rawEventFieldEvent:    json.RawMessage(raw),
+	}
+	if meta := turnRouteMetaFromContext(ctx); meta != nil {
+		payload["_meta"] = meta
 	}
 
 	if marker, replaced := rawEventMarker(payload); replaced {

@@ -76,7 +76,7 @@ func TestPiACPAgentBinaryFakeConversation(t *testing.T) {
 	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir()))
 	require.NoError(t, err, "stderr: %s", agent.stderrString())
 
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "hello via binary"))
+	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "test-turn", "hello via binary"))
 	require.NoError(t, err, "stderr: %s", agent.stderrString())
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 	require.Contains(t, client.text(), fakeDefaultReply)
@@ -122,7 +122,7 @@ func TestPiACPAgentBinaryOrphanReapOnCrash(t *testing.T) {
 	require.NoError(t, err, "stderr: %s", agent.stderrString())
 
 	go func() {
-		_, _ = conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "trigger the tool"))
+		_, _ = conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "test-turn", "trigger the tool"))
 	}()
 
 	select {
@@ -191,6 +191,7 @@ func TestPiACPAgentBinaryLiveConversation(t *testing.T) {
 	require.NoError(t, err, "stderr: %s", agent.stderrString())
 
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
+		"test-turn",
 		"Reply with exactly ACP_PI_BINARY_OK and no punctuation."))
 	require.NoError(t, err, "stderr: %s", agent.stderrString())
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)

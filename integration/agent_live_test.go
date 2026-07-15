@@ -48,6 +48,7 @@ func TestPiACPLivePromptTurn(t *testing.T) {
 	require.NoError(t, err)
 
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
+		"test-turn",
 		"Reply with exactly ACP_PI_LIVE_OK and no punctuation."))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
@@ -74,6 +75,7 @@ func TestPiACPLiveCancel(t *testing.T) {
 	promptFailed := make(chan error, 1)
 	go func() {
 		resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
+			"test-turn",
 			"Count from 1 to 500, one number per line, without stopping."))
 		if err != nil {
 			promptFailed <- err
@@ -86,7 +88,7 @@ func TestPiACPLiveCancel(t *testing.T) {
 	require.Eventually(t, func() bool { return client.text() != "" },
 		liveTurnTimeout, 50*time.Millisecond, "no streamed output before cancel")
 
-	require.NoError(t, conn.Cancel(ctx, acp.CancelNotification{SessionId: session.SessionId}))
+	require.NoError(t, conn.Cancel(ctx, piacp.CancelRequest(session.SessionId, "test-turn")))
 
 	select {
 	case resp := <-promptDone:
@@ -99,6 +101,7 @@ func TestPiACPLiveCancel(t *testing.T) {
 
 	// The aborted turn must not poison the session.
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
+		"test-turn",
 		"Reply with exactly ACP_PI_AFTER_CANCEL and no punctuation."))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
@@ -118,6 +121,7 @@ func TestPiACPLivePermissionGate(t *testing.T) {
 	require.NoError(t, err)
 
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
+		"test-turn",
 		"Use the bash tool to run exactly `echo ACP_PI_TOOL_OK` and then tell me its output."))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
@@ -142,6 +146,7 @@ func TestPiACPLivePermissionDeny(t *testing.T) {
 	// A denied tool call fails closed natively; the turn itself still
 	// finishes with a normal stop.
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
+		"test-turn",
 		"Use the bash tool to run exactly `echo ACP_PI_DENIED` once. If the tool call fails, "+
 			"reply with exactly ACP_PI_TOOL_BLOCKED and stop."))
 	require.NoError(t, err)
@@ -164,6 +169,7 @@ func TestPiACPLiveRawEventsOptIn(t *testing.T) {
 	require.NoError(t, err)
 
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
+		"test-turn",
 		"Reply with exactly ACP_PI_RAW_OK and no punctuation."))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
@@ -190,6 +196,7 @@ func TestPiACPLiveForkSession(t *testing.T) {
 	require.Error(t, err)
 
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
+		"test-turn",
 		"Remember the code word MANGOSTEEN. Reply with exactly ACP_PI_SEEDED."))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
@@ -200,6 +207,7 @@ func TestPiACPLiveForkSession(t *testing.T) {
 	require.NotEqual(t, session.SessionId, fork.SessionId, "fork mints a new session id")
 
 	resp, err = conn.Prompt(ctx, piacp.TextPromptRequest(fork.SessionId,
+		"test-turn",
 		"Reply with exactly the code word I asked you to remember, and nothing else."))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
@@ -207,6 +215,7 @@ func TestPiACPLiveForkSession(t *testing.T) {
 
 	// Both sessions stay independently usable.
 	resp, err = conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
+		"test-turn",
 		"Reply with exactly ACP_PI_PARENT_OK."))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)

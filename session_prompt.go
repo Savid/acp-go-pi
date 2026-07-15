@@ -155,8 +155,13 @@ func xmlEscape(text string) string {
 
 // Prompt sends one turn to pi and streams updates until the run settles.
 func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
-	if err := s.poisonedError(); err != nil {
+	route, err := parseInboundTurnRoute(params.Meta)
+	if err != nil {
 		return acp.PromptResponse{}, err
+	}
+
+	if poisonErr := s.poisonedError(); poisonErr != nil {
+		return acp.PromptResponse{}, poisonErr
 	}
 
 	releaseTurn, err := s.acquireTurn(ctx)
@@ -179,18 +184,26 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	}
 
 	turnCtx, cancel := context.WithCancel(ctx)
+	turnCtx = withTurnRoute(turnCtx, route.turnNonce)
 	sink := newTurnSink()
 
+	s.cancelMu.Lock()
 	s.mu.Lock()
 	s.cancel = cancel
 	s.turnCancelled = false
+	s.turnNonce = route.turnNonce
 	s.turnSink = sink
 	s.mu.Unlock()
+	s.cancelMu.Unlock()
 
 	defer func() {
+		s.cancelMu.Lock()
+		defer s.cancelMu.Unlock()
+
 		s.mu.Lock()
 		s.cancel = nil
 		s.turnCancelled = false
+		s.turnNonce = ""
 
 		if s.turnSink == sink {
 			s.turnSink = nil
@@ -225,6 +238,8 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 				return s.transportEndedTurn(params.MessageId, &timedOut)
 			}
 
+			s.emitRawPiEvent(turnCtx, event.RawJSON())
+
 			settled, err := s.handleTurnEvent(turnCtx, event, state)
 			if err != nil {
 				return acp.PromptResponse{}, s.abortAfterEmitError(ctx, err)
@@ -232,6 +247,18 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 
 			if settled {
 				return s.finishTurn(ctx, turnCtx, params, state, &timedOut)
+			}
+		case request := <-sink.uiRequests:
+			s.emitRawPiEvent(turnCtx, request.RawJSON())
+
+			if request.IsDialog() {
+				s.dialogWG.Add(1)
+
+				go func() {
+					defer s.dialogWG.Done()
+
+					s.handleUIDialog(turnCtx, request)
+				}()
 			}
 		case <-turnCtx.Done():
 			return s.contextEndedTurn(params.MessageId, &timedOut)

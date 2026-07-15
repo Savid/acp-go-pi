@@ -39,7 +39,7 @@ func TestPiACPFakeStoreResumeAfterNativeDeletion(t *testing.T) {
 	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(cwd))
 	require.NoError(t, err)
 
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "seed the store"))
+	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "test-turn", "seed the store"))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 
@@ -66,7 +66,7 @@ func TestPiACPFakeStoreResumeAfterNativeDeletion(t *testing.T) {
 		piacp.ResumeSessionRequest(session.SessionId, cwd))
 	require.NoError(t, err)
 
-	resp, err = resumeConn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "after restore"))
+	resp, err = resumeConn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "test-turn", "after restore"))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 }
@@ -92,7 +92,7 @@ func TestPiACPFakeStoreLoadReplaysHistory(t *testing.T) {
 	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(cwd))
 	require.NoError(t, err)
 
-	_, err = conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "history seed"))
+	_, err = conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "test-turn", "history seed"))
 	require.NoError(t, err)
 
 	_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
@@ -146,6 +146,7 @@ func TestPiACPLiveStoreResume(t *testing.T) {
 	require.NoError(t, err)
 
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
+		"test-turn",
 		"Remember the code word DRAGONFRUIT. Reply with exactly ACP_PI_STORED."))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
@@ -164,6 +165,7 @@ func TestPiACPLiveStoreResume(t *testing.T) {
 	require.NoError(t, err)
 
 	resp, err = resumeConn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
+		"test-turn",
 		"Reply with exactly the code word I asked you to remember, and nothing else."))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
@@ -180,7 +182,7 @@ func TestPiACPLiveStoreResume(t *testing.T) {
 		require.NotEqual(t, session.SessionId, summary.SessionId, "deleted sessions must not be listed")
 	}
 
-	_, err = resumeConn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "gone"))
+	_, err = resumeConn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "test-turn", "gone"))
 	var reqErr *acp.RequestError
 	require.ErrorAs(t, err, &reqErr)
 	require.Equal(t, -32602, reqErr.Code)

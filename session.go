@@ -17,7 +17,9 @@ const (
 	jsonFieldIndex   = "index"
 	jsonFieldMessage = "message"
 	jsonFieldMethod  = "method"
+	jsonFieldMode    = "mode"
 	jsonFieldServer  = "server"
+	jsonFieldURL     = "url"
 
 	acpFieldConfig    = "config"
 	acpFieldSessionID = "sessionId"
@@ -70,26 +72,31 @@ type agentSession struct {
 	pumpDone   chan struct{}
 	dialogWG   sync.WaitGroup
 
-	turn chan struct{}
+	turn     chan struct{}
+	cancelMu sync.Mutex
 
-	mu                 sync.Mutex
-	title              string
-	updatedAt          string
-	model              string
-	availableModels    []pi.Model
-	thinkingLevel      string
-	contextWindowSize  int64
-	availableCommands  []pi.SlashCommand
-	advertisedCommands []acp.AvailableCommand
-	poisonCause        string
-	cancel             context.CancelFunc
-	turnCancelled      bool
-	turnSink           *turnSink
-	pendingDialogs     map[string]*dialogCancel
-	rawMessages        rawMessageConfig
-	rawEventSequence   int64
-	mirroredRows       int
-	closeTurnWait      time.Duration
+	mu                  sync.Mutex
+	title               string
+	updatedAt           string
+	model               string
+	availableModels     []pi.Model
+	thinkingLevel       string
+	contextWindowSize   int64
+	availableCommands   []pi.SlashCommand
+	advertisedCommands  []acp.AvailableCommand
+	poisonCause         string
+	cancel              context.CancelFunc
+	turnCancelled       bool
+	turnNonce           string
+	turnSink            *turnSink
+	pendingDialogs      map[string]*dialogCancel
+	rawMessages         rawMessageConfig
+	rawEventSequence    int64
+	mirroredRows        int
+	closeTurnWait       time.Duration
+	nativeRootRelease   func()
+	scratchRootRelease  func()
+	nativeQuiescenceErr error
 }
 
 // dialogCancel tracks one pending extension UI dialog so session/cancel and

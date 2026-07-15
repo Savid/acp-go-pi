@@ -1,12 +1,16 @@
-//go:build unix
+//go:build linux || darwin || freebsd || openbsd
 
 package pi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -159,10 +163,108 @@ func startStubbornProcessWithSeams(t *testing.T) *Process {
 func TestProcessSignalFailuresSurface(t *testing.T) {
 	process := startStubbornProcessWithSeams(t)
 
-	syscallGetpgid = func(int) (int, error) { return 0, syscall.EPERM }
+	syscallKill = func(int, syscall.Signal) error { return syscall.EPERM }
 
 	require.ErrorContains(t, process.Shutdown(t.Context()), "terminate pi process")
 	require.ErrorContains(t, process.Kill(), "kill pi process")
+}
+
+func TestShutdownWaitsForDescendantTreeQuiescence(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	script := writeScript(t, `(trap '' TERM; while :; do sleep 1; done) &
+echo $! > "$PI_CHILD_PID_FILE"
+cat >/dev/null
+exit 0`)
+
+	process := startScriptProcess(t, LaunchSpec{
+		ExecutablePath: script,
+		AgentDir:       dir,
+		Env:            map[string]string{"PI_CHILD_PID_FILE": pidFile},
+	})
+	t.Cleanup(func() { _ = process.Close() })
+
+	require.NoError(t, process.Shutdown(t.Context()))
+
+	rawPID, err := os.ReadFile(pidFile)
+	require.NoError(t, err)
+
+	pid, err := strconv.Atoi(strings.TrimSpace(string(rawPID)))
+	require.NoError(t, err)
+	require.False(t, processPIDAlive(pid), "descendant %d still live after shutdown", pid)
+}
+
+func TestProbeVersionWaitsForDescendantTreeQuiescence(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	t.Setenv("PI_VERSION_CHILD_PID_FILE", pidFile)
+
+	script := filepath.Join(dir, "fake-pi")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+(trap '' TERM; while :; do sleep 1; done) &
+echo $! > "$PI_VERSION_CHILD_PID_FILE"
+echo 0.80.6
+`), 0o700))
+
+	version, err := ProbeVersion(t.Context(), script)
+	require.NoError(t, err)
+	require.Equal(t, "0.80.6", version)
+
+	rawPID, err := os.ReadFile(pidFile)
+	require.NoError(t, err)
+
+	pid, err := strconv.Atoi(strings.TrimSpace(string(rawPID)))
+	require.NoError(t, err)
+	require.False(t, processPIDAlive(pid), "version-probe descendant %d still live", pid)
+}
+
+func TestProcessTreeQuiescenceFailureBranches(t *testing.T) {
+	restoreSignalSeams(t)
+
+	require.NoError(t, (*processTree)(nil).terminateAndWait(time.Millisecond))
+	require.NoError(t, signalProcessGroupID(0, syscall.SIGKILL))
+	require.True(t, ProcessTreeQuiescent(nil))
+	require.False(t, ProcessTreeQuiescent(ErrProcessTreeNotQuiescent))
+
+	tree := &processTree{pgid: 12345}
+	syscallKill = func(int, syscall.Signal) error { return syscall.EPERM }
+	require.ErrorIs(t, tree.terminateAndWait(time.Millisecond), ErrProcessTreeNotQuiescent)
+
+	calls := 0
+	syscallKill = func(_ int, signal syscall.Signal) error {
+		calls++
+		if signal == 0 {
+			return syscall.ESRCH
+		}
+
+		return nil
+	}
+	require.NoError(t, tree.terminateAndWait(time.Millisecond))
+	require.Equal(t, 2, calls)
+
+	syscallKill = func(_ int, signal syscall.Signal) error {
+		if signal == 0 {
+			return syscall.EINVAL
+		}
+
+		return nil
+	}
+	require.ErrorIs(t, tree.terminateAndWait(time.Millisecond), ErrProcessTreeNotQuiescent)
+
+	syscallKill = func(_ int, signal syscall.Signal) error {
+		if signal == 0 {
+			return syscall.EPERM
+		}
+
+		return nil
+	}
+	require.ErrorIs(t, tree.terminateAndWait(time.Millisecond), ErrProcessTreeNotQuiescent)
+}
+
+func processPIDAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func TestProcessShutdownKillFailureSurfaces(t *testing.T) {

@@ -32,6 +32,15 @@ func TestSessionCloseTurnWaitFailure(t *testing.T) {
 	require.Error(t, session.Close(t.Context()))
 }
 
+func TestSessionRetainsUnprovenNativeQuiescence(t *testing.T) {
+	session := &agentSession{}
+	session.recordNativeQuiescence(errors.New("ordinary native error"))
+	require.NoError(t, session.nativeQuiescenceError())
+
+	session.recordNativeQuiescence(pi.ErrProcessTreeNotQuiescent)
+	require.ErrorIs(t, session.nativeQuiescenceError(), pi.ErrProcessTreeNotQuiescent)
+}
+
 func TestSessionTurnLifecycleBranches(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithTurnTimeout(time.Second))
 	client := newStubPiClient()
@@ -97,10 +106,23 @@ func TestRelaunchProcessBranches(t *testing.T) {
 
 	client = newStubPiClient()
 	session, agent := base(client)
+	starts := 0
 	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
-		return nil, nil, errors.New("relaunch")
+		starts++
+
+		return nil, nil, pi.ErrProcessTreeNotQuiescent
 	}
 	require.Error(t, session.ensureProcessAlive(t.Context()))
+	require.ErrorIs(t, session.nativeQuiescenceError(), pi.ErrProcessTreeNotQuiescent)
+	require.ErrorIs(t, session.ensureProcessAlive(t.Context()), pi.ErrProcessTreeNotQuiescent)
+	require.Equal(t, 1, starts, "unproven failed relaunch admitted another native root")
+
+	client = newStubPiClient()
+	session, _ = base(client)
+	oldProcess, ok := session.proc.(*stubProcess)
+	require.True(t, ok)
+	oldProcess.close = pi.ErrProcessTreeNotQuiescent
+	require.ErrorIs(t, session.ensureProcessAlive(t.Context()), pi.ErrProcessTreeNotQuiescent)
 
 	client = newStubPiClient()
 	client.startErr = errors.New("start")

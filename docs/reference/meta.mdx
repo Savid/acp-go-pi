@@ -20,6 +20,22 @@ Initialize advertises capability descriptors under `_meta.pi`:
 | `rawEvent` | The raw-event opt-in (`enabledBy`, `maxBytes`, `defaultEnabled`). |
 | `sessionStore` | Store `format` (`pi-session-jsonl-v1`) and key shape. |
 
+Initialize also advertises the separate reserved capability
+`_meta["acp-go.dev/route"] = {"versions":[1]}`. Prompts and active-turn
+cancellations require exactly `{"version":1,"turnNonce":"..."}` under that
+key. A nonce is fresh and unguessable per turn; missing, extra, unsupported, or
+stale route data is rejected.
+
+Every live-turn `session/update` and `_pi/rawEvent` notification carries the
+same exact `{version, turnNonce}` object in its notification `_meta`; raw-event
+payloads also carry their structural `sessionId`. Lifecycle and load-history
+updates remain outside a turn epoch and omit the envelope.
+
+Outbound form elicitation preserves native metadata and adds `version`,
+`sessionId`, `turnNonce`, and exactly one of `toolCallId` or `requestId` under
+the reserved key. A pre-existing reserved key is an error. Permission requests
+remain structurally correlated by ACP session and tool-call fields.
+
 Structured output is not advertised: pi has no native structured-output
 surface, so no `structuredOutput` descriptor appears and an `outputSchema`
 option fails closed at session start.

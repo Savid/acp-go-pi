@@ -1,9 +1,11 @@
 package pi
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -37,6 +39,19 @@ func TestProbeVersion(t *testing.T) {
 
 		_, err := ProbeVersion(t.Context(), filepath.Join(t.TempDir(), "missing"))
 		require.ErrorContains(t, err, "probe pi version")
+	})
+
+	t.Run("running probe cancellation is wrapped", func(t *testing.T) {
+		t.Parallel()
+
+		script := filepath.Join(t.TempDir(), "fake-pi")
+		require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n"), 0o700))
+
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+
+		_, err := ProbeVersion(ctx, script)
+		require.Error(t, err)
 	})
 }
 

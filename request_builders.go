@@ -176,17 +176,23 @@ func (config sessionRequestConfig) additionalDirectoriesClone() []string {
 
 // PromptRequest constructs a session/prompt request with a non-nil prompt
 // slice for embedded Go callers.
-func PromptRequest(sessionID acp.SessionId, blocks ...acp.ContentBlock) acp.PromptRequest {
+func PromptRequest(sessionID acp.SessionId, turnNonce string, blocks ...acp.ContentBlock) acp.PromptRequest {
 	return acp.PromptRequest{
 		SessionId: sessionID,
+		Meta:      turnRouteMeta(turnNonce),
 		Prompt:    append([]acp.ContentBlock{}, blocks...),
 	}
 }
 
 // TextPromptRequest constructs a session/prompt request containing one text
 // content block.
-func TextPromptRequest(sessionID acp.SessionId, text string) acp.PromptRequest {
-	return PromptRequest(sessionID, acp.TextBlock(text))
+func TextPromptRequest(sessionID acp.SessionId, turnNonce, text string) acp.PromptRequest {
+	return PromptRequest(sessionID, turnNonce, acp.TextBlock(text))
+}
+
+// CancelRequest builds an active-turn cancellation carrying the mandatory route nonce.
+func CancelRequest(sessionID acp.SessionId, turnNonce string) acp.CancelNotification {
+	return acp.CancelNotification{SessionId: sessionID, Meta: turnRouteMeta(turnNonce)}
 }
 
 // SetConfigOptionRequest constructs a value-id session/set_config_option request.

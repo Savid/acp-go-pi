@@ -28,8 +28,16 @@ func TestPumpDeliveryBranches(t *testing.T) {
 
 	session.turnSink = nil
 	session.dispatchUIRequest(t.Context(), pi.UIRequest{Method: "notify"})
-	session.turnSink = newTurnSink()
-	session.dispatchUIRequest(t.Context(), pi.UIRequest{Method: "notify"})
+	session.dispatchUIRequest(t.Context(), pi.UIRequest{ID: "stale", Method: uiMethodSelect})
+	sink = newTurnSink()
+	session.turnSink = sink
+	dispatched := make(chan struct{})
+	go func() {
+		session.dispatchUIRequest(t.Context(), pi.UIRequest{Method: "notify"})
+		close(dispatched)
+	}()
+	<-sink.uiRequests
+	<-dispatched
 
 	client := newStubPiClient()
 	close(client.events)

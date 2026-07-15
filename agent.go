@@ -98,15 +98,18 @@ func NewAgent(opts ...Option) *Agent {
 		log = slog.Default()
 	}
 
+	observe := observer.New(observer.Config{
+		MeterProvider:  options.MeterProvider,
+		Propagator:     options.TextMapPropagator,
+		TracerProvider: options.TracerProvider,
+		Version:        options.AgentVersion,
+	})
+	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe)
+
 	return &Agent{
-		options: options,
-		log:     log,
-		observe: observer.New(observer.Config{
-			MeterProvider:  options.MeterProvider,
-			Propagator:     options.TextMapPropagator,
-			TracerProvider: options.TracerProvider,
-			Version:        options.AgentVersion,
-		}),
+		options:          options,
+		log:              log,
+		observe:          observe,
 		sessions:         make(map[acp.SessionId]*agentSession),
 		store:            NewInMemorySessionStore(),
 		deleted:          make(map[acp.SessionId]struct{}),
@@ -128,15 +131,16 @@ func startRealPiProcess(ctx context.Context, spec pi.LaunchSpec) (piProcess, piC
 }
 
 // Serve runs an ACP agent over the provided streams.
-func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Option) error {
+func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Option) (returnErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	agent := newServeAgent(opts...)
 	defer func() {
-		if err := agent.Close(); err != nil {
-			agent.log.DebugContext(context.Background(), "close pi ACP agent failed", slog.String(jsonFieldError, err.Error()))
+		if closeErr := agent.Close(); closeErr != nil {
+			agent.log.DebugContext(context.Background(), "close pi ACP agent failed", slog.String(jsonFieldError, closeErr.Error()))
+			returnErr = closeErr
 		}
 	}()
 
@@ -215,6 +219,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 		AuthMethods: []acp.AuthMethod{},
 		AgentCapabilities: acp.AgentCapabilities{
 			Meta: map[string]any{
+				routeMetaKey: map[string]any{"versions": []int{routeVersion}},
 				piMetaKey: map[string]any{
 					metaCapabilityFork: map[string]any{
 						"unstable": true,
@@ -310,7 +315,7 @@ func (a *Agent) ensureVersion(ctx context.Context) error {
 		return err
 	}
 
-	if err := pi.CheckMinimumVersion(version, a.options.MinimumVersion); err != nil {
+	if err := pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion); err != nil {
 		return err
 	}
 

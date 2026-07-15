@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 // sessionInterruptTimeout bounds the native abort. The abort runs under a
@@ -17,6 +19,35 @@ var cancelDrainTimeout = 5 * time.Second
 
 // sessionShutdownTimeout bounds the process shutdown ladder on close.
 var sessionShutdownTimeout = 10 * time.Second
+
+// finalizeSessionRuntimeResources releases each admission only after the
+// corresponding resource is proven gone. An unproven native tree retains its
+// admission and the private session root because that tree may still use it.
+func finalizeSessionRuntimeResources(
+	runtimeErr error,
+	nativeRelease func(),
+	sessionRoot string,
+	scratchRelease func(),
+) error {
+	if !pi.ProcessTreeQuiescent(runtimeErr) {
+		return runtimeErr
+	}
+
+	if nativeRelease != nil {
+		nativeRelease()
+	}
+
+	var removeErr error
+	if sessionRoot != "" {
+		removeErr = materializeRemoveAll(sessionRoot)
+	}
+
+	if removeErr == nil && scratchRelease != nil {
+		scratchRelease()
+	}
+
+	return errors.Join(runtimeErr, removeErr)
+}
 
 func (s *agentSession) acquireTurn(ctx context.Context) (func(), error) {
 	turn := s.turnQueue()
@@ -54,6 +85,10 @@ func (s *agentSession) currentClient() piClient {
 // prompt lands here and brings the process back up on the same native session
 // file rather than returning the unknown-session error.
 func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
+	if quiescenceErr := s.nativeQuiescenceError(); quiescenceErr != nil {
+		return quiescenceErr
+	}
+
 	s.mu.Lock()
 	proc := s.proc
 	s.mu.Unlock()
@@ -70,7 +105,11 @@ func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
 
 	s.stopPump()
 
-	_ = proc.Close()
+	if closeErr := proc.Close(); closeErr != nil {
+		s.recordNativeQuiescence(closeErr)
+
+		return closeErr
+	}
 
 	s.mu.Lock()
 	lastSessionFile := s.sessionFilePath
@@ -88,20 +127,31 @@ func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
 	// Detached like the initial launch: the relaunched child must survive
 	// past the prompt request that triggered it.
 	startCtx, finishStart := s.agent.observe.StartPiProcess(context.WithoutCancel(ctx), "relaunch")
+	spawnStarted := time.Now()
 	relaunched, client, err := s.agent.startPiProcess(startCtx, spec)
+	observeRuntimeStartupStage(startCtx, s.agent.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSpawn, spawnStarted, err)
 
 	finishStart(err)
 
 	if err != nil {
+		s.recordNativeQuiescence(err)
+
 		return err
 	}
 
+	readinessStarted := time.Now()
 	if startErr := client.Start(context.WithoutCancel(ctx)); startErr != nil {
-		_ = relaunched.Kill()
-		_ = relaunched.Close()
+		observeRuntimeStartupStage(ctx, s.agent.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupReadiness, readinessStarted, startErr)
 
-		return startErr
+		killErr := relaunched.Kill()
+		closeErr := relaunched.Close()
+		cleanupErr := errors.Join(killErr, closeErr)
+		s.recordNativeQuiescence(cleanupErr)
+
+		return errors.Join(startErr, cleanupErr)
 	}
+
+	observeRuntimeStartupStage(ctx, s.agent.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupReadiness, readinessStarted, nil)
 
 	s.mu.Lock()
 	s.proc = relaunched
@@ -111,7 +161,7 @@ func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
 	s.startPump(client)
 
 	if retryErr := client.SetAutoRetry(ctx, s.autoRetry); retryErr != nil {
-		return retryErr
+		return s.cleanupFailedRelaunch(relaunched, retryErr)
 	}
 
 	// pi computes a fresh session file path per process even for the same
@@ -119,11 +169,14 @@ func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
 	// relaunch or commitMirror would silently read a path that never exists.
 	state, stateErr := client.GetState(ctx)
 	if stateErr != nil {
-		return stateErr
+		return s.cleanupFailedRelaunch(relaunched, stateErr)
 	}
 
 	if state.SessionID != string(s.id) {
-		return fmt.Errorf("native session id drift on relaunch: expected %s, got %s", s.id, state.SessionID)
+		return s.cleanupFailedRelaunch(
+			relaunched,
+			fmt.Errorf("native session id drift on relaunch: expected %s, got %s", s.id, state.SessionID),
+		)
 	}
 
 	s.mu.Lock()
@@ -137,12 +190,55 @@ func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
 	return nil
 }
 
+func (s *agentSession) cleanupFailedRelaunch(proc piProcess, cause error) error {
+	s.stopPump()
+
+	killErr := proc.Kill()
+	closeErr := proc.Close()
+	cleanupErr := errors.Join(killErr, closeErr)
+	s.recordNativeQuiescence(cleanupErr)
+
+	return errors.Join(cause, cleanupErr)
+}
+
 // Cancel cancels the active pi turn. Pending dialogs are resolved cancelled
 // first, then the native abort runs on a bounded background context; the
 // prompt loop keeps draining until pi settles the aborted turn so the mirror
 // commit still lands, with a bounded backstop that cuts the turn context if
 // the settle never arrives.
 func (s *agentSession) Cancel(ctx context.Context) (err error) {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+
+	return s.cancelNative(ctx)
+}
+
+// cancelRouted validates the active turn and keeps its native abort fenced
+// from turn completion and admission of the next turn.
+func (s *agentSession) cancelRouted(ctx context.Context, meta map[string]any) error {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+
+	s.mu.Lock()
+	activeNonce := s.turnNonce
+	active := s.cancel != nil && activeNonce != ""
+	s.mu.Unlock()
+
+	if active {
+		route, err := parseInboundTurnRoute(meta)
+		if err != nil {
+			return err
+		}
+
+		if route.turnNonce != activeNonce {
+			return routeInvalid("stale route turnNonce")
+		}
+	}
+
+	return s.cancelNative(ctx)
+}
+
+func (s *agentSession) cancelNative(ctx context.Context) (err error) {
 	s.cancelPendingInteractions()
 
 	s.mu.Lock()
@@ -235,7 +331,13 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 	s.stopPump()
 
 	if proc != nil {
-		err = errors.Join(err, proc.Close())
+		closeErr := proc.Close()
+
+		err = errors.Join(err, closeErr)
+		s.recordNativeQuiescence(closeErr)
+
+		quiescenceErr := s.nativeQuiescenceError()
+		err = errors.Join(err, quiescenceErr)
 	}
 
 	waitCtx, stopWaiting := context.WithTimeout(context.WithoutCancel(ctx), s.closeTurnTimeout())
@@ -247,13 +349,32 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 		releaseTurn()
 	}
 
-	err = errors.Join(err, s.removeSessionRoot())
+	err = finalizeSessionRuntimeResources(
+		err, s.nativeRootRelease, s.sessionRoot, s.scratchRootRelease,
+	)
 
 	if s.agent != nil {
 		s.agent.observe.RecordPiProcessExit(ctx, "closed", err)
 	}
 
 	return err
+}
+
+func (s *agentSession) recordNativeQuiescence(err error) {
+	if pi.ProcessTreeQuiescent(err) {
+		return
+	}
+
+	s.mu.Lock()
+	s.nativeQuiescenceErr = errors.Join(s.nativeQuiescenceErr, err)
+	s.mu.Unlock()
+}
+
+func (s *agentSession) nativeQuiescenceError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.nativeQuiescenceErr
 }
 
 func (s *agentSession) closeTurnTimeout() time.Duration {

@@ -17,6 +17,7 @@ const (
 	elicitationFieldValue     = "value"
 
 	elicitationModeForm = "form"
+	elicitationModeURL  = "url"
 
 	jsonSchemaTypeString  = "string"
 	jsonSchemaTypeBoolean = "boolean"
@@ -58,7 +59,7 @@ func (s *agentSession) createDialogElicitation(
 			Mode:            elicitationModeForm,
 			RequestedSchema: elicitationSchemaForDialog(request),
 		},
-	}, elicitationScope{SessionID: s.id})
+	}, elicitationScope{SessionID: s.id, TurnNonce: turnNonceFromContext(ctx), RequestID: request.ID})
 	if err != nil {
 		s.agent.log.DebugContext(ctx, "elicitation request failed closed",
 			slog.String(acpFieldSessionID, string(s.id)),

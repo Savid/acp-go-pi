@@ -31,3 +31,10 @@ free-form questions only.
 
 Because behavior depends on the client's advertised capability, test both
 paths: a client that supports elicitation and one that does not.
+
+## Route correlation
+
+The initialize response advertises route-envelope version 1. Every emitted
+form elicitation contains the owning session, current turn nonce, and exactly
+one callback correlation under `_meta["acp-go.dev/route"]`, while preserving
+other metadata. A pre-existing reserved key fails the callback closed.

@@ -39,7 +39,8 @@ servers := []acp.McpServer{
 ## How servers reach pi
 
 The adapter writes a per-session MCP config into the session's isolated agent
-directory and loads its MCP extension alongside the bridge extension. The
+directory with mode `0600` and loads its MCP extension alongside the bridge
+extension. It is removed with that session directory. The
 extension connects to every declared server before the session starts and
 registers each discovered tool under the name `mcp__<server>__<tool>`, so tool
 names are stable and provider-safe. Declared env vars are forwarded to stdio

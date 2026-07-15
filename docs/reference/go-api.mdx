@@ -25,6 +25,13 @@ Hosts that need direct method access can construct `*Agent` with `NewAgent`;
 stream-based hosts normally use `Serve`. `Options` and `ConcurrencyLimits`
 are the exported configuration value types behind the functional options.
 
+`ErrProcessTreeUnproven` is the stable `errors.Is` discriminator returned
+when shutdown cannot prove that every pi descendant exited. `Serve` returns
+an `Agent.Close` error carrying this sentinel even when the stream loop would
+otherwise return normally or with context cancellation. A host that receives
+it must retain or quarantine any resources the native process tree may still
+reach.
+
 ## Process options
 
 | Option | Purpose |
@@ -39,12 +46,12 @@ are the exported configuration value types behind the functional options.
 | `WithSessionStoreLoadTimeout` | Bound store load/list operations used during resume. |
 | `WithConcurrencyLimits` | Cap active sessions and concurrent client calls. |
 | `WithTurnTimeout` | Bound one prompt turn; expiry fails the turn with cause `timeout` (default: no deadline). |
+| `WithRuntimeResourceHooks` | Host admission hooks for native-process roots and adapter scratch roots. |
 
 ## Pi-specific options
 
 | Option | Purpose |
 | --- | --- |
-| `WithPiMinimumVersion` | Override the minimum `pi --version` accepted at startup (default: the version the adapter was verified against). |
 
 ## Per-session options
 
@@ -78,6 +85,21 @@ Request builders: `NewSessionRequest`, `LoadSessionRequest`,
 `WithSessionMeta`, `WithSessionRawEvents`, `WithSessionOutputSchema`,
 `WithListSessionsCwd`, `WithListSessionsCursor`, `WithListSessionsMeta`,
 `StdioMCPServer`, `HTTPMCPServer`.
+
+`PromptRequest(sessionID, turnNonce, blocks...)` and
+`TextPromptRequest(sessionID, turnNonce, text)` require a fresh, unguessable
+nonce per turn. `CancelRequest(sessionID, turnNonce)` must reuse the active
+turn's nonce.
+
+`RuntimeResourceHooks` exposes `AcquireNativeRoot`, `ReserveScratchRoot`,
+`ObserveProcess`, `ObserveProcessSnapshot`, and `ObserveStartupStage`.
+Admission callbacks receive `runtime`, `session`, `prompt`, or `discovery`; nil
+means unbounded standalone operation. Pi acquires discovery and per-session
+native permits before their launches, reserves scratch before making the
+isolated agent directory, and releases only after native exit and directory
+deletion. Pi is lockless and emits no home-lock-supervisor count. Descendant
+snapshots require proven containment; startup observations distinguish spawn,
+readiness, configuration, and native session setup.
 
 Session-store surface: `SessionStore`, `SessionKey`, `SessionSummary`,
 `SessionStoreReplacement`, `InMemorySessionStore`, and the constants

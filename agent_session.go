@@ -244,6 +244,11 @@ func (a *Agent) Prompt(ctx context.Context, params acp.PromptRequest) (resp acp.
 		return acp.PromptResponse{}, err
 	}
 
+	_, err = parseInboundTurnRoute(params.Meta)
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+
 	ctx, finish := a.observe.StartPrompt(ctx, params.Meta, session.currentModel())
 	defer func() { finish(promptResultForObserver(resp, err, session)) }()
 
@@ -266,7 +271,7 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) (err 
 		return err
 	}
 
-	err = session.Cancel(ctx)
+	err = session.cancelRouted(ctx, params.Meta)
 
 	return err
 }
@@ -572,7 +577,18 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		return nil, unsupportedField(optionFieldHome)
 	}
 
-	if versionErr := a.ensureVersion(ctx); versionErr != nil {
+	discoveryRelease, err := acquireNativeRoot(ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery)
+	if err != nil {
+		return nil, err
+	}
+
+	readinessStarted := time.Now()
+	versionErr := a.ensureVersion(ctx)
+	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery, RuntimeStartupReadiness, readinessStarted, versionErr)
+
+	releaseNativeRootWhenQuiescent(discoveryRelease, versionErr)
+
+	if versionErr != nil {
 		return nil, versionErr
 	}
 
@@ -590,16 +606,29 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		return nil, err
 	}
 
-	dirs, err := a.createSessionDirs()
+	scratchRelease, err := reserveScratchRoot(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession)
 	if err != nil {
 		return nil, err
 	}
 
+	var (
+		dirs          sessionDirs
+		nativeRelease func()
+	)
+
+	keepScratch := false
 	defer func() {
-		if err != nil {
-			_ = materializeRemoveAll(dirs.Root)
+		if !keepScratch {
+			err = finalizeSessionRuntimeResources(
+				err, nativeRelease, dirs.Root, scratchRelease,
+			)
 		}
 	}()
+
+	dirs, err = a.createSessionDirs()
+	if err != nil {
+		return nil, err
+	}
 
 	hydratedPath := ""
 
@@ -614,6 +643,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		}
 	}
 
+	configurationStarted := time.Now()
 	includeMCP := len(start.McpServers) > 0
 
 	extensionPaths, err := pi.WriteExtensions(dirs.AgentDir, includeMCP)
@@ -663,6 +693,8 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		SeedFiles:       a.options.SeedFiles,
 	}
 	if writeErr := agentDir.Write(); writeErr != nil {
+		observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, writeErr)
+
 		var seedErr *pi.SeedFileError
 		if errors.As(writeErr, &seedErr) {
 			return nil, unsupportedField("seedFiles." + seedErr.Name)
@@ -670,6 +702,8 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 
 		return nil, writeErr
 	}
+
+	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, nil)
 
 	spec := pi.LaunchSpec{
 		ExecutablePath: executable,
@@ -685,7 +719,15 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	// launch context is detached so the request-scoped cancel cannot kill the
 	// session's long-lived process. Teardown is owned by the shutdown ladder.
 	startCtx, finishStart := a.observe.StartPiProcess(context.WithoutCancel(ctx), "start")
+
+	nativeRelease, err = acquireNativeRoot(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession)
+	if err != nil {
+		return nil, err
+	}
+
+	spawnStarted := time.Now()
 	proc, client, err := a.startPiProcess(startCtx, spec)
+	observeRuntimeStartupStage(startCtx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSpawn, spawnStarted, err)
 
 	finishStart(err)
 
@@ -706,6 +748,8 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		client:                client,
 		turn:                  make(chan struct{}, sessionTurnCapacity),
 		rawMessages:           start.RawMessages,
+		nativeRootRelease:     nativeRelease,
+		scratchRootRelease:    scratchRelease,
 	}
 
 	// The cleanup defer must hold its own reference: failure paths return a
@@ -717,24 +761,37 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		if started && err != nil {
 			created.stopPump()
 
-			_ = proc.Kill()
-			_ = proc.Close()
+			shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), sessionShutdownTimeout)
+			shutdownErr := proc.Shutdown(shutdownCtx)
+
+			cancelShutdown()
+
+			closeErr := proc.Close()
+			cleanupErr := errors.Join(shutdownErr, closeErr)
+			err = errors.Join(err, cleanupErr)
 		}
 	}()
 
+	readinessStarted = time.Now()
 	err = client.Start(context.WithoutCancel(ctx))
+	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupReadiness, readinessStarted, err)
+
 	if err != nil {
 		return nil, err
 	}
 
 	session.startPump(client)
 
+	sessionStarted := time.Now()
 	err = a.setUpNativeSession(ctx, session, start, modelRef, hasModel)
+	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSession, sessionStarted, err)
+
 	if err != nil {
 		return nil, err
 	}
 
 	started = false
+	keepScratch = true
 
 	return session, nil
 }

@@ -11,14 +11,18 @@ import (
 // by the prompt loop when it stops reading, so the pump never blocks on a
 // finished turn.
 type turnSink struct {
-	events chan pi.Event
-	done   chan struct{}
+	events     chan pi.Event
+	uiRequests chan pi.UIRequest
+	done       chan struct{}
 }
 
 func newTurnSink() *turnSink {
 	return &turnSink{
 		events: make(chan pi.Event),
-		done:   make(chan struct{}),
+		// pi dialogs are modal and therefore serialized. One slot keeps the
+		// transport draining if a dialog arrives before the prompt RPC ack.
+		uiRequests: make(chan pi.UIRequest, 1),
+		done:       make(chan struct{}),
 	}
 }
 
@@ -81,8 +85,6 @@ func (s *agentSession) dispatchEvent(ctx context.Context, event pi.Event) {
 		return
 	}
 
-	s.emitRawPiEvent(ctx, event.RawJSON())
-
 	select {
 	case sink.events <- event:
 	case <-sink.done:
@@ -91,21 +93,20 @@ func (s *agentSession) dispatchEvent(ctx context.Context, event pi.Event) {
 }
 
 func (s *agentSession) dispatchUIRequest(ctx context.Context, request pi.UIRequest) {
-	if s.activeTurnSink() != nil {
-		s.emitRawPiEvent(ctx, request.RawJSON())
-	}
+	sink := s.activeTurnSink()
+	if sink == nil {
+		if request.IsDialog() {
+			s.respondUIDialog(ctx, pi.UICancelResponse(request.ID))
+		}
 
-	if !request.IsDialog() {
 		return
 	}
 
-	s.dialogWG.Add(1)
-
-	go func() {
-		defer s.dialogWG.Done()
-
-		s.handleUIDialog(ctx, request)
-	}()
+	select {
+	case sink.uiRequests <- request:
+	case <-sink.done:
+	case <-ctx.Done():
+	}
 }
 
 func (s *agentSession) activeTurnSink() *turnSink {

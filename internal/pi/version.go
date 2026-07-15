@@ -1,7 +1,9 @@
 package pi
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -18,13 +20,47 @@ var execCommandContext = exec.CommandContext
 // ProbeVersion runs `pi --version` and returns the reported version string.
 func ProbeVersion(ctx context.Context, executablePath string) (string, error) {
 	cmd := execCommandContext(ctx, executablePath, "--version")
+	configureProcessCommandPlatform(cmd)
 
-	output, err := cmd.Output()
+	var output bytes.Buffer
+
+	cmd.Stdout = &output
+	cmd.WaitDelay = defaultShutdownStepTimeout
+
+	tree, err := startProcessTree(cmd)
 	if err != nil {
 		return "", fmt.Errorf("probe pi version: %w", err)
 	}
 
-	version := strings.TrimSpace(string(output))
+	cancellationDone := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		defer close(cancellationDone)
+
+		_ = tree.kill()
+	})
+	waitErr := cmd.Wait()
+
+	if stopCancellation() {
+		close(cancellationDone)
+	}
+
+	<-cancellationDone
+
+	quiescenceErr := tree.terminateAndWait(defaultProcessTreeWait)
+	if errors.Is(waitErr, exec.ErrWaitDelay) && quiescenceErr == nil {
+		waitErr = nil
+	}
+
+	if waitErr != nil || quiescenceErr != nil {
+		var probeErr error
+		if waitErr != nil {
+			probeErr = fmt.Errorf("probe pi version: %w", waitErr)
+		}
+
+		return "", errors.Join(probeErr, quiescenceErr)
+	}
+
+	version := strings.TrimSpace(output.String())
 	if version == "" {
 		return "", fmt.Errorf("probe pi version: empty output")
 	}

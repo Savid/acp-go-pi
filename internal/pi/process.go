@@ -13,6 +13,9 @@ import (
 // defaultShutdownStepTimeout bounds each rung of the shutdown ladder.
 const defaultShutdownStepTimeout = 2 * time.Second
 
+// defaultProcessTreeWait bounds the final containment-boundary proof.
+const defaultProcessTreeWait = 5 * time.Second
+
 // stderrTailLimit bounds the retained stderr tail used for error reporting.
 const stderrTailLimit = 8 << 10
 
@@ -111,6 +114,7 @@ func (spec LaunchSpec) Environ() []string {
 // Process is one running pi RPC-mode child process.
 type Process struct {
 	cmd    *exec.Cmd
+	tree   *processTree
 	stdin  *os.File
 	stdout *os.File
 	stderr *tailBuffer
@@ -160,7 +164,8 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 	cmd.Stderr = stderr
 	configureProcessCommandPlatform(cmd)
 
-	if err := cmd.Start(); err != nil {
+	tree, err := startProcessTree(cmd)
+	if err != nil {
 		closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)
 
 		return nil, fmt.Errorf("start pi process: %w", err)
@@ -175,15 +180,28 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 
 	process := &Process{
 		cmd:                 cmd,
+		tree:                tree,
 		stdin:               stdinWrite,
 		stdout:              stdoutRead,
 		stderr:              stderr,
 		shutdownStepTimeout: stepTimeout,
 		exited:              make(chan struct{}),
 	}
+	cancellationDone := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		defer close(cancellationDone)
+
+		_ = tree.kill()
+	})
 
 	wait := func() {
 		process.waitErr = cmd.Wait()
+
+		if stopCancellation() {
+			close(cancellationDone)
+		}
+
+		<-cancellationDone
 
 		close(process.exited)
 	}
@@ -240,24 +258,24 @@ func (p *Process) Shutdown(ctx context.Context) error {
 	_ = p.CloseStdin()
 
 	if p.waitStep(ctx) {
-		return nil
+		return p.tree.terminateAndWait(defaultProcessTreeWait)
 	}
 
-	if _, err := terminateProcess(p.cmd); err != nil {
+	if err := p.tree.terminate(); err != nil {
 		return fmt.Errorf("terminate pi process: %w", err)
 	}
 
 	if p.waitStep(ctx) {
-		return nil
+		return p.tree.terminateAndWait(defaultProcessTreeWait)
 	}
 
-	if _, err := killProcess(p.cmd); err != nil {
+	if err := p.tree.kill(); err != nil {
 		return fmt.Errorf("kill pi process: %w", err)
 	}
 
 	select {
 	case <-p.exited:
-		return nil
+		return p.tree.terminateAndWait(defaultProcessTreeWait)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -265,7 +283,7 @@ func (p *Process) Shutdown(ctx context.Context) error {
 
 // Kill forcefully terminates the child process group.
 func (p *Process) Kill() error {
-	if _, err := killProcess(p.cmd); err != nil {
+	if err := p.tree.kill(); err != nil {
 		return fmt.Errorf("kill pi process: %w", err)
 	}
 
@@ -275,12 +293,13 @@ func (p *Process) Kill() error {
 // Close releases the parent-held pipe ends. Call after the reader is done.
 func (p *Process) Close() error {
 	_ = p.CloseStdin()
+	quiescenceErr := p.tree.terminateAndWait(defaultProcessTreeWait)
 
 	p.stdoutOnce.Do(func() {
 		_ = p.stdout.Close()
 	})
 
-	return nil
+	return quiescenceErr
 }
 
 func (p *Process) waitStep(ctx context.Context) bool {

@@ -81,7 +81,7 @@ func TestPromptSecondPoisonCheck(t *testing.T) {
 	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
 	lateCtx := &poisonOnDoneContext{session: session}
 
-	_, err := session.Prompt(lateCtx, TextPromptRequest("id", "hi"))
+	_, err := session.Prompt(lateCtx, TextPromptRequest("id", "test-turn", "hi"))
 	require.Error(t, err)
 }
 
@@ -91,7 +91,7 @@ func TestPromptClientPromptFailure(t *testing.T) {
 	client.promptErr = errors.New("prompt")
 	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
 
-	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "hi"))
+	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "test-turn", "hi"))
 	requirePiTurnFailure(t, err, failureCauseTransport)
 }
 
@@ -121,7 +121,7 @@ func TestPromptHandleTurnEventEmitFailure(t *testing.T) {
 		}
 	}()
 
-	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "hi"))
+	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "test-turn", "hi"))
 	require.Error(t, err)
 }
 
@@ -134,7 +134,7 @@ func TestFinishTurnCommitMirrorFailure(t *testing.T) {
 	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false), sessionFilePath: t.TempDir()}
 
 	var timedOut atomic.Bool
-	_, err := session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "title"), &promptTurnState{}, &timedOut)
+	_, err := session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, &timedOut)
 	require.Error(t, err)
 }
 
@@ -257,25 +257,25 @@ func TestPromptAndFinishTurnErrorBranches(t *testing.T) {
 	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
 
 	session.poisonCause = "poisoned"
-	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "hello"))
+	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "test-turn", "hello"))
 	require.Error(t, err)
 	session.poisonCause = ""
 	release, err := session.acquireTurn(t.Context())
 	require.NoError(t, err)
-	_, err = session.Prompt(t.Context(), TextPromptRequest("id", "hello"))
+	_, err = session.Prompt(t.Context(), TextPromptRequest("id", "test-turn", "hello"))
 	requireInvalidRequest(t, err)
 	release()
-	_, err = session.Prompt(t.Context(), PromptRequest("id"))
+	_, err = session.Prompt(t.Context(), PromptRequest("id", "test-turn"))
 	requireInvalidParams(t, err)
 	session.proc = nil
-	_, err = session.Prompt(t.Context(), TextPromptRequest("id", "hello"))
+	_, err = session.Prompt(t.Context(), TextPromptRequest("id", "test-turn", "hello"))
 	requirePiTurnFailure(t, err, failureCauseTransport)
 
 	finish := func(state *promptTurnState, timedOut bool) (acp.PromptResponse, error) {
 		var timeout atomic.Bool
 		timeout.Store(timedOut)
 
-		return session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "title"), state, &timeout)
+		return session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "test-turn", "title"), state, &timeout)
 	}
 	session.proc = newStubProcess(false)
 	client.stats = pi.SessionStats{SessionID: "other"}

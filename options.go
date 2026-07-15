@@ -1,18 +1,52 @@
 package piacp
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
-
-	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 // Option configures the pi ACP agent.
 type Option func(*Options)
+
+// RuntimeResourceKind identifies the lifecycle scope consuming a host-managed resource.
+type RuntimeResourceKind string
+
+const (
+	RuntimeResourceRuntime   RuntimeResourceKind = "runtime"
+	RuntimeResourceSession   RuntimeResourceKind = "session"
+	RuntimeResourcePrompt    RuntimeResourceKind = "prompt"
+	RuntimeResourceDiscovery RuntimeResourceKind = "discovery"
+)
+
+type RuntimeProcessKind string
+
+const (
+	RuntimeProcessHomeLockSupervisor RuntimeProcessKind = "home_lock_supervisor"
+	RuntimeProcessProviderDescendant RuntimeProcessKind = "provider_descendant"
+)
+
+type RuntimeStartupStage string
+
+const (
+	RuntimeStartupSpawn         RuntimeStartupStage = "spawn"
+	RuntimeStartupReadiness     RuntimeStartupStage = "readiness"
+	RuntimeStartupConfiguration RuntimeStartupStage = "configuration"
+	RuntimeStartupSession       RuntimeStartupStage = "session"
+)
+
+// RuntimeResourceHooks lets an embedding host enforce native-root and scratch-root limits.
+type RuntimeResourceHooks struct {
+	AcquireNativeRoot      func(context.Context, RuntimeResourceKind) (func(), error)
+	ReserveScratchRoot     func(context.Context, RuntimeResourceKind) (func(), error)
+	ObserveProcess         func(context.Context, RuntimeProcessKind, int64)
+	ObserveProcessSnapshot func(context.Context, RuntimeProcessKind, int)
+	ObserveStartupStage    func(context.Context, RuntimeResourceKind, RuntimeStartupStage, time.Duration, error)
+}
 
 // Options configures the ACP agent process and the pi RPC-mode sessions it
 // starts.
@@ -60,7 +94,8 @@ type Options struct {
 	SessionStoreLoadTimeout time.Duration
 	// TurnTimeout bounds one pi prompt turn. Zero (the default) means no
 	// deadline. On expiry the turn is aborted and fails with cause "timeout".
-	TurnTimeout time.Duration
+	TurnTimeout          time.Duration
+	RuntimeResourceHooks RuntimeResourceHooks
 	// ConcurrencyLimits controls process-local backpressure.
 	ConcurrencyLimits ConcurrencyLimits
 	// SeedFiles maps paths relative to each session's isolated pi agent
@@ -68,9 +103,6 @@ type Options struct {
 	// so the launched CLI reads them as its own config (e.g. settings.json,
 	// which is deep-merged under the adapter's managed keys).
 	SeedFiles map[string]string
-
-	// MinimumVersion is the minimum `pi --version` accepted at startup.
-	MinimumVersion string
 }
 
 // ConcurrencyLimits controls per-agent/session backpressure. Zero fields use defaults.
@@ -81,10 +113,9 @@ type ConcurrencyLimits struct {
 
 func applyOptions(opts []Option) Options {
 	options := Options{
-		AgentName:      "acp-go-pi",
-		AgentTitle:     "acp-go-pi",
-		AgentVersion:   "0.1.0",
-		MinimumVersion: pi.DefaultMinimumVersion,
+		AgentName:    "acp-go-pi",
+		AgentTitle:   "acp-go-pi",
+		AgentVersion: "0.1.0",
 	}
 
 	for _, opt := range opts {
@@ -147,6 +178,13 @@ func WithHome(path string) Option {
 func WithScratchDir(dir string) Option {
 	return func(options *Options) {
 		options.ScratchDir = dir
+	}
+}
+
+// WithRuntimeResourceHooks installs host-facing native-root and scratch-root admission hooks.
+func WithRuntimeResourceHooks(hooks RuntimeResourceHooks) Option {
+	return func(options *Options) {
+		options.RuntimeResourceHooks = hooks
 	}
 }
 
@@ -230,15 +268,6 @@ func WithConcurrencyLimits(limits ConcurrencyLimits) Option {
 func WithSeedFiles(files map[string]string) Option {
 	return func(options *Options) {
 		options.SeedFiles = cloneStringMap(files)
-	}
-}
-
-// WithPiMinimumVersion overrides the minimum `pi --version` the adapter
-// accepts at startup. The default is the version the adapter was verified
-// against.
-func WithPiMinimumVersion(version string) Option {
-	return func(options *Options) {
-		options.MinimumVersion = version
 	}
 }
 

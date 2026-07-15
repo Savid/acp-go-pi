@@ -381,10 +381,10 @@ func TestConformanceTurnFailuresT1ThroughT6(t *testing.T) {
 		scenario.ProviderError = "429 injected provider failure"
 		conn := connectConformanceAgent(t, ctx, &conformanceClient{}, defaultInitializeRequest(), scenario)
 		sessionID := newConformanceSession(t, ctx, conn)
-		_, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "fail"))
+		_, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "fail"))
 		data := requirePiTurnFailure(t, err, "provider")
 		require.Contains(t, data["message"], "injected provider failure")
-		_, err = conn.Prompt(ctx, TextPromptRequest(sessionID, "fail again"))
+		_, err = conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "fail again"))
 		requirePiTurnFailure(t, err, "provider")
 	})
 
@@ -395,9 +395,9 @@ func TestConformanceTurnFailuresT1ThroughT6(t *testing.T) {
 		scenario.PromptBehavior = "die"
 		conn := connectConformanceAgent(t, ctx, &conformanceClient{}, defaultInitializeRequest(), scenario)
 		sessionID := newConformanceSession(t, ctx, conn)
-		_, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "die"))
+		_, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "die"))
 		requirePiTurnFailure(t, err, "process_exit")
-		_, err = conn.Prompt(ctx, TextPromptRequest(sessionID, "addressable"))
+		_, err = conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "addressable"))
 		require.Error(t, err)
 		var requestError *acp.RequestError
 		if errors.As(err, &requestError) {
@@ -413,7 +413,7 @@ func TestConformanceTurnFailuresT1ThroughT6(t *testing.T) {
 		scenario.GarbageLines = 3
 		conn := connectConformanceAgent(t, ctx, &conformanceClient{}, defaultInitializeRequest(), scenario)
 		sessionID := newConformanceSession(t, ctx, conn)
-		response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "garbage"))
+		response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "garbage"))
 		require.NoError(t, err)
 		require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
 	})
@@ -433,11 +433,11 @@ func TestConformanceTurnFailuresT1ThroughT6(t *testing.T) {
 		}
 		done := make(chan result, 1)
 		go func() {
-			response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "cancel"))
+			response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "cancel"))
 			done <- result{response: response, err: err}
 		}()
 		require.Eventually(t, func() bool { return client.text() != "" }, 5*time.Second, 10*time.Millisecond)
-		require.NoError(t, conn.Cancel(ctx, acp.CancelNotification{SessionId: sessionID}))
+		require.NoError(t, conn.Cancel(ctx, CancelRequest(sessionID, "test-turn")))
 		turn := <-done
 		require.NoError(t, turn.err)
 		require.Equal(t, acp.StopReasonCancelled, turn.response.StopReason)
@@ -450,7 +450,7 @@ func TestConformanceTurnFailuresT1ThroughT6(t *testing.T) {
 		scenario.PromptBehavior = "hang"
 		conn := connectConformanceAgent(t, ctx, &conformanceClient{}, defaultInitializeRequest(), scenario, WithTurnTimeout(100*time.Millisecond))
 		sessionID := newConformanceSession(t, ctx, conn)
-		_, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "hang"))
+		_, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "hang"))
 		requirePiTurnFailure(t, err, "timeout")
 	})
 }
@@ -493,7 +493,7 @@ func TestConformancePermissionAndElicitationSeparation(t *testing.T) {
 				client := &conformanceClient{permissionChoice: choice}
 				conn := connectConformanceAgent(t, ctx, client, defaultInitializeRequest(), scenario)
 				sessionID := newConformanceSession(t, ctx, conn)
-				response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "tool"))
+				response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "tool"))
 				require.NoError(t, err)
 				require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
 				client.mu.Lock()
@@ -517,7 +517,7 @@ func TestConformancePermissionAndElicitationSeparation(t *testing.T) {
 		}
 		conn := connectConformanceAgent(t, ctx, client, init, scenario)
 		sessionID := newConformanceSession(t, ctx, conn)
-		response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "elicit"))
+		response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "elicit"))
 		require.NoError(t, err)
 		require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
 		require.Contains(t, client.text(), "accepted")
@@ -546,7 +546,7 @@ func TestConformancePermissionAndElicitationSeparation(t *testing.T) {
 			init.ClientCapabilities.Elicitation = capability.value
 			conn := connectConformanceAgent(t, ctx, client, init, scenario)
 			sessionID := newConformanceSession(t, ctx, conn)
-			response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "elicit"))
+			response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "elicit"))
 			require.NoError(t, err)
 			require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
 			client.mu.Lock()
@@ -605,7 +605,7 @@ func TestConformanceStoreResumeLoadAndPagination(t *testing.T) {
 	cwd := t.TempDir()
 	session, err := conn.NewSession(ctx, NewSessionRequest(cwd))
 	require.NoError(t, err)
-	_, err = conn.Prompt(ctx, TextPromptRequest(session.SessionId, "history"))
+	_, err = conn.Prompt(ctx, TextPromptRequest(session.SessionId, "test-turn", "history"))
 	require.NoError(t, err)
 	_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
 	require.NoError(t, err)
@@ -640,7 +640,7 @@ func TestConformanceDeleteForkAndUnknownSession(t *testing.T) {
 	requireInvalidParams(t, err)
 
 	sessionID := newConformanceSession(t, ctx, conn)
-	_, err = conn.Prompt(ctx, TextPromptRequest(sessionID, "persist"))
+	_, err = conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "persist"))
 	require.NoError(t, err)
 	forked, err := CallForkSession(ctx, conn, ForkSessionRequest(sessionID, t.TempDir()))
 	require.NoError(t, err)
@@ -654,7 +654,7 @@ func TestConformanceDeleteForkAndUnknownSession(t *testing.T) {
 	requireInvalidParams(t, err)
 	_, err = conn.ResumeSession(ctx, ResumeSessionRequest(sessionID, t.TempDir()))
 	requireInvalidParams(t, err)
-	_, err = conn.Prompt(ctx, TextPromptRequest(sessionID, "gone"))
+	_, err = conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "gone"))
 	requireInvalidParams(t, err)
 	require.NoError(t, conn.Cancel(ctx, acp.CancelNotification{SessionId: sessionID}))
 
