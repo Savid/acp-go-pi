@@ -135,6 +135,38 @@ func (s *agentSession) requestPermissionAnswer(ctx context.Context, request pi.U
 		toolCall.RawInput = prompt.Input
 	}
 
+	startOpts := []acp.ToolCallStartOpt{
+		acp.WithStartKind(kind),
+		acp.WithStartStatus(acp.ToolCallStatusPending),
+	}
+	if len(prompt.Input) > 0 {
+		startOpts = append(startOpts, acp.WithStartRawInput(prompt.Input))
+	}
+
+	// Pi raises the bridge dialog before it emits tool_execution_start. The
+	// ACP client must already know this exact native tool-call id before it
+	// can authorize it, so publish the pending call before requesting
+	// permission. The later native start transitions this same call to
+	// in_progress instead of publishing a second start.
+	if err := s.emitUpdates(dialogCtx, []acp.SessionUpdate{
+		acp.StartToolCall(acp.ToolCallId(prompt.ToolCallID), prompt.ToolName, startOpts...),
+	}); err != nil {
+		s.agent.log.DebugContext(ctx, "publish pending permission tool call failed closed",
+			slog.String(acpFieldSessionID, string(s.id)),
+			slog.String(jsonFieldError, err.Error()),
+		)
+
+		return string(permissionOptionDeny)
+	}
+
+	s.mu.Lock()
+	if s.permissionTools == nil {
+		s.permissionTools = make(map[string]struct{})
+	}
+
+	s.permissionTools[prompt.ToolCallID] = struct{}{}
+	s.mu.Unlock()
+
 	resp, err := conn.RequestPermission(dialogCtx, acp.RequestPermissionRequest{
 		SessionId: s.id,
 		ToolCall:  toolCall,
@@ -161,6 +193,23 @@ func (s *agentSession) requestPermissionAnswer(ctx context.Context, request pi.U
 	}
 
 	return string(permissionOptionDeny)
+}
+
+// beginPermissionTool reports whether a bridge dialog already published the
+// pending ACP tool call for this native id. Each marker is consumed exactly
+// once by tool_execution_start; turn teardown clears any marker left behind
+// when cancellation or transport failure prevents the native start event.
+func (s *agentSession) beginPermissionTool(toolCallID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.permissionTools[toolCallID]; !ok {
+		return false
+	}
+
+	delete(s.permissionTools, toolCallID)
+
+	return true
 }
 
 // respondUIDialog writes one dialog answer back to pi; a write failure is

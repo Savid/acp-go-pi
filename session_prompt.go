@@ -192,6 +192,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	s.mu.Lock()
 	s.cancel = cancel
 	s.turnCancelled = false
+	s.permissionTools = nil
 	s.turnNonce = route.turnNonce
 	s.turnSink = sink
 	s.mu.Unlock()
@@ -204,6 +205,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		s.mu.Lock()
 		s.cancel = nil
 		s.turnCancelled = false
+		s.permissionTools = nil
 		s.turnNonce = ""
 
 		if s.turnSink == sink {
@@ -293,6 +295,21 @@ func (s *agentSession) handleTurnEvent(ctx context.Context, event pi.Event, stat
 
 		return false, nil
 	case pi.ToolExecutionStartEvent:
+		if s.beginPermissionTool(typed.ToolCallID) {
+			opts := []acp.ToolCallUpdateOpt{
+				acp.WithUpdateTitle(typed.ToolName),
+				acp.WithUpdateKind(toolKindForName(typed.ToolName)),
+				acp.WithUpdateStatus(acp.ToolCallStatusInProgress),
+			}
+			if len(typed.Args) > 0 {
+				opts = append(opts, acp.WithUpdateRawInput(typed.Args))
+			}
+
+			return false, s.emitUpdates(ctx, []acp.SessionUpdate{
+				acp.UpdateToolCall(acp.ToolCallId(typed.ToolCallID), opts...),
+			})
+		}
+
 		opts := []acp.ToolCallStartOpt{
 			acp.WithStartKind(toolKindForName(typed.ToolName)),
 			acp.WithStartStatus(acp.ToolCallStatusInProgress),

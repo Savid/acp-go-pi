@@ -97,6 +97,7 @@ type agentSession struct {
 	turnNonce           string
 	turnSink            *turnSink
 	pendingDialogs      map[string]*dialogCancel
+	permissionTools     map[string]struct{}
 	rawMessages         rawMessageConfig
 	rawEventSequence    int64
 	mirroredRows        int

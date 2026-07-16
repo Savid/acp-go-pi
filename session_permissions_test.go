@@ -13,6 +13,20 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
+type orderedPermissionClient struct {
+	*dialogStubClient
+	updatesBeforePermission []acp.SessionUpdate
+}
+
+func (c *orderedPermissionClient) RequestPermission(
+	ctx context.Context,
+	request acp.RequestPermissionRequest,
+) (acp.RequestPermissionResponse, error) {
+	c.updatesBeforePermission = append(c.updatesBeforePermission, c.updates...)
+
+	return c.dialogStubClient.RequestPermission(ctx, request)
+}
+
 func TestToolKindForNameMapping(t *testing.T) {
 	for name, kind := range map[string]acp.ToolKind{
 		"read": acp.ToolKindRead, "edit": acp.ToolKindEdit, "write": acp.ToolKindEdit,
@@ -46,8 +60,22 @@ func TestRequestPermissionAnswerFailsClosed(t *testing.T) {
 	)
 
 	permissionClient := newDialogStubClient()
-	permissionClient.permissionErr = errors.New("permission failed")
+	permissionClient.updateErr = errors.New("publish failed")
 	agent.setConnection(permissionClient)
+	require.Equal(
+		t,
+		string(permissionOptionDeny),
+		session.requestPermissionAnswer(
+			t.Context(),
+			pi.UIRequest{ID: "publish-error"},
+			pi.PermissionPrompt{ToolCallID: "native-call-publish-error", ToolName: "bash"},
+		),
+	)
+	require.Empty(t, permissionClient.permissionRequests)
+	require.Empty(t, session.permissionTools)
+
+	permissionClient.updateErr = nil
+	permissionClient.permissionErr = errors.New("permission failed")
 	require.Equal(
 		t,
 		string(permissionOptionDeny),
@@ -92,6 +120,55 @@ func TestRequestPermissionUsesExactNativeToolCallID(t *testing.T) {
 	rawInput, ok := request.ToolCall.RawInput.(json.RawMessage)
 	require.True(t, ok)
 	require.JSONEq(t, `{"command":"echo hi"}`, string(rawInput))
+}
+
+func TestPermissionPublishesPendingCallBeforeRequestAndNativeStartUpdatesIt(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	client := &orderedPermissionClient{dialogStubClient: newDialogStubClient()}
+	client.permissionResponse = acp.RequestPermissionResponse{
+		Outcome: acp.NewRequestPermissionOutcomeSelected(permissionOptionAllow),
+	}
+	agent.setConnection(client)
+	native := newStubPiClient()
+	session := &agentSession{agent: agent, id: "session", client: native}
+
+	session.handleUIDialog(t.Context(), pi.UIRequest{
+		ID:     "permission-1",
+		Method: uiMethodSelect,
+		Title: pi.PermissionTitleMarker +
+			`{"toolCallId":"native-call-42","toolName":"bash","input":{"command":"echo hi"}}`,
+	})
+
+	require.Len(t, client.updatesBeforePermission, 1)
+	pending := client.updatesBeforePermission[0].ToolCall
+	require.NotNil(t, pending)
+	require.Equal(t, acp.ToolCallId("native-call-42"), pending.ToolCallId)
+	require.Equal(t, acp.ToolCallStatusPending, pending.Status)
+	require.Len(t, client.permissionRequests, 1)
+	require.Equal(t, pending.ToolCallId, client.permissionRequests[0].ToolCall.ToolCallId)
+
+	_, err := session.handleTurnEvent(t.Context(), pi.ToolExecutionStartEvent{
+		ToolCallID: "native-call-42",
+		ToolName:   "bash",
+		Args:       json.RawMessage(`{"command":"echo hi"}`),
+	}, &promptTurnState{})
+	require.NoError(t, err)
+
+	starts := 0
+	progressUpdates := 0
+	for _, update := range client.updates {
+		if update.ToolCall != nil {
+			starts++
+		}
+		if update.ToolCallUpdate != nil && update.ToolCallUpdate.Status != nil &&
+			*update.ToolCallUpdate.Status == acp.ToolCallStatusInProgress {
+			progressUpdates++
+			require.Equal(t, pending.ToolCallId, update.ToolCallUpdate.ToolCallId)
+		}
+	}
+	require.Equal(t, 1, starts, "native start must not duplicate the pending tool call")
+	require.Equal(t, 1, progressUpdates)
+	require.Empty(t, session.permissionTools)
 }
 
 func TestMalformedPermissionMarkerFailsClosed(t *testing.T) {
