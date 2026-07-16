@@ -73,11 +73,16 @@ func (s *fakePiServer) runTurn(turn *fakeTurn, message string) {
 // wrapper's containment escalation can prevent its delayed side effect.
 func (s *fakePiServer) runBlockedTool() {
 	command := exec.Command(os.Args[0], "-test.run", "^TestFakePiExecutable$") // #nosec G204 -- re-executes this fixed test helper.
-	command.Env = append(os.Environ(),
-		envFakePiDescendant+"=1",
-		envFakePiDescendantDelay+"="+strconv.Itoa(s.scenario.BlockedToolDelayMs),
-		envFakePiDescendantOutput+"="+s.scenario.BlockedToolOutput,
-	)
+	descendantMode, err := json.Marshal(fakeDescendantMode{
+		DelayMS: s.scenario.BlockedToolDelayMs,
+		Output:  s.scenario.BlockedToolOutput,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "encode blocked tool descendant mode: %v\n", err)
+
+		return
+	}
+	command.Env = fakePiHelperEnv(os.Environ(), string(descendantMode))
 
 	if err := command.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "start blocked tool descendant: %v\n", err)
@@ -104,6 +109,17 @@ func (s *fakePiServer) runBlockedTool() {
 
 	block := make(chan struct{})
 	<-block
+}
+
+func fakePiHelperEnv(base []string, helper string) []string {
+	out := make([]string, 0, len(base)+1)
+	prefix := envFakePiHelper + "="
+	for _, value := range base {
+		if !strings.HasPrefix(value, prefix) {
+			out = append(out, value)
+		}
+	}
+	return append(out, prefix+helper)
 }
 
 func (s *fakePiServer) runProviderErrorTurn() {

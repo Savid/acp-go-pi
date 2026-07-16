@@ -24,10 +24,7 @@ import (
 // It emits only native-shaped frames and implements none of the wrapper's
 // uniform behavior.
 const (
-	envFakePiHelper           = "ACP_GO_PI_FAKE_HELPER"
-	envFakePiDescendant       = "ACP_GO_PI_FAKE_DESCENDANT"
-	envFakePiDescendantDelay  = "ACP_GO_PI_FAKE_DESCENDANT_DELAY_MS"
-	envFakePiDescendantOutput = "ACP_GO_PI_FAKE_DESCENDANT_OUTPUT"
+	envFakePiHelper = "ACP_GO_PI_FAKE_HELPER"
 	// envFakePiMode carries the absolute path of a scenario JSON file; empty
 	// selects the default scenario, which mimics a credential-less real pi
 	// (unknown model, empty catalog, prompts rejected).
@@ -102,6 +99,11 @@ type fakeScenario struct {
 	BlockedToolDelayMs int               `json:"blockedToolDelayMs,omitempty"`
 }
 
+type fakeDescendantMode struct {
+	DelayMS int    `json:"delayMs"`
+	Output  string `json:"output"`
+}
+
 // fakeTurnScenario returns a scenario whose prompt turns succeed: a
 // one-model catalog is pre-selected so the no-API-key rejection does not
 // apply.
@@ -123,11 +125,12 @@ func fakeTurnScenario() fakeScenario {
 // with the helper environment set, turning this test into a standalone
 // `pi --mode rpc` replacement.
 func TestFakePiExecutable(t *testing.T) {
-	if os.Getenv(envFakePiHelper) != "1" {
+	helper := os.Getenv(envFakePiHelper)
+	if helper == "" {
 		return
 	}
-	if os.Getenv(envFakePiDescendant) == "1" {
-		runFakePiDescendant()
+	if helper != "1" {
+		runFakePiDescendant(helper)
 
 		return
 	}
@@ -135,14 +138,17 @@ func TestFakePiExecutable(t *testing.T) {
 	os.Exit(runFakePi(os.Args))
 }
 
-func runFakePiDescendant() {
-	delayMS, _ := strconv.Atoi(os.Getenv(envFakePiDescendantDelay))
-	if delayMS > 0 {
-		time.Sleep(time.Duration(delayMS) * time.Millisecond)
+func runFakePiDescendant(raw string) {
+	var mode fakeDescendantMode
+	if json.Unmarshal([]byte(raw), &mode) != nil {
+		return
+	}
+	if mode.DelayMS > 0 {
+		time.Sleep(time.Duration(mode.DelayMS) * time.Millisecond)
 	}
 
-	if output := os.Getenv(envFakePiDescendantOutput); output != "" {
-		_ = os.WriteFile(output, []byte("OLD_SHOULD_NOT_REACH"), 0o600)
+	if mode.Output != "" {
+		_ = os.WriteFile(mode.Output, []byte("OLD_SHOULD_NOT_REACH"), 0o600)
 	}
 }
 
