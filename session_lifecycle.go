@@ -13,6 +13,12 @@ import (
 // background-derived context so a cancelled caller context cannot abort it.
 var sessionInterruptTimeout = 5 * time.Second
 
+// sessionCancelAbortGrace is the time a user cancellation gives pi to emit
+// its native terminal ladder and acknowledge abort. A native tool can block
+// that acknowledgement indefinitely, so expiry escalates to the session's
+// process-tree containment boundary.
+var sessionCancelAbortGrace = 500 * time.Millisecond
+
 // cancelDrainTimeout bounds how long a cancelled or timed-out turn waits for
 // pi's terminal events after abort before the turn context is cut.
 var cancelDrainTimeout = 5 * time.Second
@@ -305,6 +311,7 @@ func (s *agentSession) cancelNative(ctx context.Context) (err error) {
 	s.mu.Lock()
 	turnCancel := s.cancel
 	client := s.client
+	proc := s.proc
 	s.mu.Unlock()
 
 	if client == nil {
@@ -318,16 +325,56 @@ func (s *agentSession) cancelNative(ctx context.Context) (err error) {
 		defer func() { finish(err) }()
 	}
 
-	interruptCtx, cancelInterrupt := context.WithTimeout(context.WithoutCancel(ctx), sessionInterruptTimeout)
+	abortTimeout := sessionInterruptTimeout
+	if turnCancel != nil {
+		abortTimeout = sessionCancelAbortGrace
+	}
+
+	interruptCtx, cancelInterrupt := context.WithTimeout(context.WithoutCancel(ctx), abortTimeout)
 	defer cancelInterrupt()
 
 	err = client.Abort(interruptCtx)
+	if err != nil && turnCancel != nil {
+		return s.terminateCancelledTurn(context.WithoutCancel(ctx), proc, turnCancel, err)
+	}
 
 	if turnCancel != nil {
 		time.AfterFunc(cancelDrainTimeout, turnCancel)
 	}
 
 	return err
+}
+
+// terminateCancelledTurn is the hard backstop for a native abort that did
+// not acknowledge within the user-cancel grace. Killing and closing the
+// contained process proves descendants quiescent before the turn context is
+// released; a later prompt can then relaunch the same logical session without
+// racing the command tree from the cancelled turn.
+func (s *agentSession) terminateCancelledTurn(
+	ctx context.Context,
+	proc piProcess,
+	turnCancel context.CancelFunc,
+	abortErr error,
+) error {
+	if proc == nil {
+		turnCancel()
+
+		return abortErr
+	}
+
+	killErr := proc.Kill()
+	closeErr := proc.Close()
+	quiescenceErr := errors.Join(killErr, closeErr)
+
+	s.retireProviderProcess(ctx, quiescenceErr)
+	s.recordNativeQuiescence(quiescenceErr)
+	turnCancel()
+
+	if quiescenceErr != nil {
+		return errors.Join(abortErr, quiescenceErr)
+	}
+
+	return nil
 }
 
 // cancelPendingInteractions marks the turn cancelled and resolves any pending

@@ -69,9 +69,11 @@ A turn resolves one of three ways:
   `StopReason`.
 - **Cancelled** — the host cancels; the adapter aborts the native turn and the
   prompt resolves as a successful `cancelled` response, never an error. A user
-  cancel wins even if a turn timeout fires at the same instant. pi keeps the
-  aborted partial assistant message in the session context, so a later prompt
-  may continue from it — that is native behavior, not a replay bug.
+  cancel wins even if a turn timeout fires at the same instant. A native abort
+  that settles normally keeps pi's aborted partial assistant message in the
+  session context. If a blocked native tool prevents that settle fence, the
+  adapter kills the contained process tree, does not mirror the partial turn,
+  and relaunches the same logical session for the next prompt.
 - **Failure** — a process exit, transport break, provider error, or
   `WithTurnTimeout` expiry ends the prompt with a `pi_turn_failed` JSON-RPC
   error. Failures are never reported as a stop reason. The

@@ -339,13 +339,21 @@ func (p *Process) Shutdown(ctx context.Context) error {
 	}
 }
 
-// Kill forcefully terminates the child process group.
+// Kill forcefully terminates the child process group and returns only after
+// the root is reaped and the complete containment boundary is proven
+// quiescent.
 func (p *Process) Kill() error {
 	if err := p.tree.kill(); err != nil {
 		return fmt.Errorf("kill pi process: %w", err)
 	}
 
-	return nil
+	select {
+	case <-p.exited:
+	case <-time.After(defaultProcessTreeWait):
+		return fmt.Errorf("%w: pi process was not reaped after kill", ErrProcessTreeNotQuiescent)
+	}
+
+	return p.tree.terminateAndWait(defaultProcessTreeWait)
 }
 
 // Close releases the parent-held pipe ends. Call after the reader is done.

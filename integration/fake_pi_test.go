@@ -24,7 +24,10 @@ import (
 // It emits only native-shaped frames and implements none of the wrapper's
 // uniform behavior.
 const (
-	envFakePiHelper = "ACP_GO_PI_FAKE_HELPER"
+	envFakePiHelper           = "ACP_GO_PI_FAKE_HELPER"
+	envFakePiDescendant       = "ACP_GO_PI_FAKE_DESCENDANT"
+	envFakePiDescendantDelay  = "ACP_GO_PI_FAKE_DESCENDANT_DELAY_MS"
+	envFakePiDescendantOutput = "ACP_GO_PI_FAKE_DESCENDANT_OUTPUT"
 	// envFakePiMode carries the absolute path of a scenario JSON file; empty
 	// selects the default scenario, which mimics a credential-less real pi
 	// (unknown model, empty catalog, prompts rejected).
@@ -54,6 +57,7 @@ const (
 	fakeBehaviorProviderError = "providerError"
 	fakeBehaviorDie           = "die"
 	fakeBehaviorHang          = "hang"
+	fakeBehaviorBlockedTool   = "blockedTool"
 	fakeBehaviorGarbageBurst  = "garbageBurst"
 )
 
@@ -78,21 +82,24 @@ type fakeCommandSpec struct {
 }
 
 type fakeScenario struct {
-	Models            []fakeModelSpec   `json:"models,omitempty"`
-	ReplyText         string            `json:"replyText,omitempty"`
-	DeltaTexts        []string          `json:"deltaTexts,omitempty"`
-	StreamDelayMs     int               `json:"streamDelayMs,omitempty"`
-	PromptBehavior    string            `json:"promptBehavior,omitempty"`
-	ProviderError     string            `json:"providerError,omitempty"`
-	GarbageLines      int               `json:"garbageLines,omitempty"`
-	ToolName          string            `json:"toolName,omitempty"`
-	ToolArgs          map[string]any    `json:"toolArgs,omitempty"`
-	ToolOutput        string            `json:"toolOutput,omitempty"`
-	PermissionPayload string            `json:"permissionPayload,omitempty"`
-	ElicitMethod      string            `json:"elicitMethod,omitempty"`
-	ElicitTitle       string            `json:"elicitTitle,omitempty"`
-	Commands          []fakeCommandSpec `json:"commands,omitempty"`
-	MCPStartupFailure string            `json:"mcpStartupFailure,omitempty"`
+	Models             []fakeModelSpec   `json:"models,omitempty"`
+	ReplyText          string            `json:"replyText,omitempty"`
+	DeltaTexts         []string          `json:"deltaTexts,omitempty"`
+	StreamDelayMs      int               `json:"streamDelayMs,omitempty"`
+	PromptBehavior     string            `json:"promptBehavior,omitempty"`
+	ProviderError      string            `json:"providerError,omitempty"`
+	GarbageLines       int               `json:"garbageLines,omitempty"`
+	ToolName           string            `json:"toolName,omitempty"`
+	ToolArgs           map[string]any    `json:"toolArgs,omitempty"`
+	ToolOutput         string            `json:"toolOutput,omitempty"`
+	PermissionPayload  string            `json:"permissionPayload,omitempty"`
+	ElicitMethod       string            `json:"elicitMethod,omitempty"`
+	ElicitTitle        string            `json:"elicitTitle,omitempty"`
+	Commands           []fakeCommandSpec `json:"commands,omitempty"`
+	MCPStartupFailure  string            `json:"mcpStartupFailure,omitempty"`
+	BlockedToolPIDFile string            `json:"blockedToolPidFile,omitempty"`
+	BlockedToolOutput  string            `json:"blockedToolOutput,omitempty"`
+	BlockedToolDelayMs int               `json:"blockedToolDelayMs,omitempty"`
 }
 
 // fakeTurnScenario returns a scenario whose prompt turns succeed: a
@@ -119,8 +126,24 @@ func TestFakePiExecutable(t *testing.T) {
 	if os.Getenv(envFakePiHelper) != "1" {
 		return
 	}
+	if os.Getenv(envFakePiDescendant) == "1" {
+		runFakePiDescendant()
+
+		return
+	}
 
 	os.Exit(runFakePi(os.Args))
+}
+
+func runFakePiDescendant() {
+	delayMS, _ := strconv.Atoi(os.Getenv(envFakePiDescendantDelay))
+	if delayMS > 0 {
+		time.Sleep(time.Duration(delayMS) * time.Millisecond)
+	}
+
+	if output := os.Getenv(envFakePiDescendantOutput); output != "" {
+		_ = os.WriteFile(output, []byte("OLD_SHOULD_NOT_REACH"), 0o600)
+	}
 }
 
 // fakePiExecutable writes an executable shim that re-runs this test binary

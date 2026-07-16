@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +48,12 @@ func (s *fakePiServer) runTurn(turn *fakeTurn, message string) {
 	case fakeBehaviorHang:
 		block := make(chan struct{})
 		<-block
+	case fakeBehaviorBlockedTool:
+		if _, err := os.Stat(s.scenario.BlockedToolPIDFile); err == nil {
+			finished = s.runReplyTurn(turn)
+		} else {
+			s.runBlockedTool()
+		}
 	case fakeBehaviorDie:
 		s.out.writeJSON(fakeTypeOnlyEvent{Type: "turn_start"})
 		s.out.writeJSON(fakeMessageEvent{Type: "message_start", Message: s.assistantJSON(nil, "", "")})
@@ -58,6 +66,44 @@ func (s *fakePiServer) runTurn(turn *fakeTurn, message string) {
 	default:
 		finished = s.runReplyTurn(turn)
 	}
+}
+
+// runBlockedTool reproduces a native command that ignores pi's abort signal.
+// The helper descendant inherits the fake pi process group, so only the
+// wrapper's containment escalation can prevent its delayed side effect.
+func (s *fakePiServer) runBlockedTool() {
+	command := exec.Command(os.Args[0], "-test.run", "^TestFakePiExecutable$") // #nosec G204 -- re-executes this fixed test helper.
+	command.Env = append(os.Environ(),
+		envFakePiDescendant+"=1",
+		envFakePiDescendantDelay+"="+strconv.Itoa(s.scenario.BlockedToolDelayMs),
+		envFakePiDescendantOutput+"="+s.scenario.BlockedToolOutput,
+	)
+
+	if err := command.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "start blocked tool descendant: %v\n", err)
+
+		return
+	}
+
+	if err := os.WriteFile(
+		s.scenario.BlockedToolPIDFile,
+		[]byte(strconv.Itoa(command.Process.Pid)),
+		0o600,
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "write blocked tool pid: %v\n", err)
+
+		return
+	}
+
+	s.out.writeJSON(fakeToolExecutionEvent{
+		Type:       "tool_execution_start",
+		ToolCallID: "blocked-call",
+		ToolName:   "bash",
+		Args:       mustJSON(map[string]any{"command": "sleep; printf OLD_SHOULD_NOT_REACH"}),
+	})
+
+	block := make(chan struct{})
+	<-block
 }
 
 func (s *fakePiServer) runProviderErrorTurn() {

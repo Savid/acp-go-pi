@@ -189,12 +189,14 @@ func messageRow(t *testing.T, message pi.AgentMessage) SessionStoreEntry {
 }
 
 type stubProcess struct {
-	exited   chan struct{}
-	waitErr  error
-	stderr   string
-	shutdown error
-	kill     error
-	close    error
+	exited     chan struct{}
+	waitErr    error
+	stderr     string
+	shutdown   error
+	kill       error
+	close      error
+	killCalls  int
+	closeCalls int
 }
 
 func newStubProcess(exited bool) *stubProcess {
@@ -211,8 +213,16 @@ func (p *stubProcess) Exited() <-chan struct{}        { return p.exited }
 func (p *stubProcess) WaitErr() error                 { return p.waitErr }
 func (p *stubProcess) StderrTail() string             { return p.stderr }
 func (p *stubProcess) Shutdown(context.Context) error { return p.shutdown }
-func (p *stubProcess) Kill() error                    { return p.kill }
-func (p *stubProcess) Close() error                   { return p.close }
+func (p *stubProcess) Kill() error {
+	p.killCalls++
+
+	return p.kill
+}
+func (p *stubProcess) Close() error {
+	p.closeCalls++
+
+	return p.close
+}
 
 type directAgentClient struct {
 	done          chan struct{}
@@ -301,6 +311,7 @@ type stubPiClient struct {
 	done         chan struct{}
 	err          error
 	abortErr     error
+	abortFunc    func(context.Context) error
 	promptErr    error
 	respondErr   error
 	responses    []pi.UIResponse
@@ -339,8 +350,14 @@ func (c *stubPiClient) RespondUI(response pi.UIResponse) error {
 	return c.respondErr
 }
 func (c *stubPiClient) Prompt(context.Context, string, []pi.ImageContent) error { return c.promptErr }
-func (c *stubPiClient) Abort(context.Context) error                             { return c.abortErr }
-func (c *stubPiClient) Clone(context.Context) (bool, error)                     { return c.cloneCancel, c.cloneErr }
+func (c *stubPiClient) Abort(ctx context.Context) error {
+	if c.abortFunc != nil {
+		return c.abortFunc(ctx)
+	}
+
+	return c.abortErr
+}
+func (c *stubPiClient) Clone(context.Context) (bool, error) { return c.cloneCancel, c.cloneErr }
 func (c *stubPiClient) GetState(context.Context) (pi.SessionState, error) {
 	return c.state, c.stateErr
 }

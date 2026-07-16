@@ -84,6 +84,62 @@ func TestSessionTurnLifecycleBranches(t *testing.T) {
 	require.Equal(t, defaultSessionCloseTurnWait, (&agentSession{}).closeTurnTimeout())
 }
 
+func TestSessionCancelEscalatesUnacknowledgedAbort(t *testing.T) {
+	originalGrace := sessionCancelAbortGrace
+	sessionCancelAbortGrace = 10 * time.Millisecond
+	t.Cleanup(func() { sessionCancelAbortGrace = originalGrace })
+
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	client := newStubPiClient()
+	client.abortFunc = func(ctx context.Context) error {
+		<-ctx.Done()
+
+		return ctx.Err()
+	}
+
+	process := newStubProcess(false)
+	turnCtx, turnCancel := context.WithCancel(t.Context())
+	session := &agentSession{
+		agent:  agent,
+		client: client,
+		proc:   process,
+		cancel: turnCancel,
+	}
+
+	require.NoError(t, session.Cancel(t.Context()))
+	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
+	require.Equal(t, 1, process.killCalls)
+	require.Equal(t, 1, process.closeCalls)
+	require.NoError(t, session.nativeQuiescenceError())
+}
+
+func TestSessionCancelEscalationFailures(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	abortErr := errors.New("abort")
+
+	t.Run("missing process", func(t *testing.T) {
+		turnCtx, turnCancel := context.WithCancel(t.Context())
+		session := &agentSession{agent: agent}
+
+		require.ErrorIs(t, session.terminateCancelledTurn(t.Context(), nil, turnCancel, abortErr), abortErr)
+		require.ErrorIs(t, turnCtx.Err(), context.Canceled)
+	})
+
+	t.Run("unproven process tree", func(t *testing.T) {
+		turnCtx, turnCancel := context.WithCancel(t.Context())
+		process := newStubProcess(false)
+		process.kill = errors.New("kill")
+		process.close = pi.ErrProcessTreeNotQuiescent
+		session := &agentSession{agent: agent}
+
+		err := session.terminateCancelledTurn(t.Context(), process, turnCancel, abortErr)
+		require.ErrorIs(t, err, abortErr)
+		require.ErrorIs(t, err, pi.ErrProcessTreeNotQuiescent)
+		require.ErrorIs(t, turnCtx.Err(), context.Canceled)
+		require.ErrorIs(t, session.nativeQuiescenceError(), pi.ErrProcessTreeNotQuiescent)
+	})
+}
+
 func TestRelaunchProcessBranches(t *testing.T) {
 	base := func(client *stubPiClient) (*agentSession, *Agent) {
 		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
