@@ -103,3 +103,30 @@ func TestAgentCloseJoinsSessionCloseError(t *testing.T) {
 	}
 	require.Error(t, agent.Close())
 }
+
+func TestServeReturnsUnprovenFailedSpawnWithoutInstalledSession(t *testing.T) {
+	previous := newServeAgent
+	t.Cleanup(func() { newServeAgent = previous })
+
+	newServeAgent = func(opts ...Option) *Agent {
+		agent := NewAgent(append(opts,
+			WithExecutablePath("/fake/pi"),
+			WithScratchDir(t.TempDir()),
+			WithLogger(slog.New(slog.DiscardHandler)),
+		)...)
+		agent.probeVersion = func(context.Context, string) (string, error) {
+			return pi.DefaultMinimumVersion, nil
+		}
+		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+			return nil, nil, pi.ErrProcessTreeNotQuiescent
+		}
+
+		_, err := agent.startSession(context.Background(), sessionStart{Cwd: t.TempDir()})
+		require.ErrorIs(t, err, ErrProcessTreeUnproven)
+		require.Empty(t, agent.sessions)
+
+		return agent
+	}
+
+	require.ErrorIs(t, Serve(context.Background(), strings.NewReader(""), io.Discard), ErrProcessTreeUnproven)
+}

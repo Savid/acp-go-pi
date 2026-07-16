@@ -583,6 +583,8 @@ func unknownSessionError() *acp.RequestError {
 // the native setup sequence (auto-retry off, thinking level, model, catalog,
 // state, commands).
 func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *agentSession, err error) {
+	defer func() { a.recordNativeQuiescence(err) }()
+
 	// pi has no native config or auth root, so a configured Home is an
 	// unsupported option; every session-establishing method fails here.
 	if a.options.Home != "" {

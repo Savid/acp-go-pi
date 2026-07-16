@@ -64,17 +64,18 @@ type Agent struct {
 
 	// Lock order: acquire mu before any session lock. Do not call session
 	// close methods while holding mu.
-	mu                 sync.Mutex
-	closed             bool
-	conn               agentClient
-	sessions           map[acp.SessionId]*agentSession
-	store              SessionStore
-	deleted            map[acp.SessionId]struct{}
-	clientCalls        chan struct{}
-	clientCapabilities acp.ClientCapabilities
-	positionEncoding   acp.PositionEncodingKind
-	activeLimitErr     error
-	processes          *providerProcessTracker
+	mu                  sync.Mutex
+	closed              bool
+	conn                agentClient
+	sessions            map[acp.SessionId]*agentSession
+	store               SessionStore
+	deleted             map[acp.SessionId]struct{}
+	clientCalls         chan struct{}
+	clientCapabilities  acp.ClientCapabilities
+	positionEncoding    acp.PositionEncodingKind
+	activeLimitErr      error
+	processes           *providerProcessTracker
+	nativeQuiescenceErr error
 
 	versionMu      sync.Mutex
 	versionChecked bool
@@ -133,6 +134,7 @@ func (a *Agent) startTrackedPiProcess(
 	if err != nil {
 		if !providerProcessTreeProven(err) {
 			a.processes.register()
+			a.recordNativeQuiescence(err)
 		}
 
 		return nil, nil, nil, err
@@ -205,7 +207,33 @@ func (a *Agent) Close() error {
 		}
 	}
 
-	return errors.Join(closeErrs...)
+	closeErr := errors.Join(closeErrs...)
+	if !pi.ProcessTreeQuiescent(closeErr) {
+		a.recordNativeQuiescence(closeErr)
+
+		return closeErr
+	}
+
+	return errors.Join(closeErr, a.nativeQuiescenceError())
+}
+
+func (a *Agent) recordNativeQuiescence(err error) {
+	if pi.ProcessTreeQuiescent(err) {
+		return
+	}
+
+	a.mu.Lock()
+	if a.nativeQuiescenceErr == nil {
+		a.nativeQuiescenceErr = err
+	}
+	a.mu.Unlock()
+}
+
+func (a *Agent) nativeQuiescenceError() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return a.nativeQuiescenceErr
 }
 
 func (a *Agent) setConnection(conn agentClient) {

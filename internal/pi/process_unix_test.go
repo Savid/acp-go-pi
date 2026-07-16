@@ -169,6 +169,12 @@ func TestProcessSignalFailuresSurface(t *testing.T) {
 	require.ErrorContains(t, process.Kill(), "kill pi process")
 }
 
+func TestProcessKillReportsUnreapedRoot(t *testing.T) {
+	process := &Process{tree: &processTree{}, exited: make(chan struct{})}
+
+	require.ErrorIs(t, process.Kill(), ErrProcessTreeNotQuiescent)
+}
+
 func TestShutdownWaitsForDescendantTreeQuiescence(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "child.pid")

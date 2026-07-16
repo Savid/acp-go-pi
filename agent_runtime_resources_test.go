@@ -183,6 +183,8 @@ func TestSessionStartRetainsScratchWhenSpawnTreeIsUnproven(t *testing.T) {
 
 	_, err := agent.startSession(t.Context(), sessionStart{Cwd: t.TempDir()})
 	require.ErrorIs(t, err, internalpi.ErrProcessTreeNotQuiescent)
+	require.ErrorIs(t, agent.Close(), ErrProcessTreeUnproven)
+	require.ErrorIs(t, agent.Close(), ErrProcessTreeUnproven)
 	require.Zero(t, nativeReleases)
 	require.Zero(t, scratchReleases)
 	entries, readErr := os.ReadDir(scratch)

@@ -428,11 +428,14 @@ func (s *agentSession) emitRawPiEvent(ctx context.Context, raw []byte) {
 		payload["_meta"] = meta
 	}
 
-	if marker, replaced := rawEventMarker(payload); replaced {
-		payload[rawEventFieldEvent] = marker
+	capped, err := capRawEventPayload(payload)
+	if err != nil {
+		s.agent.observe.RecordRawMessageEmitFailure(ctx, err)
+
+		return
 	}
 
-	if err := conn.NotifyExtension(ctx, RawEventMethod, payload); err != nil {
+	if err := conn.NotifyExtension(ctx, RawEventMethod, capped); err != nil {
 		s.agent.observe.RecordRawMessageEmitFailure(ctx, err)
 	}
 }

@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -14,9 +15,10 @@ func TestRouteEnvelopeHardCutover(t *testing.T) {
 	require.Equal(t, turnRouteMeta("turn-old"), turnRouteMetaFromContext(ctx))
 	require.Nil(t, turnRouteMetaFromContext(context.Background()))
 
-	route, err := parseInboundTurnRoute(turnRouteMeta("turn-1"))
+	boundaryNonce := strings.Repeat("n", routeTurnNonceMaxBytes)
+	route, err := parseInboundTurnRoute(turnRouteMeta(boundaryNonce))
 	require.NoError(t, err)
-	require.Equal(t, "turn-1", route.turnNonce)
+	require.Equal(t, boundaryNonce, route.turnNonce)
 
 	for _, meta := range []map[string]any{
 		nil,
@@ -26,6 +28,7 @@ func TestRouteEnvelopeHardCutover(t *testing.T) {
 		{routeMetaKey: map[string]any{routeFieldVer: 1, routeFieldTurn: ""}},
 		{routeMetaKey: map[string]any{routeFieldVer: 1.5, routeFieldTurn: "turn"}},
 		{routeMetaKey: map[string]any{routeFieldVer: "1", routeFieldTurn: "turn"}},
+		{routeMetaKey: map[string]any{routeFieldVer: 1, routeFieldTurn: strings.Repeat("n", routeTurnNonceMaxBytes+1)}},
 	} {
 		_, routeErr := parseInboundTurnRoute(meta)
 		require.Error(t, routeErr)

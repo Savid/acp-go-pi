@@ -1,6 +1,9 @@
 package piacp
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 const (
 	rawEventMaxBytes = 64 * 1024
@@ -69,4 +72,25 @@ func rawEventMarker(payload map[string]any) (map[string]any, bool) {
 	}
 
 	return nil, false
+}
+
+// capRawEventPayload replaces only the native event when the complete routed
+// payload is oversized, then proves the marker payload itself fits. Valid
+// inbound routes are bounded so this final check is defensive rather than a
+// reason to discard a native event.
+func capRawEventPayload(payload map[string]any) (map[string]any, error) {
+	if marker, replaced := rawEventMarker(payload); replaced {
+		payload[rawEventFieldEvent] = marker
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal capped raw event payload: %w", err)
+	}
+
+	if len(data) > rawEventMaxBytes {
+		return nil, fmt.Errorf("capped raw event payload is %d bytes, exceeds %d", len(data), rawEventMaxBytes)
+	}
+
+	return payload, nil
 }

@@ -78,6 +78,10 @@ func TestRawEventSixCases(t *testing.T) {
 
 	client.notifyErr = errors.New("emit")
 	first.emitRawPiEvent(t.Context(), []byte(`{"type":"still-success"}`))
+	first.emitRawPiEvent(
+		withTurnRoute(t.Context(), strings.Repeat("n", rawEventMaxBytes)),
+		[]byte(`{"type":"unbounded-internal-route"}`),
+	)
 	disabled := &agentSession{agent: agent, id: "disabled"}
 	disabled.emitRawPiEvent(t.Context(), []byte(`{"type":"off"}`))
 	first.emitRawPiEvent(t.Context(), nil)

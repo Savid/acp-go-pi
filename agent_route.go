@@ -11,11 +11,12 @@ import (
 )
 
 const (
-	routeMetaKey   = "acp-go.dev/route"
-	routeVersion   = 1
-	routeFieldVer  = "version"
-	routeFieldID   = "sessionId"
-	routeFieldTurn = "turnNonce"
+	routeMetaKey           = "acp-go.dev/route"
+	routeVersion           = 1
+	routeTurnNonceMaxBytes = 4 * 1024
+	routeFieldVer          = "version"
+	routeFieldID           = "sessionId"
+	routeFieldTurn         = "turnNonce"
 )
 
 type inboundTurnRoute struct{ turnNonce string }
@@ -42,6 +43,10 @@ func parseInboundTurnRoute(meta map[string]any) (inboundTurnRoute, error) {
 	nonce, ok := object[routeFieldTurn].(string)
 	if !ok || strings.TrimSpace(nonce) == "" {
 		return inboundTurnRoute{}, routeInvalid("route turnNonce is required")
+	}
+
+	if len(nonce) > routeTurnNonceMaxBytes {
+		return inboundTurnRoute{}, routeInvalid("route turnNonce exceeds the maximum size")
 	}
 
 	return inboundTurnRoute{turnNonce: nonce}, nil
