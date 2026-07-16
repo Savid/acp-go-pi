@@ -128,6 +128,11 @@ func (s *agentSession) requestPermissionAnswer(ctx context.Context, request pi.U
 	state := s.lockToolCallState(prompt.ToolCallID)
 	defer state.mu.Unlock()
 
+	turnNonce, active := s.permissionTurnNonce(dialogCtx)
+	if !active {
+		return string(permissionOptionDeny)
+	}
+
 	if state.permissionRequested || state.terminalPublished {
 		return string(permissionOptionDeny)
 	}
@@ -146,7 +151,8 @@ func (s *agentSession) requestPermissionAnswer(ctx context.Context, request pi.U
 			startOpts = append(startOpts, acp.WithStartRawInput(prompt.Input))
 		}
 
-		if err := s.emitUpdates(dialogCtx, []acp.SessionUpdate{
+		pendingCtx := withTurnRoute(dialogCtx, turnNonce)
+		if err := s.emitUpdates(pendingCtx, []acp.SessionUpdate{
 			acp.StartToolCall(acp.ToolCallId(prompt.ToolCallID), prompt.ToolName, startOpts...),
 		}); err != nil {
 			s.agent.log.DebugContext(ctx, "publish pending permission tool call failed closed",
@@ -199,6 +205,29 @@ func (s *agentSession) requestPermissionAnswer(ctx context.Context, request pi.U
 	}
 
 	return string(permissionOptionDeny)
+}
+
+// permissionTurnNonce captures the active prompt route for a bridge dialog.
+// The dialog context and session must name the same active turn. Cancellation,
+// missing routes, teardown, and stale dialog goroutines all fail closed instead
+// of being rebound to a later turn.
+func (s *agentSession) permissionTurnNonce(ctx context.Context) (string, bool) {
+	if ctx.Err() != nil {
+		return "", false
+	}
+
+	contextNonce := turnNonceFromContext(ctx)
+
+	s.mu.Lock()
+	activeNonce := s.turnNonce
+	active := s.cancel != nil && activeNonce != ""
+	s.mu.Unlock()
+
+	if !active || contextNonce == "" || contextNonce != activeNonce {
+		return "", false
+	}
+
+	return activeNonce, true
 }
 
 // respondUIDialog writes one dialog answer back to pi; a write failure is

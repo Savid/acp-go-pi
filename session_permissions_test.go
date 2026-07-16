@@ -17,6 +17,8 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
+const permissionTestTurnNonce = "permission-turn-0123456789abcdef"
+
 type orderedPermissionClient struct {
 	*dialogStubClient
 	updatesBeforePermission []acp.SessionUpdate
@@ -30,6 +32,7 @@ type strictPermissionClient struct {
 	*directAgentClient
 
 	mu                 sync.Mutex
+	expectedTurnNonce  string
 	tools              map[acp.ToolCallId]acp.ToolCallStatus
 	updates            []acp.SessionUpdate
 	permissionRequests []acp.RequestPermissionRequest
@@ -40,11 +43,25 @@ type strictPermissionClient struct {
 	gateOnce           sync.Once
 }
 
-func newStrictPermissionClient() *strictPermissionClient {
+func newStrictPermissionClient(turnNonce string) *strictPermissionClient {
 	return &strictPermissionClient{
 		directAgentClient: newDirectAgentClient(),
+		expectedTurnNonce: turnNonce,
 		tools:             make(map[acp.ToolCallId]acp.ToolCallStatus),
 	}
+}
+
+func activatePermissionTestTurn(t *testing.T, session *agentSession, turnNonce string) context.Context {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	session.mu.Lock()
+	session.cancel = cancel
+	session.turnNonce = turnNonce
+	session.mu.Unlock()
+
+	return withTurnRoute(ctx, turnNonce)
 }
 
 func (c *strictPermissionClient) gate(
@@ -60,6 +77,10 @@ func (c *strictPermissionClient) gate(
 }
 
 func (c *strictPermissionClient) SessionUpdate(_ context.Context, notification acp.SessionNotification) error {
+	if err := requireExactTurnRoute(notification.Meta, c.expectedTurnNonce); err != nil {
+		return err
+	}
+
 	update := notification.Update
 	toolCallID := acp.ToolCallId("")
 	status := acp.ToolCallStatus("")
@@ -101,6 +122,25 @@ func (c *strictPermissionClient) SessionUpdate(_ context.Context, notification a
 	if shouldGate {
 		c.gateOnce.Do(func() { close(entered) })
 		<-release
+	}
+
+	return nil
+}
+
+func requireExactTurnRoute(meta map[string]any, expectedNonce string) error {
+	raw, ok := meta[routeMetaKey]
+	if !ok {
+		return errors.New("active-turn session update is missing route metadata")
+	}
+
+	route, ok := raw.(map[string]any)
+	if !ok || len(route) != 2 || !routeVersionIsOne(route[routeFieldVer]) {
+		return errors.New("active-turn session update has malformed route metadata")
+	}
+
+	nonce, ok := route[routeFieldTurn].(string)
+	if !ok || nonce == "" || nonce != expectedNonce {
+		return fmt.Errorf("active-turn session update has stale route nonce %q", nonce)
 	}
 
 	return nil
@@ -189,11 +229,12 @@ func TestRequestPermissionAnswerFailsClosed(t *testing.T) {
 	permissionClient := newDialogStubClient()
 	permissionClient.updateErr = errors.New("publish failed")
 	agent.setConnection(permissionClient)
+	turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
 	require.Equal(
 		t,
 		string(permissionOptionDeny),
 		session.requestPermissionAnswer(
-			t.Context(),
+			turnCtx,
 			pi.UIRequest{ID: "publish-error"},
 			pi.PermissionPrompt{ToolCallID: "native-call-publish-error", ToolName: "bash"},
 		),
@@ -207,7 +248,7 @@ func TestRequestPermissionAnswerFailsClosed(t *testing.T) {
 		t,
 		string(permissionOptionDeny),
 		session.requestPermissionAnswer(
-			t.Context(),
+			turnCtx,
 			pi.UIRequest{ID: "error"},
 			pi.PermissionPrompt{
 				ToolCallID: "native-call-error",
@@ -218,6 +259,68 @@ func TestRequestPermissionAnswerFailsClosed(t *testing.T) {
 	)
 }
 
+func TestPermissionRouteValidationFailsClosed(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	client := newStrictPermissionClient(permissionTestTurnNonce)
+	agent.setConnection(client)
+	session := &agentSession{agent: agent, id: "session"}
+	turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
+
+	require.Equal(t, string(permissionOptionDeny), session.requestPermissionAnswer(
+		t.Context(),
+		pi.UIRequest{ID: "missing-context-route"},
+		pi.PermissionPrompt{ToolCallID: "missing-context-route", ToolName: "bash"},
+	))
+	require.Equal(t, string(permissionOptionDeny), session.requestPermissionAnswer(
+		withTurnRoute(t.Context(), "stale-turn-0123456789abcdef"),
+		pi.UIRequest{ID: "stale-context-route"},
+		pi.PermissionPrompt{ToolCallID: "stale-context-route", ToolName: "bash"},
+	))
+
+	cancelledCtx, cancel := context.WithCancel(turnCtx)
+	cancel()
+	require.Equal(t, string(permissionOptionDeny), session.requestPermissionAnswer(
+		cancelledCtx,
+		pi.UIRequest{ID: "cancelled"},
+		pi.PermissionPrompt{ToolCallID: "cancelled", ToolName: "bash"},
+	))
+
+	inactiveSession := &agentSession{agent: agent, id: "inactive-session"}
+	require.Equal(t, string(permissionOptionDeny), inactiveSession.requestPermissionAnswer(
+		withTurnRoute(t.Context(), permissionTestTurnNonce),
+		pi.UIRequest{ID: "outside-turn"},
+		pi.PermissionPrompt{ToolCallID: "outside-turn", ToolName: "bash"},
+	))
+
+	updates, permissions := client.snapshot()
+	require.Empty(t, updates)
+	require.Empty(t, permissions)
+}
+
+func TestStrictPermissionClientRequiresExactTurnRoute(t *testing.T) {
+	client := newStrictPermissionClient(permissionTestTurnNonce)
+	update := acp.StartToolCall("native-call", "bash")
+
+	require.ErrorContains(t, client.SessionUpdate(t.Context(), acp.SessionNotification{
+		Update: update,
+	}), "missing route metadata")
+	require.ErrorContains(t, client.SessionUpdate(t.Context(), acp.SessionNotification{
+		Meta: map[string]any{routeMetaKey: map[string]any{
+			routeFieldVer:  2,
+			routeFieldTurn: permissionTestTurnNonce,
+		}},
+		Update: update,
+	}), "malformed route metadata")
+	require.ErrorContains(t, client.SessionUpdate(t.Context(), acp.SessionNotification{
+		Meta:   turnRouteMeta("stale-turn-0123456789abcdef"),
+		Update: update,
+	}), "stale route nonce")
+	require.NoError(t, client.SessionUpdate(t.Context(), acp.SessionNotification{
+		Meta:   turnRouteMeta(permissionTestTurnNonce),
+		Update: update,
+	}))
+}
+
 func TestRequestPermissionUsesExactNativeToolCallID(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	permissionClient := newDialogStubClient()
@@ -226,9 +329,10 @@ func TestRequestPermissionUsesExactNativeToolCallID(t *testing.T) {
 	}
 	agent.setConnection(permissionClient)
 	session := &agentSession{agent: agent, id: "session"}
+	turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
 
 	answer := session.requestPermissionAnswer(
-		t.Context(),
+		turnCtx,
 		pi.UIRequest{ID: "permission-1"},
 		pi.PermissionPrompt{
 			ToolCallID: "native-call-42",
@@ -248,7 +352,7 @@ func TestRequestPermissionUsesExactNativeToolCallID(t *testing.T) {
 	require.True(t, ok)
 	require.JSONEq(t, `{"command":"echo hi"}`, string(rawInput))
 	require.Equal(t, string(permissionOptionDeny), session.requestPermissionAnswer(
-		t.Context(),
+		turnCtx,
 		pi.UIRequest{ID: "permission-duplicate"},
 		pi.PermissionPrompt{ToolCallID: "native-call-42", ToolName: "bash"},
 	))
@@ -264,8 +368,9 @@ func TestPermissionPublishesPendingCallBeforeRequestAndNativeStartUpdatesIt(t *t
 	agent.setConnection(client)
 	native := newStubPiClient()
 	session := &agentSession{agent: agent, id: "session", client: native}
+	turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
 
-	session.handleUIDialog(t.Context(), pi.UIRequest{
+	session.handleUIDialog(turnCtx, pi.UIRequest{
 		ID:     "permission-1",
 		Method: uiMethodSelect,
 		Title: pi.PermissionTitleMarker +
@@ -280,7 +385,7 @@ func TestPermissionPublishesPendingCallBeforeRequestAndNativeStartUpdatesIt(t *t
 	require.Len(t, client.permissionRequests, 1)
 	require.Equal(t, pending.ToolCallId, client.permissionRequests[0].ToolCall.ToolCallId)
 
-	_, err := session.handleTurnEvent(t.Context(), pi.ToolExecutionStartEvent{
+	_, err := session.handleTurnEvent(turnCtx, pi.ToolExecutionStartEvent{
 		ToolCallID: "native-call-42",
 		ToolName:   "bash",
 		Args:       json.RawMessage(`{"command":"echo hi"}`),
@@ -313,23 +418,24 @@ func TestPermissionSerializationUIFirstDuringPendingPublication(t *testing.T) {
 	defer runtime.GOMAXPROCS(previousProcs)
 
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	client := newStrictPermissionClient()
+	client := newStrictPermissionClient(permissionTestTurnNonce)
 	entered, release := client.gate("native-call", acp.ToolCallStatusPending)
 	agent.setConnection(client)
 	session := &agentSession{agent: agent, id: "session"}
+	turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
 	prompt := pi.PermissionPrompt{ToolCallID: "native-call", ToolName: "bash"}
 
 	answerDone := make(chan string, 1)
 	go func() {
 		answerDone <- session.requestPermissionAnswer(
-			t.Context(), pi.UIRequest{ID: "permission"}, prompt,
+			turnCtx, pi.UIRequest{ID: "permission"}, prompt,
 		)
 	}()
 	requireSignal(t, entered)
 
 	startDone := make(chan error, 1)
 	go func() {
-		_, err := session.handleTurnEvent(t.Context(), pi.ToolExecutionStartEvent{
+		_, err := session.handleTurnEvent(turnCtx, pi.ToolExecutionStartEvent{
 			ToolCallID: prompt.ToolCallID,
 			ToolName:   prompt.ToolName,
 		}, &promptTurnState{})
@@ -345,15 +451,16 @@ func TestPermissionSerializationUIFirstDuringPendingPublication(t *testing.T) {
 
 func TestPermissionSerializationDoesNotBlockUnrelatedToolID(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	client := newStrictPermissionClient()
+	client := newStrictPermissionClient(permissionTestTurnNonce)
 	entered, release := client.gate("permission-call", acp.ToolCallStatusPending)
 	agent.setConnection(client)
 	session := &agentSession{agent: agent, id: "session"}
+	turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
 
 	answerDone := make(chan string, 1)
 	go func() {
 		answerDone <- session.requestPermissionAnswer(
-			t.Context(),
+			turnCtx,
 			pi.UIRequest{ID: "permission"},
 			pi.PermissionPrompt{ToolCallID: "permission-call", ToolName: "bash"},
 		)
@@ -362,7 +469,7 @@ func TestPermissionSerializationDoesNotBlockUnrelatedToolID(t *testing.T) {
 
 	startDone := make(chan error, 1)
 	go func() {
-		_, err := session.handleTurnEvent(t.Context(), pi.ToolExecutionStartEvent{
+		_, err := session.handleTurnEvent(turnCtx, pi.ToolExecutionStartEvent{
 			ToolCallID: "unrelated-call",
 			ToolName:   "read",
 		}, &promptTurnState{})
@@ -377,21 +484,22 @@ func TestPermissionSerializationDoesNotBlockUnrelatedToolID(t *testing.T) {
 
 func TestPermissionSerializationNativeStartFirst(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	client := newStrictPermissionClient()
+	client := newStrictPermissionClient(permissionTestTurnNonce)
 	agent.setConnection(client)
 	session := &agentSession{agent: agent, id: "session"}
+	turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
 	prompt := pi.PermissionPrompt{ToolCallID: "native-call", ToolName: "bash"}
 
-	_, err := session.handleTurnEvent(t.Context(), pi.ToolExecutionStartEvent{
+	_, err := session.handleTurnEvent(turnCtx, pi.ToolExecutionStartEvent{
 		ToolCallID: prompt.ToolCallID,
 		ToolName:   prompt.ToolName,
 	}, &promptTurnState{})
 	require.NoError(t, err)
 	require.Equal(t, string(permissionOptionAllow), session.requestPermissionAnswer(
-		t.Context(), pi.UIRequest{ID: "permission"}, prompt,
+		turnCtx, pi.UIRequest{ID: "permission"}, prompt,
 	))
 
-	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionStartEvent{
+	_, err = session.handleTurnEvent(turnCtx, pi.ToolExecutionStartEvent{
 		ToolCallID: prompt.ToolCallID,
 		ToolName:   prompt.ToolName,
 	}, &promptTurnState{})
@@ -404,23 +512,24 @@ func TestPermissionSerializationTerminalCannotOvertakeAdmission(t *testing.T) {
 	defer runtime.GOMAXPROCS(previousProcs)
 
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	client := newStrictPermissionClient()
+	client := newStrictPermissionClient(permissionTestTurnNonce)
 	entered, release := client.gate("native-call", acp.ToolCallStatusPending)
 	agent.setConnection(client)
 	session := &agentSession{agent: agent, id: "session"}
+	turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
 	prompt := pi.PermissionPrompt{ToolCallID: "native-call", ToolName: "bash"}
 
 	answerDone := make(chan string, 1)
 	go func() {
 		answerDone <- session.requestPermissionAnswer(
-			t.Context(), pi.UIRequest{ID: "permission"}, prompt,
+			turnCtx, pi.UIRequest{ID: "permission"}, prompt,
 		)
 	}()
 	requireSignal(t, entered)
 
 	terminalDone := make(chan error, 1)
 	go func() {
-		_, err := session.handleTurnEvent(t.Context(), pi.ToolExecutionEndEvent{
+		_, err := session.handleTurnEvent(turnCtx, pi.ToolExecutionEndEvent{
 			ToolCallID: prompt.ToolCallID,
 		}, &promptTurnState{})
 		terminalDone <- err
@@ -431,7 +540,7 @@ func TestPermissionSerializationTerminalCannotOvertakeAdmission(t *testing.T) {
 	require.Equal(t, string(permissionOptionAllow), requireValue(t, answerDone))
 	require.NoError(t, requireValue(t, terminalDone))
 
-	_, err := session.handleTurnEvent(t.Context(), pi.ToolExecutionEndEvent{
+	_, err := session.handleTurnEvent(turnCtx, pi.ToolExecutionEndEvent{
 		ToolCallID: prompt.ToolCallID,
 	}, &promptTurnState{})
 	require.NoError(t, err)
@@ -441,9 +550,10 @@ func TestPermissionSerializationTerminalCannotOvertakeAdmission(t *testing.T) {
 func TestPermissionSerializationConcurrentDeliveryStress(t *testing.T) {
 	for iteration := range 128 {
 		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-		client := newStrictPermissionClient()
+		client := newStrictPermissionClient(permissionTestTurnNonce)
 		agent.setConnection(client)
 		session := &agentSession{agent: agent, id: "session"}
+		turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
 		prompt := pi.PermissionPrompt{ToolCallID: fmt.Sprintf("native-call-%d", iteration), ToolName: "bash"}
 		start := make(chan struct{})
 		answerDone := make(chan string, 1)
@@ -452,12 +562,12 @@ func TestPermissionSerializationConcurrentDeliveryStress(t *testing.T) {
 		go func() {
 			<-start
 			answerDone <- session.requestPermissionAnswer(
-				t.Context(), pi.UIRequest{ID: fmt.Sprintf("permission-%d", iteration)}, prompt,
+				turnCtx, pi.UIRequest{ID: fmt.Sprintf("permission-%d", iteration)}, prompt,
 			)
 		}()
 		go func() {
 			<-start
-			_, err := session.handleTurnEvent(t.Context(), pi.ToolExecutionStartEvent{
+			_, err := session.handleTurnEvent(turnCtx, pi.ToolExecutionStartEvent{
 				ToolCallID: prompt.ToolCallID,
 				ToolName:   prompt.ToolName,
 			}, &promptTurnState{})
@@ -479,30 +589,31 @@ func TestPermissionToolLifecycleEmitFailuresAndLateEvents(t *testing.T) {
 	}
 	agent.setConnection(client)
 	session := &agentSession{agent: agent, id: "session"}
+	turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
 	prompt := pi.PermissionPrompt{ToolCallID: "native-call", ToolName: "bash"}
 
 	require.Equal(t, string(permissionOptionAllow), session.requestPermissionAnswer(
-		t.Context(), pi.UIRequest{ID: "permission"}, prompt,
+		turnCtx, pi.UIRequest{ID: "permission"}, prompt,
 	))
 	client.updateErr = errors.New("in-progress update failed")
-	_, err := session.handleTurnEvent(t.Context(), pi.ToolExecutionStartEvent{
+	_, err := session.handleTurnEvent(turnCtx, pi.ToolExecutionStartEvent{
 		ToolCallID: prompt.ToolCallID,
 		ToolName:   prompt.ToolName,
 	}, &promptTurnState{})
 	require.ErrorContains(t, err, "in-progress update failed")
 
 	client.updateErr = nil
-	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionStartEvent{
+	_, err = session.handleTurnEvent(turnCtx, pi.ToolExecutionStartEvent{
 		ToolCallID: prompt.ToolCallID,
 		ToolName:   prompt.ToolName,
 	}, &promptTurnState{})
 	require.NoError(t, err)
-	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionEndEvent{
+	_, err = session.handleTurnEvent(turnCtx, pi.ToolExecutionEndEvent{
 		ToolCallID: prompt.ToolCallID,
 	}, &promptTurnState{})
 	require.NoError(t, err)
 	updatesBeforeLatePartial := len(client.updates)
-	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionUpdateEvent{
+	_, err = session.handleTurnEvent(turnCtx, pi.ToolExecutionUpdateEvent{
 		ToolCallID:    prompt.ToolCallID,
 		PartialResult: &pi.ToolResult{},
 	}, &promptTurnState{})
@@ -514,18 +625,19 @@ func TestPermissionToolLifecycleEmitFailuresAndLateEvents(t *testing.T) {
 	terminalClient.updateErr = errors.New("terminal update failed")
 	terminalAgent.setConnection(terminalClient)
 	terminalSession := &agentSession{agent: terminalAgent, id: "session"}
-	_, err = terminalSession.handleTurnEvent(t.Context(), pi.ToolExecutionEndEvent{
+	terminalTurnCtx := activatePermissionTestTurn(t, terminalSession, permissionTestTurnNonce)
+	_, err = terminalSession.handleTurnEvent(terminalTurnCtx, pi.ToolExecutionEndEvent{
 		ToolCallID: "terminal-before-start",
 	}, &promptTurnState{})
 	require.ErrorContains(t, err, "terminal update failed")
 
 	terminalClient.updateErr = nil
-	_, err = terminalSession.handleTurnEvent(t.Context(), pi.ToolExecutionEndEvent{
+	_, err = terminalSession.handleTurnEvent(terminalTurnCtx, pi.ToolExecutionEndEvent{
 		ToolCallID: "terminal-before-start",
 	}, &promptTurnState{})
 	require.NoError(t, err)
 	require.Equal(t, string(permissionOptionDeny), terminalSession.requestPermissionAnswer(
-		t.Context(),
+		terminalTurnCtx,
 		pi.UIRequest{ID: "permission-after-terminal"},
 		pi.PermissionPrompt{ToolCallID: "terminal-before-start", ToolName: "bash"},
 	))
