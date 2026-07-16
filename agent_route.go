@@ -72,6 +72,10 @@ func stampRouteMeta(meta map[string]any, scope elicitationScope) (map[string]any
 		return nil, fmt.Errorf("route metadata requires sessionId and turnNonce")
 	}
 
+	if len(scope.TurnNonce) > routeTurnNonceMaxBytes {
+		return nil, fmt.Errorf("route turnNonce exceeds the maximum size")
+	}
+
 	if _, exists := meta[routeMetaKey]; exists {
 		return nil, fmt.Errorf("reserved route metadata collision")
 	}
@@ -124,6 +128,18 @@ func newRouteRequestID() (string, error) {
 
 func turnRouteMeta(turnNonce string) map[string]any {
 	return map[string]any{routeMetaKey: map[string]any{routeFieldVer: routeVersion, routeFieldTurn: turnNonce}}
+}
+
+func requestTurnRouteMeta(turnNonce string) map[string]any {
+	if !validRouteTurnNonce(turnNonce) {
+		return nil
+	}
+
+	return turnRouteMeta(turnNonce)
+}
+
+func validRouteTurnNonce(turnNonce string) bool {
+	return strings.TrimSpace(turnNonce) != "" && len(turnNonce) <= routeTurnNonceMaxBytes
 }
 
 func withTurnRoute(ctx context.Context, turnNonce string) context.Context {

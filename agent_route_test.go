@@ -19,6 +19,9 @@ func TestRouteEnvelopeHardCutover(t *testing.T) {
 	route, err := parseInboundTurnRoute(turnRouteMeta(boundaryNonce))
 	require.NoError(t, err)
 	require.Equal(t, boundaryNonce, route.turnNonce)
+	require.NotNil(t, requestTurnRouteMeta(boundaryNonce))
+	require.Nil(t, requestTurnRouteMeta(""))
+	require.Nil(t, requestTurnRouteMeta(strings.Repeat("n", routeTurnNonceMaxBytes+1)))
 
 	for _, meta := range []map[string]any{
 		nil,
@@ -55,6 +58,13 @@ func TestRouteEnvelopeHardCutover(t *testing.T) {
 	require.ErrorContains(t, err, "exactly one")
 	_, err = stampRouteMeta(nil, elicitationScope{})
 	require.Error(t, err)
+	_, err = stampRouteMeta(nil, elicitationScope{SessionID: "s", TurnNonce: strings.Repeat("n", routeTurnNonceMaxBytes+1)})
+	require.ErrorContains(t, err, "maximum size")
+	boundaryStamped, err := stampRouteMeta(nil, elicitationScope{
+		SessionID: "s", TurnNonce: boundaryNonce, RequestID: "request-boundary",
+	})
+	require.NoError(t, err)
+	require.Equal(t, boundaryNonce, anyMap(t, boundaryStamped[routeMetaKey])[routeFieldTurn])
 	generated, err := stampRouteMeta(nil, elicitationScope{SessionID: "s", TurnNonce: "t"})
 	require.NoError(t, err)
 	generatedRoute, ok := generated[routeMetaKey].(map[string]any)

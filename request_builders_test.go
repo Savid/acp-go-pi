@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -42,6 +43,13 @@ func TestSessionRequestBuildersAndCloning(t *testing.T) {
 	require.Len(t, TextPromptRequest("id", "test-turn", "text").Prompt, 1)
 	require.NotNil(t, PromptRequest("id", "turn-2").Prompt)
 	require.Equal(t, turnRouteMeta("turn-cancel"), CancelRequest("id", "turn-cancel").Meta)
+	boundaryNonce := strings.Repeat("n", routeTurnNonceMaxBytes)
+	require.Equal(t, turnRouteMeta(boundaryNonce), PromptRequest("id", boundaryNonce).Meta)
+	require.Equal(t, turnRouteMeta(boundaryNonce), CancelRequest("id", boundaryNonce).Meta)
+	for _, invalidNonce := range []string{"", " \t", strings.Repeat("n", routeTurnNonceMaxBytes+1)} {
+		require.Nil(t, PromptRequest("id", invalidNonce).Meta)
+		require.Nil(t, CancelRequest("id", invalidNonce).Meta)
+	}
 
 	config := SetConfigOptionRequest("id", "custom", "value")
 	require.NotNil(t, config.ValueId)

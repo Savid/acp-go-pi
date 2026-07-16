@@ -175,24 +175,26 @@ func (config sessionRequestConfig) additionalDirectoriesClone() []string {
 }
 
 // PromptRequest constructs a session/prompt request with a non-nil prompt
-// slice for embedded Go callers.
+// slice for embedded Go callers. turnNonce must be non-empty and at most 4096
+// bytes; an invalid value omits route metadata so the agent rejects the request.
 func PromptRequest(sessionID acp.SessionId, turnNonce string, blocks ...acp.ContentBlock) acp.PromptRequest {
 	return acp.PromptRequest{
 		SessionId: sessionID,
-		Meta:      turnRouteMeta(turnNonce),
+		Meta:      requestTurnRouteMeta(turnNonce),
 		Prompt:    append([]acp.ContentBlock{}, blocks...),
 	}
 }
 
 // TextPromptRequest constructs a session/prompt request containing one text
-// content block.
+// content block. It applies the same turn-nonce validation as PromptRequest.
 func TextPromptRequest(sessionID acp.SessionId, turnNonce, text string) acp.PromptRequest {
 	return PromptRequest(sessionID, turnNonce, acp.TextBlock(text))
 }
 
-// CancelRequest builds an active-turn cancellation carrying the mandatory route nonce.
+// CancelRequest builds an active-turn cancellation carrying the mandatory
+// route nonce. Invalid nonces omit route metadata and fail closed at the agent.
 func CancelRequest(sessionID acp.SessionId, turnNonce string) acp.CancelNotification {
-	return acp.CancelNotification{SessionId: sessionID, Meta: turnRouteMeta(turnNonce)}
+	return acp.CancelNotification{SessionId: sessionID, Meta: requestTurnRouteMeta(turnNonce)}
 }
 
 // SetConfigOptionRequest constructs a value-id session/set_config_option request.

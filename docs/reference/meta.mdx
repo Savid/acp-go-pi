@@ -23,8 +23,8 @@ Initialize advertises capability descriptors under `_meta.pi`:
 Initialize also advertises the separate reserved capability
 `_meta["acp-go.dev/route"] = {"versions":[1]}`. Prompts and active-turn
 cancellations require exactly `{"version":1,"turnNonce":"..."}` under that
-key. A nonce is fresh and unguessable per turn; missing, extra, unsupported, or
-stale route data is rejected.
+key. A nonce is fresh and unguessable per turn, non-empty, and at most 4096
+bytes; missing, oversized, extra, unsupported, or stale route data is rejected.
 
 Every live-turn `session/update` and `_pi/rawEvent` notification carries the
 same exact `{version, turnNonce}` object in its notification `_meta`; raw-event
