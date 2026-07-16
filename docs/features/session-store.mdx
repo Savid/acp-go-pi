@@ -30,11 +30,11 @@ session directory when the local file is missing. Because the ACP session id
 is pi's own session UUID (it lives in the header row), a restored session
 keeps its id and full history.
 
-The fence applies uniformly to success, cancellation, and provider-error
-turns: if pi emits `agent_settled`, its durable native state is mirrored before
-the ACP terminal result. A transport break, process exit, or cancellation path
-that never reaches `agent_settled` is never mirrored, even if partial bytes
-exist on disk.
+The fence applies to natively settled success and provider-error turns: their
+durable state is mirrored before the ACP terminal result. Cancellation and
+timeout instead terminate and prove the per-session process tree, then resume
+from the last committed mirror on a later prompt. Transport and process
+failures likewise never mirror partial bytes.
 
 ## The store contract
 

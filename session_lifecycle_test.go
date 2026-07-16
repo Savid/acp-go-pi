@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -111,6 +112,112 @@ func TestSessionCancelEscalatesUnacknowledgedAbort(t *testing.T) {
 	require.Equal(t, 1, process.killCalls)
 	require.Equal(t, 1, process.closeCalls)
 	require.NoError(t, session.nativeQuiescenceError())
+}
+
+func TestSessionCancelContainsAcknowledgedAbortBeforeReturning(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	client := newStubPiClient()
+	process := newStubProcess(false)
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	process.closeFunc = func() error {
+		close(closeStarted)
+		<-releaseClose
+
+		return nil
+	}
+
+	turnCtx, turnCancel := context.WithCancel(t.Context())
+	session := &agentSession{
+		agent:         agent,
+		client:        client,
+		proc:          process,
+		cancel:        turnCancel,
+		turnFenceDone: make(chan struct{}),
+	}
+
+	cancelDone := make(chan error, 1)
+	go func() { cancelDone <- session.Cancel(t.Context()) }()
+
+	<-closeStarted
+	require.NoError(t, turnCtx.Err(), "turn context must remain live until containment is proved")
+	select {
+	case err := <-cancelDone:
+		t.Fatalf("cancel settled before process-tree proof: %v", err)
+	default:
+	}
+
+	close(releaseClose)
+	require.NoError(t, <-cancelDone)
+	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
+	require.Equal(t, 1, process.killCalls)
+	require.Equal(t, 1, process.closeCalls)
+}
+
+func TestPromptTimeoutContainsProcessTreeBeforeReturning(t *testing.T) {
+	agent := NewAgent(
+		WithLogger(slog.New(slog.DiscardHandler)),
+		WithTurnTimeout(20*time.Millisecond),
+	)
+	client := newStubPiClient()
+	process := newStubProcess(false)
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	process.closeFunc = func() error {
+		close(closeStarted)
+		<-releaseClose
+
+		return nil
+	}
+	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
+	session.startPump(client)
+
+	promptDone := make(chan error, 1)
+	go func() {
+		_, err := session.Prompt(t.Context(), TextPromptRequest("id", "timeout-turn", "hang"))
+		promptDone <- err
+	}()
+
+	<-closeStarted
+	select {
+	case err := <-promptDone:
+		t.Fatalf("timeout settled before process-tree proof: %v", err)
+	default:
+	}
+
+	close(releaseClose)
+	err := <-promptDone
+	requirePiTurnFailure(t, err, failureCauseTimeout)
+	require.Equal(t, 1, process.killCalls)
+	require.Equal(t, 1, process.closeCalls)
+}
+
+func TestTurnFenceInactiveIdempotentAndErrorBranches(t *testing.T) {
+	var timedOut atomic.Bool
+	inactive := &agentSession{}
+	require.NoError(t, inactive.fenceTimedOutTurn(t.Context(), &timedOut))
+	require.False(t, timedOut.Load())
+	require.NoError(t, inactive.fenceTurnAfterContext(t.Context()))
+	require.NoError(t, inactive.fenceTurnAfterFailure(t.Context()))
+
+	turnCtx, turnCancel := context.WithCancel(t.Context())
+	process := newStubProcess(false)
+	process.close = pi.ErrProcessTreeNotQuiescent
+	active := &agentSession{
+		client:        newStubPiClient(),
+		proc:          process,
+		cancel:        turnCancel,
+		turnFenceDone: make(chan struct{}),
+	}
+	err := active.fenceTurnAfterContext(t.Context())
+	require.ErrorIs(t, err, pi.ErrProcessTreeNotQuiescent)
+	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
+	require.ErrorIs(t, active.fenceTurnAfterFailure(t.Context()), pi.ErrProcessTreeNotQuiescent)
+	require.Equal(t, 1, process.killCalls)
+	require.Equal(t, 1, process.closeCalls)
+
+	settling := &agentSession{cancel: func() {}, turnSettling: true}
+	require.NoError(t, settling.fenceTurnAfterContext(t.Context()))
 }
 
 func TestSessionCancelEscalationFailures(t *testing.T) {

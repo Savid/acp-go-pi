@@ -53,12 +53,13 @@ the tree entries appended after each settled turn.
 
 Each prompt is a *turn*. A turn ends with an ACP `StopReason`, a user cancel,
 or a native failure. Cancelling a turn resolves as a successful `cancelled`
-response, not an error. If a native tool prevents pi from acknowledging its
-abort, the adapter terminates the session's contained process tree and proves
-it quiescent before admitting another turn; the next prompt relaunches the
-same logical session. A turn that never terminates can be bounded with
-`WithTurnTimeout`; on expiry the native turn is aborted and the prompt fails
-with a `pi_turn_failed` error whose cause is `timeout`. See
+response, not an error. Native abort is advisory: for every active cancel the
+adapter terminates the session's contained process tree and proves it
+quiescent before either the cancel path or prompt settles. The next prompt
+lazily relaunches the same logical session. A turn that never terminates can
+be bounded with `WithTurnTimeout`; on expiry the adapter applies the same
+process-tree fence before the prompt fails with a `pi_turn_failed` error whose
+cause is `timeout`. See
 [Prompt streaming](/docs/core/prompt-streaming) for how turn output is
 delivered and [ACP methods](/docs/reference/acp-methods) for the failure
 contract.

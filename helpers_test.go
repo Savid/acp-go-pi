@@ -195,6 +195,8 @@ type stubProcess struct {
 	shutdown   error
 	kill       error
 	close      error
+	killFunc   func() error
+	closeFunc  func() error
 	killCalls  int
 	closeCalls int
 }
@@ -215,11 +217,17 @@ func (p *stubProcess) StderrTail() string             { return p.stderr }
 func (p *stubProcess) Shutdown(context.Context) error { return p.shutdown }
 func (p *stubProcess) Kill() error {
 	p.killCalls++
+	if p.killFunc != nil {
+		return p.killFunc()
+	}
 
 	return p.kill
 }
 func (p *stubProcess) Close() error {
 	p.closeCalls++
+	if p.closeFunc != nil {
+		return p.closeFunc()
+	}
 
 	return p.close
 }

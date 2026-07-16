@@ -2,6 +2,7 @@ package piacp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -197,6 +198,10 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	s.turnCancelled = false
 	s.turnNonce = route.turnNonce
 	s.turnSink = sink
+	s.turnFenceStarted = false
+	s.turnFenceDone = make(chan struct{})
+	s.turnFenceErr = nil
+	s.turnSettling = false
 	s.mu.Unlock()
 	s.cancelMu.Unlock()
 
@@ -210,6 +215,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		s.cancel = nil
 		s.turnCancelled = false
 		s.turnNonce = ""
+		s.turnSettling = false
 
 		if s.turnSink == sink {
 			s.turnSink = nil
@@ -224,15 +230,16 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 
 	if timeout := s.agent.turnTimeout(); timeout > 0 {
 		timer := time.AfterFunc(timeout, func() {
-			timedOut.Store(true)
-			s.abortForTimeout(cancel)
+			_ = s.fenceTimedOutTurn(context.Background(), &timedOut)
 		})
 		defer timer.Stop()
 	}
 
 	client := s.currentClient()
 	if promptErr := client.Prompt(turnCtx, mapped.Message, mapped.Images); promptErr != nil {
-		return acp.PromptResponse{}, s.nativeTurnFailure(promptErr)
+		fenceErr := s.fenceTurnAfterFailure(context.WithoutCancel(ctx))
+
+		return acp.PromptResponse{}, errors.Join(s.nativeTurnFailure(promptErr), fenceErr)
 	}
 
 	state := &promptTurnState{}
@@ -241,6 +248,10 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		select {
 		case event, ok := <-sink.events:
 			if !ok {
+				if fenceErr := s.fenceTurnAfterFailure(context.WithoutCancel(ctx)); fenceErr != nil {
+					return acp.PromptResponse{}, fenceErr
+				}
+
 				return s.transportEndedTurn(params.MessageId, &timedOut)
 			}
 
@@ -267,6 +278,10 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 				}()
 			}
 		case <-turnCtx.Done():
+			if fenceErr := s.fenceTurnAfterContext(context.WithoutCancel(ctx)); fenceErr != nil {
+				return acp.PromptResponse{}, fenceErr
+			}
+
 			return s.contextEndedTurn(params.MessageId, &timedOut)
 		}
 	}
@@ -405,6 +420,18 @@ func (s *agentSession) finishTurn(
 	state *promptTurnState,
 	timedOut *atomic.Bool,
 ) (acp.PromptResponse, error) {
+	if fenceErr := s.claimTurnSettlement(); fenceErr != nil {
+		return acp.PromptResponse{}, fenceErr
+	}
+
+	if s.wasTurnCancelled() {
+		return cancelledResponse(params.MessageId), nil
+	}
+
+	if timedOut.Load() {
+		return acp.PromptResponse{}, turnFailureError(failureCauseTimeout, fmt.Sprintf("pi turn exceeded %s", s.agent.turnTimeout()))
+	}
+
 	stats := s.settledSessionStats(turnCtx)
 
 	// A native session id change mid-session breaks the wrapper's identity
@@ -423,17 +450,6 @@ func (s *agentSession) finishTurn(
 
 	if err := s.commitMirror(context.WithoutCancel(ctx)); err != nil {
 		return acp.PromptResponse{}, err
-	}
-
-	// The cancel guard runs before all failure mapping: an explicit user
-	// cancel wins over a simultaneous timeout, and a timeout is a failure,
-	// never a cancel.
-	if s.wasTurnCancelled() {
-		return cancelledResponse(params.MessageId), nil
-	}
-
-	if timedOut.Load() {
-		return acp.PromptResponse{}, turnFailureError(failureCauseTimeout, fmt.Sprintf("pi turn exceeded %s", s.agent.turnTimeout()))
 	}
 
 	if err := providerTurnFailure(state); err != nil {
@@ -525,6 +541,10 @@ func (s *agentSession) currentModelContextWindow() int64 {
 // runs first; otherwise the real cause is recovered from the child exit
 // status and stderr tail before falling back to a transport classification.
 func (s *agentSession) transportEndedTurn(messageID *string, timedOut *atomic.Bool) (acp.PromptResponse, error) {
+	if fenceErr := s.awaitTurnFence(); fenceErr != nil {
+		return acp.PromptResponse{}, fenceErr
+	}
+
 	if s.wasTurnCancelled() {
 		return cancelledResponse(messageID), nil
 	}
@@ -554,6 +574,10 @@ func (s *agentSession) transportEndedTurn(messageID *string, timedOut *atomic.Bo
 // a user cancel whose drain window elapsed, a timeout whose abort never
 // settled, or a cancelled host request context.
 func (s *agentSession) contextEndedTurn(messageID *string, timedOut *atomic.Bool) (acp.PromptResponse, error) {
+	if fenceErr := s.awaitTurnFence(); fenceErr != nil {
+		return acp.PromptResponse{}, fenceErr
+	}
+
 	if s.wasTurnCancelled() {
 		return cancelledResponse(messageID), nil
 	}
@@ -572,28 +596,8 @@ func cancelledResponse(messageID *string) acp.PromptResponse {
 	}
 }
 
-// abortForTimeout aborts the native turn after a turn-deadline expiry, then
-// cuts the turn context if the settle never arrives.
-func (s *agentSession) abortForTimeout(turnCancel context.CancelFunc) {
-	if client := s.currentClient(); client != nil {
-		abortCtx, cancel := context.WithTimeout(context.Background(), sessionInterruptTimeout)
-		defer cancel()
-
-		_ = client.Abort(abortCtx)
-	}
-
-	time.AfterFunc(cancelDrainTimeout, turnCancel)
-}
-
 // abortAfterEmitError aborts the native turn under a bounded background
 // context after an update-emission failure, then surfaces the original error.
 func (s *agentSession) abortAfterEmitError(ctx context.Context, err error) error {
-	if client := s.currentClient(); client != nil {
-		abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionInterruptTimeout)
-		defer cancel()
-
-		_ = client.Abort(abortCtx)
-	}
-
-	return err
+	return errors.Join(err, s.fenceTurnAfterFailure(context.WithoutCancel(ctx)))
 }

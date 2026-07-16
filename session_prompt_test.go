@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -93,6 +94,56 @@ func TestPromptClientPromptFailure(t *testing.T) {
 
 	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "test-turn", "hi"))
 	requirePiTurnFailure(t, err, failureCauseTransport)
+}
+
+func TestPromptParentCancellationContainsProcessTree(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	client := newStubPiClient()
+	process := newStubProcess(false)
+	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
+	session.startPump(client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	promptDone := make(chan struct {
+		response acp.PromptResponse
+		err      error
+	}, 1)
+	go func() {
+		response, err := session.Prompt(ctx, TextPromptRequest("id", "parent-cancel", "hang"))
+		promptDone <- struct {
+			response acp.PromptResponse
+			err      error
+		}{response: response, err: err}
+	}()
+
+	require.Eventually(t, func() bool { return session.activeTurnSink() != nil }, time.Second, time.Millisecond)
+	cancel()
+	result := <-promptDone
+	require.NoError(t, result.err)
+	require.Equal(t, acp.StopReasonCancelled, result.response.StopReason)
+	require.Equal(t, 1, process.killCalls)
+	require.Equal(t, 1, process.closeCalls)
+}
+
+func TestTurnTerminalPathsReturnContainmentProofFailure(t *testing.T) {
+	fenceErr := pi.ErrProcessTreeNotQuiescent
+	done := make(chan struct{})
+	close(done)
+	session := &agentSession{
+		agent:            NewAgent(WithLogger(slog.New(slog.DiscardHandler))),
+		turnFenceStarted: true,
+		turnFenceDone:    done,
+		turnFenceErr:     fenceErr,
+	}
+	var timedOut atomic.Bool
+	messageID := "message"
+
+	_, err := session.transportEndedTurn(&messageID, &timedOut)
+	require.ErrorIs(t, err, fenceErr)
+	_, err = session.contextEndedTurn(&messageID, &timedOut)
+	require.ErrorIs(t, err, fenceErr)
+	_, err = session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "turn", "done"), &promptTurnState{}, &timedOut)
+	require.ErrorIs(t, err, fenceErr)
 }
 
 func TestPromptHandleTurnEventEmitFailure(t *testing.T) {

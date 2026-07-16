@@ -79,24 +79,25 @@ type fakeCommandSpec struct {
 }
 
 type fakeScenario struct {
-	Models             []fakeModelSpec   `json:"models,omitempty"`
-	ReplyText          string            `json:"replyText,omitempty"`
-	DeltaTexts         []string          `json:"deltaTexts,omitempty"`
-	StreamDelayMs      int               `json:"streamDelayMs,omitempty"`
-	PromptBehavior     string            `json:"promptBehavior,omitempty"`
-	ProviderError      string            `json:"providerError,omitempty"`
-	GarbageLines       int               `json:"garbageLines,omitempty"`
-	ToolName           string            `json:"toolName,omitempty"`
-	ToolArgs           map[string]any    `json:"toolArgs,omitempty"`
-	ToolOutput         string            `json:"toolOutput,omitempty"`
-	PermissionPayload  string            `json:"permissionPayload,omitempty"`
-	ElicitMethod       string            `json:"elicitMethod,omitempty"`
-	ElicitTitle        string            `json:"elicitTitle,omitempty"`
-	Commands           []fakeCommandSpec `json:"commands,omitempty"`
-	MCPStartupFailure  string            `json:"mcpStartupFailure,omitempty"`
-	BlockedToolPIDFile string            `json:"blockedToolPidFile,omitempty"`
-	BlockedToolOutput  string            `json:"blockedToolOutput,omitempty"`
-	BlockedToolDelayMs int               `json:"blockedToolDelayMs,omitempty"`
+	Models               []fakeModelSpec   `json:"models,omitempty"`
+	ReplyText            string            `json:"replyText,omitempty"`
+	DeltaTexts           []string          `json:"deltaTexts,omitempty"`
+	StreamDelayMs        int               `json:"streamDelayMs,omitempty"`
+	PromptBehavior       string            `json:"promptBehavior,omitempty"`
+	ProviderError        string            `json:"providerError,omitempty"`
+	GarbageLines         int               `json:"garbageLines,omitempty"`
+	ToolName             string            `json:"toolName,omitempty"`
+	ToolArgs             map[string]any    `json:"toolArgs,omitempty"`
+	ToolOutput           string            `json:"toolOutput,omitempty"`
+	PermissionPayload    string            `json:"permissionPayload,omitempty"`
+	ElicitMethod         string            `json:"elicitMethod,omitempty"`
+	ElicitTitle          string            `json:"elicitTitle,omitempty"`
+	Commands             []fakeCommandSpec `json:"commands,omitempty"`
+	MCPStartupFailure    string            `json:"mcpStartupFailure,omitempty"`
+	BlockedToolPIDFile   string            `json:"blockedToolPidFile,omitempty"`
+	BlockedToolOutput    string            `json:"blockedToolOutput,omitempty"`
+	BlockedToolDelayMs   int               `json:"blockedToolDelayMs,omitempty"`
+	AbortAcksImmediately bool              `json:"abortAcksImmediately,omitempty"`
 }
 
 type fakeDescendantMode struct {
@@ -704,10 +705,19 @@ func (s *fakePiServer) handleAbort(id string) {
 		return
 	}
 
-	// The abort ack must trail the aborted turn's terminal events; a hung
-	// turn therefore never acks (deliberate, for timeout coverage).
+	turn.requestAbort()
+	if s.scenario.AbortAcksImmediately {
+		// This reproduces a native runtime that acknowledges foreground abort
+		// while a background tool descendant remains alive. The adapter must
+		// not treat this acknowledgement as process-containment proof.
+		s.respondOK(id, "abort")
+
+		return
+	}
+
+	// Ordinarily the abort ack trails the aborted turn's terminal events; a
+	// hung turn therefore never acks (deliberate, for timeout coverage).
 	go func() {
-		turn.requestAbort()
 		<-turn.done
 		s.respondOK(id, "abort")
 	}()

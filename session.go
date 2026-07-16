@@ -98,6 +98,10 @@ type agentSession struct {
 	turnCancelled       bool
 	turnNonce           string
 	turnSink            *turnSink
+	turnFenceStarted    bool
+	turnFenceDone       chan struct{}
+	turnFenceErr        error
+	turnSettling        bool
 	pendingDialogs      map[string]*dialogCancel
 	turnTools           map[string]*turnToolCall
 	rawMessages         rawMessageConfig

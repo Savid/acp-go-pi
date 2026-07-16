@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/savid/acp-go-pi/internal/pi"
@@ -18,10 +19,6 @@ var sessionInterruptTimeout = 5 * time.Second
 // that acknowledgement indefinitely, so expiry escalates to the session's
 // process-tree containment boundary.
 var sessionCancelAbortGrace = 500 * time.Millisecond
-
-// cancelDrainTimeout bounds how long a cancelled or timed-out turn waits for
-// pi's terminal events after abort before the turn context is cut.
-var cancelDrainTimeout = 5 * time.Second
 
 // sessionShutdownTimeout bounds the process shutdown ladder on close.
 var sessionShutdownTimeout = 10 * time.Second
@@ -269,15 +266,13 @@ func (s *agentSession) cleanupFailedRelaunch(proc piProcess, cause error) error 
 }
 
 // Cancel cancels the active pi turn. Pending dialogs are resolved cancelled
-// first, then the native abort runs on a bounded background context; the
-// prompt loop keeps draining until pi settles the aborted turn so the mirror
-// commit still lands, with a bounded backstop that cuts the turn context if
-// the settle never arrives.
+// first, then native abort is attempted and the complete per-session process
+// tree is closed and proved quiescent before either Cancel or Prompt settles.
 func (s *agentSession) Cancel(ctx context.Context) (err error) {
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
 
-	return s.cancelNative(ctx)
+	return s.cancelNativeLocked(ctx)
 }
 
 // cancelRouted validates the active turn and keeps its native abort fenced
@@ -302,21 +297,16 @@ func (s *agentSession) cancelRouted(ctx context.Context, meta map[string]any) er
 		}
 	}
 
-	return s.cancelNative(ctx)
+	return s.cancelNativeLocked(ctx)
 }
 
-func (s *agentSession) cancelNative(ctx context.Context) (err error) {
+func (s *agentSession) cancelNativeLocked(ctx context.Context) (err error) {
 	s.cancelPendingInteractions()
 
 	s.mu.Lock()
 	turnCancel := s.cancel
 	client := s.client
-	proc := s.proc
 	s.mu.Unlock()
-
-	if client == nil {
-		return nil
-	}
 
 	if s.agent != nil {
 		var finish func(error)
@@ -325,31 +315,156 @@ func (s *agentSession) cancelNative(ctx context.Context) (err error) {
 		defer func() { finish(err) }()
 	}
 
-	abortTimeout := sessionInterruptTimeout
 	if turnCancel != nil {
-		abortTimeout = sessionCancelAbortGrace
+		return s.fenceActiveTurnLocked(context.WithoutCancel(ctx))
 	}
 
-	interruptCtx, cancelInterrupt := context.WithTimeout(context.WithoutCancel(ctx), abortTimeout)
+	if client == nil {
+		return nil
+	}
+
+	interruptCtx, cancelInterrupt := context.WithTimeout(context.WithoutCancel(ctx), sessionInterruptTimeout)
 	defer cancelInterrupt()
 
-	err = client.Abort(interruptCtx)
-	if err != nil && turnCancel != nil {
-		return s.terminateCancelledTurn(context.WithoutCancel(ctx), proc, turnCancel, err)
+	return client.Abort(interruptCtx)
+}
+
+// fenceTimedOutTurn contains the exact active turn before its timeout can
+// settle. The native abort is advisory; only closing and proving the complete
+// per-session process tree authorizes the turn context to be released.
+func (s *agentSession) fenceTimedOutTurn(ctx context.Context, timedOut *atomic.Bool) error {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+
+	s.mu.Lock()
+	active := s.cancel != nil && !s.turnSettling
+	s.mu.Unlock()
+
+	if !active {
+		return nil
 	}
 
-	if turnCancel != nil {
-		time.AfterFunc(cancelDrainTimeout, turnCancel)
+	timedOut.Store(true)
+
+	return s.fenceActiveTurnLocked(ctx)
+}
+
+// fenceTurnAfterContext makes parent-context cancellation use the same native
+// containment boundary as session/cancel and timeout.
+func (s *agentSession) fenceTurnAfterContext(ctx context.Context) error {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+
+	return s.fenceActiveTurnLocked(ctx)
+}
+
+// fenceTurnAfterFailure prevents a native command or ACP update failure from
+// returning while the failed turn can still own native tool descendants.
+func (s *agentSession) fenceTurnAfterFailure(ctx context.Context) error {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+
+	return s.fenceActiveTurnLocked(ctx)
+}
+
+// fenceActiveTurnLocked is the one idempotent containment fence for the live
+// turn. cancelMu is held by every caller, so a coincident cancel, timeout, or
+// failure observes and returns the same proof result.
+func (s *agentSession) fenceActiveTurnLocked(ctx context.Context) (err error) {
+	s.mu.Lock()
+	if s.cancel == nil || s.turnSettling {
+		s.mu.Unlock()
+
+		return nil
 	}
+
+	if s.turnFenceStarted {
+		err = s.turnFenceErr
+		s.mu.Unlock()
+
+		return err
+	}
+
+	s.turnFenceStarted = true
+	if s.turnFenceDone == nil {
+		s.turnFenceDone = make(chan struct{})
+	}
+
+	done := s.turnFenceDone
+	turnCancel := s.cancel
+	client := s.client
+	proc := s.proc
+	s.mu.Unlock()
+
+	var abortErr error
+
+	if client != nil {
+		interruptCtx, cancelInterrupt := context.WithTimeout(context.WithoutCancel(ctx), sessionCancelAbortGrace)
+		abortErr = client.Abort(interruptCtx)
+
+		cancelInterrupt()
+	}
+
+	// Stop transport delivery before closing its pipes. Prompt settlement may
+	// observe the closed turn sink, but awaitTurnFence keeps it behind this
+	// proof boundary.
+	s.stopPump()
+	err = s.terminateCancelledTurn(context.WithoutCancel(ctx), proc, turnCancel, abortErr)
+
+	s.mu.Lock()
+	s.turnFenceErr = err
+
+	close(done)
+	s.mu.Unlock()
 
 	return err
 }
 
-// terminateCancelledTurn is the hard backstop for a native abort that did
-// not acknowledge within the user-cancel grace. Killing and closing the
-// contained process proves descendants quiescent before the turn context is
-// released; a later prompt can then relaunch the same logical session without
-// racing the command tree from the cancelled turn.
+// claimTurnSettlement linearizes a native AgentSettled event against cancel
+// and timeout. Once claimed, the turn has no active native work to contain;
+// a fence that won the race is already complete because it holds cancelMu for
+// its entire process-tree proof.
+func (s *agentSession) claimTurnSettlement() error {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.turnFenceStarted {
+		return s.turnFenceErr
+	}
+
+	s.turnSettling = true
+
+	return nil
+}
+
+// awaitTurnFence blocks every prompt terminal path behind a containment fence
+// that has started. A normal, natively settled turn has no fence and returns
+// immediately.
+func (s *agentSession) awaitTurnFence() error {
+	s.mu.Lock()
+	started := s.turnFenceStarted
+	done := s.turnFenceDone
+	s.mu.Unlock()
+
+	if !started || done == nil {
+		return nil
+	}
+
+	<-done
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.turnFenceErr
+}
+
+// terminateCancelledTurn is the hard containment boundary after the advisory
+// native abort. Killing and closing the contained process proves descendants
+// quiescent before the turn context is released; a later prompt can then
+// relaunch the same logical session without racing the cancelled command tree.
 func (s *agentSession) terminateCancelledTurn(
 	ctx context.Context,
 	proc piProcess,
@@ -359,7 +474,7 @@ func (s *agentSession) terminateCancelledTurn(
 	if proc == nil {
 		turnCancel()
 
-		return abortErr
+		return errors.Join(abortErr, pi.ErrProcessTreeNotQuiescent, errors.New("active pi turn has no contained process root"))
 	}
 
 	killErr := proc.Kill()
