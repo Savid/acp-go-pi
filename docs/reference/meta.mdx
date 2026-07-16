@@ -45,7 +45,9 @@ input option.
 Outbound form elicitation preserves native metadata and adds `version`,
 `sessionId`, `turnNonce`, and exactly one of `toolCallId` or `requestId` under
 the reserved key. A pre-existing reserved key is an error. Permission requests
-remain structurally correlated by ACP session and tool-call fields.
+remain structurally correlated by ACP session and tool-call fields: the
+permission `toolCallId` is pi's exact native id and matches the corresponding
+tool-call session updates. Permission requests carry no route metadata.
 
 Structured output is not advertised: pi has no native structured-output
 surface, so no `structuredOutput` descriptor appears and an `outputSchema`

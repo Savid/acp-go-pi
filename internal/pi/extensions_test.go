@@ -32,6 +32,7 @@ func TestWriteExtensions(t *testing.T) {
 		require.Contains(t, string(bridge), `ctx.ui.input`)
 		require.Contains(t, string(bridge), `ctx.ui.select`)
 		require.Contains(t, string(bridge), `event.toolName === QUESTION_TOOL`)
+		require.Contains(t, string(bridge), `toolCallId: event.toolCallId`)
 		require.NoFileExists(t, filepath.Join(dir, MCPExtensionFileName))
 	})
 
@@ -99,12 +100,17 @@ func TestParsePermissionTitle(t *testing.T) {
 	t.Run("valid marker payload", func(t *testing.T) {
 		t.Parallel()
 
-		prompt := PermissionPrompt{ToolName: "bash", Input: json.RawMessage(`{"command":"ls -la"}`)}
+		prompt := PermissionPrompt{
+			ToolCallID: "native-call-42",
+			ToolName:   "bash",
+			Input:      json.RawMessage(`{"command":"ls -la"}`),
+		}
 		payload, err := json.Marshal(prompt)
 		require.NoError(t, err)
 
 		parsed, ok := ParsePermissionTitle(PermissionTitleMarker + string(payload))
 		require.True(t, ok)
+		require.Equal(t, "native-call-42", parsed.ToolCallID)
 		require.Equal(t, "bash", parsed.ToolName)
 		require.JSONEq(t, `{"command":"ls -la"}`, string(parsed.Input))
 	})
@@ -116,12 +122,23 @@ func TestParsePermissionTitle(t *testing.T) {
 		require.False(t, ok)
 	})
 
-	t.Run("marker with invalid payload", func(t *testing.T) {
-		t.Parallel()
+	for _, testCase := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "invalid json", payload: "not json"},
+		{name: "missing native id", payload: `{"toolName":"bash"}`},
+		{name: "empty native id", payload: `{"toolCallId":"","toolName":"bash"}`},
+		{name: "blank native id", payload: `{"toolCallId":"  ","toolName":"bash"}`},
+		{name: "malformed native id", payload: `{"toolCallId":7,"toolName":"bash"}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
 
-		_, ok := ParsePermissionTitle(PermissionTitleMarker + "not json")
-		require.False(t, ok)
-	})
+			_, ok := ParsePermissionTitle(PermissionTitleMarker + testCase.payload)
+			require.False(t, ok)
+		})
+	}
 }
 
 func TestWriteMCPConfig(t *testing.T) {

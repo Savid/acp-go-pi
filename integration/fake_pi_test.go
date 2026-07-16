@@ -88,6 +88,7 @@ type fakeScenario struct {
 	ToolName          string            `json:"toolName,omitempty"`
 	ToolArgs          map[string]any    `json:"toolArgs,omitempty"`
 	ToolOutput        string            `json:"toolOutput,omitempty"`
+	PermissionPayload string            `json:"permissionPayload,omitempty"`
 	ElicitMethod      string            `json:"elicitMethod,omitempty"`
 	ElicitTitle       string            `json:"elicitTitle,omitempty"`
 	Commands          []fakeCommandSpec `json:"commands,omitempty"`

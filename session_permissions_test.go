@@ -54,9 +54,72 @@ func TestRequestPermissionAnswerFailsClosed(t *testing.T) {
 		session.requestPermissionAnswer(
 			t.Context(),
 			pi.UIRequest{ID: "error"},
-			pi.PermissionPrompt{ToolName: "surface_tool", Input: json.RawMessage(`{"value":true}`)},
+			pi.PermissionPrompt{
+				ToolCallID: "native-call-error",
+				ToolName:   "surface_tool",
+				Input:      json.RawMessage(`{"value":true}`),
+			},
 		),
 	)
+}
+
+func TestRequestPermissionUsesExactNativeToolCallID(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	permissionClient := newDialogStubClient()
+	permissionClient.permissionResponse = acp.RequestPermissionResponse{
+		Outcome: acp.NewRequestPermissionOutcomeSelected(permissionOptionAllow),
+	}
+	agent.setConnection(permissionClient)
+	session := &agentSession{agent: agent, id: "session"}
+
+	answer := session.requestPermissionAnswer(
+		t.Context(),
+		pi.UIRequest{ID: "permission-1"},
+		pi.PermissionPrompt{
+			ToolCallID: "native-call-42",
+			ToolName:   "bash",
+			Input:      json.RawMessage(`{"command":"echo hi"}`),
+		},
+	)
+
+	require.Equal(t, string(permissionOptionAllow), answer)
+	require.Len(t, permissionClient.permissionRequests, 1)
+	request := permissionClient.permissionRequests[0]
+	require.Equal(t, acp.SessionId("session"), request.SessionId)
+	require.Equal(t, acp.ToolCallId("native-call-42"), request.ToolCall.ToolCallId)
+	require.NotEqual(t, acp.ToolCallId("bash"), request.ToolCall.ToolCallId)
+	require.Equal(t, "bash", *request.ToolCall.Title)
+	rawInput, ok := request.ToolCall.RawInput.(json.RawMessage)
+	require.True(t, ok)
+	require.JSONEq(t, `{"command":"echo hi"}`, string(rawInput))
+}
+
+func TestMalformedPermissionMarkerFailsClosed(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	permissionClient := newDialogStubClient()
+	agent.setConnection(permissionClient)
+	native := newStubPiClient()
+	session := &agentSession{agent: agent, id: "session", client: native}
+
+	requests := []pi.UIRequest{
+		{ID: "missing", Method: uiMethodSelect, Title: pi.PermissionTitleMarker + `{"toolName":"bash"}`},
+		{ID: "malformed", Method: uiMethodSelect, Title: pi.PermissionTitleMarker + `{"toolCallId":7,"toolName":"bash"}`},
+		{
+			ID:     "wrong-method",
+			Method: uiMethodConfirm,
+			Title:  pi.PermissionTitleMarker + `{"toolCallId":"native-call-42","toolName":"bash"}`,
+		},
+	}
+	for _, request := range requests {
+		session.handleUIDialog(t.Context(), request)
+	}
+
+	require.Empty(t, permissionClient.permissionRequests, "malformed markers must not reach ACP permissions")
+	require.Empty(t, permissionClient.elicitationRequests, "malformed markers must not be reclassified as elicitation")
+	require.Len(t, native.responses, len(requests))
+	for index, request := range requests {
+		require.Equal(t, pi.UICancelResponse(request.ID), native.responses[index])
+	}
 }
 
 func TestRespondUIDialogFailures(t *testing.T) {

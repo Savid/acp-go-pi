@@ -251,7 +251,61 @@ func TestAgentFakePermissionOutcomes(t *testing.T) {
 
 			request := client.permissionSnapshot()[0]
 			require.Equal(t, sessionID, request.SessionId)
+			require.Equal(t, acp.ToolCallId("call_1"), request.ToolCall.ToolCallId)
+			require.NotEqual(t, acp.ToolCallId("bash"), request.ToolCall.ToolCallId)
 			require.NotEmpty(t, request.Options)
+
+			var publishedToolCallID acp.ToolCallId
+			for _, notification := range client.notificationSnapshot() {
+				if notification.Update.ToolCall != nil {
+					publishedToolCallID = notification.Update.ToolCall.ToolCallId
+					break
+				}
+			}
+			require.Equal(t, request.ToolCall.ToolCallId, publishedToolCallID,
+				"permission request and published tool update must share the native id")
+		})
+	}
+}
+
+func TestAgentFakeMalformedPermissionMarkerFailsClosed(t *testing.T) {
+	requireRunIntegration(t)
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "missing native id", payload: `{"toolName":"bash","input":{"command":"do not run"}}`},
+		{name: "malformed native id", payload: `{"toolCallId":7,"toolName":"bash"}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			scenario := fakeTurnScenario()
+			scenario.ToolName = "bash"
+			scenario.ToolArgs = map[string]any{"command": "do not run"}
+			scenario.ToolOutput = "MALFORMED_PERMISSION_EXECUTED"
+			scenario.PermissionPayload = testCase.payload
+
+			client := &recordingClient{permissionChoice: permissionChoiceAllow}
+			conn := connectFakeAgentForTest(t, ctx, client, scenario)
+			sessionID := newFakeSession(t, ctx, conn)
+
+			resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "use the tool"))
+			require.NoError(t, err)
+			require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
+			require.Zero(t, client.permissionCount(), "malformed marker must not reach ACP permissions")
+			require.Empty(t, client.elicitationSnapshot(), "malformed marker must not become elicitation")
+
+			encoded, err := json.Marshal(client.notificationSnapshot())
+			require.NoError(t, err)
+			require.NotContains(t, string(encoded), scenario.ToolOutput,
+				"native tool implementation must not execute after a malformed marker")
+			require.Contains(t, string(encoded), "Denied by ACP client")
 		})
 	}
 }

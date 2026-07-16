@@ -35,6 +35,10 @@ answers by selecting an option id. A denied call returns a blocked tool result
 to pi — the tool errors, and the turn continues rather than failing. A
 cancelled or unanswerable dialog fails closed as a deny.
 
+The prompt's ACP `toolCallId` is pi's exact native tool-call id. It is the same
+id used by the corresponding tool-call session updates; the tool name remains
+separate display and classification data.
+
 The gate covers every tool the session can run, including MCP tools supplied
 by the adapter's [MCP extension](/docs/features/mcp) — a denied MCP call is
 blocked before it reaches the server.

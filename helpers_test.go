@@ -61,10 +61,13 @@ func newFailingCloseProcess() *stubProcess {
 type dialogStubClient struct {
 	*directAgentClient
 
+	dialogMu            sync.Mutex
 	elicitationResponse acp.UnstableCreateElicitationResponse
 	elicitationErr      error
+	elicitationRequests []acp.UnstableCreateElicitationRequest
 	permissionResponse  acp.RequestPermissionResponse
 	permissionErr       error
+	permissionRequests  []acp.RequestPermissionRequest
 }
 
 func newDialogStubClient() *dialogStubClient {
@@ -72,17 +75,25 @@ func newDialogStubClient() *dialogStubClient {
 }
 
 func (c *dialogStubClient) CreateElicitation(
-	context.Context,
-	acp.UnstableCreateElicitationRequest,
-	elicitationScope,
+	_ context.Context,
+	request acp.UnstableCreateElicitationRequest,
+	_ elicitationScope,
 ) (acp.UnstableCreateElicitationResponse, error) {
+	c.dialogMu.Lock()
+	c.elicitationRequests = append(c.elicitationRequests, request)
+	c.dialogMu.Unlock()
+
 	return c.elicitationResponse, c.elicitationErr
 }
 
 func (c *dialogStubClient) RequestPermission(
-	context.Context,
-	acp.RequestPermissionRequest,
+	_ context.Context,
+	request acp.RequestPermissionRequest,
 ) (acp.RequestPermissionResponse, error) {
+	c.dialogMu.Lock()
+	c.permissionRequests = append(c.permissionRequests, request)
+	c.dialogMu.Unlock()
+
 	return c.permissionResponse, c.permissionErr
 }
 
@@ -284,6 +295,7 @@ func (s *errorSessionStore) Delete(context.Context, SessionKey) error {
 }
 
 type stubPiClient struct {
+	mu           sync.Mutex
 	events       chan pi.Event
 	uiRequests   chan pi.UIRequest
 	done         chan struct{}
@@ -291,6 +303,7 @@ type stubPiClient struct {
 	abortErr     error
 	promptErr    error
 	respondErr   error
+	responses    []pi.UIResponse
 	stats        pi.SessionStats
 	statsErr     error
 	model        pi.Model
@@ -313,12 +326,18 @@ func newStubPiClient() *stubPiClient {
 	return &stubPiClient{events: make(chan pi.Event), uiRequests: make(chan pi.UIRequest), done: make(chan struct{})}
 }
 
-func (c *stubPiClient) Start(context.Context) error                             { return c.startErr }
-func (c *stubPiClient) Events() <-chan pi.Event                                 { return c.events }
-func (c *stubPiClient) UIRequests() <-chan pi.UIRequest                         { return c.uiRequests }
-func (c *stubPiClient) Done() <-chan struct{}                                   { return c.done }
-func (c *stubPiClient) Err() error                                              { return c.err }
-func (c *stubPiClient) RespondUI(pi.UIResponse) error                           { return c.respondErr }
+func (c *stubPiClient) Start(context.Context) error     { return c.startErr }
+func (c *stubPiClient) Events() <-chan pi.Event         { return c.events }
+func (c *stubPiClient) UIRequests() <-chan pi.UIRequest { return c.uiRequests }
+func (c *stubPiClient) Done() <-chan struct{}           { return c.done }
+func (c *stubPiClient) Err() error                      { return c.err }
+func (c *stubPiClient) RespondUI(response pi.UIResponse) error {
+	c.mu.Lock()
+	c.responses = append(c.responses, response)
+	c.mu.Unlock()
+
+	return c.respondErr
+}
 func (c *stubPiClient) Prompt(context.Context, string, []pi.ImageContent) error { return c.promptErr }
 func (c *stubPiClient) Abort(context.Context) error                             { return c.abortErr }
 func (c *stubPiClient) Clone(context.Context) (bool, error)                     { return c.cloneCancel, c.cloneErr }

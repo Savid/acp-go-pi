@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"log/slog"
+	"strings"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -37,12 +38,17 @@ const (
 // elicitation. Exactly one UIResponse is always written back so the bridge
 // extension never hangs.
 func (s *agentSession) handleUIDialog(ctx context.Context, request pi.UIRequest) {
-	if request.Method == uiMethodSelect {
-		if prompt, ok := pi.ParsePermissionTitle(request.Title); ok {
-			s.handlePermissionDialog(ctx, request, prompt)
+	if strings.HasPrefix(request.Title, pi.PermissionTitleMarker) {
+		prompt, ok := pi.ParsePermissionTitle(request.Title)
+		if request.Method != uiMethodSelect || !ok {
+			s.respondUIDialog(ctx, pi.UICancelResponse(request.ID))
 
 			return
 		}
+
+		s.handlePermissionDialog(ctx, request, prompt)
+
+		return
 	}
 
 	s.handleElicitationDialog(ctx, request)
@@ -103,6 +109,10 @@ func (s *agentSession) handlePermissionDialog(ctx context.Context, request pi.UI
 }
 
 func (s *agentSession) requestPermissionAnswer(ctx context.Context, request pi.UIRequest, prompt pi.PermissionPrompt) string {
+	if strings.TrimSpace(prompt.ToolCallID) == "" {
+		return string(permissionOptionDeny)
+	}
+
 	conn := s.agent.connection()
 	if conn == nil {
 		return string(permissionOptionDeny)
@@ -116,7 +126,7 @@ func (s *agentSession) requestPermissionAnswer(ctx context.Context, request pi.U
 	status := acp.ToolCallStatusPending
 
 	toolCall := acp.ToolCallUpdate{
-		ToolCallId: acp.ToolCallId(prompt.ToolName),
+		ToolCallId: acp.ToolCallId(prompt.ToolCallID),
 		Title:      &title,
 		Kind:       &kind,
 		Status:     &status,

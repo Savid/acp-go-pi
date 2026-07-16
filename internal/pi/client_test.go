@@ -157,7 +157,7 @@ func TestClientUIRequestRoundTrip(t *testing.T) {
 	harness := newTestHarness(t)
 
 	harness.emit(t, `{"type":"extension_ui_request","id":"uuid-1","method":"select",`+
-		`"title":"acp-go-pi:permission:{\"toolName\":\"bash\",\"input\":{\"command\":\"ls\"}}",`+
+		`"title":"acp-go-pi:permission:{\"toolCallId\":\"native-call-1\",\"toolName\":\"bash\",\"input\":{\"command\":\"ls\"}}",`+
 		`"options":["allow","deny"]}`)
 
 	request := <-harness.client.UIRequests()
@@ -165,6 +165,7 @@ func TestClientUIRequestRoundTrip(t *testing.T) {
 
 	prompt, ok := ParsePermissionTitle(request.Title)
 	require.True(t, ok)
+	require.Equal(t, "native-call-1", prompt.ToolCallID)
 	require.Equal(t, "bash", prompt.ToolName)
 
 	// RespondUI blocks on the synchronous pipe until the fake reads it.

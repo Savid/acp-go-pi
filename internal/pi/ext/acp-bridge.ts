@@ -76,11 +76,16 @@ export default function (pi: ExtensionAPI) {
     let payload: string;
     try {
       payload = JSON.stringify({
+        toolCallId: event.toolCallId,
         toolName: event.toolName,
         input: event.input ?? {},
       });
     } catch {
-      payload = JSON.stringify({ toolName: event.toolName, input: {} });
+      payload = JSON.stringify({
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        input: {},
+      });
     }
 
     const choice = await ctx.ui.select(PERMISSION_MARKER + payload, [

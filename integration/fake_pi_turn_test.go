@@ -227,7 +227,7 @@ func (s *fakePiServer) runToolTurn(turn *fakeTurn) []json.RawMessage {
 
 	allowed := true
 	if len(s.extensionPaths) > 0 && s.permissionAsk {
-		allowed = s.askPermission(turn, argsJSON)
+		allowed = s.askPermission(turn, toolCallID, argsJSON)
 	}
 
 	s.out.writeJSON(fakeToolExecutionEvent{
@@ -311,11 +311,16 @@ func (s *fakePiServer) raiseDialog(turn *fakeTurn, method string, title string, 
 // the payload travels JSON-encoded in the dialog title behind the marker
 // prefix, and any non-allow answer (deny or a cancelled dialog) fails
 // closed.
-func (s *fakePiServer) askPermission(turn *fakeTurn, input json.RawMessage) bool {
-	title := pi.PermissionTitleMarker + string(mustJSON(pi.PermissionPrompt{
-		ToolName: s.scenario.ToolName,
-		Input:    input,
-	}))
+func (s *fakePiServer) askPermission(turn *fakeTurn, toolCallID string, input json.RawMessage) bool {
+	payload := s.scenario.PermissionPayload
+	if payload == "" {
+		payload = string(mustJSON(pi.PermissionPrompt{
+			ToolCallID: toolCallID,
+			ToolName:   s.scenario.ToolName,
+			Input:      input,
+		}))
+	}
+	title := pi.PermissionTitleMarker + payload
 
 	answer := s.raiseDialog(turn, "select", title,
 		[]string{pi.PermissionOptionAllow, pi.PermissionOptionDeny})

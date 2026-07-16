@@ -78,8 +78,9 @@ func WriteExtensions(dir string, includeMCP bool) ([]string, error) {
 // PermissionPrompt is the payload the bridge extension encodes into a
 // permission select-dialog title.
 type PermissionPrompt struct {
-	ToolName string          `json:"toolName"`
-	Input    json.RawMessage `json:"input,omitempty"`
+	ToolCallID string          `json:"toolCallId"`
+	ToolName   string          `json:"toolName"`
+	Input      json.RawMessage `json:"input,omitempty"`
 }
 
 // ParsePermissionTitle recognizes a bridge permission dialog title and
@@ -92,6 +93,10 @@ func ParsePermissionTitle(title string) (PermissionPrompt, bool) {
 
 	var prompt PermissionPrompt
 	if err := json.Unmarshal([]byte(payload), &prompt); err != nil {
+		return PermissionPrompt{}, false
+	}
+
+	if strings.TrimSpace(prompt.ToolCallID) == "" {
 		return PermissionPrompt{}, false
 	}
 

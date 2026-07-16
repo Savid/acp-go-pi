@@ -581,6 +581,7 @@ func TestFakePiPermissionDialog(t *testing.T) {
 
 			prompt, ok := pi.ParsePermissionTitle(request.Title)
 			require.True(t, ok, "permission dialog title must carry the marker payload: %q", request.Title)
+			require.Equal(t, "call_1", prompt.ToolCallID)
 			require.Equal(t, "bash", prompt.ToolName)
 			require.JSONEq(t, `{"command":"echo hi"}`, string(prompt.Input))
 
