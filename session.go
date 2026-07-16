@@ -81,6 +81,7 @@ type agentSession struct {
 
 	turn     chan struct{}
 	cancelMu sync.Mutex
+	toolMu   sync.Mutex
 
 	mu                  sync.Mutex
 	title               string
@@ -97,7 +98,7 @@ type agentSession struct {
 	turnNonce           string
 	turnSink            *turnSink
 	pendingDialogs      map[string]*dialogCancel
-	permissionTools     map[string]struct{}
+	turnTools           map[string]*turnToolCall
 	rawMessages         rawMessageConfig
 	rawEventSequence    int64
 	mirroredRows        int
@@ -106,6 +107,20 @@ type agentSession struct {
 	scratchRootRelease  func()
 	nativeQuiescenceErr error
 	providerProcessRoot *providerProcessRoot
+}
+
+// turnToolCall is the exact-ID lifecycle published for one native tool call.
+// Its lock serializes ACP publication with permission admission so concurrent
+// bridge-dialog and native-event delivery cannot create two starts or
+// authorize an already-terminal call. agentSession.toolMu protects only the
+// turnTools index, allowing unrelated native tool ids to progress independently.
+type turnToolCall struct {
+	mu                   sync.Mutex
+	published            bool
+	nativeStartPublished bool
+	permissionRequested  bool
+	terminalPublished    bool
+	status               acp.ToolCallStatus
 }
 
 // dialogCancel tracks one pending extension UI dialog so session/cancel and

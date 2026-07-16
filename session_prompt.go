@@ -184,28 +184,31 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	}
 	defer s.observeProviderProcess(context.WithoutCancel(ctx))
 
+	s.resetTurnTools()
+
 	turnCtx, cancel := context.WithCancel(ctx)
 	turnCtx = withTurnRoute(turnCtx, route.turnNonce)
+
 	sink := newTurnSink()
 
 	s.cancelMu.Lock()
 	s.mu.Lock()
 	s.cancel = cancel
 	s.turnCancelled = false
-	s.permissionTools = nil
 	s.turnNonce = route.turnNonce
 	s.turnSink = sink
 	s.mu.Unlock()
 	s.cancelMu.Unlock()
 
 	defer func() {
+		cancel()
+
 		s.cancelMu.Lock()
 		defer s.cancelMu.Unlock()
 
 		s.mu.Lock()
 		s.cancel = nil
 		s.turnCancelled = false
-		s.permissionTools = nil
 		s.turnNonce = ""
 
 		if s.turnSink == sink {
@@ -214,7 +217,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		s.mu.Unlock()
 
 		close(sink.done)
-		cancel()
+		s.resetTurnTools()
 	}()
 
 	var timedOut atomic.Bool
@@ -295,42 +298,16 @@ func (s *agentSession) handleTurnEvent(ctx context.Context, event pi.Event, stat
 
 		return false, nil
 	case pi.ToolExecutionStartEvent:
-		if s.beginPermissionTool(typed.ToolCallID) {
-			opts := []acp.ToolCallUpdateOpt{
-				acp.WithUpdateTitle(typed.ToolName),
-				acp.WithUpdateKind(toolKindForName(typed.ToolName)),
-				acp.WithUpdateStatus(acp.ToolCallStatusInProgress),
-			}
-			if len(typed.Args) > 0 {
-				opts = append(opts, acp.WithUpdateRawInput(typed.Args))
-			}
-
-			return false, s.emitUpdates(ctx, []acp.SessionUpdate{
-				acp.UpdateToolCall(acp.ToolCallId(typed.ToolCallID), opts...),
-			})
-		}
-
-		opts := []acp.ToolCallStartOpt{
-			acp.WithStartKind(toolKindForName(typed.ToolName)),
-			acp.WithStartStatus(acp.ToolCallStatusInProgress),
-		}
-		if len(typed.Args) > 0 {
-			opts = append(opts, acp.WithStartRawInput(typed.Args))
-		}
-
-		return false, s.emitUpdates(ctx, []acp.SessionUpdate{
-			acp.StartToolCall(acp.ToolCallId(typed.ToolCallID), typed.ToolName, opts...),
-		})
+		return false, s.publishNativeToolStart(ctx, typed)
 	case pi.ToolExecutionUpdateEvent:
 		if typed.PartialResult == nil {
 			return false, nil
 		}
 
-		return false, s.emitUpdates(ctx, []acp.SessionUpdate{
-			acp.UpdateToolCall(acp.ToolCallId(typed.ToolCallID),
-				acp.WithUpdateContent(toolCallContent(typed.PartialResult.Content)),
-			),
-		})
+		return false, s.publishNativeToolUpdate(ctx, typed.ToolCallID, acp.UpdateToolCall(
+			acp.ToolCallId(typed.ToolCallID),
+			acp.WithUpdateContent(toolCallContent(typed.PartialResult.Content)),
+		))
 	case pi.ToolExecutionEndEvent:
 		status := acp.ToolCallStatusCompleted
 		if typed.IsError {
@@ -342,9 +319,8 @@ func (s *agentSession) handleTurnEvent(ctx context.Context, event pi.Event, stat
 			opts = append(opts, acp.WithUpdateContent(toolCallContent(typed.Result.Content)))
 		}
 
-		return false, s.emitUpdates(ctx, []acp.SessionUpdate{
-			acp.UpdateToolCall(acp.ToolCallId(typed.ToolCallID), opts...),
-		})
+		return false, s.publishNativeToolTerminal(ctx, typed.ToolCallID, status,
+			acp.UpdateToolCall(acp.ToolCallId(typed.ToolCallID), opts...))
 	default:
 		return false, nil
 	}
