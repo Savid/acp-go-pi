@@ -413,10 +413,12 @@ func (s *agentSession) emitRawPiEvent(ctx context.Context, raw []byte) {
 	conn := s.agent.conn
 	s.agent.mu.Unlock()
 
-	s.mu.Lock()
-	s.rawEventSequence++
-	sequence := s.rawEventSequence
-	s.mu.Unlock()
+	// Serialize reservation through delivery so successful notifications cannot
+	// reorder and a failed attempt leaves the next contiguous sequence reusable.
+	s.rawEventMu.Lock()
+	defer s.rawEventMu.Unlock()
+
+	sequence := s.rawEventSequence + 1
 
 	payload := map[string]any{
 		acpFieldSessionID:     s.id,
@@ -437,5 +439,9 @@ func (s *agentSession) emitRawPiEvent(ctx context.Context, raw []byte) {
 
 	if err := conn.NotifyExtension(ctx, RawEventMethod, capped); err != nil {
 		s.agent.observe.RecordRawMessageEmitFailure(ctx, err)
+
+		return
 	}
+
+	s.rawEventSequence = sequence
 }

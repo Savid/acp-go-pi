@@ -94,6 +94,38 @@ func TestRawEventSixCases(t *testing.T) {
 	first.emitRawPiEvent(t.Context(), []byte(`{"type":"closed"}`))
 }
 
+func TestRawEventSequenceCommitsOnlyAfterSuccessfulDelivery(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	client := newDirectAgentClient()
+	agent.setConnection(client)
+	session := &agentSession{agent: agent, id: "session", rawMessages: rawMessageConfig{All: true}}
+
+	session.emitRawPiEvent(t.Context(), nil)
+	require.Empty(t, client.notified)
+	require.Zero(t, session.rawEventSequence)
+
+	session.emitRawPiEvent(
+		withTurnRoute(t.Context(), strings.Repeat("n", rawEventMaxBytes)),
+		[]byte(`{"type":"internal-cap-failure"}`),
+	)
+	require.Empty(t, client.notified)
+	require.Zero(t, session.rawEventSequence)
+
+	client.notifyErr = errors.New("delivery failed")
+	session.emitRawPiEvent(t.Context(), []byte(`{"type":"failed"}`))
+	require.Len(t, client.notified, 1)
+	require.EqualValues(t, 1, client.notified[0][rawEventFieldSequence])
+	require.Zero(t, session.rawEventSequence)
+
+	client.notifyErr = nil
+	session.emitRawPiEvent(t.Context(), []byte(`{"type":"recovered"}`))
+	session.emitRawPiEvent(t.Context(), []byte(`{"type":"next"}`))
+	require.Len(t, client.notified, 3)
+	require.EqualValues(t, 1, client.notified[1][rawEventFieldSequence])
+	require.EqualValues(t, 2, client.notified[2][rawEventFieldSequence])
+	require.EqualValues(t, 2, session.rawEventSequence)
+}
+
 func TestSessionUpdateEmissionAndPoisoning(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := newDirectAgentClient()

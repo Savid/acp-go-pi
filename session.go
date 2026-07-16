@@ -79,9 +79,10 @@ type agentSession struct {
 	pumpDone   chan struct{}
 	dialogWG   sync.WaitGroup
 
-	turn     chan struct{}
-	cancelMu sync.Mutex
-	toolMu   sync.Mutex
+	turn       chan struct{}
+	cancelMu   sync.Mutex
+	toolMu     sync.Mutex
+	rawEventMu sync.Mutex
 
 	mu                  sync.Mutex
 	title               string
