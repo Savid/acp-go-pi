@@ -20,14 +20,20 @@ var execCommandContext = exec.CommandContext
 // ProbeVersion runs `pi --version` and returns the reported version string.
 func ProbeVersion(ctx context.Context, executablePath string) (string, error) {
 	cmd := execCommandContext(ctx, executablePath, "--version")
-	configureProcessCommandPlatform(cmd)
 
 	var output bytes.Buffer
 
 	cmd.Stdout = &output
 	cmd.WaitDelay = defaultShutdownStepTimeout
 
-	tree, err := startProcessTree(cmd)
+	launch, err := prepareProcessTreeCommand(cmd)
+	if err != nil {
+		return "", fmt.Errorf("prepare pi version probe: %w", err)
+	}
+
+	cmd = launch.cmd
+
+	tree, err := startProcessTree(launch)
 	if err != nil {
 		return "", fmt.Errorf("probe pi version: %w", err)
 	}
@@ -47,10 +53,6 @@ func ProbeVersion(ctx context.Context, executablePath string) (string, error) {
 	<-cancellationDone
 
 	quiescenceErr := tree.terminateAndWait(defaultProcessTreeWait)
-	if errors.Is(waitErr, exec.ErrWaitDelay) && quiescenceErr == nil {
-		waitErr = nil
-	}
-
 	if waitErr != nil || quiescenceErr != nil {
 		var probeErr error
 		if waitErr != nil {

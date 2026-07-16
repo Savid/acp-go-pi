@@ -33,9 +33,16 @@ deny, and `allow` mode is only ever explicit per session — see
 
 Each session's pi process runs in its own isolated agent directory under the
 `WithScratchDir` parent, so sessions share no config, auth, or session files.
-The adapter shuts children down by closing stdin — which pi honors by exiting
-immediately — escalating to signals only when needed, so a crashed or killed
-adapter does not leave orphaned pi processes behind.
+Linux launches each native root through a private embedded subreaper. A
+control-descriptor EOF contains the tree if the adapter dies, and a distinct
+proof record is accepted only after the supervisor has killed and reaped every
+descendant, including processes that call `setsid`. Supervisor failure without
+that record fails containment closed. Windows starts the root suspended,
+assigns it to a kill-on-close Job Object, and only then resumes it. Platforms
+without an authoritative boundary for process-group escape (including Darwin,
+FreeBSD, and OpenBSD) reject native startup rather than certifying a weaker
+process-group check. Within a supported boundary, shutdown begins by closing
+stdin and escalates to termination only when needed.
 
 ## Input validation
 

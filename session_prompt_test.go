@@ -146,6 +146,30 @@ func TestTurnTerminalPathsReturnContainmentProofFailure(t *testing.T) {
 	require.ErrorIs(t, err, fenceErr)
 }
 
+func TestPromptTransportEndReturnsContainmentProofFailure(t *testing.T) {
+	fenceErr := pi.ErrProcessTreeNotQuiescent
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	client := newStubPiClient()
+	process := newStubProcess(false)
+	process.close = fenceErr
+	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
+	session.startPump(client)
+	t.Cleanup(session.stopPump)
+
+	go func() {
+		deadline := time.Now().Add(time.Second)
+		for session.activeTurnSink() == nil && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+
+		close(client.events)
+		close(client.uiRequests)
+	}()
+
+	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "transport-end", "hang"))
+	require.ErrorIs(t, err, fenceErr)
+}
+
 func TestPromptHandleTurnEventEmitFailure(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	connection := newDirectAgentClient()

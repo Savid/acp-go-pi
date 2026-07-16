@@ -220,9 +220,17 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 	cmd.Stdin = stdinRead
 	cmd.Stdout = stdoutWrite
 	cmd.Stderr = stderr
-	configureProcessCommandPlatform(cmd)
 
-	tree, err := startProcessTree(cmd)
+	launch, err := prepareProcessTreeCommand(cmd)
+	if err != nil {
+		closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)
+
+		return nil, fmt.Errorf("prepare pi process: %w", err)
+	}
+
+	cmd = launch.cmd
+
+	tree, err := startProcessTree(launch)
 	if err != nil {
 		closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)
 

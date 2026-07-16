@@ -1,11 +1,13 @@
-//go:build linux || darwin || freebsd || openbsd
+//go:build linux
 
 package pi
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +18,15 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+)
+
+const adapterDeathHelperEnv = "ACP_GO_PI_ADAPTER_DEATH_TEST_HELPER"
+
+const (
+	detachedNativePathEnv = "ACP_GO_PI_DETACHED_NATIVE_PATH"
+	detachedPIDFileEnv    = "ACP_GO_PI_DETACHED_PID_FILE"
+	detachedSentinelEnv   = "ACP_GO_PI_DETACHED_SENTINEL"
+	detachedAgentDirEnv   = "ACP_GO_PI_DETACHED_AGENT_DIR"
 )
 
 func restoreSignalSeams(t *testing.T) {
@@ -162,6 +173,14 @@ func startStubbornProcessWithSeams(t *testing.T) *Process {
 
 func TestProcessSignalFailuresSurface(t *testing.T) {
 	process := startStubbornProcessWithSeams(t)
+	process.tree.mu.Lock()
+	process.tree.supervised = false
+	process.tree.mu.Unlock()
+	t.Cleanup(func() {
+		process.tree.mu.Lock()
+		process.tree.supervised = true
+		process.tree.mu.Unlock()
+	})
 
 	syscallKill = func(int, syscall.Signal) error { return syscall.EPERM }
 
@@ -267,6 +286,199 @@ func TestProcessTreeQuiescenceFailureBranches(t *testing.T) {
 	require.ErrorIs(t, tree.terminateAndWait(time.Millisecond), ErrProcessTreeNotQuiescent)
 }
 
+func TestShutdownReturnsFromGracefulSignalRung(t *testing.T) {
+	stdinRead, stdinWrite, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = stdinRead.Close() })
+
+	process := &Process{
+		tree:                &processTree{},
+		stdin:               stdinWrite,
+		shutdownStepTimeout: 50 * time.Millisecond,
+		exited:              make(chan struct{}),
+	}
+	go func() {
+		time.Sleep(75 * time.Millisecond)
+		close(process.exited)
+	}()
+
+	require.NoError(t, process.Shutdown(t.Context()))
+}
+
+func TestLinuxSupervisorProofBranches(t *testing.T) {
+	t.Run("missing channel", func(t *testing.T) {
+		tree := &processTree{supervised: true}
+		require.ErrorIs(t, tree.proveQuiescence(), ErrProcessTreeNotQuiescent)
+		require.ErrorIs(t, tree.proveQuiescence(), ErrProcessTreeNotQuiescent)
+	})
+
+	t.Run("deadline failure", func(t *testing.T) {
+		proof, err := os.CreateTemp(t.TempDir(), "proof")
+		require.NoError(t, err)
+		tree := &processTree{supervised: true, proof: proof, status: bufio.NewReader(proof)}
+		require.ErrorContains(t, tree.proveQuiescence(), "arm pi turn supervisor proof")
+	})
+
+	for _, test := range []struct {
+		name  string
+		value string
+		ok    bool
+	}{
+		{name: "eof"},
+		{name: "invalid", value: "not-proof\n"},
+		{name: "proven", value: turnSupervisorProven, ok: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			proof, writer, err := os.Pipe()
+			require.NoError(t, err)
+			if test.value != "" {
+				_, err = io.WriteString(writer, test.value)
+				require.NoError(t, err)
+			}
+			require.NoError(t, writer.Close())
+
+			tree := &processTree{supervised: true, proof: proof, status: bufio.NewReader(proof)}
+			err = tree.proveQuiescence()
+			if test.ok {
+				require.NoError(t, err)
+				require.NoError(t, tree.proveQuiescence())
+			} else {
+				require.ErrorIs(t, err, ErrProcessTreeNotQuiescent)
+			}
+		})
+	}
+}
+
+func TestLinuxSupervisorPreparationFailuresSurfaceAtCallers(t *testing.T) {
+	restoreTurnSupervisorSeams(t)
+	want := errors.New("memfd unavailable")
+	turnSupervisorMemfd = func(string, int) (int, error) { return 0, want }
+
+	_, err := StartProcess(t.Context(), LaunchSpec{
+		ExecutablePath: "/bin/true",
+		AgentDir:       t.TempDir(),
+	})
+	require.ErrorIs(t, err, want)
+	require.ErrorContains(t, err, "prepare pi process")
+
+	_, err = ProbeVersion(t.Context(), "/bin/true")
+	require.ErrorIs(t, err, want)
+	require.ErrorContains(t, err, "prepare pi version probe")
+}
+
+func TestSignalProcessGroupIDVanishedIsSuccess(t *testing.T) {
+	restoreSignalSeams(t)
+	syscallKill = func(int, syscall.Signal) error { return syscall.ESRCH }
+	require.NoError(t, signalProcessGroupID(1234, syscall.SIGKILL))
+}
+
+func TestLinuxSupervisorAdapterDeathContainsDetachedDescendant(t *testing.T) {
+	if os.Getenv(adapterDeathHelperEnv) == "1" {
+		process, err := StartProcess(context.Background(), LaunchSpec{
+			ExecutablePath: os.Getenv(detachedNativePathEnv),
+			AgentDir:       os.Getenv(detachedAgentDirEnv),
+			Env: map[string]string{
+				"PI_DETACHED_PID_FILE": os.Getenv(detachedPIDFileEnv),
+				"PI_DETACHED_SENTINEL": os.Getenv(detachedSentinelEnv),
+			},
+		})
+		if err != nil {
+			os.Exit(21)
+		}
+
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(os.Getenv(detachedPIDFileEnv)); err == nil {
+				// Deliberately bypass every cleanup path. Adapter process death
+				// must close the private control descriptor by kernel action.
+				_ = process
+				os.Exit(0)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		os.Exit(22)
+	}
+
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "detached.pid")
+	sentinel := filepath.Join(dir, "leaked")
+	script := detachedNativeScript(t, 2*time.Second)
+
+	helper := exec.Command(os.Args[0], "-test.run", "^TestLinuxSupervisorAdapterDeathContainsDetachedDescendant$")
+	helper.Env = append(os.Environ(),
+		adapterDeathHelperEnv+"=1",
+		detachedNativePathEnv+"="+script,
+		detachedPIDFileEnv+"="+pidFile,
+		detachedSentinelEnv+"="+sentinel,
+		detachedAgentDirEnv+"="+dir,
+	)
+	require.NoError(t, helper.Run())
+
+	pid := readProcessPID(t, pidFile)
+	require.Eventually(t, func() bool { return !processPIDAlive(pid) }, 5*time.Second, 10*time.Millisecond)
+	require.Never(t, func() bool {
+		_, err := os.Stat(sentinel)
+
+		return err == nil
+	}, 2200*time.Millisecond, 20*time.Millisecond, "adapter-death descendant reached delayed side effect")
+}
+
+func TestLinuxSupervisorDeathCannotForgeContainmentProof(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "detached.pid")
+	sentinel := filepath.Join(dir, "leaked")
+	script := detachedNativeScript(t, 20*time.Second)
+	process, err := StartProcess(context.Background(), LaunchSpec{
+		ExecutablePath: script,
+		AgentDir:       dir,
+		Env: map[string]string{
+			"PI_DETACHED_PID_FILE": pidFile,
+			"PI_DETACHED_SENTINEL": sentinel,
+		},
+	})
+	require.NoError(t, err)
+
+	pid := readProcessPID(t, pidFile)
+	require.True(t, processPIDAlive(pid))
+	require.NoError(t, process.cmd.Process.Kill())
+	<-process.Exited()
+
+	err = process.Close()
+	require.ErrorIs(t, err, ErrProcessTreeNotQuiescent)
+	require.False(t, ProcessTreeQuiescent(err))
+	require.True(t, processPIDAlive(pid), "escaped child unexpectedly served as proof after supervisor death")
+
+	require.NoError(t, syscall.Kill(pid, syscall.SIGKILL))
+	require.Eventually(t, func() bool { return !processPIDAlive(pid) }, 5*time.Second, 10*time.Millisecond)
+}
+
+func detachedNativeScript(t *testing.T, delay time.Duration) string {
+	t.Helper()
+
+	return writeScript(t, fmt.Sprintf(`setsid /bin/sh -c 'trap "" INT TERM; echo $$ > "$1"; sleep %d; echo LEAK > "$2"' ignored "$PI_DETACHED_PID_FILE" "$PI_DETACHED_SENTINEL" &
+trap '' INT TERM
+while :; do sleep 1; done`, int(delay/time.Second)))
+}
+
+func readProcessPID(t *testing.T, path string) int {
+	t.Helper()
+
+	var pid int
+	require.Eventually(t, func() bool {
+		raw, err := os.ReadFile(path) // #nosec G304 -- private test path.
+		if err != nil {
+			return false
+		}
+
+		pid, err = strconv.Atoi(strings.TrimSpace(string(raw)))
+
+		return err == nil && pid > 0
+	}, 5*time.Second, 10*time.Millisecond)
+
+	return pid
+}
+
 func processPIDAlive(pid int) bool {
 	err := syscall.Kill(pid, 0)
 
@@ -275,6 +487,14 @@ func processPIDAlive(pid int) bool {
 
 func TestProcessShutdownKillFailureSurfaces(t *testing.T) {
 	process := startStubbornProcessWithSeams(t)
+	process.tree.mu.Lock()
+	process.tree.supervised = false
+	process.tree.mu.Unlock()
+	t.Cleanup(func() {
+		process.tree.mu.Lock()
+		process.tree.supervised = true
+		process.tree.mu.Unlock()
+	})
 
 	syscallKill = func(pgid int, signal syscall.Signal) error {
 		if signal == syscall.SIGKILL {

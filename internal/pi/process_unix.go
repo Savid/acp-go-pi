@@ -3,24 +3,56 @@
 package pi
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 type processTree struct {
-	pgid int
+	mu         sync.Mutex
+	pgid       int
+	control    *os.File
+	supervised bool
+	proof      *os.File
+	status     *bufio.Reader
+	proofOnce  sync.Once
+	proofErr   error
 }
 
-func startProcessTree(cmd *exec.Cmd) (*processTree, error) {
-	if err := cmd.Start(); err != nil {
+func startProcessTree(launch *processTreeCommand) (*processTree, error) {
+	if err := launch.cmd.Start(); err != nil {
+		launch.close()
+
 		return nil, err
 	}
 
-	return &processTree{pgid: cmd.Process.Pid}, nil
+	launch.releaseInherited()
+
+	if err := awaitProcessTreeReady(launch); err != nil {
+		launch.close()
+		waitErr := launch.cmd.Wait()
+
+		return nil, errors.Join(err, waitErr)
+	}
+
+	tree := &processTree{
+		pgid:       launch.cmd.Process.Pid,
+		control:    launch.control,
+		supervised: launch.control != nil,
+		proof:      launch.ready,
+		status:     launch.status,
+	}
+	launch.control = nil
+	launch.ready = nil
+	launch.status = nil
+
+	return tree, nil
 }
 
 func (t *processTree) terminate() error {
@@ -28,6 +60,19 @@ func (t *processTree) terminate() error {
 }
 
 func (t *processTree) kill() error {
+	t.mu.Lock()
+	if t.supervised {
+		var err error
+		if t.control != nil {
+			err = t.control.Close()
+			t.control = nil
+		}
+		t.mu.Unlock()
+
+		return err
+	}
+	t.mu.Unlock()
+
 	return signalProcessGroupID(t.pgid, syscall.SIGKILL)
 }
 
@@ -49,7 +94,7 @@ func (t *processTree) terminateAndWait(timeout time.Duration) error {
 	for {
 		err := syscallKill(-t.pgid, 0)
 		if errors.Is(err, syscall.ESRCH) {
-			return nil
+			return t.proveQuiescence()
 		}
 
 		if err != nil && !errors.Is(err, syscall.EPERM) {
@@ -62,6 +107,46 @@ func (t *processTree) terminateAndWait(timeout time.Duration) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+func (t *processTree) proveQuiescence() error {
+	if !t.supervised {
+		return nil
+	}
+
+	t.proofOnce.Do(func() {
+		defer func() {
+			if t.proof != nil {
+				_ = t.proof.Close()
+				t.proof = nil
+			}
+		}()
+
+		if t.proof == nil || t.status == nil {
+			t.proofErr = fmt.Errorf("%w: pi turn supervisor proof channel is unavailable", ErrProcessTreeNotQuiescent)
+
+			return
+		}
+
+		if err := t.proof.SetReadDeadline(time.Now().Add(defaultProcessTreeWait)); err != nil {
+			t.proofErr = fmt.Errorf("%w: arm pi turn supervisor proof: %v", ErrProcessTreeNotQuiescent, err)
+
+			return
+		}
+
+		line, err := t.status.ReadString('\n')
+		if err != nil {
+			t.proofErr = fmt.Errorf("%w: await pi turn supervisor proof: %v", ErrProcessTreeNotQuiescent, err)
+
+			return
+		}
+
+		if line != turnSupervisorProven {
+			t.proofErr = fmt.Errorf("%w: invalid pi turn supervisor proof %q", ErrProcessTreeNotQuiescent, strings.TrimSpace(line))
+		}
+	})
+
+	return t.proofErr
 }
 
 func (*processTree) descendantCount() (int, bool) {

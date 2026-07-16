@@ -251,12 +251,13 @@ func TestProcessShutdownLadderSigterm(t *testing.T) {
 	process := startScriptProcess(t, LaunchSpec{
 		ExecutablePath:      script,
 		AgentDir:            t.TempDir(),
-		ShutdownStepTimeout: 200 * time.Millisecond,
+		ShutdownStepTimeout: time.Second,
 	})
 
 	t.Cleanup(func() { _ = process.Close() })
 
 	require.NoError(t, process.Shutdown(t.Context()))
+	require.NoError(t, process.WaitErr(), "SIGTERM rung must settle before SIGKILL escalation")
 }
 
 func TestProcessShutdownLadderSigkill(t *testing.T) {

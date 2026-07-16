@@ -1,14 +1,14 @@
-//go:build integration && (linux || darwin || freebsd || openbsd)
+//go:build integration && linux
 
 package integration
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -53,17 +53,18 @@ func TestAgentFakeCancelKillsBlockedNativeToolTree(t *testing.T) {
 		promptDone <- resp
 	}()
 
-	var descendantPID int
+	var descendant fakeProcessIdentity
 	require.Eventually(t, func() bool {
 		data, err := os.ReadFile(pidFile) // #nosec G304 -- private test path.
 		if err != nil {
 			return false
 		}
 
-		descendantPID, err = strconv.Atoi(strings.TrimSpace(string(data)))
+		err = json.Unmarshal(data, &descendant)
 
-		return err == nil && processAlive(descendantPID)
+		return err == nil && processAlive(descendant.PID)
 	}, 10*time.Second, 10*time.Millisecond, "blocked native descendant never started")
+	requireDetachedFromNativeRoot(t, descendant)
 
 	cancelStarted := time.Now()
 	require.NoError(t, conn.Cancel(ctx, piacp.CancelRequest(sessionID, "blocked-turn")))
@@ -77,7 +78,7 @@ func TestAgentFakeCancelKillsBlockedNativeToolTree(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("blocked prompt did not return after cancellation escalation")
 	}
-	require.False(t, processAlive(descendantPID), "cancelled prompt returned before the native descendant was dead: %s", processDebug(descendantPID))
+	require.False(t, processAlive(descendant.PID), "cancelled prompt returned before the native descendant was dead: %s", processDebug(descendant.PID))
 
 	require.Never(t, func() bool {
 		_, err := os.Stat(oldOutput)
@@ -122,21 +123,22 @@ func TestAgentFakeTimeoutKillsAcknowledgedNativeToolTreeBeforeReturning(t *testi
 		promptErr <- err
 	}()
 
-	var descendantPID int
+	var descendant fakeProcessIdentity
 	require.Eventually(t, func() bool {
 		data, err := os.ReadFile(pidFile) // #nosec G304 -- private test path.
 		if err != nil {
 			return false
 		}
 
-		descendantPID, err = strconv.Atoi(strings.TrimSpace(string(data)))
+		err = json.Unmarshal(data, &descendant)
 
-		return err == nil && processAlive(descendantPID)
+		return err == nil && processAlive(descendant.PID)
 	}, 10*time.Second, 10*time.Millisecond, "blocked native descendant never started")
+	requireDetachedFromNativeRoot(t, descendant)
 
 	err := <-promptErr
 	requireTurnFailure(t, err, "timeout")
-	require.False(t, processAlive(descendantPID), "timeout returned before the native descendant was dead")
+	require.False(t, processAlive(descendant.PID), "timeout returned before the native descendant was dead")
 	require.Never(t, func() bool {
 		_, statErr := os.Stat(oldOutput)
 
@@ -149,6 +151,18 @@ func TestAgentFakeTimeoutKillsAcknowledgedNativeToolTreeBeforeReturning(t *testi
 
 	_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: sessionID})
 	require.NoError(t, err)
+}
+
+func requireDetachedFromNativeRoot(t *testing.T, identity fakeProcessIdentity) {
+	t.Helper()
+	require.Positive(t, identity.NativePID)
+	require.Positive(t, identity.NativePGID)
+	require.Positive(t, identity.NativeSID)
+	require.NotEqual(t, identity.NativePID, identity.PID)
+	require.NotEqual(t, identity.NativePGID, identity.PGID)
+	require.NotEqual(t, identity.NativeSID, identity.SID)
+	require.Equal(t, identity.PID, identity.PGID, "setsid descendant must lead its own process group")
+	require.Equal(t, identity.PID, identity.SID, "setsid descendant must lead its own session")
 }
 
 func processAlive(pid int) bool {

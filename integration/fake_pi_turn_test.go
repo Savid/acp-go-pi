@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,13 +68,16 @@ func (s *fakePiServer) runTurn(turn *fakeTurn, message string) {
 }
 
 // runBlockedTool reproduces a native command that ignores pi's abort signal.
-// The helper descendant inherits the fake pi process group, so only the
-// wrapper's containment escalation can prevent its delayed side effect.
+// Its descendant creates a new session and ignores INT/TERM, so only the
+// wrapper's authoritative containment boundary can prevent its delayed side
+// effect.
 func (s *fakePiServer) runBlockedTool() {
 	command := exec.Command(os.Args[0], "-test.run", "^TestFakePiExecutable$") // #nosec G204 -- re-executes this fixed test helper.
 	descendantMode, err := json.Marshal(fakeDescendantMode{
-		DelayMS: s.scenario.BlockedToolDelayMs,
-		Output:  s.scenario.BlockedToolOutput,
+		DelayMS:       s.scenario.BlockedToolDelayMs,
+		Output:        s.scenario.BlockedToolOutput,
+		PIDFile:       s.scenario.BlockedToolPIDFile,
+		NativeProcess: currentFakeProcessIdentity(),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "encode blocked tool descendant mode: %v\n", err)
@@ -86,16 +88,6 @@ func (s *fakePiServer) runBlockedTool() {
 
 	if err := command.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "start blocked tool descendant: %v\n", err)
-
-		return
-	}
-
-	if err := os.WriteFile(
-		s.scenario.BlockedToolPIDFile,
-		[]byte(strconv.Itoa(command.Process.Pid)),
-		0o600,
-	); err != nil {
-		fmt.Fprintf(os.Stderr, "write blocked tool pid: %v\n", err)
 
 		return
 	}

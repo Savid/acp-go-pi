@@ -101,8 +101,19 @@ type fakeScenario struct {
 }
 
 type fakeDescendantMode struct {
-	DelayMS int    `json:"delayMs"`
-	Output  string `json:"output"`
+	DelayMS       int                 `json:"delayMs"`
+	Output        string              `json:"output"`
+	PIDFile       string              `json:"pidFile"`
+	NativeProcess fakeProcessIdentity `json:"nativeProcess"`
+}
+
+type fakeProcessIdentity struct {
+	PID        int `json:"pid"`
+	PGID       int `json:"pgid"`
+	SID        int `json:"sid"`
+	NativePID  int `json:"nativePid"`
+	NativePGID int `json:"nativePgid"`
+	NativeSID  int `json:"nativeSid"`
 }
 
 // fakeTurnScenario returns a scenario whose prompt turns succeed: a
@@ -144,6 +155,22 @@ func runFakePiDescendant(raw string) {
 	if json.Unmarshal([]byte(raw), &mode) != nil {
 		return
 	}
+
+	identity, err := isolateFakeDescendant()
+	if err != nil {
+		return
+	}
+	identity.NativePID = mode.NativeProcess.PID
+	identity.NativePGID = mode.NativeProcess.PGID
+	identity.NativeSID = mode.NativeProcess.SID
+
+	if mode.PIDFile != "" {
+		encoded, marshalErr := json.Marshal(identity)
+		if marshalErr != nil || os.WriteFile(mode.PIDFile, encoded, 0o600) != nil {
+			return
+		}
+	}
+
 	if mode.DelayMS > 0 {
 		time.Sleep(time.Duration(mode.DelayMS) * time.Millisecond)
 	}

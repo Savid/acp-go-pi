@@ -71,9 +71,11 @@ A turn resolves one of three ways:
   prompt resolves as a successful `cancelled` response, never an error. A user
   cancel wins even if a turn timeout fires at the same instant. Abort
   acknowledgement is not containment proof: the adapter always kills and
-  proves the active session process tree before cancellation settles, does not
-  mirror the partial turn, and lazily relaunches the same logical session for
-  the next prompt.
+  proves the active session process tree before cancellation settles. On Linux
+  that proof comes from an embedded subreaper after even session-detached
+  descendants are reaped; on Windows it comes from an empty Job Object. The
+  adapter does not mirror the partial turn and lazily relaunches the same
+  logical session for the next prompt.
 - **Failure** — a process exit, transport break, provider error, or
   `WithTurnTimeout` expiry ends the prompt with a `pi_turn_failed` JSON-RPC
   error. Timeout uses the same process-tree proof before returning. Failures
