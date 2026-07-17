@@ -85,6 +85,18 @@ func (s *agentSession) dispatchEvent(ctx context.Context, event pi.Event) {
 		return
 	}
 
+	// The native response barrier ends when the client hands this event to the
+	// pump, not when the prompt goroutine receives it from the turn sink. Record
+	// agent_settled before the cancellable sink send so stopPump cannot erase a
+	// durability fence that native pi has already crossed.
+	if _, settled := event.(pi.AgentSettledEvent); settled {
+		s.mu.Lock()
+		if s.turnSink == sink {
+			s.turnNativeSettled = true
+		}
+		s.mu.Unlock()
+	}
+
 	select {
 	case sink.events <- event:
 	case <-sink.done:

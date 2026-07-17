@@ -198,10 +198,12 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	s.turnCancelled = false
 	s.turnNonce = route.turnNonce
 	s.turnSink = sink
+	s.turnNativeSettled = false
 	s.turnFenceStarted = false
 	s.turnFenceDone = make(chan struct{})
 	s.turnFenceErr = nil
 	s.turnSettling = false
+	s.turnCommitOnCancel = false
 	s.mu.Unlock()
 	s.cancelMu.Unlock()
 
@@ -216,6 +218,8 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		s.turnCancelled = false
 		s.turnNonce = ""
 		s.turnSettling = false
+		s.turnNativeSettled = false
+		s.turnCommitOnCancel = false
 
 		if s.turnSink == sink {
 			s.turnSink = nil
@@ -424,7 +428,26 @@ func (s *agentSession) finishTurn(
 		return acp.PromptResponse{}, fenceErr
 	}
 
+	// A routed user cancellation can win the settlement race after pi has
+	// already emitted agent_settled. In that case the native session file is a
+	// complete durable generation (including pi's aborted assistant row), so
+	// publish it before the cancelled response. The cancel fence handles the
+	// opposite race, where the pump observes agent_settled but stopPump wins
+	// before the prompt goroutine receives it. Paths that never reach
+	// agent_settled deliberately preserve the prior mirror instead.
 	if s.wasTurnCancelled() {
+		s.mu.Lock()
+		commitCancelled := s.turnCommitOnCancel
+		s.mu.Unlock()
+
+		if !commitCancelled {
+			return cancelledResponse(params.MessageId), nil
+		}
+
+		if err := s.commitMirror(context.WithoutCancel(ctx)); err != nil {
+			return acp.PromptResponse{}, err
+		}
+
 		return cancelledResponse(params.MessageId), nil
 	}
 

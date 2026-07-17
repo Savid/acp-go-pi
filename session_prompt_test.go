@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -224,6 +226,40 @@ func TestFinishTurnCommitMirrorFailure(t *testing.T) {
 	var timedOut atomic.Bool
 	_, err := session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, &timedOut)
 	require.Error(t, err)
+
+	session.turnCancelled = true
+	session.turnCommitOnCancel = true
+	_, err = session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, &timedOut)
+	require.Error(t, err, "a settled cancellation must not hide its mirror failure")
+}
+
+func TestFinishTurnSettledCancelCommitsMirror(t *testing.T) {
+	store := NewInMemorySessionStore()
+	agent := NewAgent(
+		WithLogger(slog.New(slog.DiscardHandler)),
+		WithSessionStore(store),
+	)
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("{\"type\":\"session\"}\n{\"type\":\"message\"}\n"), 0o600))
+	session := &agentSession{
+		agent:              agent,
+		id:                 "id",
+		sessionFilePath:    path,
+		turnCancelled:      true,
+		turnCommitOnCancel: true,
+	}
+
+	var timedOut atomic.Bool
+	timedOut.Store(true)
+	response, err := session.finishTurn(
+		t.Context(), t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, &timedOut,
+	)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonCancelled, response.StopReason,
+		"an explicit cancel must win a simultaneous timeout")
+	entries, err := store.Load(t.Context(), SessionKey{SessionID: "id"})
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "the durable cancelled generation must precede the response")
 }
 
 func TestTurnEventAndUsageBranches(t *testing.T) {

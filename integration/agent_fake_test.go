@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -12,6 +13,17 @@ import (
 	piacp "github.com/savid/acp-go-pi"
 	"github.com/stretchr/testify/require"
 )
+
+type failingAppendStore struct {
+	*piacp.InMemorySessionStore
+	err error
+}
+
+func (s *failingAppendStore) Append(
+	context.Context, piacp.SessionKey, []piacp.SessionStoreEntry,
+) error {
+	return s.err
+}
 
 // requireTurnFailure asserts the uniform native-turn-failure wire shape: a
 // JSON-RPC -32603 error carrying data.error "pi_turn_failed" and the given
@@ -89,7 +101,10 @@ func TestAgentFakeCancelDuringStream(t *testing.T) {
 	client := &recordingClient{}
 	store := piacp.NewInMemorySessionStore()
 	conn := connectFakeAgentForTest(t, ctx, client, scenario, piacp.WithSessionStore(store))
-	sessionID := newFakeSession(t, ctx, conn)
+	cwd := t.TempDir()
+	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	sessionID := session.SessionId
 
 	promptDone := make(chan acp.PromptResponse, 1)
 	promptErr := make(chan error, 1)
@@ -121,6 +136,51 @@ func TestAgentFakeCancelDuringStream(t *testing.T) {
 	entries, err := store.Load(ctx, piacp.SessionKey{SessionID: string(sessionID)})
 	require.NoError(t, err)
 	require.NotEmpty(t, entries, "a cancelled turn is mirrored only after its native settle fence")
+	require.Contains(t, string(entries[len(entries)-1]), `"stopReason":"aborted"`,
+		"the committed generation must include pi's durable aborted assistant row")
+
+	_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: sessionID})
+	require.NoError(t, err)
+
+	resumeClient := &recordingClient{}
+	resumeConn := connectFakeAgentForTest(t, ctx, resumeClient, scenario, piacp.WithSessionStore(store))
+	_, err = resumeConn.ResumeSession(ctx, piacp.ResumeSessionRequest(sessionID, cwd))
+	require.NoError(t, err, "a first-turn cancel must leave a resumable native session")
+
+	resp, err := resumeConn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn-2", "continue after cancel"))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
+}
+
+func TestAgentFakeSettledCancelMirrorFailureFailsPrompt(t *testing.T) {
+	requireRunIntegration(t)
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	scenario := fakeTurnScenario()
+	scenario.DeltaTexts = []string{"one ", "two ", "three ", "four "}
+	scenario.StreamDelayMs = 250
+	client := &recordingClient{}
+	store := &failingAppendStore{
+		InMemorySessionStore: piacp.NewInMemorySessionStore(),
+		err:                  errors.New("cancel mirror unavailable"),
+	}
+	conn := connectFakeAgentForTest(t, ctx, client, scenario, piacp.WithSessionStore(store))
+	sessionID := newFakeSession(t, ctx, conn)
+
+	promptDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "count slowly"))
+		promptDone <- err
+	}()
+
+	require.Eventually(t, func() bool { return client.text() != "" },
+		30*time.Second, 20*time.Millisecond, "no streamed chunk before cancel")
+	require.NoError(t, conn.Cancel(ctx, piacp.CancelRequest(sessionID, "test-turn")))
+	require.ErrorContains(t, <-promptDone, "cancel mirror unavailable",
+		"a cancelled response must not hide its failed durability fence")
 }
 
 func TestAgentFakeProviderErrorTurnFailure(t *testing.T) {

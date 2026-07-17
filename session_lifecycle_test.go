@@ -154,6 +154,158 @@ func TestSessionCancelContainsAcknowledgedAbortBeforeReturning(t *testing.T) {
 	require.Equal(t, 1, process.closeCalls)
 }
 
+func TestSessionCancelCommitsPumpObservedSettlementAfterContainment(t *testing.T) {
+	store := NewInMemorySessionStore()
+	agent := NewAgent(
+		WithLogger(slog.New(slog.DiscardHandler)),
+		WithSessionStore(store),
+	)
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("{\"type\":\"session\"}\n{\"type\":\"message\"}\n"), 0o600))
+
+	process := newStubProcess(false)
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	process.closeFunc = func() error {
+		close(closeStarted)
+		<-releaseClose
+
+		return nil
+	}
+
+	turnCtx, turnCancel := context.WithCancel(t.Context())
+	session := &agentSession{
+		agent:           agent,
+		id:              "id",
+		client:          newStubPiClient(),
+		proc:            process,
+		cancel:          turnCancel,
+		turnSink:        newTurnSink(),
+		turnFenceDone:   make(chan struct{}),
+		sessionFilePath: path,
+	}
+
+	// Reproduce the response-barrier race: the pump has accepted
+	// agent_settled, but cancellation prevents delivery to the prompt sink.
+	dispatchCtx, stopDispatch := context.WithCancel(t.Context())
+	stopDispatch()
+	session.dispatchEvent(dispatchCtx, pi.AgentSettledEvent{})
+
+	cancelDone := make(chan error, 1)
+	go func() { cancelDone <- session.Cancel(t.Context()) }()
+
+	<-closeStarted
+	entries, err := store.Load(t.Context(), SessionKey{SessionID: "id"})
+	require.NoError(t, err)
+	require.Empty(t, entries, "the mirror must remain behind process-tree containment")
+
+	close(releaseClose)
+	require.NoError(t, <-cancelDone)
+	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
+	entries, err = store.Load(t.Context(), SessionKey{SessionID: "id"})
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+}
+
+func TestSessionCancelWithoutNativeSettlementPreservesMirror(t *testing.T) {
+	store := NewInMemorySessionStore()
+	agent := NewAgent(
+		WithLogger(slog.New(slog.DiscardHandler)),
+		WithSessionStore(store),
+	)
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("{\"type\":\"session\"}\n{\"type\":\"message\"}\n"), 0o600))
+	_, turnCancel := context.WithCancel(t.Context())
+	session := &agentSession{
+		agent:           agent,
+		id:              "id",
+		client:          newStubPiClient(),
+		proc:            newStubProcess(false),
+		cancel:          turnCancel,
+		turnFenceDone:   make(chan struct{}),
+		sessionFilePath: path,
+	}
+
+	require.NoError(t, session.Cancel(t.Context()))
+	entries, err := store.Load(t.Context(), SessionKey{SessionID: "id"})
+	require.NoError(t, err)
+	require.Empty(t, entries, "a forced pre-settle cancellation must not adopt partial native bytes")
+}
+
+func TestSessionCloseAndTimeoutDoNotCommitSettledCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		fence func(*agentSession) error
+	}{
+		{
+			name: "close",
+			fence: func(session *agentSession) error {
+				return session.cancelForClose(t.Context())
+			},
+		},
+		{
+			name: "timeout",
+			fence: func(session *agentSession) error {
+				var timedOut atomic.Bool
+
+				return session.fenceTimedOutTurn(t.Context(), &timedOut)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := NewInMemorySessionStore()
+			agent := NewAgent(
+				WithLogger(slog.New(slog.DiscardHandler)),
+				WithSessionStore(store),
+			)
+			path := filepath.Join(t.TempDir(), "session.jsonl")
+			require.NoError(t, os.WriteFile(path, []byte("{\"type\":\"session\"}\n{\"type\":\"message\"}\n"), 0o600))
+			_, turnCancel := context.WithCancel(t.Context())
+			session := &agentSession{
+				agent:             agent,
+				id:                "id",
+				client:            newStubPiClient(),
+				proc:              newStubProcess(false),
+				cancel:            turnCancel,
+				turnNativeSettled: true,
+				turnFenceDone:     make(chan struct{}),
+				sessionFilePath:   path,
+			}
+
+			require.NoError(t, test.fence(session))
+			entries, err := store.Load(t.Context(), SessionKey{SessionID: "id"})
+			require.NoError(t, err)
+			require.Empty(t, entries, "non-user cancellation must preserve the prior mirror")
+		})
+	}
+}
+
+func TestSessionSettledCancelMirrorFailureFailsFence(t *testing.T) {
+	store := newFaultySessionStore()
+	store.appendErr = errors.New("durability unavailable")
+	agent := NewAgent(
+		WithLogger(slog.New(slog.DiscardHandler)),
+		WithSessionStore(store),
+	)
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("{\"type\":\"session\"}\n{\"type\":\"message\"}\n"), 0o600))
+	_, turnCancel := context.WithCancel(t.Context())
+	session := &agentSession{
+		agent:             agent,
+		id:                "id",
+		client:            newStubPiClient(),
+		proc:              newStubProcess(false),
+		cancel:            turnCancel,
+		turnNativeSettled: true,
+		turnFenceDone:     make(chan struct{}),
+		sessionFilePath:   path,
+	}
+
+	err := session.Cancel(t.Context())
+	require.ErrorContains(t, err, "durability unavailable")
+	require.ErrorIs(t, session.awaitTurnFence(), errSessionMirrorAppend)
+}
+
 func TestPromptTimeoutContainsProcessTreeBeforeReturning(t *testing.T) {
 	agent := NewAgent(
 		WithLogger(slog.New(slog.DiscardHandler)),

@@ -272,7 +272,18 @@ func (s *agentSession) Cancel(ctx context.Context) (err error) {
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
 
-	return s.cancelNativeLocked(ctx)
+	return s.cancelNativeLocked(ctx, true)
+}
+
+// cancelForClose contains active work for session close/delete without
+// adopting a fresh native generation. Close and delete are teardown, not an
+// explicit session/cancel request, and retain their documented no-mirror
+// behavior.
+func (s *agentSession) cancelForClose(ctx context.Context) error {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+
+	return s.cancelNativeLocked(ctx, false)
 }
 
 // cancelRouted validates the active turn and keeps its native abort fenced
@@ -297,15 +308,19 @@ func (s *agentSession) cancelRouted(ctx context.Context, meta map[string]any) er
 		}
 	}
 
-	return s.cancelNativeLocked(ctx)
+	return s.cancelNativeLocked(ctx, true)
 }
 
-func (s *agentSession) cancelNativeLocked(ctx context.Context) (err error) {
+func (s *agentSession) cancelNativeLocked(ctx context.Context, commitSettled bool) (err error) {
 	s.cancelPendingInteractions()
 
 	s.mu.Lock()
 	turnCancel := s.cancel
 	client := s.client
+
+	if turnCancel != nil && commitSettled {
+		s.turnCommitOnCancel = true
+	}
 	s.mu.Unlock()
 
 	if s.agent != nil {
@@ -410,6 +425,19 @@ func (s *agentSession) fenceActiveTurnLocked(ctx context.Context) (err error) {
 	// proof boundary.
 	s.stopPump()
 	err = s.terminateCancelledTurn(context.WithoutCancel(ctx), proc, turnCancel, abortErr)
+
+	// Pi's abort response follows its native terminal ladder. The pump records
+	// agent_settled before forwarding it to the prompt goroutine, so even when
+	// stopPump wins that delivery race we can still publish the complete
+	// durable aborted generation. Never adopt a forced-kill partial turn: both
+	// successful containment and the native settle marker are required.
+	s.mu.Lock()
+	commitCancelled := err == nil && s.turnCommitOnCancel && s.turnNativeSettled
+	s.mu.Unlock()
+
+	if commitCancelled {
+		err = s.commitMirror(context.WithoutCancel(ctx))
+	}
 
 	s.mu.Lock()
 	s.turnFenceErr = err

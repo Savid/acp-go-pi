@@ -74,8 +74,11 @@ A turn resolves one of three ways:
   proves the active session process tree before cancellation settles. On Linux
   that proof comes from an embedded subreaper after even session-detached
   descendants are reaped; on Windows it comes from an empty Job Object. The
-  adapter does not mirror the partial turn and lazily relaunches the same
-  logical session for the next prompt.
+  normal native abort ladder ends at `agent_settled`; after containment, the
+  adapter synchronously mirrors that durable aborted generation before the
+  cancelled response. If escalation stops the runtime before
+  `agent_settled`, no fresh generation is mirrored. The next prompt lazily
+  relaunches the same logical session from the resulting committed state.
 - **Failure** — a process exit, transport break, provider error, or
   `WithTurnTimeout` expiry ends the prompt with a `pi_turn_failed` JSON-RPC
   error. Timeout uses the same process-tree proof before returning. Failures
@@ -83,7 +86,7 @@ A turn resolves one of three ways:
   [ACP methods](/docs/reference/acp-methods) reference documents the error
   code and cause vocabulary.
 
-Only turns that cross pi's native `agent_settled` fence without losing the
-cancel/timeout settlement race are mirrored. Provider errors that settle are
-mirrored; cancelled, timed-out, transport, or process-failed partial turns are
-not.
+Only turns that cross pi's native `agent_settled` durability fence are
+mirrored. Successes, settled provider errors, and settled explicit cancels are
+included. Timed-out, transport-failed, process-failed, or cancellation-
+escalated partial turns that never settle are not.

@@ -299,7 +299,7 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 		return acp.CloseSessionResponse{}, err
 	}
 
-	_ = session.Cancel(ctx)
+	_ = session.cancelForClose(ctx)
 	closeErr := session.Close(ctx)
 
 	a.mu.Lock()
@@ -337,7 +337,7 @@ func (a *Agent) UnstableDeleteSession(
 	var cleanupErr error
 
 	if session != nil {
-		_ = session.Cancel(ctx)
+		_ = session.cancelForClose(ctx)
 		if err := session.Close(ctx); err != nil {
 			cleanupErr = errors.Join(cleanupErr, err)
 		}
