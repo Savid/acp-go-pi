@@ -26,6 +26,7 @@ const (
 	envKeyNodeOptions = "NODE_OPTIONS"
 	envKeyBashEnv     = "BASH_ENV"
 	envKeyEnv         = "ENV"
+	privateEnvPrefix  = "ACP_" + "GO_PI_INTERNAL_"
 )
 
 // PiOptions is the stable, supported pi-specific subset accepted at
@@ -318,6 +319,10 @@ func validEnvName(name string) bool {
 // (loader/preload and node/shell injection vectors).
 func blockedEnvKey(key string) bool {
 	upper := strings.ToUpper(key)
+	if strings.HasPrefix(upper, privateEnvPrefix) {
+		return true
+	}
+
 	switch upper {
 	case envKeyPath, envKeyNodeOptions, envKeyBashEnv, envKeyEnv:
 		return true

@@ -17,15 +17,19 @@ var (
 	materializeRemoveAll = os.RemoveAll
 	materializeWriteFile = os.WriteFile
 	materializeStat      = os.Stat
+	materializeReadFile  = os.ReadFile
+	materializeWalkDir   = filepath.WalkDir
+	materializeRel       = filepath.Rel
 )
 
 // sessionDirs is one session's isolated on-disk layout: an agent directory
 // (PI_CODING_AGENT_DIR) and a session storage directory (--session-dir),
 // both under one removable root.
 type sessionDirs struct {
-	Root       string
-	AgentDir   string
-	SessionDir string
+	SessionRoot string
+	Root        string
+	AgentDir    string
+	SessionDir  string
 }
 
 // createSessionDirs creates a fresh isolated per-session root under the
@@ -36,16 +40,30 @@ func (a *Agent) createSessionDirs() (sessionDirs, error) {
 		return sessionDirs{}, err
 	}
 
-	root, err := materializeMkdirTemp(parent, "acp-go-pi-session-*")
+	sessionRoot, err := materializeMkdirTemp(parent, "acp-go-pi-session-*")
 	if err != nil {
 		return sessionDirs{}, fmt.Errorf("create session root: %w", err)
 	}
 
-	dirs := sessionDirs{
-		Root:       root,
-		AgentDir:   filepath.Join(root, "agent"),
-		SessionDir: filepath.Join(root, "sessions"),
+	dirs, err := createSessionGeneration(sessionRoot)
+	if err != nil {
+		_ = materializeRemoveAll(sessionRoot)
+
+		return sessionDirs{}, err
 	}
+
+	dirs.SessionRoot = sessionRoot
+
+	return dirs, nil
+}
+
+func createSessionGeneration(sessionRoot string) (sessionDirs, error) {
+	root, err := materializeMkdirTemp(sessionRoot, "acp-go-pi-runtime-*")
+	if err != nil {
+		return sessionDirs{}, fmt.Errorf("create session runtime generation: %w", err)
+	}
+
+	dirs := sessionDirs{Root: root, AgentDir: filepath.Join(root, "agent"), SessionDir: filepath.Join(root, "sessions")}
 
 	for _, dir := range []string{dirs.AgentDir, dirs.SessionDir} {
 		if err := materializeMkdirAll(dir, 0o700); err != nil {
@@ -56,6 +74,58 @@ func (a *Agent) createSessionDirs() (sessionDirs, error) {
 	}
 
 	return dirs, nil
+}
+
+func copyGenerationAgentDir(source string, target string) error {
+	return materializeWalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+
+		relative, err := materializeRel(source, path)
+		if err != nil {
+			return err
+		}
+
+		if relative == "." {
+			return nil
+		}
+
+		destination := filepath.Join(target, relative)
+
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+
+		if entry.IsDir() {
+			return materializeMkdirAll(destination, info.Mode().Perm())
+		}
+
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("copy runtime generation agent path %q: non-regular entry", relative)
+		}
+
+		contents, err := materializeReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		return materializeWriteFile(destination, contents, info.Mode().Perm())
+	})
+}
+
+func rebaseGenerationPath(path string, oldRoot string, newRoot string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+
+	relative, err := materializeRel(oldRoot, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("runtime generation path %q is outside %q", path, oldRoot)
+	}
+
+	return filepath.Join(newRoot, relative), nil
 }
 
 // writeHydratedSessionFile materializes stored rows as a native session file

@@ -50,13 +50,13 @@ func TestNativeRootReleaseRequiresProcessTreeQuiescence(t *testing.T) {
 	releases := 0
 	release := func() { releases++ }
 
-	releaseNativeRootWhenQuiescent(release, internalpi.ErrProcessTreeNotQuiescent)
+	releaseNativeRootWhenComplete(release, internalpi.ErrProcessContainmentIncomplete)
 	require.Zero(t, releases)
 
-	releaseNativeRootWhenQuiescent(release, errors.New("native command failed"))
+	releaseNativeRootWhenComplete(release, errors.New("native command failed"))
 	require.Equal(t, 1, releases)
 
-	releaseNativeRootWhenQuiescent(nil, nil)
+	releaseNativeRootWhenComplete(nil, nil)
 }
 
 func TestSessionResourceAdmissionFailsBeforeNativeStart(t *testing.T) {
@@ -74,6 +74,19 @@ func TestSessionResourceAdmissionFailsBeforeNativeStart(t *testing.T) {
 	_, err = scratchBlocked.startSession(t.Context(), sessionStart{Cwd: t.TempDir()})
 	require.ErrorIs(t, err, wantErr)
 
+	sessionScratchBlocked := newStubClientAgent(t, newStubPiClient(), WithRuntimeResourceHooks(RuntimeResourceHooks{
+		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) { return func() {}, nil },
+		ReserveScratchRoot: func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
+			if kind == RuntimeResourceSession {
+				return nil, wantErr
+			}
+
+			return func() {}, nil
+		},
+	}))
+	_, err = sessionScratchBlocked.startSession(t.Context(), sessionStart{Cwd: t.TempDir()})
+	require.ErrorIs(t, err, wantErr)
+
 	scratchReleases := 0
 	sessionBlocked := newStubClientAgent(t, newStubPiClient(), WithRuntimeResourceHooks(RuntimeResourceHooks{
 		AcquireNativeRoot: func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
@@ -89,7 +102,25 @@ func TestSessionResourceAdmissionFailsBeforeNativeStart(t *testing.T) {
 	}))
 	_, err = sessionBlocked.startSession(t.Context(), sessionStart{Cwd: t.TempDir()})
 	require.ErrorIs(t, err, wantErr)
-	require.Equal(t, 1, scratchReleases)
+	require.Equal(t, 2, scratchReleases)
+
+	restoreRuntimeGenerationSeams(t)
+	randomCalls := 0
+	runtimeGenerationRandRead = func(destination []byte) (int, error) {
+		randomCalls++
+		if randomCalls == 2 {
+			return 0, wantErr
+		}
+
+		for index := range destination {
+			destination[index] = byte(index + 1)
+		}
+
+		return len(destination), nil
+	}
+	containmentBlocked := newStubClientAgent(t, newStubPiClient())
+	_, err = containmentBlocked.startSession(t.Context(), sessionStart{Cwd: t.TempDir()})
+	require.ErrorIs(t, err, wantErr)
 }
 
 func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
@@ -112,19 +143,19 @@ func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
 		require.NoDirExists(t, root)
 	})
 
-	t.Run("unproven tree retains root and both admissions", func(t *testing.T) {
+	t.Run("incomplete containment retains root and both admissions", func(t *testing.T) {
 		root := filepath.Join(t.TempDir(), "session")
 		require.NoError(t, os.Mkdir(root, 0o700))
 		nativeReleases, scratchReleases := 0, 0
 
 		err := finalizeSessionRuntimeResources(
-			internalpi.ErrProcessTreeNotQuiescent,
+			internalpi.ErrProcessContainmentIncomplete,
 			func() { nativeReleases++ },
 			root,
 			func() { scratchReleases++ },
 		)
 
-		require.ErrorIs(t, err, internalpi.ErrProcessTreeNotQuiescent)
+		require.ErrorIs(t, err, internalpi.ErrProcessContainmentIncomplete)
 		require.Zero(t, nativeReleases)
 		require.Zero(t, scratchReleases)
 		require.DirExists(t, root)
@@ -157,7 +188,7 @@ func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
 	})
 }
 
-func TestSessionStartRetainsScratchWhenSpawnTreeIsUnproven(t *testing.T) {
+func TestSessionStartRetainsScratchWhenSpawnContainmentIsIncomplete(t *testing.T) {
 	scratch := t.TempDir()
 	nativeReleases, scratchReleases := 0, 0
 	agent := newStubClientAgent(
@@ -178,15 +209,15 @@ func TestSessionStartRetainsScratchWhenSpawnTreeIsUnproven(t *testing.T) {
 		}),
 	)
 	agent.startPiProcess = func(context.Context, internalpi.LaunchSpec) (piProcess, piClient, error) {
-		return nil, nil, internalpi.ErrProcessTreeNotQuiescent
+		return nil, nil, internalpi.ErrProcessContainmentIncomplete
 	}
 
 	_, err := agent.startSession(t.Context(), sessionStart{Cwd: t.TempDir()})
-	require.ErrorIs(t, err, internalpi.ErrProcessTreeNotQuiescent)
-	require.ErrorIs(t, agent.Close(), ErrProcessTreeUnproven)
-	require.ErrorIs(t, agent.Close(), ErrProcessTreeUnproven)
+	require.ErrorIs(t, err, internalpi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, agent.Close(), ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, agent.Close(), ErrProcessContainmentIncomplete)
 	require.Zero(t, nativeReleases)
-	require.Zero(t, scratchReleases)
+	require.Equal(t, 1, scratchReleases)
 	entries, readErr := os.ReadDir(scratch)
 	require.NoError(t, readErr)
 	require.NotEmpty(t, entries)

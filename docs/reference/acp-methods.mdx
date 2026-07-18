@@ -55,7 +55,7 @@ The `cause` vocabulary:
 | `process_exit` | The pi process died mid-turn; `message` carries the real exit status and a stderr tail. |
 | `transport` | pi's stdout closed or the event stream broke mid-turn. |
 | `provider` | pi reported a provider error for the turn (bad key, quota, upstream failure); `message` carries pi's error text verbatim. |
-| `timeout` | A `WithTurnTimeout` deadline expired; the native turn was aborted and its contained process tree was proved quiescent before return. |
+| `timeout` | A `WithTurnTimeout` deadline expired; the native turn was aborted and reached its selected containment boundary before return. On Darwin best-effort this means direct-child reap plus original-group absence, not escaped-descendant absence. |
 
 A provider failure leaves the session addressable: the next `session/prompt`
 re-drives the turn. A single malformed native line is skipped and counted, not

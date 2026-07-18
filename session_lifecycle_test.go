@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,13 +34,16 @@ func TestSessionCloseTurnWaitFailure(t *testing.T) {
 	require.Error(t, session.Close(t.Context()))
 }
 
-func TestSessionRetainsUnprovenNativeQuiescence(t *testing.T) {
-	session := &agentSession{}
-	session.recordNativeQuiescence(errors.New("ordinary native error"))
-	require.NoError(t, session.nativeQuiescenceError())
+func TestSessionRetainsIncompleteNativeContainment(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	session := &agentSession{agent: agent}
+	session.recordNativeContainment(errors.New("ordinary native error"))
+	require.NoError(t, session.nativeContainmentError())
+	require.NoError(t, agent.nativeContainmentError())
 
-	session.recordNativeQuiescence(pi.ErrProcessTreeNotQuiescent)
-	require.ErrorIs(t, session.nativeQuiescenceError(), pi.ErrProcessTreeNotQuiescent)
+	session.recordNativeContainment(pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, agent.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
 }
 
 func TestSessionTurnLifecycleBranches(t *testing.T) {
@@ -111,7 +115,7 @@ func TestSessionCancelEscalatesUnacknowledgedAbort(t *testing.T) {
 	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
 	require.Equal(t, 1, process.killCalls)
 	require.Equal(t, 1, process.closeCalls)
-	require.NoError(t, session.nativeQuiescenceError())
+	require.NoError(t, session.nativeContainmentError())
 }
 
 func TestSessionCancelContainsAcknowledgedAbortBeforeReturning(t *testing.T) {
@@ -140,10 +144,10 @@ func TestSessionCancelContainsAcknowledgedAbortBeforeReturning(t *testing.T) {
 	go func() { cancelDone <- session.Cancel(t.Context()) }()
 
 	<-closeStarted
-	require.NoError(t, turnCtx.Err(), "turn context must remain live until containment is proved")
+	require.NoError(t, turnCtx.Err(), "turn context must remain live until the selected boundary completes")
 	select {
 	case err := <-cancelDone:
-		t.Fatalf("cancel settled before process-tree proof: %v", err)
+		t.Fatalf("cancel settled before the selected containment boundary: %v", err)
 	default:
 	}
 
@@ -333,7 +337,7 @@ func TestPromptTimeoutContainsProcessTreeBeforeReturning(t *testing.T) {
 	<-closeStarted
 	select {
 	case err := <-promptDone:
-		t.Fatalf("timeout settled before process-tree proof: %v", err)
+		t.Fatalf("timeout settled before the selected containment boundary: %v", err)
 	default:
 	}
 
@@ -354,7 +358,7 @@ func TestTurnFenceInactiveIdempotentAndErrorBranches(t *testing.T) {
 
 	turnCtx, turnCancel := context.WithCancel(t.Context())
 	process := newStubProcess(false)
-	process.close = pi.ErrProcessTreeNotQuiescent
+	process.close = pi.ErrProcessContainmentIncomplete
 	active := &agentSession{
 		client:        newStubPiClient(),
 		proc:          process,
@@ -362,9 +366,9 @@ func TestTurnFenceInactiveIdempotentAndErrorBranches(t *testing.T) {
 		turnFenceDone: make(chan struct{}),
 	}
 	err := active.fenceTurnAfterContext(t.Context())
-	require.ErrorIs(t, err, pi.ErrProcessTreeNotQuiescent)
+	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
 	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
-	require.ErrorIs(t, active.fenceTurnAfterFailure(t.Context()), pi.ErrProcessTreeNotQuiescent)
+	require.ErrorIs(t, active.fenceTurnAfterFailure(t.Context()), pi.ErrProcessContainmentIncomplete)
 	require.Equal(t, 1, process.killCalls)
 	require.Equal(t, 1, process.closeCalls)
 
@@ -384,18 +388,18 @@ func TestSessionCancelEscalationFailures(t *testing.T) {
 		require.ErrorIs(t, turnCtx.Err(), context.Canceled)
 	})
 
-	t.Run("unproven process tree", func(t *testing.T) {
+	t.Run("incomplete process containment", func(t *testing.T) {
 		turnCtx, turnCancel := context.WithCancel(t.Context())
 		process := newStubProcess(false)
 		process.kill = errors.New("kill")
-		process.close = pi.ErrProcessTreeNotQuiescent
+		process.close = pi.ErrProcessContainmentIncomplete
 		session := &agentSession{agent: agent}
 
 		err := session.terminateCancelledTurn(t.Context(), process, turnCancel, abortErr)
 		require.ErrorIs(t, err, abortErr)
-		require.ErrorIs(t, err, pi.ErrProcessTreeNotQuiescent)
+		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
 		require.ErrorIs(t, turnCtx.Err(), context.Canceled)
-		require.ErrorIs(t, session.nativeQuiescenceError(), pi.ErrProcessTreeNotQuiescent)
+		require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
 	})
 }
 
@@ -404,6 +408,7 @@ func TestRelaunchProcessBranches(t *testing.T) {
 		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 		old := newStubProcess(true)
 		session := &agentSession{agent: agent, id: "id", proc: old, client: newStubPiClient(), sessionFilePath: filepath.Join(t.TempDir(), "missing"), mirroredRows: 5}
+		prepareRelaunchFixture(t, session)
 		relaunched := newStubProcess(false)
 		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
 			return relaunched, client, nil
@@ -425,19 +430,19 @@ func TestRelaunchProcessBranches(t *testing.T) {
 	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
 		starts++
 
-		return nil, nil, pi.ErrProcessTreeNotQuiescent
+		return nil, nil, pi.ErrProcessContainmentIncomplete
 	}
 	require.Error(t, session.ensureProcessAlive(t.Context()))
-	require.ErrorIs(t, session.nativeQuiescenceError(), pi.ErrProcessTreeNotQuiescent)
-	require.ErrorIs(t, session.ensureProcessAlive(t.Context()), pi.ErrProcessTreeNotQuiescent)
-	require.Equal(t, 1, starts, "unproven failed relaunch admitted another native root")
+	require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, session.ensureProcessAlive(t.Context()), pi.ErrProcessContainmentIncomplete)
+	require.Equal(t, 1, starts, "incomplete failed relaunch admitted another native root")
 
 	client = newStubPiClient()
 	session, _ = base(client)
 	oldProcess, ok := session.proc.(*stubProcess)
 	require.True(t, ok)
-	oldProcess.close = pi.ErrProcessTreeNotQuiescent
-	require.ErrorIs(t, session.ensureProcessAlive(t.Context()), pi.ErrProcessTreeNotQuiescent)
+	oldProcess.close = pi.ErrProcessContainmentIncomplete
+	require.ErrorIs(t, session.ensureProcessAlive(t.Context()), pi.ErrProcessContainmentIncomplete)
 
 	client = newStubPiClient()
 	client.startErr = errors.New("start")
@@ -494,11 +499,14 @@ func TestRefreshMCPToolsRebuildsRegistryOnFirstTurn(t *testing.T) {
 		proc:              old,
 		client:            newStubPiClient(),
 	}
+	prepareRelaunchFixture(t, session)
 	t.Cleanup(session.stopPump)
 
 	require.NoError(t, session.refreshMCPTools(t.Context()))
 	require.Equal(t, 1, starts)
-	require.Equal(t, sessionFile, launched.SessionPath)
+	require.NotEqual(t, sessionFile, launched.SessionPath)
+	require.FileExists(t, launched.SessionPath)
+	require.Contains(t, launched.SessionPath, launched.Containment.GenerationRoot)
 	require.Empty(t, launched.SessionID)
 	require.Same(t, relaunched, session.proc)
 	require.Same(t, client, session.client)
@@ -521,14 +529,168 @@ func TestRefreshMCPToolsKeepsRetryPendingAfterFailedRelaunch(t *testing.T) {
 		proc:              newStubProcess(false),
 		client:            newStubPiClient(),
 	}
+	prepareRelaunchFixture(t, session)
 
 	require.ErrorContains(t, session.refreshMCPTools(t.Context()), "relaunch")
 	require.True(t, session.mcpRefreshPending)
 
-	unproven := newStubProcess(false)
-	unproven.close = pi.ErrProcessTreeNotQuiescent
-	session.proc = unproven
-	session.nativeQuiescenceErr = nil
-	require.ErrorIs(t, session.refreshMCPTools(t.Context()), pi.ErrProcessTreeNotQuiescent)
+	incomplete := newStubProcess(false)
+	incomplete.close = pi.ErrProcessContainmentIncomplete
+	session.proc = incomplete
+	session.nativeContainmentErr = nil
+	require.ErrorIs(t, session.refreshMCPTools(t.Context()), pi.ErrProcessContainmentIncomplete)
 	require.True(t, session.mcpRefreshPending)
+}
+
+func prepareRelaunchFixture(t *testing.T, session *agentSession) {
+	t.Helper()
+	parent := t.TempDir()
+	sessionRoot, err := os.MkdirTemp(parent, "acp-go-pi-session-*")
+	require.NoError(t, err)
+	dirs, err := createSessionGeneration(sessionRoot)
+	require.NoError(t, err)
+	session.sessionRoot = sessionRoot
+	session.launch.AgentDir = dirs.AgentDir
+	session.launch.SessionDir = dirs.SessionDir
+	session.launch.Containment = pi.ContainmentSpec{
+		ScratchParent:  parent,
+		GenerationRoot: dirs.Root,
+		RuntimeID:      strings.Repeat("a", 32),
+		LifecycleKind:  string(RuntimeResourceSession),
+	}
+}
+
+func TestNextRuntimeLaunchFailureBranches(t *testing.T) {
+	wantErr := errors.New("injected relaunch materialization failure")
+
+	fixture := func(t *testing.T) (*agentSession, pi.LaunchSpec, string) {
+		t.Helper()
+		parent := t.TempDir()
+		sessionRoot, err := os.MkdirTemp(parent, "acp-go-pi-session-")
+		require.NoError(t, err)
+		oldRoot, err := os.MkdirTemp(sessionRoot, "acp-go-pi-runtime-")
+		require.NoError(t, err)
+		oldAgent := filepath.Join(oldRoot, "agent")
+		require.NoError(t, os.Mkdir(oldAgent, 0o700))
+		agent := NewAgent(testContainmentOption(), WithScratchDir(parent), WithLogger(slog.New(slog.DiscardHandler)))
+		session := &agentSession{agent: agent, id: "id", sessionRoot: sessionRoot}
+		previous := pi.LaunchSpec{
+			AgentDir:    oldAgent,
+			Containment: pi.ContainmentSpec{GenerationRoot: oldRoot},
+		}
+
+		return session, previous, oldRoot
+	}
+
+	t.Run("generation", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		session, previous, _ := fixture(t)
+		materializeMkdirTemp = func(string, string) (string, error) { return "", wantErr }
+		_, err := session.nextRuntimeLaunch(previous, "")
+		require.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("copy agent", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		session, previous, _ := fixture(t)
+		previous.AgentDir = filepath.Join(t.TempDir(), "missing")
+		_, err := session.nextRuntimeLaunch(previous, "")
+		require.ErrorContains(t, err, "copy pi agent generation")
+	})
+
+	for _, test := range []struct {
+		name  string
+		apply func(*pi.LaunchSpec, string)
+	}{
+		{name: "extension", apply: func(spec *pi.LaunchSpec, outside string) { spec.ExtensionPaths = []string{outside} }},
+		{name: "skill", apply: func(spec *pi.LaunchSpec, outside string) { spec.SkillPaths = []string{outside} }},
+		{name: "prompt template", apply: func(spec *pi.LaunchSpec, outside string) { spec.PromptTemplatePaths = []string{outside} }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			restoreMaterializeSeams(t)
+			session, previous, _ := fixture(t)
+			test.apply(&previous, filepath.Join(t.TempDir(), "outside"))
+			_, err := session.nextRuntimeLaunch(previous, "")
+			require.ErrorContains(t, err, "outside")
+		})
+	}
+
+	t.Run("hydrate write", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		session, previous, _ := fixture(t)
+		last := filepath.Join(t.TempDir(), "session.jsonl")
+		require.NoError(t, os.WriteFile(last, []byte("{}\n"), 0o600))
+		materializeWriteFile = func(string, []byte, os.FileMode) error { return wantErr }
+		_, err := session.nextRuntimeLaunch(previous, last)
+		require.ErrorContains(t, err, "hydrate relaunched pi session")
+	})
+
+	t.Run("hydrate read", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		session, previous, _ := fixture(t)
+		materializeReadFile = func(string) ([]byte, error) { return nil, wantErr }
+		_, err := session.nextRuntimeLaunch(previous, "/prior/session.jsonl")
+		require.ErrorContains(t, err, "read prior pi session")
+	})
+
+	t.Run("containment identity", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		restoreRuntimeGenerationSeams(t)
+		session, previous, _ := fixture(t)
+		runtimeGenerationRandRead = func([]byte) (int, error) { return 0, wantErr }
+		_, err := session.nextRuntimeLaunch(previous, "")
+		require.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("remove previous", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		session, previous, oldRoot := fixture(t)
+		materializeRemoveAll = func(path string) error {
+			if path == oldRoot {
+				return wantErr
+			}
+
+			return os.RemoveAll(path)
+		}
+		_, err := session.nextRuntimeLaunch(previous, "")
+		require.ErrorContains(t, err, "remove prior runtime generation")
+	})
+
+	t.Run("rebases environment", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		session, previous, _ := fixture(t)
+		previous.Env = map[string]string{"RESOURCE": filepath.Join(previous.AgentDir, "resource"), "OTHER": "/outside"}
+		spec, err := session.nextRuntimeLaunch(previous, "")
+		require.NoError(t, err)
+		require.Equal(t, filepath.Join(spec.AgentDir, "resource"), spec.Env["RESOURCE"])
+		require.Equal(t, "/outside", spec.Env["OTHER"])
+		require.Equal(t, string(session.id), spec.SessionID)
+	})
+}
+
+func TestRelaunchAdmissionFailureBranches(t *testing.T) {
+	t.Run("agent closed", func(t *testing.T) {
+		agent := NewAgent(testContainmentOption())
+		agent.mu.Lock()
+		agent.closed = true
+		agent.mu.Unlock()
+
+		session := &agentSession{agent: agent}
+		require.ErrorIs(t, session.relaunchProcess(t.Context()), errAgentClosed)
+	})
+
+	t.Run("next launch", func(t *testing.T) {
+		session := &agentSession{agent: NewAgent(testContainmentOption()), sessionRoot: filepath.Join(t.TempDir(), "missing")}
+		require.Error(t, session.relaunchProcess(t.Context()))
+	})
+
+	t.Run("native root", func(t *testing.T) {
+		wantErr := errors.New("native root unavailable")
+		agent := NewAgent(testContainmentOption(), WithRuntimeResourceHooks(RuntimeResourceHooks{
+			AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) { return nil, wantErr },
+		}))
+		session := &agentSession{agent: agent, id: "id"}
+		prepareRelaunchFixture(t, session)
+		require.ErrorIs(t, session.relaunchProcess(t.Context()), wantErr)
+	})
 }

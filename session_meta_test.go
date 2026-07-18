@@ -77,7 +77,7 @@ func TestEnvironmentValidation(t *testing.T) {
 	for _, name := range []string{"", "1A", "A-B", "A B", "é"} {
 		require.False(t, validEnvName(name))
 	}
-	for _, name := range []string{"PATH", "path", "NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "dyld_insert_libraries"} {
+	for _, name := range []string{"PATH", "path", "NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_DARWIN_LAUNCH", "acp_go_pi_internal_turn_supervisor"} {
 		require.True(t, blockedEnvKey(name))
 	}
 }

@@ -10,16 +10,18 @@ import (
 
 type processTree struct{}
 
+func (*processTree) directChildWait() *directChildWait { return nil }
+
 func configureProcessCommandPlatform(*exec.Cmd) {}
 
 func startProcessTree(launch *processTreeCommand) (*processTree, error) {
 	launch.close()
 
-	return nil, fmt.Errorf("%w: platform containment backend unavailable", ErrProcessTreeNotQuiescent)
+	return nil, fmt.Errorf("%w: platform containment backend unavailable", ErrProcessContainmentIncomplete)
 }
 
-func (*processTree) terminate() error { return ErrProcessTreeNotQuiescent }
-func (*processTree) kill() error      { return ErrProcessTreeNotQuiescent }
+func (*processTree) terminate() error { return ErrProcessContainmentIncomplete }
+func (*processTree) kill() error      { return ErrProcessContainmentIncomplete }
 func (*processTree) terminateAndWait(time.Duration) error {
-	return ErrProcessTreeNotQuiescent
+	return ErrProcessContainmentIncomplete
 }

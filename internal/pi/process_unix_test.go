@@ -32,113 +32,10 @@ const (
 func restoreSignalSeams(t *testing.T) {
 	t.Helper()
 
-	osProcess, getpgid, kill := signalOSProcess, syscallGetpgid, syscallKill
+	getpgid, kill := syscallGetpgid, syscallKill
 
 	t.Cleanup(func() {
-		signalOSProcess, syscallGetpgid, syscallKill = osProcess, getpgid, kill
-	})
-}
-
-func startedThrowawayCommand(t *testing.T) *exec.Cmd {
-	t.Helper()
-
-	cmd := exec.Command("/bin/sh", "-c", "sleep 5")
-	require.NoError(t, cmd.Start())
-
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	})
-
-	return cmd
-}
-
-func TestSignalProcessNilTargets(t *testing.T) {
-	t.Parallel()
-
-	signalled, err := signalProcess(nil, syscall.SIGTERM)
-	require.NoError(t, err)
-	require.False(t, signalled)
-
-	signalled, err = signalProcess(&exec.Cmd{}, syscall.SIGTERM)
-	require.NoError(t, err)
-	require.False(t, signalled)
-}
-
-func TestSignalProcessWithoutProcessGroup(t *testing.T) {
-	restoreSignalSeams(t)
-
-	cmd := startedThrowawayCommand(t)
-	require.False(t, usesProcessGroup(cmd))
-
-	t.Run("signal delivered", func(t *testing.T) {
-		signalled, err := signalProcess(cmd, syscall.SIGCONT)
-		require.NoError(t, err)
-		require.True(t, signalled)
-	})
-
-	t.Run("done process is not an error", func(t *testing.T) {
-		signalOSProcess = func(*os.Process, os.Signal) error { return os.ErrProcessDone }
-
-		signalled, err := signalProcess(cmd, syscall.SIGTERM)
-		require.NoError(t, err)
-		require.False(t, signalled)
-	})
-
-	t.Run("other signal errors propagate", func(t *testing.T) {
-		signalOSProcess = func(*os.Process, os.Signal) error { return fmt.Errorf("boom") }
-
-		_, err := signalProcess(cmd, syscall.SIGTERM)
-		require.ErrorContains(t, err, "boom")
-	})
-}
-
-func TestSignalProcessGroupSeams(t *testing.T) {
-	restoreSignalSeams(t)
-
-	cmd := startedThrowawayCommand(t)
-	cmd.SysProcAttr = processSysProcAttr()
-	require.True(t, usesProcessGroup(cmd))
-
-	t.Run("vanished group on getpgid", func(t *testing.T) {
-		syscallGetpgid = func(int) (int, error) { return 0, syscall.ESRCH }
-
-		signalled, err := signalProcess(cmd, syscall.SIGTERM)
-		require.NoError(t, err)
-		require.False(t, signalled)
-	})
-
-	t.Run("getpgid errors propagate", func(t *testing.T) {
-		syscallGetpgid = func(int) (int, error) { return 0, syscall.EPERM }
-
-		_, err := signalProcess(cmd, syscall.SIGTERM)
-		require.Error(t, err)
-	})
-
-	t.Run("vanished group on kill", func(t *testing.T) {
-		syscallGetpgid = func(int) (int, error) { return 12345, nil }
-		syscallKill = func(int, syscall.Signal) error { return syscall.ESRCH }
-
-		signalled, err := signalProcess(cmd, syscall.SIGTERM)
-		require.NoError(t, err)
-		require.False(t, signalled)
-	})
-
-	t.Run("kill errors propagate", func(t *testing.T) {
-		syscallGetpgid = func(int) (int, error) { return 12345, nil }
-		syscallKill = func(int, syscall.Signal) error { return syscall.EPERM }
-
-		_, err := signalProcess(cmd, syscall.SIGTERM)
-		require.Error(t, err)
-	})
-
-	t.Run("group signal delivered", func(t *testing.T) {
-		syscallGetpgid = func(int) (int, error) { return 12345, nil }
-		syscallKill = func(int, syscall.Signal) error { return nil }
-
-		signalled, err := signalProcess(cmd, syscall.SIGTERM)
-		require.NoError(t, err)
-		require.True(t, signalled)
+		syscallGetpgid, syscallKill = getpgid, kill
 	})
 }
 
@@ -149,7 +46,7 @@ func TestSignalProcessGroupSeams(t *testing.T) {
 func startStubbornProcessWithSeams(t *testing.T) *Process {
 	t.Helper()
 
-	osProcess, getpgid, kill := signalOSProcess, syscallGetpgid, syscallKill
+	getpgid, kill := syscallGetpgid, syscallKill
 
 	script := writeScript(t, `trap '' TERM; while :; do sleep 0.1; done`)
 
@@ -161,7 +58,7 @@ func startStubbornProcessWithSeams(t *testing.T) *Process {
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
-		signalOSProcess, syscallGetpgid, syscallKill = osProcess, getpgid, kill
+		syscallGetpgid, syscallKill = getpgid, kill
 
 		_ = process.Kill()
 		<-process.Exited()
@@ -191,7 +88,7 @@ func TestProcessSignalFailuresSurface(t *testing.T) {
 func TestProcessKillReportsUnreapedRoot(t *testing.T) {
 	process := &Process{tree: &processTree{}, exited: make(chan struct{})}
 
-	require.ErrorIs(t, process.Kill(), ErrProcessTreeNotQuiescent)
+	require.ErrorIs(t, process.Kill(), ErrProcessContainmentIncomplete)
 }
 
 func TestShutdownWaitsForDescendantTreeQuiescence(t *testing.T) {
@@ -231,7 +128,7 @@ echo $! > "$PI_VERSION_CHILD_PID_FILE"
 echo 0.80.6
 `), 0o700))
 
-	version, err := ProbeVersion(t.Context(), script)
+	version, err := ProbeVersion(t.Context(), script, testContainmentSpec(t))
 	require.NoError(t, err)
 	require.Equal(t, "0.80.6", version)
 
@@ -248,12 +145,12 @@ func TestProcessTreeQuiescenceFailureBranches(t *testing.T) {
 
 	require.NoError(t, (*processTree)(nil).terminateAndWait(time.Millisecond))
 	require.NoError(t, signalProcessGroupID(0, syscall.SIGKILL))
-	require.True(t, ProcessTreeQuiescent(nil))
-	require.False(t, ProcessTreeQuiescent(ErrProcessTreeNotQuiescent))
+	require.True(t, ProcessContainmentComplete(nil))
+	require.False(t, ProcessContainmentComplete(ErrProcessContainmentIncomplete))
 
 	tree := &processTree{pgid: 12345}
 	syscallKill = func(int, syscall.Signal) error { return syscall.EPERM }
-	require.ErrorIs(t, tree.terminateAndWait(time.Millisecond), ErrProcessTreeNotQuiescent)
+	require.ErrorIs(t, tree.terminateAndWait(time.Millisecond), ErrProcessContainmentIncomplete)
 
 	calls := 0
 	syscallKill = func(_ int, signal syscall.Signal) error {
@@ -274,7 +171,7 @@ func TestProcessTreeQuiescenceFailureBranches(t *testing.T) {
 
 		return nil
 	}
-	require.ErrorIs(t, tree.terminateAndWait(time.Millisecond), ErrProcessTreeNotQuiescent)
+	require.ErrorIs(t, tree.terminateAndWait(time.Millisecond), ErrProcessContainmentIncomplete)
 
 	syscallKill = func(_ int, signal syscall.Signal) error {
 		if signal == 0 {
@@ -283,7 +180,7 @@ func TestProcessTreeQuiescenceFailureBranches(t *testing.T) {
 
 		return nil
 	}
-	require.ErrorIs(t, tree.terminateAndWait(time.Millisecond), ErrProcessTreeNotQuiescent)
+	require.ErrorIs(t, tree.terminateAndWait(time.Millisecond), ErrProcessContainmentIncomplete)
 }
 
 func TestShutdownReturnsFromGracefulSignalRung(t *testing.T) {
@@ -308,15 +205,15 @@ func TestShutdownReturnsFromGracefulSignalRung(t *testing.T) {
 func TestLinuxSupervisorProofBranches(t *testing.T) {
 	t.Run("missing channel", func(t *testing.T) {
 		tree := &processTree{supervised: true}
-		require.ErrorIs(t, tree.proveQuiescence(), ErrProcessTreeNotQuiescent)
-		require.ErrorIs(t, tree.proveQuiescence(), ErrProcessTreeNotQuiescent)
+		require.ErrorIs(t, tree.completeBoundary(), ErrProcessContainmentIncomplete)
+		require.ErrorIs(t, tree.completeBoundary(), ErrProcessContainmentIncomplete)
 	})
 
 	t.Run("deadline failure", func(t *testing.T) {
-		proof, err := os.CreateTemp(t.TempDir(), "proof")
+		boundary, err := os.CreateTemp(t.TempDir(), "boundary")
 		require.NoError(t, err)
-		tree := &processTree{supervised: true, proof: proof, status: bufio.NewReader(proof)}
-		require.ErrorContains(t, tree.proveQuiescence(), "arm pi turn supervisor proof")
+		tree := &processTree{supervised: true, boundary: boundary, status: bufio.NewReader(boundary)}
+		require.ErrorContains(t, tree.completeBoundary(), "arm pi turn supervisor boundary")
 	})
 
 	for _, test := range []struct {
@@ -326,10 +223,10 @@ func TestLinuxSupervisorProofBranches(t *testing.T) {
 	}{
 		{name: "eof"},
 		{name: "invalid", value: "not-proof\n"},
-		{name: "proven", value: turnSupervisorProven, ok: true},
+		{name: "complete", value: turnSupervisorComplete, ok: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			proof, writer, err := os.Pipe()
+			boundary, writer, err := os.Pipe()
 			require.NoError(t, err)
 			if test.value != "" {
 				_, err = io.WriteString(writer, test.value)
@@ -337,13 +234,13 @@ func TestLinuxSupervisorProofBranches(t *testing.T) {
 			}
 			require.NoError(t, writer.Close())
 
-			tree := &processTree{supervised: true, proof: proof, status: bufio.NewReader(proof)}
-			err = tree.proveQuiescence()
+			tree := &processTree{supervised: true, boundary: boundary, status: bufio.NewReader(boundary)}
+			err = tree.completeBoundary()
 			if test.ok {
 				require.NoError(t, err)
-				require.NoError(t, tree.proveQuiescence())
+				require.NoError(t, tree.completeBoundary())
 			} else {
-				require.ErrorIs(t, err, ErrProcessTreeNotQuiescent)
+				require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
 			}
 		})
 	}
@@ -361,7 +258,7 @@ func TestLinuxSupervisorPreparationFailuresSurfaceAtCallers(t *testing.T) {
 	require.ErrorIs(t, err, want)
 	require.ErrorContains(t, err, "prepare pi process")
 
-	_, err = ProbeVersion(t.Context(), "/bin/true")
+	_, err = ProbeVersion(t.Context(), "/bin/true", testContainmentSpec(t))
 	require.ErrorIs(t, err, want)
 	require.ErrorContains(t, err, "prepare pi version probe")
 }
@@ -445,8 +342,8 @@ func TestLinuxSupervisorDeathCannotForgeContainmentProof(t *testing.T) {
 	<-process.Exited()
 
 	err = process.Close()
-	require.ErrorIs(t, err, ErrProcessTreeNotQuiescent)
-	require.False(t, ProcessTreeQuiescent(err))
+	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	require.False(t, ProcessContainmentComplete(err))
 	require.True(t, processPIDAlive(pid), "escaped child unexpectedly served as proof after supervisor death")
 
 	require.NoError(t, syscall.Kill(pid, syscall.SIGKILL))
@@ -507,25 +404,9 @@ func TestProcessShutdownKillFailureSurfaces(t *testing.T) {
 	require.ErrorContains(t, process.Shutdown(t.Context()), "kill pi process")
 }
 
-func TestConfigureProcessCommandPlatformCancel(t *testing.T) {
-	restoreSignalSeams(t)
-
-	var delivered []os.Signal
-
-	signalOSProcess = func(_ *os.Process, signal os.Signal) error {
-		delivered = append(delivered, signal)
-
-		return nil
-	}
-
-	cmd := startedThrowawayCommand(t)
+func TestConfigureProcessCommandPlatformAttributes(t *testing.T) {
+	cmd := &exec.Cmd{}
 	configureProcessCommandPlatform(cmd)
 	require.NotNil(t, cmd.SysProcAttr)
-	require.NotNil(t, cmd.Cancel)
-
-	// Started before configure, so no process group: Cancel signals the
-	// process directly through the seam.
-	cmd.SysProcAttr = nil
-	require.NoError(t, cmd.Cancel())
-	require.Equal(t, []os.Signal{syscall.SIGTERM}, delivered)
+	require.Nil(t, cmd.Cancel)
 }

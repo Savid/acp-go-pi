@@ -130,7 +130,11 @@ func turnSupervisorBootstrap() {
 	turnSupervisorExit(0)
 }
 
-func prepareProcessTreeCommand(native *exec.Cmd) (*processTreeCommand, error) {
+func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*processTreeCommand, error) {
+	if containment.DarwinBestEffort {
+		return nil, fmt.Errorf("%w: Darwin best-effort containment is invalid on linux", ErrProcessContainmentIncomplete)
+	}
+
 	config := turnSupervisorConfig{
 		Path: native.Path,
 		Args: append([]string(nil), native.Args...),
@@ -343,7 +347,7 @@ func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutpu
 }
 
 func publishTurnSupervisorProof(output io.Writer) error {
-	if _, err := io.WriteString(output, turnSupervisorProven); err != nil {
+	if _, err := io.WriteString(output, turnSupervisorComplete); err != nil {
 		return fmt.Errorf("publish pi turn supervisor containment proof: %w", err)
 	}
 
@@ -369,13 +373,13 @@ func containLinuxSupervisorDescendants(supervisorPID int, nativePID int) error {
 	for {
 		descendants, err := turnSupervisorDescendants(supervisorPID)
 		if err != nil {
-			return fmt.Errorf("%w: enumerate supervised pi descendants: %v", ErrProcessTreeNotQuiescent, err)
+			return fmt.Errorf("%w: enumerate supervised pi descendants: %v", ErrProcessContainmentIncomplete, err)
 		}
 
 		for _, descendant := range descendants {
 			if descendant.state != 'Z' {
 				if err := turnSupervisorSignalPID(descendant, syscall.SIGKILL); err != nil {
-					return fmt.Errorf("%w: kill supervised pi descendant %d: %v", ErrProcessTreeNotQuiescent, descendant.pid, err)
+					return fmt.Errorf("%w: kill supervised pi descendant %d: %v", ErrProcessContainmentIncomplete, descendant.pid, err)
 				}
 			}
 		}
@@ -395,7 +399,7 @@ func containLinuxSupervisorDescendants(supervisorPID int, nativePID int) error {
 			}
 
 			if waitErr != nil {
-				return fmt.Errorf("%w: inspect supervised pi child set: %v", ErrProcessTreeNotQuiescent, waitErr)
+				return fmt.Errorf("%w: inspect supervised pi child set: %v", ErrProcessContainmentIncomplete, waitErr)
 			}
 
 			break

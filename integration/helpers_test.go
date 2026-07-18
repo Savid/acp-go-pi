@@ -4,6 +4,8 @@ package integration
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	piacp "github.com/savid/acp-go-pi"
+	internalpi "github.com/savid/acp-go-pi/internal/pi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,6 +35,28 @@ const (
 )
 
 var integrationLogger = slog.New(slog.DiscardHandler)
+
+func integrationContainmentSpec(t *testing.T) internalpi.ContainmentSpec {
+	t.Helper()
+	if runtime.GOOS != "darwin" {
+		return internalpi.ContainmentSpec{}
+	}
+
+	parent := t.TempDir()
+	root, err := os.MkdirTemp(parent, "acp-go-pi-runtime-*")
+	require.NoError(t, err)
+	identity := make([]byte, 16)
+	_, err = rand.Read(identity)
+	require.NoError(t, err)
+
+	return internalpi.ContainmentSpec{
+		DarwinBestEffort: true,
+		ScratchParent:    parent,
+		GenerationRoot:   root,
+		RuntimeID:        hex.EncodeToString(identity),
+		LifecycleKind:    "discovery",
+	}
+}
 
 func TestMain(m *testing.M) {
 	previousLogger := slog.Default()

@@ -39,9 +39,18 @@ Every serve-mode flag has an option equivalent:
 | `-scratch-dir` | `WithScratchDir` |
 | `-model` | `WithDefaultModel` |
 | `-seed-file` | `WithSeedFiles` |
+| `-darwin-best-effort-containment` | `WithDarwinBestEffortContainment` |
 
 Embed-only options carry no flag. Use `WithSessionStore` when the host wants
 durable session storage, plus `WithEnv` for credential injection,
 `WithTurnTimeout`, `WithConcurrencyLimits`, and the
 OpenTelemetry providers. See the [Go API reference](/docs/reference/go-api)
 for the full catalog.
+
+Both entry points fail native startup closed on Darwin unless the explicit
+best-effort option is present. The CLI prints a warning; embedded hosts receive
+the same mode through `Agent.ContainmentMode`,
+`RuntimeResourceHooks.ObserveContainment`, structured logs, and the
+`acp_go_pi.runtime.containment` metric. Linux and Windows remain
+authoritative, while FreeBSD, OpenBSD, and unsupported platforms remain
+unavailable.

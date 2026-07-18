@@ -15,8 +15,16 @@ import (
 )
 
 type processTree struct {
-	mu  sync.Mutex
-	job windows.Handle
+	mu     sync.Mutex
+	job    windows.Handle
+	direct *directChildWait
+}
+
+func installDirectChildWait(cmd *exec.Cmd) *directChildWait {
+	wait := installPausedDirectChildWait(cmd)
+	wait.begin()
+
+	return wait
 }
 
 type jobBasicAccountingInformation struct {
@@ -81,16 +89,24 @@ func startProcessTree(launch *processTreeCommand) (*processTree, error) {
 	}
 	launch.control = nil
 
-	return &processTree{job: job}, nil
+	return &processTree{job: job, direct: installDirectChildWait(cmd)}, nil
+}
+
+func (t *processTree) directChildWait() *directChildWait {
+	if t == nil {
+		return nil
+	}
+
+	return t.direct
 }
 
 func abortSuspendedProcess(cmd *exec.Cmd, job windows.Handle, cause error) error {
 	tree := &processTree{job: job}
 	terminateErr := tree.kill()
 	waitErr := cmd.Wait()
-	quiescenceErr := tree.terminateAndWait(defaultProcessTreeWait)
+	containmentErr := tree.terminateAndWait(defaultProcessTreeWait)
 
-	return errors.Join(cause, terminateErr, waitErr, quiescenceErr)
+	return errors.Join(cause, terminateErr, waitErr, containmentErr)
 }
 
 func resumeProcessThreads(pid uint32) error {
@@ -160,7 +176,7 @@ func (t *processTree) terminateAndWait(timeout time.Duration) error {
 		return nil
 	}
 	if err := t.kill(); err != nil {
-		return fmt.Errorf("%w: terminate Windows job: %w", ErrProcessTreeNotQuiescent, err)
+		return fmt.Errorf("%w: terminate Windows job: %w", ErrProcessContainmentIncomplete, err)
 	}
 
 	deadline := time.NewTimer(timeout)
@@ -195,7 +211,7 @@ func (t *processTree) terminateAndWait(timeout time.Duration) error {
 		t.mu.Unlock()
 
 		if err != nil {
-			return fmt.Errorf("%w: inspect Windows job: %w", ErrProcessTreeNotQuiescent, err)
+			return fmt.Errorf("%w: inspect Windows job: %w", ErrProcessContainmentIncomplete, err)
 		}
 		if info.ActiveProcesses == 0 {
 			return nil
@@ -203,7 +219,7 @@ func (t *processTree) terminateAndWait(timeout time.Duration) error {
 
 		select {
 		case <-deadline.C:
-			return fmt.Errorf("%w: Windows job remained active", ErrProcessTreeNotQuiescent)
+			return fmt.Errorf("%w: Windows job remained active", ErrProcessContainmentIncomplete)
 		case <-ticker.C:
 		}
 	}

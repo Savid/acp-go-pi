@@ -2,6 +2,7 @@ package pi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,17 +15,20 @@ import (
 // defaultShutdownStepTimeout bounds each rung of the shutdown ladder.
 const defaultShutdownStepTimeout = 2 * time.Second
 
-// defaultProcessTreeWait bounds the final containment-boundary proof.
+// defaultProcessTreeWait bounds completion of the selected containment boundary.
 const defaultProcessTreeWait = 5 * time.Second
 
 // stderrTailLimit bounds the retained stderr tail used for error reporting.
 const stderrTailLimit = 8 << 10
 
 const (
-	envPath        = "PATH"
-	envNodeOptions = "NODE_OPTIONS"
-	envBashEnv     = "BASH_ENV"
-	envShellEnv    = "ENV"
+	envPath          = "PATH"
+	envNodeOptions   = "NODE_OPTIONS"
+	envBashEnv       = "BASH_ENV"
+	envShellEnv      = "ENV"
+	envRuntimeID     = "ACP_GO_PI_RUNTIME_ID"
+	envScratchRoot   = "ACP_GO_PI_SCRATCH_ROOT"
+	privateEnvPrefix = "ACP_" + "GO_PI_INTERNAL_"
 )
 
 // baseEnvironmentKeys are the only parent environment variables a pi child
@@ -32,6 +36,15 @@ const (
 // as live auth, so credentials must flow through explicit env additions.
 var baseEnvironmentKeys = []string{envPath, "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM"}
 var processPipe = os.Pipe
+var processPrepareTreeCommand = prepareProcessTreeCommand
+var processPrepareContainmentRecord = prepareContainmentRecord
+var processStartTree = startProcessTree
+var processAfterPrepare = func() {}
+var processDirectChildWait = func(tree *processTree) *directChildWait { return tree.directChildWait() }
+var processTreeTerminate = func(tree *processTree) error { return tree.terminate() }
+var processTreeKill = func(tree *processTree) error { return tree.kill() }
+var processTreeTerminateAndWait = func(tree *processTree, timeout time.Duration) error { return tree.terminateAndWait(timeout) }
+var processKillWait = defaultProcessTreeWait
 
 // LaunchSpec describes one pi RPC-mode process launch.
 type LaunchSpec struct {
@@ -59,6 +72,7 @@ type LaunchSpec struct {
 	// ShutdownStepTimeout bounds each rung of the shutdown ladder; zero uses
 	// the default.
 	ShutdownStepTimeout time.Duration
+	Containment         ContainmentSpec
 }
 
 // Args returns the pi CLI argument list for the launch: RPC mode with all
@@ -116,7 +130,12 @@ func (spec LaunchSpec) Environ() []string {
 	}
 
 	env["PI_OFFLINE"] = "1"
+
 	env["PI_CODING_AGENT_DIR"] = spec.AgentDir
+	if spec.Containment.DarwinBestEffort {
+		env[envRuntimeID] = spec.Containment.RuntimeID
+		env[envScratchRoot] = spec.Containment.GenerationRoot
+	}
 
 	keys := make([]string, 0, len(env))
 	for key := range env {
@@ -155,6 +174,10 @@ func safeExplicitEnvKey(key string) bool {
 		return false
 	}
 
+	if strings.HasPrefix(upper, privateEnvPrefix) {
+		return false
+	}
+
 	return !strings.HasPrefix(upper, "LD_") && !strings.HasPrefix(upper, "DYLD_")
 }
 
@@ -190,8 +213,9 @@ func (p *Process) ProviderDescendantCount() (int, bool) {
 // StartProcess launches pi per spec with a scrubbed environment, its own
 // process group, and parent-death enforcement where the platform supports it.
 func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	contextErr := ctx.Err()
+	if contextErr != nil {
+		return nil, contextErr
 	}
 
 	if spec.ExecutablePath == "" {
@@ -212,25 +236,45 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 
 	stderr := &tailBuffer{limit: stderrTailLimit}
 
-	// The context owns the child: cancellation triggers the platform Cancel
-	// (group SIGTERM where supported), backstopping the shutdown ladder.
-	cmd := exec.CommandContext(ctx, spec.ExecutablePath, spec.Args()...) // #nosec G204 -- launches the operator-configured pi binary with wrapper-built args.
+	// Cancellation is joined below only after the original process boundary has
+	// been captured. An exec.Cmd context watcher would be a second, racing
+	// signal owner and could rediscover a reused process-group id.
+	cmd := exec.Command(spec.ExecutablePath, spec.Args()...) // #nosec G204 -- launches the operator-configured pi binary with wrapper-built args.
 	cmd.Dir = spec.Cwd
 	cmd.Env = spec.Environ()
 	cmd.Stdin = stdinRead
 	cmd.Stdout = stdoutWrite
 	cmd.Stderr = stderr
 
-	launch, err := prepareProcessTreeCommand(cmd)
+	launch, err := processPrepareTreeCommand(cmd, spec.Containment)
 	if err != nil {
 		closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)
 
 		return nil, fmt.Errorf("prepare pi process: %w", err)
 	}
 
+	launch.containment, err = processPrepareContainmentRecord(spec.Containment)
+	if err != nil {
+		launch.close()
+		closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)
+
+		return nil, fmt.Errorf("prepare pi containment record: %w", err)
+	}
+
+	processAfterPrepare()
+
+	contextErr = ctx.Err()
+	if contextErr != nil {
+		recordErr := completeUnstartedContainment(launch.containment)
+		launch.close()
+		closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)
+
+		return nil, errors.Join(contextErr, recordErr)
+	}
+
 	cmd = launch.cmd
 
-	tree, err := startProcessTree(launch)
+	tree, err := processStartTree(launch)
 	if err != nil {
 		closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)
 
@@ -257,11 +301,17 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 	stopCancellation := context.AfterFunc(ctx, func() {
 		defer close(cancellationDone)
 
-		_ = tree.kill()
+		_ = processTreeKill(tree)
 	})
 
+	waiter := processDirectChildWait(tree)
 	wait := func() {
-		process.waitErr = cmd.Wait()
+		if waiter == nil {
+			process.waitErr = ErrProcessContainmentIncomplete
+		} else {
+			<-waiter.done
+			process.waitErr = settleDirectProcessExit(tree, waiter.err)
+		}
 
 		if stopCancellation() {
 			close(cancellationDone)
@@ -324,56 +374,65 @@ func (p *Process) Shutdown(ctx context.Context) error {
 	_ = p.CloseStdin()
 
 	if p.waitStep(ctx) {
-		return p.tree.terminateAndWait(defaultProcessTreeWait)
+		return processTreeTerminateAndWait(p.tree, defaultProcessTreeWait)
 	}
 
-	if err := p.tree.terminate(); err != nil {
-		return fmt.Errorf("terminate pi process: %w", err)
+	terminateErr := processTreeTerminate(p.tree)
+	if terminateErr != nil {
+		return fmt.Errorf("terminate pi process: %w", terminateErr)
 	}
 
 	if p.waitStep(ctx) {
-		return p.tree.terminateAndWait(defaultProcessTreeWait)
+		return processTreeTerminateAndWait(p.tree, defaultProcessTreeWait)
 	}
 
-	if err := p.tree.kill(); err != nil {
-		return fmt.Errorf("kill pi process: %w", err)
+	killErr := processTreeKill(p.tree)
+	if killErr != nil {
+		return fmt.Errorf("kill pi process: %w", killErr)
 	}
 
 	select {
 	case <-p.exited:
-		return p.tree.terminateAndWait(defaultProcessTreeWait)
+		return processTreeTerminateAndWait(p.tree, defaultProcessTreeWait)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
 // Kill forcefully terminates the child process group and returns only after
-// the root is reaped and the complete containment boundary is proven
-// quiescent.
+// the root is reaped and the selected containment boundary is complete.
 func (p *Process) Kill() error {
-	if err := p.tree.kill(); err != nil {
-		return fmt.Errorf("kill pi process: %w", err)
+	killErr := processTreeKill(p.tree)
+	if killErr != nil {
+		return fmt.Errorf("kill pi process: %w", killErr)
 	}
 
 	select {
 	case <-p.exited:
-	case <-time.After(defaultProcessTreeWait):
-		return fmt.Errorf("%w: pi process was not reaped after kill", ErrProcessTreeNotQuiescent)
+	case <-time.After(processKillWait):
+		return fmt.Errorf("%w: pi process was not reaped after kill", ErrProcessContainmentIncomplete)
 	}
 
-	return p.tree.terminateAndWait(defaultProcessTreeWait)
+	return processTreeTerminateAndWait(p.tree, defaultProcessTreeWait)
 }
 
 // Close releases the parent-held pipe ends. Call after the reader is done.
 func (p *Process) Close() error {
 	_ = p.CloseStdin()
-	quiescenceErr := p.tree.terminateAndWait(defaultProcessTreeWait)
+
+	containmentErr := processTreeTerminateAndWait(p.tree, defaultProcessTreeWait)
+	if !p.waitStep(context.Background()) {
+		containmentErr = errors.Join(
+			containmentErr,
+			fmt.Errorf("%w: pi direct child was not reaped", ErrProcessContainmentIncomplete),
+		)
+	}
 
 	p.stdoutOnce.Do(func() {
 		_ = p.stdout.Close()
 	})
 
-	return quiescenceErr
+	return containmentErr
 }
 
 func (p *Process) waitStep(ctx context.Context) bool {

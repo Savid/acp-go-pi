@@ -61,8 +61,8 @@ func (r *providerProcessRoot) observe(ctx context.Context, process any) {
 	r.tracker.update(ctx, r.id, providerProcessEntry{inventory: inventory})
 }
 
-func (r *providerProcessRoot) retire(ctx context.Context, proven bool) {
-	if !proven {
+func (r *providerProcessRoot) retire(ctx context.Context, complete bool) {
+	if !complete {
 		return
 	}
 
@@ -153,6 +153,6 @@ func (t *providerProcessTracker) snapshotLocked() (int, bool) {
 	return total, true
 }
 
-func providerProcessTreeProven(err error) bool {
-	return !errors.Is(err, internalpi.ErrProcessTreeNotQuiescent)
+func providerProcessTreeComplete(err error) bool {
+	return !errors.Is(err, internalpi.ErrProcessContainmentIncomplete)
 }

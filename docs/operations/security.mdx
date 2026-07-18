@@ -33,16 +33,61 @@ deny, and `allow` mode is only ever explicit per session — see
 
 Each session's pi process runs in its own isolated agent directory under the
 `WithScratchDir` parent, so sessions share no config, auth, or session files.
-Linux launches each native root through a private embedded subreaper. A
-control-descriptor EOF contains the tree if the adapter dies, and a distinct
-proof record is accepted only after the supervisor has killed and reaped every
-descendant, including processes that call `setsid`. Supervisor failure without
-that record fails containment closed. Windows starts the root suspended,
-assigns it to a kill-on-close Job Object, and only then resumes it. Platforms
-without an authoritative boundary for process-group escape (including Darwin,
-FreeBSD, and OpenBSD) reject native startup rather than certifying a weaker
-process-group check. Within a supported boundary, shutdown begins by closing
-stdin and escalates to termination only when needed.
+Linux launches each native root through a private embedded subreaper. Its
+control-descriptor boundary kills and reaps descendants, including processes
+that call `setsid`. Windows starts the root suspended, assigns it to a
+kill-on-close Job Object, and only then resumes it. These platforms report
+`containment=authoritative`.
+
+FreeBSD, OpenBSD, and unsupported platforms reject native startup. Darwin also
+rejects startup by default. `WithDarwinBestEffortContainment` or
+`-darwin-best-effort-containment` is an explicit operator acceptance of a
+weaker boundary; it reports `containment=best_effort` and prints a warning.
+The option is invalid on every other platform.
+
+Darwin best-effort places the direct child in a new process group, installs one
+immediate waiter that always reaps it, captures that original PGID once, and
+runs a single memoized cleanup ladder. Cleanup sends TERM, waits up to 500 ms,
+then sends KILL and polls only the captured PGID for at most five seconds in
+total. Unexpected TERM, probe, or KILL errors force-kill the direct child and
+join its sole waiter within the same deadline. The first `ESRCH` is terminal
+and no later signal is sent to that numeric PGID. Success requires the direct
+child to be reaped and the original group to be absent.
+
+That result is not whole-tree quiescence. A descendant can call `setsid`,
+leave the group, and survive. A numeric PGID can be reused before it is first
+observed absent, so group signalling can affect unrelated work. Native-root
+admission permits bound wrapper-managed roots; they do not bound provider work
+that escaped. Darwin therefore emits no provider-descendant inventory
+snapshot, including zero.
+
+Every Darwin launch receives exact `ACP_GO_PI_RUNTIME_ID` and
+`ACP_GO_PI_SCRATCH_ROOT` markers after environment scrubbing and writes a
+strict current record in a `0700` registry; records are non-symlink regular
+files at `0600` and limited to 4096 current entries. Only `group_absent`
+records older than 30 days expire before a new launch. `running` and
+`cleanup_incomplete` records remain indefinitely so unresolved work stays
+actionable. Each real native generation has its own `0700` root and 128-bit
+runtime id. Markers are correlation hints, not ownership: descendants can
+inherit them, erase them, or outlive their original group. An empty marker
+scan is not evidence that every descendant is absent.
+
+The operator cleanup command requires a chosen runtime id plus `-force`. Its
+fixed five-second deadline starts before the first process enumeration and
+bounds the 500 ms TERM grace, KILL phase, and final scan. It scans only
+same-UID processes, correlates both exact markers, revalidates PID, start time,
+UID, and markers immediately before each signal, and signals individual PIDs
+only. PID-by-PID cleanup has a PID-reuse time-of-check/time-of-use race and can
+signal an unrelated reused PID; this is a collateral-signalling risk even
+after revalidation. Recorded PIDs and PGIDs are never signal authority. Gone
+means `ESRCH`; changed identity, unreadable identity, or scrubbed markers are
+ambiguous and report-only. Cleanup rescans for candidates created during the
+TERM grace period, retains the generation root on remaining or ambiguous
+identities, and removes it only after repeated empty correlated scans. Even a
+successful cleanup is not proof that an unmarked escaped descendant is absent.
+Reaching the shared deadline is terminal even after an empty scan: cleanup
+does not enumerate again, validate again, remove the generation root, or
+report success.
 
 ## Input validation
 

@@ -54,14 +54,17 @@ the tree entries appended after each settled turn.
 Each prompt is a *turn*. A turn ends with an ACP `StopReason`, a user cancel,
 or a native failure. Cancelling a turn resolves as a successful `cancelled`
 response, not an error. Native abort is advisory: for every active cancel the
-adapter terminates the session's contained process tree and proves it
-quiescent before either the cancel path or prompt settles. If native
+adapter drives the session process to its selected containment boundary before
+either the cancel path or prompt settles. Linux and Windows provide an
+authoritative boundary. Darwin best-effort only reaps the direct child and
+observes the captured original process group absent; it never establishes that
+escaped descendants are absent. If native
 `agent_settled` preceded the abort acknowledgement, the adapter then commits
 pi's durable aborted generation before returning `cancelled`; an escalated
 pre-settle cancellation preserves the prior commit. The next prompt lazily
 relaunches the same logical session. A turn that never terminates can be
 bounded with `WithTurnTimeout`; on expiry the adapter applies the same
-process-tree fence without committing a partial generation before the prompt
+selected containment fence without committing a partial generation before the prompt
 fails with a `pi_turn_failed` error whose cause is `timeout`. See
 [Prompt streaming](/docs/core/prompt-streaming) for how turn output is
 delivered and [ACP methods](/docs/reference/acp-methods) for the failure

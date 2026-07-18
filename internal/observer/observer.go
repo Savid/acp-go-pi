@@ -207,6 +207,12 @@ func mustInt64UpDownCounter(meter metric.Meter, name string, description string)
 	return instrument
 }
 
+func mustInt64Gauge(meter metric.Meter, name string, description string) metric.Int64Gauge {
+	instrument, _ := meter.Int64Gauge(name, metric.WithDescription(description))
+
+	return instrument
+}
+
 // Extract pulls trace context from ACP _meta reserved keys into ctx.
 func (o *Observer) Extract(ctx context.Context, meta map[string]any) context.Context {
 	if o == nil || len(meta) == 0 {

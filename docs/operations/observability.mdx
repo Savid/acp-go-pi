@@ -16,6 +16,21 @@ logging with `-debug` (`WithLogger` for a custom logger). Telemetry records
 lifecycle timing, request outcomes, and counters, and by default avoids
 recording prompt text, tool inputs, tool outputs, and raw pi event bodies.
 
+## Containment signal
+
+`acp_go_pi.runtime.containment` is recorded as `1` with the exact
+`containment` attribute `authoritative`, `best_effort`, or `unavailable`.
+Embedded hosts receive the same value once through
+`RuntimeResourceHooks.ObserveContainment`; `Agent.ContainmentMode` exposes it
+directly.
+
+Darwin opt-in logs a structured warning with `containment=best_effort`, and the
+standalone binary prints a plain warning even without `-debug`. Best-effort
+mode emits no `provider_descendant` process snapshot, including zero, because
+the process group cannot inventory escaped descendants. Resource admissions
+still describe wrapper-managed native roots and scratch roots; they must not
+be interpreted as a bound on escaped provider work.
+
 ## Diagnosing turn failures
 
 A failed prompt returns a `pi_turn_failed` error whose `cause` tells you where

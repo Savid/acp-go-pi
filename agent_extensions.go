@@ -81,7 +81,7 @@ func (a *Agent) handleForkSession(
 		return acp.UnstableForkSessionResponse{}, emptyForkSessionError()
 	}
 
-	session, err := a.startSession(ctx, sessionStart{
+	session, err := a.startAndStoreSession(ctx, sessionStart{
 		Cwd:                   params.Cwd,
 		AdditionalDirectories: additionalDirectories,
 		McpServers:            mcpServers,
@@ -92,10 +92,6 @@ func (a *Agent) handleForkSession(
 		RawMessages:           rawMessageConfigFromMeta(params.Meta),
 	})
 	if err != nil {
-		return acp.UnstableForkSessionResponse{}, err
-	}
-
-	if err := a.storeStartedSession(ctx, session); err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
 

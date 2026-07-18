@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -66,6 +67,7 @@ var serve = piacp.Serve
 var exit = os.Exit
 var shutdownOpenTelemetry = shutdownTelemetry
 var agentVersion = version
+var mainRuntimePlatform = runtime.GOOS
 
 func main() {
 	if code := run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr); code != 0 {
@@ -74,12 +76,17 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "containment" {
+		return runContainmentCommand(args[1:], stdout, stderr)
+	}
+
 	flags := flag.NewFlagSet("acp-go-pi", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 
 	piPath := flags.String("path", "", "path to pi CLI")
 	piHome := flags.String("home", "", "unsupported: pi has no native config root; a non-empty value fails session start")
 	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
+	darwinBestEffort := flags.Bool("darwin-best-effort-containment", false, "opt into Darwin process-group containment with residual escape and PGID-reuse risks")
 	model := flags.String("model", "", "default pi model as provider/id")
 	seedFiles := &seedFileFlag{}
 	flags.Var(seedFiles, "seed-file", "seed file written into each session's pi agent dir as <relpath>=<hostpath>; repeatable")
@@ -91,13 +98,24 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	}
 
 	version := agentVersion()
+
+	if *darwinBestEffort && mainRuntimePlatform != "darwin" {
+		_, _ = fmt.Fprintln(stderr, "acp-go-pi: -darwin-best-effort-containment is valid only on darwin")
+
+		return 2
+	}
+
 	if *printVersion {
 		_, _ = fmt.Fprintln(stdout, version)
 
 		return 0
 	}
 
-	logger := slog.New(slog.DiscardHandler)
+	if *darwinBestEffort {
+		_, _ = fmt.Fprintln(stderr, "WARNING: containment=best_effort on Darwin; setsid descendants can escape and survive, marker correlation is not ownership and markers can be scrubbed, numeric PGID reuse can cause collateral signalling, and native-root permits do not bound escaped provider work")
+	}
+
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	if *debug {
 		logger = slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
@@ -132,6 +150,9 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		piacp.WithDefaultModel(*model),
 		piacp.WithLogger(logger),
 	)
+	if *darwinBestEffort {
+		serveOptions = append(serveOptions, piacp.WithDarwinBestEffortContainment())
+	}
 
 	if len(seedFiles.files) > 0 {
 		serveOptions = append(serveOptions, piacp.WithSeedFiles(seedFiles.files))

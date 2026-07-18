@@ -9,8 +9,8 @@ import (
 )
 
 func TestUnsupportedUnixContainmentFailsClosed(t *testing.T) {
-	launch, err := prepareProcessTreeCommand(exec.Command("pi"))
-	if launch != nil || !errors.Is(err, ErrProcessTreeNotQuiescent) {
+	launch, err := prepareProcessTreeCommand(exec.Command("pi"), ContainmentSpec{})
+	if launch != nil || !errors.Is(err, ErrProcessContainmentIncomplete) {
 		t.Fatalf("prepareProcessTreeCommand() = %#v, %v", launch, err)
 	}
 }

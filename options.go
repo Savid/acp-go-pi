@@ -39,6 +39,15 @@ const (
 	RuntimeStartupSession       RuntimeStartupStage = "session"
 )
 
+// RuntimeContainmentMode identifies the effective native process boundary.
+type RuntimeContainmentMode string
+
+const (
+	RuntimeContainmentAuthoritative RuntimeContainmentMode = "authoritative"
+	RuntimeContainmentBestEffort    RuntimeContainmentMode = "best_effort"
+	RuntimeContainmentUnavailable   RuntimeContainmentMode = "unavailable"
+)
+
 // RuntimeResourceHooks lets an embedding host enforce native-root and scratch-root limits.
 type RuntimeResourceHooks struct {
 	AcquireNativeRoot      func(context.Context, RuntimeResourceKind) (func(), error)
@@ -46,6 +55,7 @@ type RuntimeResourceHooks struct {
 	ObserveProcess         func(context.Context, RuntimeProcessKind, int64)
 	ObserveProcessSnapshot func(context.Context, RuntimeProcessKind, int)
 	ObserveStartupStage    func(context.Context, RuntimeResourceKind, RuntimeStartupStage, time.Duration, error)
+	ObserveContainment     func(context.Context, RuntimeContainmentMode)
 }
 
 // Options configures the ACP agent process and the pi RPC-mode sessions it
@@ -70,6 +80,9 @@ type Options struct {
 	// Empty means the system temp directory. The directory is created 0700
 	// when missing.
 	ScratchDir string
+	// DarwinBestEffortContainment explicitly selects Darwin process-group
+	// containment. It is invalid on every other platform.
+	DarwinBestEffortContainment bool
 	// DefaultModel selects the model for newly created pi sessions when
 	// non-empty, as "provider/id" (for example "openai/gpt-4o").
 	DefaultModel string
@@ -179,6 +192,15 @@ func WithHome(path string) Option {
 func WithScratchDir(dir string) Option {
 	return func(options *Options) {
 		options.ScratchDir = dir
+	}
+}
+
+// WithDarwinBestEffortContainment opts into Darwin process-group containment.
+// The boundary reaps the direct child and waits for the captured original
+// process group to disappear, but cannot contain descendants that leave it.
+func WithDarwinBestEffortContainment() Option {
+	return func(options *Options) {
+		options.DarwinBestEffortContainment = true
 	}
 }
 

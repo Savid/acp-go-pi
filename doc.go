@@ -23,4 +23,9 @@
 // global OpenTelemetry providers; the acp-go-pi binary handles env-based
 // exporter setup for command-line use. Caller-supplied providers remain
 // owned by the caller, including ForceFlush and Shutdown.
+//
+// Linux and Windows provide authoritative native process containment. Darwin
+// fails native startup closed unless [WithDarwinBestEffortContainment] is
+// supplied; that mode reaps the direct child and observes only the captured
+// original process group, so it does not establish escaped-descendant absence.
 package piacp

@@ -43,11 +43,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 		return acp.NewSessionResponse{}, validationErr
 	}
 
-	if openErr := a.ensureOpen(); openErr != nil {
-		return acp.NewSessionResponse{}, openErr
-	}
-
-	session, err := a.startSession(ctx, sessionStart{
+	session, err := a.startAndStoreSession(ctx, sessionStart{
 		Cwd:                   params.Cwd,
 		AdditionalDirectories: additionalDirectories,
 		McpServers:            params.McpServers,
@@ -55,10 +51,6 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 		RawMessages:           rawMessageConfigFromMeta(params.Meta),
 	})
 	if err != nil {
-		return acp.NewSessionResponse{}, err
-	}
-
-	if err := a.storeStartedSession(ctx, session); err != nil {
 		return acp.NewSessionResponse{}, err
 	}
 
@@ -180,13 +172,9 @@ func (a *Agent) restoreSession(
 
 	start.HydrateEntries = entries
 
-	session, err := a.startSession(ctx, start)
+	session, err := a.startAndStoreSession(ctx, start)
 	if err != nil {
 		return nil, nil, false, err
-	}
-
-	if storeErr := a.storeStartedSession(ctx, session); storeErr != nil {
-		return nil, nil, false, storeErr
 	}
 
 	return session, entries, true, nil
@@ -482,6 +470,24 @@ func (a *Agent) storeStartedSession(ctx context.Context, session *agentSession) 
 	return nil
 }
 
+func (a *Agent) startAndStoreSession(ctx context.Context, start sessionStart) (*agentSession, error) {
+	if err := a.beginNativeConstruction(); err != nil {
+		return nil, err
+	}
+	defer a.endNativeConstruction()
+
+	session, err := a.startSession(ctx, start)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := a.storeStartedSession(ctx, session); err != nil {
+		return nil, err
+	}
+
+	return session, nil
+}
+
 func (a *Agent) connection() agentClient {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -583,7 +589,7 @@ func unknownSessionError() *acp.RequestError {
 // the native setup sequence (auto-retry off, thinking level, model, catalog,
 // state, commands).
 func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *agentSession, err error) {
-	defer func() { a.recordNativeQuiescence(err) }()
+	defer func() { a.recordNativeContainment(err) }()
 
 	// pi has no native config or auth root, so a configured Home is an
 	// unsupported option; every session-establishing method fails here.
@@ -598,16 +604,9 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		})
 	}
 
-	discoveryRelease, err := acquireNativeRoot(ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery)
-	if err != nil {
-		return nil, err
-	}
-
 	readinessStarted := time.Now()
 	versionErr := a.ensureVersion(ctx)
 	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery, RuntimeStartupReadiness, readinessStarted, versionErr)
-
-	releaseNativeRootWhenQuiescent(discoveryRelease, versionErr)
 
 	if versionErr != nil {
 		return nil, versionErr
@@ -641,7 +640,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	defer func() {
 		if !keepScratch {
 			err = finalizeSessionRuntimeResources(
-				err, nativeRelease, dirs.Root, scratchRelease,
+				err, nativeRelease, dirs.SessionRoot, scratchRelease,
 			)
 		}
 	}()
@@ -748,6 +747,11 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		Cwd:                 start.Cwd,
 	}
 
+	spec.Containment, err = a.containmentSpecForRoot(scratchParent(a.options.ScratchDir), dirs.Root, RuntimeResourceSession)
+	if err != nil {
+		return nil, err
+	}
+
 	// The pi child must outlive the lifecycle request that spawns it: its
 	// launch context is detached so the request-scoped cancel cannot kill the
 	// session's long-lived process. Teardown is owned by the shutdown ladder.
@@ -774,7 +778,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		additionalDirectories: slices.Clone(start.AdditionalDirectories),
 		fingerprint:           sessionStartFingerprint(start),
 		launch:                spec,
-		sessionRoot:           dirs.Root,
+		sessionRoot:           dirs.SessionRoot,
 		permissionMode:        permission,
 		autoRetry:             start.MetaOptions.AutoRetry,
 		mcpRefreshPending:     includeMCP,

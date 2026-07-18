@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os/exec"
+	"runtime"
 	"sync"
 
 	"github.com/coder/acp-go-sdk"
@@ -19,6 +21,10 @@ const (
 	metaCapabilityFork      = "fork"
 	elicitationScopeSession = "session"
 )
+
+const darwinPlatform = "darwin"
+
+var agentRuntimePlatform = runtime.GOOS
 
 var newServeAgent = NewAgent
 
@@ -64,24 +70,27 @@ type Agent struct {
 
 	// Lock order: acquire mu before any session lock. Do not call session
 	// close methods while holding mu.
-	mu                  sync.Mutex
-	closed              bool
-	conn                agentClient
-	sessions            map[acp.SessionId]*agentSession
-	store               SessionStore
-	deleted             map[acp.SessionId]struct{}
-	clientCalls         chan struct{}
-	clientCapabilities  acp.ClientCapabilities
-	positionEncoding    acp.PositionEncodingKind
-	activeLimitErr      error
-	processes           *providerProcessTracker
-	nativeQuiescenceErr error
+	mu                   sync.Mutex
+	closed               bool
+	conn                 agentClient
+	sessions             map[acp.SessionId]*agentSession
+	store                SessionStore
+	deleted              map[acp.SessionId]struct{}
+	clientCalls          chan struct{}
+	clientCapabilities   acp.ClientCapabilities
+	positionEncoding     acp.PositionEncodingKind
+	activeLimitErr       error
+	processes            *providerProcessTracker
+	nativeContainmentErr error
+	constructions        sync.WaitGroup
+	closeOnce            sync.Once
+	closeErr             error
 
 	versionMu      sync.Mutex
 	versionChecked bool
 
 	startPiProcess func(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error)
-	probeVersion   func(ctx context.Context, executablePath string) (string, error)
+	probeVersion   func(ctx context.Context, executablePath string, containment pi.ContainmentSpec) (string, error)
 	lookPath       func(file string) (string, error)
 }
 
@@ -106,7 +115,8 @@ func NewAgent(opts ...Option) *Agent {
 		TracerProvider: options.TracerProvider,
 		Version:        options.AgentVersion,
 	})
-	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe)
+	mode := containmentMode(options)
+	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe, mode)
 
 	agent := &Agent{
 		options:          options,
@@ -116,14 +126,57 @@ func NewAgent(opts ...Option) *Agent {
 		store:            NewInMemorySessionStore(),
 		deleted:          make(map[acp.SessionId]struct{}),
 		positionEncoding: acp.PositionEncodingKindUtf16,
-		activeLimitErr:   validateConcurrencyLimits(options.ConcurrencyLimits),
+		activeLimitErr:   errors.Join(validateConcurrencyLimits(options.ConcurrencyLimits), validateContainmentOption(options)),
 		startPiProcess:   startRealPiProcess,
 		probeVersion:     pi.ProbeVersion,
 		lookPath:         exec.LookPath,
 	}
 	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
+	observeRuntimeContainment(context.Background(), options.RuntimeResourceHooks, mode)
+
+	if mode == RuntimeContainmentBestEffort {
+		log.WarnContext(
+			context.Background(),
+			"Darwin process containment is best effort; escaped descendants may survive, marker correlation is not ownership and markers can be scrubbed, numeric process-group reuse can cause collateral signalling, and native-root permits do not bound escaped provider work",
+			slog.String("containment", string(mode)),
+		)
+	}
 
 	return agent
+}
+
+// ContainmentMode reports the effective native process boundary.
+func (a *Agent) ContainmentMode() RuntimeContainmentMode {
+	if a == nil {
+		return RuntimeContainmentUnavailable
+	}
+
+	return containmentMode(a.options)
+}
+
+func containmentMode(options Options) RuntimeContainmentMode {
+	switch agentRuntimePlatform {
+	case "linux", "windows":
+		if options.DarwinBestEffortContainment {
+			return RuntimeContainmentUnavailable
+		}
+
+		return RuntimeContainmentAuthoritative
+	case darwinPlatform:
+		if options.DarwinBestEffortContainment {
+			return RuntimeContainmentBestEffort
+		}
+	}
+
+	return RuntimeContainmentUnavailable
+}
+
+func validateContainmentOption(options Options) error {
+	if options.DarwinBestEffortContainment && agentRuntimePlatform != darwinPlatform {
+		return errors.New("darwin best-effort containment is only valid on darwin")
+	}
+
+	return nil
 }
 
 func (a *Agent) startTrackedPiProcess(
@@ -132,9 +185,9 @@ func (a *Agent) startTrackedPiProcess(
 ) (piProcess, piClient, *providerProcessRoot, error) {
 	process, client, err := a.startPiProcess(ctx, spec)
 	if err != nil {
-		if !providerProcessTreeProven(err) {
+		if !providerProcessTreeComplete(err) {
 			a.processes.register()
-			a.recordNativeQuiescence(err)
+			a.recordNativeContainment(err)
 		}
 
 		return nil, nil, nil, err
@@ -182,6 +235,20 @@ func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Optio
 
 // Close cancels and closes all resources owned by the agent.
 func (a *Agent) Close() error {
+	a.closeOnce.Do(func() {
+		a.closeErr = a.close()
+	})
+
+	return a.closeErr
+}
+
+func (a *Agent) close() error {
+	a.mu.Lock()
+	a.closed = true
+	a.mu.Unlock()
+
+	a.constructions.Wait()
+
 	a.mu.Lock()
 
 	sessions := make([]*agentSession, 0, len(a.sessions))
@@ -192,7 +259,6 @@ func (a *Agent) Close() error {
 	a.sessions = make(map[acp.SessionId]*agentSession)
 	a.deleted = make(map[acp.SessionId]struct{})
 	a.conn = nil
-	a.closed = true
 	a.mu.Unlock()
 
 	if len(sessions) > 0 {
@@ -208,32 +274,49 @@ func (a *Agent) Close() error {
 	}
 
 	closeErr := errors.Join(closeErrs...)
-	if !pi.ProcessTreeQuiescent(closeErr) {
-		a.recordNativeQuiescence(closeErr)
+	if !pi.ProcessContainmentComplete(closeErr) {
+		a.recordNativeContainment(closeErr)
 
 		return closeErr
 	}
 
-	return errors.Join(closeErr, a.nativeQuiescenceError())
+	return errors.Join(closeErr, a.nativeContainmentError())
 }
 
-func (a *Agent) recordNativeQuiescence(err error) {
-	if pi.ProcessTreeQuiescent(err) {
+func (a *Agent) beginNativeConstruction() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return errAgentClosed
+	}
+
+	a.constructions.Add(1)
+
+	return nil
+}
+
+func (a *Agent) endNativeConstruction() {
+	a.constructions.Done()
+}
+
+func (a *Agent) recordNativeContainment(err error) {
+	if pi.ProcessContainmentComplete(err) {
 		return
 	}
 
 	a.mu.Lock()
-	if a.nativeQuiescenceErr == nil {
-		a.nativeQuiescenceErr = err
+	if a.nativeContainmentErr == nil {
+		a.nativeContainmentErr = err
 	}
 	a.mu.Unlock()
 }
 
-func (a *Agent) nativeQuiescenceError() error {
+func (a *Agent) nativeContainmentError() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	return a.nativeQuiescenceErr
+	return a.nativeContainmentErr
 }
 
 func (a *Agent) setConnection(conn agentClient) {
@@ -356,12 +439,29 @@ func (a *Agent) ensureVersion(ctx context.Context) error {
 		return nil
 	}
 
+	if a.ContainmentMode() == RuntimeContainmentUnavailable {
+		return fmt.Errorf("%w: native process containment is unavailable", ErrProcessContainmentIncomplete)
+	}
+
 	executable, err := a.resolveExecutablePath()
 	if err != nil {
 		return err
 	}
 
-	version, err := a.probeVersion(ctx, executable)
+	containment, generation, err := a.createRuntimeGeneration(ctx, RuntimeResourceDiscovery)
+	if err != nil {
+		return err
+	}
+
+	nativeRelease, err := acquireNativeRoot(ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery)
+	if err != nil {
+		return generation.finalize(err)
+	}
+
+	version, err := a.probeVersion(ctx, executable, containment)
+	err = generation.finalize(err)
+	releaseNativeRootWhenComplete(nativeRelease, err)
+
 	if err != nil {
 		return err
 	}

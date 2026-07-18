@@ -8,7 +8,11 @@ import (
 	"github.com/savid/acp-go-pi/internal/observer"
 )
 
-func instrumentRuntimeResourceHooks(hooks RuntimeResourceHooks, observe *observer.Observer) RuntimeResourceHooks {
+func instrumentRuntimeResourceHooks(
+	hooks RuntimeResourceHooks,
+	observe *observer.Observer,
+	mode RuntimeContainmentMode,
+) RuntimeResourceHooks {
 	wrapAcquire := func(resource string, acquire func(context.Context, RuntimeResourceKind) (func(), error)) func(context.Context, RuntimeResourceKind) (func(), error) {
 		return func(ctx context.Context, lifecycle RuntimeResourceKind) (func(), error) {
 			var (
@@ -54,10 +58,22 @@ func instrumentRuntimeResourceHooks(hooks RuntimeResourceHooks, observe *observe
 	}
 	externalSnapshot := hooks.ObserveProcessSnapshot
 	hooks.ObserveProcessSnapshot = func(ctx context.Context, kind RuntimeProcessKind, count int) {
+		if mode == RuntimeContainmentBestEffort && kind == RuntimeProcessProviderDescendant {
+			return
+		}
+
 		observe.SetRuntimeProcess(ctx, string(kind), count)
 
 		if externalSnapshot != nil {
 			externalSnapshot(ctx, kind, count)
+		}
+	}
+	externalContainment := hooks.ObserveContainment
+	hooks.ObserveContainment = func(ctx context.Context, got RuntimeContainmentMode) {
+		observe.RecordRuntimeContainment(ctx, string(got))
+
+		if externalContainment != nil {
+			externalContainment(ctx, got)
 		}
 	}
 	externalStage := hooks.ObserveStartupStage
@@ -70,6 +86,12 @@ func instrumentRuntimeResourceHooks(hooks RuntimeResourceHooks, observe *observe
 	}
 
 	return hooks
+}
+
+func observeRuntimeContainment(ctx context.Context, hooks RuntimeResourceHooks, mode RuntimeContainmentMode) {
+	if hooks.ObserveContainment != nil {
+		hooks.ObserveContainment(ctx, mode)
+	}
 }
 
 func observeRuntimeProcess(ctx context.Context, hooks RuntimeResourceHooks, kind RuntimeProcessKind, delta int64) {

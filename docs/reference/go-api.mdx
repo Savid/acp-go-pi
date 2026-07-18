@@ -25,12 +25,18 @@ Hosts that need direct method access can construct `*Agent` with `NewAgent`;
 stream-based hosts normally use `Serve`. `Options` and `ConcurrencyLimits`
 are the exported configuration value types behind the functional options.
 
-`ErrProcessTreeUnproven` is the stable `errors.Is` discriminator returned
-when shutdown cannot prove that every pi descendant exited. `Serve` returns
+`ErrProcessContainmentIncomplete` is the stable `errors.Is` discriminator
+returned when the selected native boundary does not complete. `Serve` returns
 an `Agent.Close` error carrying this sentinel even when the stream loop would
 otherwise return normally or with context cancellation. A host that receives
-it must retain or quarantine any resources the native process tree may still
-reach.
+it must retain or quarantine any resources the native runtime may still
+reach. It does not mean that every descendant can be inventoried on Darwin.
+
+`Agent.ContainmentMode()` returns `RuntimeContainmentAuthoritative` on Linux
+and Windows, `RuntimeContainmentBestEffort` on an opted-in Darwin agent, and
+`RuntimeContainmentUnavailable` otherwise. Darwin fails closed unless
+`WithDarwinBestEffortContainment` is supplied; that option is invalid off
+Darwin.
 
 ## Process options
 
@@ -47,6 +53,7 @@ reach.
 | `WithConcurrencyLimits` | Cap active sessions and concurrent client calls. |
 | `WithTurnTimeout` | Bound one prompt turn; expiry fails the turn with cause `timeout` (default: no deadline). |
 | `WithRuntimeResourceHooks` | Host admission hooks for native-process roots and adapter scratch roots. |
+| `WithDarwinBestEffortContainment` | Explicitly accept Darwin process-group containment and its escaped-descendant risk. Invalid on other platforms. |
 
 ## Pi-specific options
 
@@ -94,14 +101,18 @@ builders fail closed for an invalid nonce by omitting route metadata, so the
 agent rejects the resulting prompt or active-turn cancellation.
 
 `RuntimeResourceHooks` exposes `AcquireNativeRoot`, `ReserveScratchRoot`,
-`ObserveProcess`, `ObserveProcessSnapshot`, and `ObserveStartupStage`.
+`ObserveProcess`, `ObserveProcessSnapshot`, `ObserveStartupStage`, and
+`ObserveContainment`.
 Admission callbacks receive `runtime`, `session`, `prompt`, or `discovery`; nil
 means unbounded standalone operation. Pi acquires discovery and per-session
-native permits before their launches, reserves scratch before making the
-isolated agent directory, and releases only after native exit and directory
-deletion. Pi is lockless and emits no home-lock-supervisor count. Descendant
-snapshots require proven containment; startup observations distinguish spawn,
-readiness, configuration, and native session setup.
+native permits immediately before their launches, reserves scratch before
+making the isolated agent directory, and releases only after the selected
+boundary completes and directory deletion succeeds. Pi is lockless and emits
+no home-lock-supervisor count. Provider descendant snapshots are emitted only
+when inventory is authoritative; Darwin best-effort emits no provider
+snapshot, including zero. `ObserveContainment` is called once with the
+effective mode. Startup observations distinguish spawn, readiness,
+configuration, and native session setup.
 
 Session-store surface: `SessionStore`, `SessionKey`, `SessionSummary`,
 `SessionStoreReplacement`, `InMemorySessionStore`, and the constants

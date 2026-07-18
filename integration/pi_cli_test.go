@@ -21,7 +21,7 @@ func TestPiCLIVersionProbe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	version, err := pi.ProbeVersion(ctx, path)
+	version, err := pi.ProbeVersion(ctx, path, integrationContainmentSpec(t))
 	require.NoError(t, err)
 	require.NotEmpty(t, version)
 	require.NoError(t, pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion),

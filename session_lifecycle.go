@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"time"
 
@@ -23,16 +25,17 @@ var sessionCancelAbortGrace = 500 * time.Millisecond
 // sessionShutdownTimeout bounds the process shutdown ladder on close.
 var sessionShutdownTimeout = 10 * time.Second
 
-// finalizeSessionRuntimeResources releases each admission only after the
-// corresponding resource is proven gone. An unproven native tree retains its
-// admission and the private session root because that tree may still use it.
+// finalizeSessionRuntimeResources releases each admission only after its
+// selected containment boundary completes. An incomplete native boundary
+// retains its admission and private session root because descendants may
+// still use them.
 func finalizeSessionRuntimeResources(
 	runtimeErr error,
 	nativeRelease func(),
 	sessionRoot string,
 	scratchRelease func(),
 ) error {
-	if !pi.ProcessTreeQuiescent(runtimeErr) {
+	if !pi.ProcessContainmentComplete(runtimeErr) {
 		return runtimeErr
 	}
 
@@ -88,8 +91,8 @@ func (s *agentSession) currentClient() piClient {
 // prompt lands here and brings the process back up on the same native session
 // file rather than returning the unknown-session error.
 func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
-	if quiescenceErr := s.nativeQuiescenceError(); quiescenceErr != nil {
-		return quiescenceErr
+	if containmentErr := s.nativeContainmentError(); containmentErr != nil {
+		return containmentErr
 	}
 
 	s.mu.Lock()
@@ -110,9 +113,10 @@ func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
 
 	closeErr := proc.Close()
 	s.retireProviderProcess(context.WithoutCancel(ctx), closeErr)
+	s.releaseNativeRootAfterCompletion(closeErr)
 
 	if closeErr != nil {
-		s.recordNativeQuiescence(closeErr)
+		s.recordNativeContainment(closeErr)
 
 		return closeErr
 	}
@@ -148,12 +152,13 @@ func (s *agentSession) refreshMCPTools(ctx context.Context) error {
 	s.stopPump()
 
 	closeErr := proc.Close()
-	quiescenceErr := errors.Join(shutdownErr, closeErr)
+	containmentErr := errors.Join(shutdownErr, closeErr)
 	s.retireProviderProcess(context.WithoutCancel(ctx), closeErr)
-	s.recordNativeQuiescence(quiescenceErr)
+	s.recordNativeContainment(containmentErr)
+	s.releaseNativeRootAfterCompletion(containmentErr)
 
-	if !pi.ProcessTreeQuiescent(quiescenceErr) {
-		return quiescenceErr
+	if !pi.ProcessContainmentComplete(containmentErr) {
+		return containmentErr
 	}
 
 	if err := s.relaunchProcess(ctx); err != nil {
@@ -168,25 +173,55 @@ func (s *agentSession) refreshMCPTools(ctx context.Context) error {
 }
 
 // relaunchProcess starts the same logical pi session after the previous
-// process has been proven quiescent. Its extension factories run again, so
+// process reaches its selected containment boundary. Its extension factories run again, so
 // their fixed tool registry is rebuilt from the MCP server's current view.
-func (s *agentSession) relaunchProcess(ctx context.Context) error {
+func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
+	if constructionErr := s.agent.beginNativeConstruction(); constructionErr != nil {
+		return constructionErr
+	}
+	defer func() {
+		s.recordNativeContainment(err)
+		s.agent.endNativeConstruction()
+	}()
+
 	s.mu.Lock()
 	lastSessionFile := s.sessionFilePath
+	previousLaunch := s.launch
 	s.mu.Unlock()
 
-	spec := s.launch
-	if s.sessionFileExists() {
-		spec.SessionPath = lastSessionFile
-		spec.SessionID = ""
-	} else {
-		spec.SessionPath = ""
-		spec.SessionID = string(s.id)
+	spec, err := s.nextRuntimeLaunch(previousLaunch, lastSessionFile)
+	if err != nil {
+		return err
 	}
+
+	keepGeneration := false
+	defer func() {
+		if !keepGeneration && pi.ProcessContainmentComplete(err) {
+			err = errors.Join(err, materializeRemoveAll(spec.Containment.GenerationRoot))
+		}
+	}()
 
 	// Detached like the initial launch: the relaunched child must survive
 	// past the prompt request that triggered it.
 	startCtx, finishStart := s.agent.observe.StartPiProcess(context.WithoutCancel(ctx), "relaunch")
+
+	nativeRelease, err := acquireNativeRoot(ctx, s.agent.options.RuntimeResourceHooks, RuntimeResourceSession)
+	if err != nil {
+		finishStart(err)
+
+		return err
+	}
+
+	s.mu.Lock()
+	s.nativeRootRelease = nativeRelease
+	s.mu.Unlock()
+
+	defer func() {
+		if err != nil {
+			s.releaseNativeRootAfterCompletion(err)
+		}
+	}()
+
 	spawnStarted := time.Now()
 	relaunched, client, processRoot, err := s.agent.startTrackedPiProcess(startCtx, spec)
 	observeRuntimeStartupStage(startCtx, s.agent.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSpawn, spawnStarted, err)
@@ -194,7 +229,7 @@ func (s *agentSession) relaunchProcess(ctx context.Context) error {
 	finishStart(err)
 
 	if err != nil {
-		s.recordNativeQuiescence(err)
+		s.recordNativeContainment(err)
 
 		return err
 	}
@@ -206,8 +241,8 @@ func (s *agentSession) relaunchProcess(ctx context.Context) error {
 		killErr := relaunched.Kill()
 		closeErr := relaunched.Close()
 		cleanupErr := errors.Join(killErr, closeErr)
-		processRoot.retire(context.WithoutCancel(ctx), providerProcessTreeProven(closeErr))
-		s.recordNativeQuiescence(cleanupErr)
+		processRoot.retire(context.WithoutCancel(ctx), providerProcessTreeComplete(closeErr))
+		s.recordNativeContainment(cleanupErr)
 
 		return errors.Join(startErr, cleanupErr)
 	}
@@ -244,13 +279,100 @@ func (s *agentSession) relaunchProcess(ctx context.Context) error {
 
 	s.mu.Lock()
 	s.sessionFilePath = state.SessionFile
+	s.launch = spec
 
 	if spec.SessionID != "" {
 		s.mirroredRows = 0
 	}
 	s.mu.Unlock()
 
+	keepGeneration = true
+
 	return nil
+}
+
+func (s *agentSession) nextRuntimeLaunch(previous pi.LaunchSpec, lastSessionFile string) (pi.LaunchSpec, error) {
+	dirs, err := createSessionGeneration(s.sessionRoot)
+	if err != nil {
+		return pi.LaunchSpec{}, err
+	}
+
+	fail := func(cause error) (pi.LaunchSpec, error) {
+		return pi.LaunchSpec{}, errors.Join(cause, materializeRemoveAll(dirs.Root))
+	}
+
+	if copyErr := copyGenerationAgentDir(previous.AgentDir, dirs.AgentDir); copyErr != nil {
+		return fail(fmt.Errorf("copy pi agent generation: %w", copyErr))
+	}
+
+	spec := previous
+	spec.Env = cloneStringMap(previous.Env)
+	spec.AgentDir = dirs.AgentDir
+	spec.SessionDir = dirs.SessionDir
+
+	rebasePaths := func(paths []string) ([]string, error) {
+		rebased := make([]string, len(paths))
+		for index, path := range paths {
+			rebased[index], err = rebaseGenerationPath(path, previous.AgentDir, dirs.AgentDir)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return rebased, nil
+	}
+	if spec.ExtensionPaths, err = rebasePaths(previous.ExtensionPaths); err != nil {
+		return fail(err)
+	}
+
+	if spec.SkillPaths, err = rebasePaths(previous.SkillPaths); err != nil {
+		return fail(err)
+	}
+
+	if spec.PromptTemplatePaths, err = rebasePaths(previous.PromptTemplatePaths); err != nil {
+		return fail(err)
+	}
+
+	for key, value := range spec.Env {
+		if rebased, rebaseErr := rebaseGenerationPath(value, previous.AgentDir, dirs.AgentDir); rebaseErr == nil {
+			spec.Env[key] = rebased
+		}
+	}
+
+	if lastSessionFile != "" {
+		contents, readErr := materializeReadFile(lastSessionFile)
+		if readErr == nil {
+			spec.SessionPath = filepath.Join(dirs.SessionDir, filepath.Base(lastSessionFile))
+			if writeErr := materializeWriteFile(spec.SessionPath, contents, 0o600); writeErr != nil {
+				return fail(fmt.Errorf("hydrate relaunched pi session: %w", writeErr))
+			}
+
+			spec.SessionID = ""
+		} else if !errors.Is(readErr, os.ErrNotExist) {
+			return fail(fmt.Errorf("read prior pi session: %w", readErr))
+		}
+	}
+
+	if spec.SessionPath == "" {
+		spec.SessionID = string(s.id)
+	}
+
+	spec.Containment, err = s.agent.containmentSpecForRoot(
+		scratchParent(s.agent.options.ScratchDir),
+		dirs.Root,
+		RuntimeResourceSession,
+	)
+	if err != nil {
+		return fail(err)
+	}
+
+	if previous.Containment.GenerationRoot != "" {
+		if err := materializeRemoveAll(previous.Containment.GenerationRoot); err != nil {
+			return fail(fmt.Errorf("remove prior runtime generation: %w", err))
+		}
+	}
+
+	return spec, nil
 }
 
 func (s *agentSession) cleanupFailedRelaunch(proc piProcess, cause error) error {
@@ -260,14 +382,15 @@ func (s *agentSession) cleanupFailedRelaunch(proc piProcess, cause error) error 
 	closeErr := proc.Close()
 	cleanupErr := errors.Join(killErr, closeErr)
 	s.retireProviderProcess(context.Background(), closeErr)
-	s.recordNativeQuiescence(cleanupErr)
+	s.recordNativeContainment(cleanupErr)
 
 	return errors.Join(cause, cleanupErr)
 }
 
 // Cancel cancels the active pi turn. Pending dialogs are resolved cancelled
 // first, then native abort is attempted and the complete per-session process
-// tree is closed and proved quiescent before either Cancel or Prompt settles.
+// tree is closed and reaches its selected containment boundary before either
+// Cancel or Prompt settles.
 func (s *agentSession) Cancel(ctx context.Context) (err error) {
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
@@ -384,7 +507,7 @@ func (s *agentSession) fenceTurnAfterFailure(ctx context.Context) error {
 
 // fenceActiveTurnLocked is the one idempotent containment fence for the live
 // turn. cancelMu is held by every caller, so a coincident cancel, timeout, or
-// failure observes and returns the same proof result.
+// failure observes and returns the same selected-boundary result.
 func (s *agentSession) fenceActiveTurnLocked(ctx context.Context) (err error) {
 	s.mu.Lock()
 	if s.cancel == nil || s.turnSettling {
@@ -422,7 +545,7 @@ func (s *agentSession) fenceActiveTurnLocked(ctx context.Context) (err error) {
 
 	// Stop transport delivery before closing its pipes. Prompt settlement may
 	// observe the closed turn sink, but awaitTurnFence keeps it behind this
-	// proof boundary.
+	// selected containment boundary.
 	s.stopPump()
 	err = s.terminateCancelledTurn(context.WithoutCancel(ctx), proc, turnCancel, abortErr)
 
@@ -451,7 +574,7 @@ func (s *agentSession) fenceActiveTurnLocked(ctx context.Context) (err error) {
 // claimTurnSettlement linearizes a native AgentSettled event against cancel
 // and timeout. Once claimed, the turn has no active native work to contain;
 // a fence that won the race is already complete because it holds cancelMu for
-// its entire process-tree proof.
+// its entire selected containment boundary.
 func (s *agentSession) claimTurnSettlement() error {
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
@@ -490,8 +613,8 @@ func (s *agentSession) awaitTurnFence() error {
 }
 
 // terminateCancelledTurn is the hard containment boundary after the advisory
-// native abort. Killing and closing the contained process proves descendants
-// quiescent before the turn context is released; a later prompt can then
+// native abort. Killing and closing the contained process completes the
+// selected boundary before the turn context is released; a later prompt can then
 // relaunch the same logical session without racing the cancelled command tree.
 func (s *agentSession) terminateCancelledTurn(
 	ctx context.Context,
@@ -502,19 +625,23 @@ func (s *agentSession) terminateCancelledTurn(
 	if proc == nil {
 		turnCancel()
 
-		return errors.Join(abortErr, pi.ErrProcessTreeNotQuiescent, errors.New("active pi turn has no contained process root"))
+		containmentErr := errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("active pi turn has no contained process root"))
+		s.recordNativeContainment(containmentErr)
+
+		return errors.Join(abortErr, containmentErr)
 	}
 
 	killErr := proc.Kill()
 	closeErr := proc.Close()
-	quiescenceErr := errors.Join(killErr, closeErr)
+	containmentErr := errors.Join(killErr, closeErr)
 
-	s.retireProviderProcess(ctx, quiescenceErr)
-	s.recordNativeQuiescence(quiescenceErr)
+	s.retireProviderProcess(ctx, containmentErr)
+	s.recordNativeContainment(containmentErr)
+	s.releaseNativeRootAfterCompletion(containmentErr)
 	turnCancel()
 
-	if quiescenceErr != nil {
-		return errors.Join(abortErr, quiescenceErr)
+	if containmentErr != nil {
+		return errors.Join(abortErr, containmentErr)
 	}
 
 	return nil
@@ -586,11 +713,10 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 
 		err = errors.Join(err, closeErr)
 		s.retireProviderProcess(context.WithoutCancel(ctx), closeErr)
-		s.recordNativeQuiescence(closeErr)
-
-		quiescenceErr := s.nativeQuiescenceError()
-		err = errors.Join(err, quiescenceErr)
+		s.recordNativeContainment(closeErr)
 	}
+
+	err = errors.Join(err, s.nativeContainmentError())
 
 	waitCtx, stopWaiting := context.WithTimeout(context.WithoutCancel(ctx), s.closeTurnTimeout())
 	defer stopWaiting()
@@ -613,18 +739,33 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 }
 
 func (s *agentSession) retireProviderProcess(ctx context.Context, err error) {
-	proven := providerProcessTreeProven(err)
+	complete := providerProcessTreeComplete(err)
 
 	s.mu.Lock()
 
 	root := s.providerProcessRoot
-	if proven {
+	if complete {
 		s.providerProcessRoot = nil
 	}
 	s.mu.Unlock()
 
 	if root != nil {
-		root.retire(ctx, proven)
+		root.retire(ctx, complete)
+	}
+}
+
+func (s *agentSession) releaseNativeRootAfterCompletion(err error) {
+	if !pi.ProcessContainmentComplete(err) {
+		return
+	}
+
+	s.mu.Lock()
+	release := s.nativeRootRelease
+	s.nativeRootRelease = nil
+	s.mu.Unlock()
+
+	if release != nil {
+		release()
 	}
 }
 
@@ -639,21 +780,25 @@ func (s *agentSession) observeProviderProcess(ctx context.Context) {
 	}
 }
 
-func (s *agentSession) recordNativeQuiescence(err error) {
-	if pi.ProcessTreeQuiescent(err) {
+func (s *agentSession) recordNativeContainment(err error) {
+	if pi.ProcessContainmentComplete(err) {
 		return
 	}
 
 	s.mu.Lock()
-	s.nativeQuiescenceErr = errors.Join(s.nativeQuiescenceErr, err)
+	s.nativeContainmentErr = errors.Join(s.nativeContainmentErr, err)
 	s.mu.Unlock()
+
+	if s.agent != nil {
+		s.agent.recordNativeContainment(err)
+	}
 }
 
-func (s *agentSession) nativeQuiescenceError() error {
+func (s *agentSession) nativeContainmentError() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.nativeQuiescenceErr
+	return s.nativeContainmentErr
 }
 
 func (s *agentSession) closeTurnTimeout() time.Duration {

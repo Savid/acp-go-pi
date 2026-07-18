@@ -65,8 +65,8 @@ test-integration-cover:
 ## docs-audit: check public docs, examples, required files, CLI flags, and removed terms
 docs-audit:
 	@missing=0; for file in README.md doc.go docs.json example_test.go AGENTS.md docs/overview.mdx docs/core/sessions.mdx docs/core/prompt-streaming.mdx docs/features/authentication.mdx docs/features/elicitation.mdx docs/features/mcp.mdx docs/features/models-config.mdx docs/features/permissions.mdx docs/features/raw-events.mdx docs/features/session-store.mdx docs/get-started/examples.mdx docs/get-started/install.mdx docs/get-started/quickstart.mdx docs/get-started/run-modes.mdx docs/operations/observability.mdx docs/operations/security.mdx docs/reference/acp-methods.mdx docs/reference/cli.mdx docs/reference/go-api.mdx docs/reference/meta.mdx docs/reference/updates.mdx examples/minimal-client/main.go examples/resume-from-file/main.go examples/interactive-chat/main.go; do if [ ! -f "$$file" ]; then echo "missing required docs file: $$file"; missing=1; fi; done; exit $$missing
-	@for flag in -path -home -model -debug -version; do rg -q -- "$$flag" docs/reference/cli.mdx || { echo "missing CLI flag in docs/reference/cli.mdx: $$flag"; exit 1; }; done
-	@for flag in path home model debug version; do rg -q -- "\"$$flag\"" cmd/acp-go-pi/main.go || { echo "missing CLI flag registration in main.go: $$flag"; exit 1; }; done
+	@for flag in -path -home -scratch-dir -darwin-best-effort-containment -model -seed-file -debug -version; do rg -q -- "$$flag" docs/reference/cli.mdx || { echo "missing CLI flag in docs/reference/cli.mdx: $$flag"; exit 1; }; done
+	@for flag in path home scratch-dir darwin-best-effort-containment model seed-file debug version; do rg -q -- "\"$$flag\"" cmd/acp-go-pi/main.go || { echo "missing CLI flag registration in main.go: $$flag"; exit 1; }; done
 	@! rg -n -- '--cli|proxy|compatibility|deprecated|legacy|migration|session/import|sdkMessage|setGoal|goals|NES|SSE MCP|mcpCapabilities\.acp' README.md doc.go docs.json docs examples cmd/acp-go-pi/*.go AGENTS.md
 
 ## clean: remove build artifacts

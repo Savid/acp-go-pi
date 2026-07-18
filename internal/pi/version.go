@@ -8,32 +8,59 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // DefaultMinimumVersion is the minimum `pi --version` the adapter accepts by
 // default: the version its behavior was verified against.
 const DefaultMinimumVersion = "0.80.6"
 
-// execCommandContext is a seam for version-probe tests.
-var execCommandContext = exec.CommandContext
+// execCommand is a seam for version-probe tests. Probe cancellation is joined
+// only after the selected process boundary has been captured.
+var execCommand = exec.Command
+var versionPrepareTreeCommand = prepareProcessTreeCommand
+var versionPrepareContainmentRecord = prepareContainmentRecord
+var versionStartTree = startProcessTree
+var versionAfterPrepare = func() {}
+var versionTreeKill = func(tree *processTree) error { return tree.kill() }
+var versionTreeTerminateAndWait = func(tree *processTree, timeout time.Duration) error { return tree.terminateAndWait(timeout) }
 
 // ProbeVersion runs `pi --version` and returns the reported version string.
-func ProbeVersion(ctx context.Context, executablePath string) (string, error) {
-	cmd := execCommandContext(ctx, executablePath, "--version")
+func ProbeVersion(ctx context.Context, executablePath string, containment ContainmentSpec) (string, error) {
+	if contextErr := ctx.Err(); contextErr != nil {
+		return "", contextErr
+	}
+
+	cmd := execCommand(executablePath, "--version")
 
 	var output bytes.Buffer
 
 	cmd.Stdout = &output
 	cmd.WaitDelay = defaultShutdownStepTimeout
+	cmd.Env = (LaunchSpec{Containment: containment}).Environ()
 
-	launch, err := prepareProcessTreeCommand(cmd)
+	launch, err := versionPrepareTreeCommand(cmd, containment)
 	if err != nil {
 		return "", fmt.Errorf("prepare pi version probe: %w", err)
 	}
 
-	cmd = launch.cmd
+	launch.containment, err = versionPrepareContainmentRecord(containment)
+	if err != nil {
+		launch.close()
 
-	tree, err := startProcessTree(launch)
+		return "", fmt.Errorf("prepare pi version containment record: %w", err)
+	}
+
+	versionAfterPrepare()
+
+	if contextErr := ctx.Err(); contextErr != nil {
+		recordErr := completeUnstartedContainment(launch.containment)
+		launch.close()
+
+		return "", errors.Join(contextErr, recordErr)
+	}
+
+	tree, err := versionStartTree(launch)
 	if err != nil {
 		return "", fmt.Errorf("probe pi version: %w", err)
 	}
@@ -42,9 +69,9 @@ func ProbeVersion(ctx context.Context, executablePath string) (string, error) {
 	stopCancellation := context.AfterFunc(ctx, func() {
 		defer close(cancellationDone)
 
-		_ = tree.kill()
+		_ = versionTreeKill(tree)
 	})
-	waitErr := cmd.Wait()
+	waitErr := tree.directChildWait().await(defaultProcessTreeWait)
 
 	if stopCancellation() {
 		close(cancellationDone)
@@ -52,14 +79,18 @@ func ProbeVersion(ctx context.Context, executablePath string) (string, error) {
 
 	<-cancellationDone
 
-	quiescenceErr := tree.terminateAndWait(defaultProcessTreeWait)
-	if waitErr != nil || quiescenceErr != nil {
+	containmentErr := versionTreeTerminateAndWait(tree, defaultProcessTreeWait)
+	if containmentErr == nil && errors.Is(waitErr, exec.ErrWaitDelay) {
+		waitErr = nil
+	}
+
+	if waitErr != nil || containmentErr != nil {
 		var probeErr error
 		if waitErr != nil {
 			probeErr = fmt.Errorf("probe pi version: %w", waitErr)
 		}
 
-		return "", errors.Join(probeErr, quiescenceErr)
+		return "", errors.Join(probeErr, containmentErr)
 	}
 
 	version := strings.TrimSpace(output.String())

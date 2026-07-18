@@ -156,7 +156,7 @@ func TestFakePiVersionProbe(t *testing.T) {
 	requireRunIntegration(t)
 	t.Parallel()
 
-	version, err := pi.ProbeVersion(t.Context(), fakePiExecutable(t, fakeScenario{}))
+	version, err := pi.ProbeVersion(t.Context(), fakePiExecutable(t, fakeScenario{}), integrationContainmentSpec(t))
 	require.NoError(t, err)
 	require.Equal(t, fakePiVersion, version)
 	require.NoError(t, pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion))

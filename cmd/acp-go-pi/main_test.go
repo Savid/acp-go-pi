@@ -34,6 +34,7 @@ func restoreMainSeams(t *testing.T) {
 	realVersion := agentVersion
 	realExit := exit
 	realArgs := os.Args
+	realPlatform := mainRuntimePlatform
 
 	t.Cleanup(func() {
 		serve = realServe
@@ -41,6 +42,7 @@ func restoreMainSeams(t *testing.T) {
 		agentVersion = realVersion
 		exit = realExit
 		os.Args = realArgs
+		mainRuntimePlatform = realPlatform
 	})
 }
 
@@ -149,6 +151,39 @@ func TestRunOptionsCancellationAndSignal(t *testing.T) {
 		return errors.New("ignored after cancellation")
 	}
 	require.Zero(t, run(ctx, nil, bytes.NewReader(nil), io.Discard, io.Discard))
+}
+
+func TestRunDarwinContainmentOptionAndSubcommand(t *testing.T) {
+	disableTelemetry(t)
+	restoreMainSeams(t)
+	restoreContainmentCommandSeams(t)
+
+	mainRuntimePlatform = "linux"
+	var stderr bytes.Buffer
+	require.Equal(t, 2, run(t.Context(), []string{"-darwin-best-effort-containment"}, bytes.NewReader(nil), io.Discard, &stderr))
+	require.Contains(t, stderr.String(), "valid only on darwin")
+
+	mainRuntimePlatform = "darwin"
+	shutdownOpenTelemetry = func(context.Context, func(context.Context) error) error { return nil }
+	serve = func(_ context.Context, _ io.Reader, _ io.Writer, options ...piacp.Option) error {
+		configured := piacp.Options{}
+		for _, option := range options {
+			option(&configured)
+		}
+		require.True(t, configured.DarwinBestEffortContainment)
+
+		return nil
+	}
+	stderr.Reset()
+	require.Zero(t, run(t.Context(), []string{"-darwin-best-effort-containment"}, bytes.NewReader(nil), io.Discard, &stderr))
+	require.Contains(t, stderr.String(), "containment=best_effort")
+
+	containmentDiagnoseCommand = func(string) (containmentDiagnoseOutput, error) {
+		return containmentDiagnoseOutput{Records: []containmentDiagnoseRecord{}}, nil
+	}
+	var stdout bytes.Buffer
+	require.Zero(t, run(t.Context(), []string{"containment", "diagnose", "-scratch-dir", "/scratch"}, bytes.NewReader(nil), &stdout, &stderr))
+	require.Contains(t, stdout.String(), `"records":[]`)
 }
 
 type namedSignal string

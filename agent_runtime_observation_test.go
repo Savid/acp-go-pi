@@ -15,6 +15,7 @@ func TestRuntimeObservationHooksComposeExactLifetimes(t *testing.T) {
 	var processDelta int64
 	var snapshot int
 	var stage RuntimeStartupStage
+	var containment RuntimeContainmentMode
 	hooks := instrumentRuntimeResourceHooks(RuntimeResourceHooks{
 		AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
 			return func() { releases++ }, nil
@@ -28,7 +29,10 @@ func TestRuntimeObservationHooksComposeExactLifetimes(t *testing.T) {
 		ObserveStartupStage: func(_ context.Context, _ RuntimeResourceKind, got RuntimeStartupStage, _ time.Duration, _ error) {
 			stage = got
 		},
-	}, observer.New(observer.Config{}))
+		ObserveContainment: func(_ context.Context, got RuntimeContainmentMode) {
+			containment = got
+		},
+	}, observer.New(observer.Config{}), RuntimeContainmentAuthoritative)
 
 	release, err := hooks.AcquireNativeRoot(t.Context(), RuntimeResourceSession)
 	require.NoError(t, err)
@@ -39,16 +43,32 @@ func TestRuntimeObservationHooksComposeExactLifetimes(t *testing.T) {
 	observeRuntimeProcess(t.Context(), hooks, RuntimeProcessHomeLockSupervisor, 2)
 	observeRuntimeProcessSnapshot(t.Context(), hooks, RuntimeProcessProviderDescendant, 3)
 	observeRuntimeStartupStage(t.Context(), hooks, RuntimeResourceRuntime, RuntimeStartupReadiness, time.Now(), nil)
+	observeRuntimeContainment(t.Context(), hooks, RuntimeContainmentAuthoritative)
 	require.Equal(t, int64(2), processDelta)
 	require.Equal(t, 3, snapshot)
 	require.Equal(t, RuntimeStartupReadiness, stage)
+	require.Equal(t, RuntimeContainmentAuthoritative, containment)
 
 	wantErr := errors.New("full")
 	rejected := instrumentRuntimeResourceHooks(RuntimeResourceHooks{
 		ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
 			return nil, wantErr
 		},
-	}, observer.New(observer.Config{}))
+	}, observer.New(observer.Config{}), RuntimeContainmentAuthoritative)
 	_, err = rejected.ReserveScratchRoot(t.Context(), RuntimeResourcePrompt)
 	require.ErrorIs(t, err, wantErr)
+}
+
+func TestBestEffortRuntimeObservationPublishesNoProviderSnapshots(t *testing.T) {
+	called := 0
+	hooks := instrumentRuntimeResourceHooks(RuntimeResourceHooks{
+		ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) { called++ },
+	}, observer.New(observer.Config{}), RuntimeContainmentBestEffort)
+
+	observeRuntimeProcessSnapshot(t.Context(), hooks, RuntimeProcessProviderDescendant, 0)
+	observeRuntimeProcessSnapshot(t.Context(), hooks, RuntimeProcessProviderDescendant, 9)
+	require.Zero(t, called)
+
+	observeRuntimeProcessSnapshot(t.Context(), hooks, RuntimeProcessHomeLockSupervisor, 0)
+	require.Equal(t, 1, called)
 }

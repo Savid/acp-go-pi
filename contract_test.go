@@ -281,6 +281,7 @@ func connectConformanceAgent(
 	done := make(chan error, 1)
 
 	options := append([]Option{
+		testContainmentOption(),
 		WithExecutablePath(unitFakeExecutable(t, scenario)),
 		WithScratchDir(t.TempDir()),
 		WithLogger(slog.New(slog.DiscardHandler)),

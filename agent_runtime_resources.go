@@ -12,8 +12,8 @@ func acquireNativeRoot(ctx context.Context, hooks RuntimeResourceHooks, kind Run
 	return acquireRuntimeResource(ctx, hooks.AcquireNativeRoot, kind, "native root")
 }
 
-func releaseNativeRootWhenQuiescent(release func(), err error) {
-	if release != nil && internalpi.ProcessTreeQuiescent(err) {
+func releaseNativeRootWhenComplete(release func(), err error) {
+	if release != nil && internalpi.ProcessContainmentComplete(err) {
 		release()
 	}
 }

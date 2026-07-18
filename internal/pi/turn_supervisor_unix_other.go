@@ -1,4 +1,4 @@
-//go:build darwin || freebsd || openbsd
+//go:build freebsd || openbsd
 
 package pi
 
@@ -7,10 +7,10 @@ import (
 	"os/exec"
 )
 
-func prepareProcessTreeCommand(*exec.Cmd) (*processTreeCommand, error) {
+func prepareProcessTreeCommand(*exec.Cmd, ContainmentSpec) (*processTreeCommand, error) {
 	return nil, fmt.Errorf(
 		"%w: platform cannot prove pi descendants that escape a process group",
-		ErrProcessTreeNotQuiescent,
+		ErrProcessContainmentIncomplete,
 	)
 }
 

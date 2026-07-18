@@ -113,6 +113,33 @@ start; use the scratch directory to place per-session on-disk state.
 - OpenTelemetry spans, metrics, trace propagation, and structured logs
   without recording prompt or tool secrets by default.
 
+## Process containment
+
+Linux and Windows provide the authoritative native process boundary. Darwin
+fails closed by default because a process-group check cannot account for
+descendants that call `setsid`. Operators who accept that limitation can opt
+in explicitly:
+
+```sh
+acp-go-pi -darwin-best-effort-containment
+```
+
+Embedded hosts use `WithDarwinBestEffortContainment`. The effective mode is
+available from `Agent.ContainmentMode` and is reported as `authoritative`,
+`best_effort`, or `unavailable`. FreeBSD, OpenBSD, and other unsupported
+platforms continue to fail closed.
+
+Darwin best-effort mode reaps the direct child and applies a bounded
+TERM-to-KILL ladder to the captured original process group. It does not claim
+that escaped descendants are absent. The adapter prints a warning on startup
+and retains runtime records that operators can inspect with `acp-go-pi
+containment diagnose`; see the [CLI reference](docs/reference/cli.mdx) and
+[security limits](docs/operations/security.mdx).
+Only `group_absent` records expire after 30 days; `running` and
+`cleanup_incomplete` records remain actionable. Forced PID-by-PID cleanup has
+a PID-reuse time-of-check/time-of-use race and can signal an unrelated reused
+PID despite immediate identity revalidation.
+
 ## Slash Commands
 
 The adapter projects only commands returned by pi's RPC command inventory.

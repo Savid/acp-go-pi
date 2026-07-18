@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -39,7 +40,7 @@ func TestProbeVersion(t *testing.T) {
 	t.Run("exec failure is wrapped", func(t *testing.T) {
 		t.Parallel()
 
-		_, err := ProbeVersion(t.Context(), filepath.Join(t.TempDir(), "missing"))
+		_, err := ProbeVersion(t.Context(), filepath.Join(t.TempDir(), "missing"), testContainmentSpec(t))
 		require.ErrorContains(t, err, "probe pi version")
 	})
 
@@ -65,13 +66,153 @@ func probeVersionTestScript(t *testing.T, ctx context.Context, script string) (s
 	t.Helper()
 
 	for attempt := 0; ; attempt++ {
-		version, err := ProbeVersion(ctx, script)
+		version, err := ProbeVersion(ctx, script, testContainmentSpec(t))
 		if err == nil || attempt >= 50 || !errors.Is(err, syscall.ETXTBSY) {
 			return version, err
 		}
 
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func restoreVersionSeams(t *testing.T) {
+	t.Helper()
+	command := execCommand
+	prepareTree := versionPrepareTreeCommand
+	prepareRecord := versionPrepareContainmentRecord
+	startTree := versionStartTree
+	afterPrepare := versionAfterPrepare
+	kill := versionTreeKill
+	terminateAndWait := versionTreeTerminateAndWait
+	t.Cleanup(func() {
+		execCommand = command
+		versionPrepareTreeCommand = prepareTree
+		versionPrepareContainmentRecord = prepareRecord
+		versionStartTree = startTree
+		versionAfterPrepare = afterPrepare
+		versionTreeKill = kill
+		versionTreeTerminateAndWait = terminateAndWait
+	})
+}
+
+func closedVersionTree(waitErr error) *processTree {
+	done := make(chan struct{})
+	close(done)
+
+	return &processTree{direct: &directChildWait{done: done, err: waitErr}}
+}
+
+func TestProbeVersionStageBranches(t *testing.T) {
+	wantErr := errors.New("injected version stage failure")
+	require.NoError(t, versionTreeKill(&processTree{}))
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := ProbeVersion(cancelled, "/usr/bin/true", ContainmentSpec{})
+	require.ErrorIs(t, err, context.Canceled)
+
+	t.Run("prepare command", func(t *testing.T) {
+		restoreVersionSeams(t)
+		versionPrepareTreeCommand = func(*exec.Cmd, ContainmentSpec) (*processTreeCommand, error) { return nil, wantErr }
+		_, err := ProbeVersion(t.Context(), "/usr/bin/true", ContainmentSpec{})
+		require.ErrorContains(t, err, "prepare pi version probe")
+	})
+
+	t.Run("prepare record", func(t *testing.T) {
+		restoreVersionSeams(t)
+		versionPrepareTreeCommand = func(cmd *exec.Cmd, _ ContainmentSpec) (*processTreeCommand, error) {
+			return &processTreeCommand{cmd: cmd}, nil
+		}
+		versionPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, wantErr }
+		_, err := ProbeVersion(t.Context(), "/usr/bin/true", ContainmentSpec{})
+		require.ErrorContains(t, err, "prepare pi version containment record")
+	})
+
+	t.Run("cancel after prepare", func(t *testing.T) {
+		restoreVersionSeams(t)
+		ctx, cancel := context.WithCancel(t.Context())
+		versionPrepareTreeCommand = func(cmd *exec.Cmd, _ ContainmentSpec) (*processTreeCommand, error) {
+			return &processTreeCommand{cmd: cmd}, nil
+		}
+		versionPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
+		versionAfterPrepare = cancel
+		_, err := ProbeVersion(ctx, "/usr/bin/true", ContainmentSpec{})
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("start tree", func(t *testing.T) {
+		restoreVersionSeams(t)
+		versionPrepareTreeCommand = func(cmd *exec.Cmd, _ ContainmentSpec) (*processTreeCommand, error) {
+			return &processTreeCommand{cmd: cmd}, nil
+		}
+		versionPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
+		versionStartTree = func(*processTreeCommand) (*processTree, error) { return nil, wantErr }
+		_, err := ProbeVersion(t.Context(), "/usr/bin/true", ContainmentSpec{})
+		require.ErrorContains(t, err, "probe pi version")
+	})
+
+	for _, test := range []struct {
+		name           string
+		waitErr        error
+		containmentErr error
+		output         string
+		wantErr        bool
+	}{
+		{name: "wait delay is normalized", waitErr: exec.ErrWaitDelay, output: " 0.80.6 ", wantErr: false},
+		{name: "wait failure", waitErr: wantErr, output: "0.80.6", wantErr: true},
+		{name: "containment failure", containmentErr: wantErr, output: "0.80.6", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			restoreVersionSeams(t)
+			versionPrepareTreeCommand = func(cmd *exec.Cmd, _ ContainmentSpec) (*processTreeCommand, error) {
+				return &processTreeCommand{cmd: cmd}, nil
+			}
+			versionPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
+			versionStartTree = func(launch *processTreeCommand) (*processTree, error) {
+				_, err := launch.cmd.Stdout.Write([]byte(test.output))
+				require.NoError(t, err)
+
+				return closedVersionTree(test.waitErr), nil
+			}
+			versionTreeTerminateAndWait = func(*processTree, time.Duration) error { return test.containmentErr }
+			version, err := ProbeVersion(t.Context(), "/usr/bin/true", ContainmentSpec{})
+			if test.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, "0.80.6", version)
+			}
+		})
+	}
+
+	t.Run("cancellation callback", func(t *testing.T) {
+		restoreVersionSeams(t)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		versionPrepareTreeCommand = func(cmd *exec.Cmd, _ ContainmentSpec) (*processTreeCommand, error) {
+			return &processTreeCommand{cmd: cmd}, nil
+		}
+		versionPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
+		versionStartTree = func(launch *processTreeCommand) (*processTree, error) {
+			_, err := launch.cmd.Stdout.Write([]byte("0.80.6"))
+			require.NoError(t, err)
+
+			return &processTree{direct: &directChildWait{done: done}}, nil
+		}
+		versionTreeKill = func(*processTree) error {
+			close(done)
+
+			return nil
+		}
+		versionTreeTerminateAndWait = func(*processTree, time.Duration) error { return nil }
+		go func() {
+			time.Sleep(time.Millisecond)
+			cancel()
+		}()
+		version, err := ProbeVersion(ctx, "/usr/bin/true", ContainmentSpec{})
+		require.NoError(t, err)
+		require.Equal(t, "0.80.6", version)
+	})
 }
 
 func TestCheckMinimumVersion(t *testing.T) {

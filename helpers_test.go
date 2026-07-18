@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -29,12 +30,13 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 
 	base := make([]Option, 0, 3+len(opts))
 	base = append(base,
+		testContainmentOption(),
 		WithExecutablePath("/fake/pi"),
 		WithScratchDir(t.TempDir()),
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
 	agent := NewAgent(append(base, opts...)...)
-	agent.probeVersion = func(context.Context, string) (string, error) {
+	agent.probeVersion = func(context.Context, string, pi.ContainmentSpec) (string, error) {
 		return pi.DefaultMinimumVersion, nil
 	}
 
@@ -44,6 +46,14 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 	}
 
 	return agent
+}
+
+func testContainmentOption() Option {
+	if runtime.GOOS == "darwin" {
+		return WithDarwinBestEffortContainment()
+	}
+
+	return func(*Options) {}
 }
 
 // newFailingCloseProcess returns a stub process whose shutdown and close

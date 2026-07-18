@@ -127,8 +127,28 @@ func TestPromptParentCancellationContainsProcessTree(t *testing.T) {
 	require.Equal(t, 1, process.closeCalls)
 }
 
+func TestPromptParentCancellationReturnsContainmentFailure(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	client := newStubPiClient()
+	process := newStubProcess(false)
+	process.close = pi.ErrProcessContainmentIncomplete
+	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
+	session.startPump(client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	promptDone := make(chan error, 1)
+	go func() {
+		_, err := session.Prompt(ctx, TextPromptRequest("id", "parent-cancel-incomplete", "hang"))
+		promptDone <- err
+	}()
+
+	require.Eventually(t, func() bool { return session.activeTurnSink() != nil }, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-promptDone, pi.ErrProcessContainmentIncomplete)
+}
+
 func TestTurnTerminalPathsReturnContainmentProofFailure(t *testing.T) {
-	fenceErr := pi.ErrProcessTreeNotQuiescent
+	fenceErr := pi.ErrProcessContainmentIncomplete
 	done := make(chan struct{})
 	close(done)
 	session := &agentSession{
@@ -149,7 +169,7 @@ func TestTurnTerminalPathsReturnContainmentProofFailure(t *testing.T) {
 }
 
 func TestPromptTransportEndReturnsContainmentProofFailure(t *testing.T) {
-	fenceErr := pi.ErrProcessTreeNotQuiescent
+	fenceErr := pi.ErrProcessContainmentIncomplete
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := newStubPiClient()
 	process := newStubProcess(false)

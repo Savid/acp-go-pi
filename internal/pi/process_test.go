@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -132,6 +134,8 @@ func TestLaunchSpecEnviron(t *testing.T) {
 func TestSafeExplicitEnvKeyBoundary(t *testing.T) {
 	require.False(t, safeExplicitEnvKey(""))
 	require.True(t, safeExplicitEnvKey("A1"))
+	require.False(t, safeExplicitEnvKey("ACP_GO_PI_INTERNAL_DARWIN_LAUNCH"))
+	require.False(t, safeExplicitEnvKey("acp_go_pi_internal_turn_supervisor"))
 }
 
 func writeScript(t *testing.T, body string) string {
@@ -151,6 +155,7 @@ func startScriptProcess(t *testing.T, spec LaunchSpec) *Process {
 	t.Helper()
 
 	for attempt := 0; ; attempt++ {
+		spec.Containment = testContainmentSpec(t)
 		process, err := StartProcess(t.Context(), spec)
 		if err == nil {
 			return process
@@ -166,13 +171,173 @@ func startScriptProcess(t *testing.T, spec LaunchSpec) *Process {
 	}
 }
 
+func restoreProcessSeams(t *testing.T) {
+	t.Helper()
+	prepareTree := processPrepareTreeCommand
+	prepareRecord := processPrepareContainmentRecord
+	startTree := processStartTree
+	afterPrepare := processAfterPrepare
+	directWait := processDirectChildWait
+	terminate := processTreeTerminate
+	kill := processTreeKill
+	terminateAndWait := processTreeTerminateAndWait
+	killWait := processKillWait
+	t.Cleanup(func() {
+		processPrepareTreeCommand = prepareTree
+		processPrepareContainmentRecord = prepareRecord
+		processStartTree = startTree
+		processAfterPrepare = afterPrepare
+		processDirectChildWait = directWait
+		processTreeTerminate = terminate
+		processTreeKill = kill
+		processTreeTerminateAndWait = terminateAndWait
+		processKillWait = killWait
+	})
+}
+
+func TestStartProcessStageFailures(t *testing.T) {
+	wantErr := errors.New("injected process stage failure")
+
+	t.Run("prepare command", func(t *testing.T) {
+		restoreProcessSeams(t)
+		processPrepareTreeCommand = func(*exec.Cmd, ContainmentSpec) (*processTreeCommand, error) { return nil, wantErr }
+		_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true"})
+		require.ErrorContains(t, err, "prepare pi process")
+	})
+
+	t.Run("prepare record", func(t *testing.T) {
+		restoreProcessSeams(t)
+		processPrepareTreeCommand = func(cmd *exec.Cmd, _ ContainmentSpec) (*processTreeCommand, error) {
+			return &processTreeCommand{cmd: cmd}, nil
+		}
+		processPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, wantErr }
+		_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true"})
+		require.ErrorContains(t, err, "prepare pi containment record")
+	})
+
+	t.Run("cancel after prepare", func(t *testing.T) {
+		restoreProcessSeams(t)
+		ctx, cancel := context.WithCancel(t.Context())
+		processPrepareTreeCommand = func(cmd *exec.Cmd, _ ContainmentSpec) (*processTreeCommand, error) {
+			return &processTreeCommand{cmd: cmd}, nil
+		}
+		processPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
+		processAfterPrepare = cancel
+		_, err := StartProcess(ctx, LaunchSpec{ExecutablePath: "/usr/bin/true"})
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("start tree", func(t *testing.T) {
+		restoreProcessSeams(t)
+		processPrepareTreeCommand = func(cmd *exec.Cmd, _ ContainmentSpec) (*processTreeCommand, error) {
+			return &processTreeCommand{cmd: cmd}, nil
+		}
+		processPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
+		processStartTree = func(*processTreeCommand) (*processTree, error) { return nil, wantErr }
+		_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true"})
+		require.ErrorContains(t, err, "start pi process")
+	})
+
+	t.Run("missing waiter", func(t *testing.T) {
+		restoreProcessSeams(t)
+		processPrepareTreeCommand = func(cmd *exec.Cmd, _ ContainmentSpec) (*processTreeCommand, error) {
+			return &processTreeCommand{cmd: cmd}, nil
+		}
+		processPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
+		processStartTree = func(*processTreeCommand) (*processTree, error) { return &processTree{}, nil }
+		processDirectChildWait = func(*processTree) *directChildWait { return nil }
+		processTreeKill = func(*processTree) error { return nil }
+		process, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true"})
+		require.NoError(t, err)
+		<-process.Exited()
+		require.ErrorIs(t, process.WaitErr(), ErrProcessContainmentIncomplete)
+		require.NoError(t, process.Close())
+	})
+}
+
+func TestProcessMethodControlBranches(t *testing.T) {
+	wantErr := errors.New("injected process control failure")
+	newProcess := func(t *testing.T, exited bool) *Process {
+		t.Helper()
+		read, write, err := os.Pipe()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = read.Close() })
+		channel := make(chan struct{})
+		if exited {
+			close(channel)
+		}
+
+		return &Process{tree: &processTree{}, stdin: write, stdout: read, exited: channel, shutdownStepTimeout: time.Millisecond}
+	}
+
+	t.Run("shutdown settled", func(t *testing.T) {
+		restoreProcessSeams(t)
+		processTreeTerminateAndWait = func(*processTree, time.Duration) error { return wantErr }
+		require.ErrorIs(t, newProcess(t, true).Shutdown(t.Context()), wantErr)
+	})
+
+	t.Run("shutdown terminate failure", func(t *testing.T) {
+		restoreProcessSeams(t)
+		processTreeTerminate = func(*processTree) error { return wantErr }
+		require.ErrorContains(t, newProcess(t, false).Shutdown(t.Context()), "terminate pi process")
+	})
+
+	t.Run("shutdown kill failure", func(t *testing.T) {
+		restoreProcessSeams(t)
+		processTreeTerminate = func(*processTree) error { return nil }
+		processTreeKill = func(*processTree) error { return wantErr }
+		require.ErrorContains(t, newProcess(t, false).Shutdown(t.Context()), "kill pi process")
+	})
+
+	t.Run("shutdown context after kill", func(t *testing.T) {
+		restoreProcessSeams(t)
+		processTreeTerminate = func(*processTree) error { return nil }
+		processTreeKill = func(*processTree) error { return nil }
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		require.ErrorIs(t, newProcess(t, false).Shutdown(ctx), context.Canceled)
+	})
+
+	t.Run("shutdown exits after kill", func(t *testing.T) {
+		restoreProcessSeams(t)
+		processTreeTerminate = func(*processTree) error { return nil }
+		processTreeKill = func(*processTree) error { return nil }
+		processTreeTerminateAndWait = func(*processTree, time.Duration) error { return wantErr }
+		process := newProcess(t, false)
+		go func() {
+			time.Sleep(3 * time.Millisecond)
+			close(process.exited)
+		}()
+		require.ErrorIs(t, process.Shutdown(t.Context()), wantErr)
+	})
+
+	t.Run("kill failure", func(t *testing.T) {
+		restoreProcessSeams(t)
+		processTreeKill = func(*processTree) error { return wantErr }
+		require.ErrorContains(t, newProcess(t, true).Kill(), "kill pi process")
+	})
+
+	t.Run("kill timeout", func(t *testing.T) {
+		restoreProcessSeams(t)
+		processTreeKill = func(*processTree) error { return nil }
+		processKillWait = time.Millisecond
+		require.ErrorIs(t, newProcess(t, false).Kill(), ErrProcessContainmentIncomplete)
+	})
+
+	t.Run("close unreaped", func(t *testing.T) {
+		restoreProcessSeams(t)
+		process := newProcess(t, false)
+		require.ErrorIs(t, process.Close(), ErrProcessContainmentIncomplete)
+	})
+}
+
 func TestStartProcessValidation(t *testing.T) {
 	t.Parallel()
 
 	_, err := StartProcess(t.Context(), LaunchSpec{})
 	require.ErrorContains(t, err, "executable path is required")
 
-	_, err = StartProcess(t.Context(), LaunchSpec{ExecutablePath: filepath.Join(t.TempDir(), "missing")})
+	_, err = StartProcess(t.Context(), LaunchSpec{ExecutablePath: filepath.Join(t.TempDir(), "missing"), Containment: testContainmentSpec(t)})
 	require.ErrorContains(t, err, "start pi process")
 }
 
@@ -257,7 +422,13 @@ func TestProcessShutdownLadderSigterm(t *testing.T) {
 	t.Cleanup(func() { _ = process.Close() })
 
 	require.NoError(t, process.Shutdown(t.Context()))
-	require.NoError(t, process.WaitErr(), "SIGTERM rung must settle before SIGKILL escalation")
+	if runtime.GOOS == "darwin" {
+		if waitErr := process.WaitErr(); waitErr != nil {
+			require.ErrorContains(t, waitErr, "terminated")
+		}
+	} else {
+		require.NoError(t, process.WaitErr(), "SIGTERM rung must settle before SIGKILL escalation")
+	}
 }
 
 func TestProcessShutdownLadderSigkill(t *testing.T) {
@@ -291,7 +462,14 @@ func TestProcessShutdownCanceled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	require.ErrorIs(t, process.Shutdown(ctx), context.Canceled)
+	err := process.Shutdown(ctx)
+	if runtime.GOOS == "darwin" {
+		if err != nil {
+			require.ErrorIs(t, err, context.Canceled)
+		}
+	} else {
+		require.ErrorIs(t, err, context.Canceled)
+	}
 	<-process.Exited()
 }
 
@@ -376,7 +554,7 @@ func TestStartProcessCancellationTerminatesContainedProcess(t *testing.T) {
 
 	script := writeScript(t, `trap '' TERM; while :; do sleep 0.1; done`)
 	ctx, cancel := context.WithCancel(t.Context())
-	process, err := StartProcess(ctx, LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir()})
+	process, err := StartProcess(ctx, LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir(), Containment: testContainmentSpec(t)})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = process.Close() })
 

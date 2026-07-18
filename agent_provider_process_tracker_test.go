@@ -75,8 +75,8 @@ func TestProviderProcessTrackerAggregatesOnlyCompleteInventories(t *testing.T) {
 
 	unknown.retire(t.Context(), false)
 	require.Equal(t, []int{5}, snapshots)
-	require.False(t, providerProcessTreeProven(internalpi.ErrProcessTreeNotQuiescent))
-	require.True(t, providerProcessTreeProven(errors.New("ordinary close error")))
+	require.False(t, providerProcessTreeComplete(internalpi.ErrProcessContainmentIncomplete))
+	require.True(t, providerProcessTreeComplete(errors.New("ordinary close error")))
 
 	unknown.retire(t.Context(), true)
 	known.retire(t.Context(), true)
@@ -186,10 +186,10 @@ func TestPiProductionProcessSnapshotLifecycle(t *testing.T) {
 		closeErr      error
 		wantSnapshots []int
 	}{
-		{name: "proven close resets zero", wantSnapshots: []int{4, 4, 0}},
+		{name: "complete close resets zero", wantSnapshots: []int{4, 4, 0}},
 		{
-			name:          "unproven close preserves nonzero",
-			closeErr:      internalpi.ErrProcessTreeNotQuiescent,
+			name:          "incomplete close preserves nonzero",
+			closeErr:      internalpi.ErrProcessContainmentIncomplete,
 			wantSnapshots: []int{4, 4},
 		},
 	}
@@ -213,7 +213,11 @@ func TestPiProductionProcessSnapshotLifecycle(t *testing.T) {
 			session, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 			require.NoError(t, err)
 			require.ErrorIs(t, session.Close(t.Context()), test.closeErr)
-			require.Equal(t, test.wantSnapshots, snapshots)
+			if agent.ContainmentMode() == RuntimeContainmentBestEffort {
+				require.Empty(t, snapshots)
+			} else {
+				require.Equal(t, test.wantSnapshots, snapshots)
+			}
 		})
 	}
 }

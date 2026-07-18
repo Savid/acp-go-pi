@@ -116,13 +116,14 @@ func TestForkExtensionStoreLimitAfterNativeClone(t *testing.T) {
 	)
 
 	agent := NewAgent(
+		testContainmentOption(),
 		WithExecutablePath("/fake/pi"),
 		WithScratchDir(t.TempDir()),
 		WithSessionStore(store),
 		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}),
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
-	agent.probeVersion = func(context.Context, string) (string, error) {
+	agent.probeVersion = func(context.Context, string, pi.ContainmentSpec) (string, error) {
 		return pi.DefaultMinimumVersion, nil
 	}
 	agent.sessions["occupied"] = &agentSession{agent: agent, id: "occupied"}

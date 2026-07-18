@@ -736,7 +736,7 @@ func (s *fakePiServer) handleAbort(id string) {
 	if s.scenario.AbortAcksImmediately {
 		// This reproduces a native runtime that acknowledges foreground abort
 		// while a background tool descendant remains alive. The adapter must
-		// not treat this acknowledgement as process-containment proof.
+		// not treat this acknowledgement as selected-boundary completion.
 		s.respondOK(id, "abort")
 
 		return

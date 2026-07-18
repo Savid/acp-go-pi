@@ -18,6 +18,7 @@ acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt
 | `-home` | Unsupported: pi has no native config or auth root. A non-empty value fails session start. Use `-scratch-dir` instead. |
 | `-model` | Default model for new sessions, as `"provider/id"`. |
 | `-seed-file` | Write a host file into each session's agent directory as `<relpath>=<hostpath>`; repeatable. |
+| `-darwin-best-effort-containment` | Explicitly accept Darwin process-group containment. Invalid off Darwin. |
 | `-debug` | Emit debug logs to stderr. |
 | `-version` | Print adapter version and exit. |
 
@@ -27,3 +28,53 @@ credential env injection, OpenTelemetry providers, and the session store are
 embedded-Go only — configure them with the [Go API](/docs/reference/go-api)
 options such as `WithTurnTimeout`, `WithEnv`, and `WithSessionStore`.
 </Note>
+
+## Darwin containment operations
+
+Darwin native startup fails closed unless
+`-darwin-best-effort-containment` is present. Opt-in prints a warning to
+stderr with `containment=best_effort`; structured library logs carry the same
+attribute. Best-effort means the adapter reaps the direct child and observes
+the captured original process group disappear after a bounded TERM-to-KILL
+ladder. It does not establish that `setsid` descendants are absent.
+
+Each actual Darwin native launch gets a fresh `0700` generation root and a
+128-bit runtime id. Inspect current records without changing processes or
+files:
+
+```sh
+acp-go-pi containment diagnose -scratch-dir /tmp/pi-scratch
+```
+
+Select one runtime explicitly for cleanup:
+
+```sh
+acp-go-pi containment cleanup \
+  -scratch-dir /tmp/pi-scratch \
+  -runtime-id 0123456789abcdef0123456789abcdef \
+  -force
+```
+
+Both commands write one JSON object to stdout. Common fields are `vendor`,
+`containment`, `scratch_parent`, and the exact warning `PID-by-PID cleanup has
+a PID-reuse time-of-check/time-of-use race and can signal an unrelated reused
+PID; correlation is not ownership or proof of absence; inherited markers can
+be scrubbed`.
+`diagnose` adds a sorted `records` array; each record contains `runtime_id`,
+`state`, `generation_root`, `correlated_pids`, and `ambiguous_pids`. `cleanup`
+adds `runtime_id`, `generation_root`, `term_signaled_pids`,
+`kill_signaled_pids`, `remaining_correlated_pids`, `ambiguous_pids`, and
+`root_removed`.
+
+Usage errors return exit 2 with stderr only. Operational errors return exit 1.
+When cleanup has selected and inspected a record but cannot finish, it emits
+the populated JSON result to stdout and the error to stderr; failures before
+record selection emit no stdout. Success returns exit 0. These operations are
+available only on Darwin.
+
+The `-force` help and this warning disclose that per-PID revalidation cannot
+eliminate PID-reuse or collateral-signalling risk. Cleanup uses one fixed
+five-second deadline beginning before its first process enumeration; the TERM
+grace, KILL phase, and final scan share that deadline. Deadline exhaustion is
+terminal and retains the selected generation root without further validation,
+enumeration, or removal.

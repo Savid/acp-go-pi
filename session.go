@@ -84,36 +84,36 @@ type agentSession struct {
 	toolMu     sync.Mutex
 	rawEventMu sync.Mutex
 
-	mu                  sync.Mutex
-	title               string
-	updatedAt           string
-	model               string
-	availableModels     []pi.Model
-	thinkingLevel       string
-	contextWindowSize   int64
-	availableCommands   []pi.SlashCommand
-	advertisedCommands  []acp.AvailableCommand
-	poisonCause         string
-	cancel              context.CancelFunc
-	turnCancelled       bool
-	turnNonce           string
-	turnSink            *turnSink
-	turnNativeSettled   bool
-	turnFenceStarted    bool
-	turnFenceDone       chan struct{}
-	turnFenceErr        error
-	turnSettling        bool
-	turnCommitOnCancel  bool
-	pendingDialogs      map[string]*dialogCancel
-	turnTools           map[string]*turnToolCall
-	rawMessages         rawMessageConfig
-	rawEventSequence    int64
-	mirroredRows        int
-	closeTurnWait       time.Duration
-	nativeRootRelease   func()
-	scratchRootRelease  func()
-	nativeQuiescenceErr error
-	providerProcessRoot *providerProcessRoot
+	mu                   sync.Mutex
+	title                string
+	updatedAt            string
+	model                string
+	availableModels      []pi.Model
+	thinkingLevel        string
+	contextWindowSize    int64
+	availableCommands    []pi.SlashCommand
+	advertisedCommands   []acp.AvailableCommand
+	poisonCause          string
+	cancel               context.CancelFunc
+	turnCancelled        bool
+	turnNonce            string
+	turnSink             *turnSink
+	turnNativeSettled    bool
+	turnFenceStarted     bool
+	turnFenceDone        chan struct{}
+	turnFenceErr         error
+	turnSettling         bool
+	turnCommitOnCancel   bool
+	pendingDialogs       map[string]*dialogCancel
+	turnTools            map[string]*turnToolCall
+	rawMessages          rawMessageConfig
+	rawEventSequence     int64
+	mirroredRows         int
+	closeTurnWait        time.Duration
+	nativeRootRelease    func()
+	scratchRootRelease   func()
+	nativeContainmentErr error
+	providerProcessRoot  *providerProcessRoot
 }
 
 // turnToolCall is the exact-ID lifecycle published for one native tool call.
