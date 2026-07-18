@@ -4,4 +4,11 @@ package pi
 
 import "testing"
 
-func testContainmentSpec(*testing.T) ContainmentSpec { return ContainmentSpec{} }
+func TestContainmentOperationsUnavailableOffDarwin(t *testing.T) {
+	if _, err := DiagnoseContainment("scratch"); err == nil {
+		t.Fatal("diagnose unexpectedly available")
+	}
+	if _, err := CleanupContainment("scratch", "runtime", true); err == nil {
+		t.Fatal("cleanup unexpectedly available")
+	}
+}

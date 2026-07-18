@@ -220,9 +220,9 @@ func TestFakePiMatchesRealPi(t *testing.T) {
 		requireCommandError(t, err, "set_model", "Model not found: nope/missing")
 	}
 
-	for i, h := range pair {
+	for _, h := range pair {
 		_, err := h.client.Clone(ctx)
-		requireCommandError(t, err, "clone", fmt.Sprintf("Entry %s not found", leafIDs[i]))
+		requireCommandError(t, err, "clone", "This session has not been saved yet. Wait for the first assistant response before cloning or forking it.")
 
 		response := h.call(t, ctx, map[string]any{"type": "bogus_command"})
 		require.False(t, response.Success)

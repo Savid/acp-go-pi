@@ -71,9 +71,22 @@ func TestContainmentModePlatformMatrix(t *testing.T) {
 	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{}))
 	require.Equal(t, RuntimeContainmentBestEffort, containmentMode(Options{DarwinBestEffortContainment: true}))
 	require.NoError(t, validateContainmentOption(Options{DarwinBestEffortContainment: true}))
+	var logs strings.Builder
+	bestEffort := NewAgent(
+		WithDarwinBestEffortContainment(),
+		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+	)
+	require.Equal(t, RuntimeContainmentBestEffort, bestEffort.ContainmentMode())
+	require.Contains(t, logs.String(), "escaped descendants may survive")
 
 	agentRuntimePlatform = "freebsd"
 	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{}))
+	unavailable := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	require.ErrorIs(t, unavailable.ensureVersion(t.Context()), ErrProcessContainmentIncomplete)
+
+	var configured Options
+	WithDarwinBestEffortContainment()(&configured)
+	require.True(t, configured.DarwinBestEffortContainment)
 }
 
 func TestStartRealPiProcessRejectsEmptySpec(t *testing.T) {

@@ -20,6 +20,7 @@ func awaitProcessGroupBoundary(tree *processTree, timeout time.Duration) error {
 
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
+
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -28,6 +29,7 @@ func awaitProcessGroupBoundary(tree *processTree, timeout time.Duration) error {
 		if errors.Is(err, syscall.ESRCH) {
 			return tree.completeBoundary()
 		}
+
 		if err != nil && !errors.Is(err, syscall.EPERM) {
 			return fmt.Errorf("%w: inspect process group %d: %w", ErrProcessContainmentIncomplete, tree.pgid, err)
 		}

@@ -783,13 +783,9 @@ func (s *fakePiServer) handleClone(id string) {
 	}
 
 	if !hasMessage {
-		leaf := "null"
-		if len(s.session.entries) > 0 {
-			leaf = s.session.entries[len(s.session.entries)-1].id
-		}
 		s.mu.Unlock()
 
-		s.respondError(id, "clone", fmt.Sprintf("Entry %s not found", leaf))
+		s.respondError(id, "clone", "This session has not been saved yet. Wait for the first assistant response before cloning or forking it.")
 
 		return
 	}

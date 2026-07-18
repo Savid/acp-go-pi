@@ -80,6 +80,8 @@ type ContainmentSpec struct {
 // complete. Managed-root callers must retain its resources.
 var ErrProcessContainmentIncomplete = errors.New("pi process containment incomplete")
 
+var completeProcessContainmentRecord = completeContainmentRecord
+
 const (
 	containmentStateRunning = "running"
 	containmentStateAbsent  = "group_absent"
@@ -103,7 +105,7 @@ type processTreeCommand struct {
 }
 
 type containmentRecord struct {
-	path string
+	path string //nolint:unused // Darwin records persist the generation identity here.
 }
 
 func (c *processTreeCommand) releaseInherited() {
@@ -162,7 +164,7 @@ func ProcessContainmentComplete(err error) bool {
 }
 
 func completeUnstartedContainment(record containmentRecord) error {
-	if err := completeContainmentRecord(record, containmentStateAbsent); err != nil {
+	if err := completeProcessContainmentRecord(record, containmentStateAbsent); err != nil {
 		return fmt.Errorf("%w: finalize unstarted containment record: %v", ErrProcessContainmentIncomplete, err)
 	}
 

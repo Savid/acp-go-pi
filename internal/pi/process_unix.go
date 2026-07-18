@@ -15,7 +15,7 @@ import (
 )
 
 type processTree struct {
-	mu           sync.Mutex //nolint:unused // Used by the authoritative Unix build.
+	mu           sync.Mutex
 	pgid         int
 	process      *os.Process
 	containment  containmentRecord
@@ -26,11 +26,12 @@ type processTree struct {
 	boundaryOnce sync.Once
 	boundaryErr  error
 	direct       *directChildWait
-	cleanupOnce  sync.Once
-	cleanupErr   error
+	cleanupOnce  sync.Once //nolint:unused // Darwin cleanup memoizes the best-effort boundary.
+	cleanupErr   error     //nolint:unused // Darwin cleanup memoizes the best-effort boundary.
 }
 
 var activateProcessContainmentRecord = activateContainmentRecord
+var processHandleVanishedLeader = handleVanishedProcessGroupLeader
 
 func startProcessTree(launch *processTreeCommand) (*processTree, error) {
 	if err := launch.cmd.Start(); err != nil {
@@ -45,7 +46,7 @@ func startProcessTree(launch *processTreeCommand) (*processTree, error) {
 
 	pgid, err := syscallGetpgid(launch.cmd.Process.Pid)
 	if errors.Is(err, syscall.ESRCH) {
-		if tree, handled, handleErr := handleVanishedProcessGroupLeader(launch, direct); handled {
+		if tree, handled, handleErr := processHandleVanishedLeader(launch, direct); handled {
 			return tree, handleErr
 		}
 	}
@@ -78,6 +79,7 @@ func startProcessTree(launch *processTreeCommand) (*processTree, error) {
 
 	if err := activateProcessContainmentRecord(launch.containment, launch.cmd.Process.Pid, pgid); err != nil {
 		launch.abortStartGate()
+		tree.direct.begin()
 
 		cleanupErr := tree.kill()
 		waitErr := tree.direct.await(defaultProcessTreeWait)
@@ -88,6 +90,7 @@ func startProcessTree(launch *processTreeCommand) (*processTree, error) {
 	}
 
 	if err := launch.releaseStartGate(); err != nil {
+		tree.direct.begin()
 		cleanupErr := tree.kill()
 		waitErr := tree.direct.await(defaultProcessTreeWait)
 

@@ -119,14 +119,13 @@ exit 0`)
 func TestProbeVersionWaitsForDescendantTreeQuiescence(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "child.pid")
-	t.Setenv("PI_VERSION_CHILD_PID_FILE", pidFile)
 
 	script := filepath.Join(dir, "fake-pi")
-	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+	require.NoError(t, os.WriteFile(script, []byte(fmt.Sprintf(`#!/bin/sh
 (trap '' TERM; while :; do sleep 1; done) &
-echo $! > "$PI_VERSION_CHILD_PID_FILE"
+echo $! > %s
 echo 0.80.6
-`), 0o700))
+`, strconv.Quote(pidFile))), 0o700))
 
 	version, err := ProbeVersion(t.Context(), script, testContainmentSpec(t))
 	require.NoError(t, err)

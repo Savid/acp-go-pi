@@ -5,8 +5,6 @@ package pi
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -97,25 +95,6 @@ func (reader *darwinTestReadCloser) Close() error {
 	reader.closed = true
 
 	return reader.closeErr
-}
-
-func testContainmentSpec(t *testing.T) ContainmentSpec {
-	t.Helper()
-
-	parent := t.TempDir()
-	root, err := os.MkdirTemp(parent, "acp-go-pi-runtime-*")
-	require.NoError(t, err)
-	identity := make([]byte, 16)
-	_, err = rand.Read(identity)
-	require.NoError(t, err)
-
-	return ContainmentSpec{
-		DarwinBestEffort: true,
-		ScratchParent:    parent,
-		GenerationRoot:   filepath.Clean(root),
-		RuntimeID:        hex.EncodeToString(identity),
-		LifecycleKind:    "discovery",
-	}
 }
 
 func TestDarwinLaunchBootstrapProtocol(t *testing.T) {
