@@ -342,7 +342,11 @@ func (h *postResponseHooks) runAfterResponseWrite(data []byte) {
 		h.all = append(h.all[:index], h.all[index+1:]...)
 		h.mu.Unlock()
 
-		go hook.run()
+		go func() {
+			defer recoverAgentGoroutine(context.Background(), h.log, "post-response hook")
+
+			hook.run()
+		}()
 
 		return
 	}

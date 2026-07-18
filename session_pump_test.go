@@ -1,8 +1,10 @@
 package piacp
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/savid/acp-go-pi/internal/pi"
@@ -48,5 +50,31 @@ func TestPumpDeliveryBranches(t *testing.T) {
 	case <-done:
 	default:
 		t.Fatal("pump did not finish")
+	}
+}
+
+func TestPumpPanicIsContainedAndEndsTurn(t *testing.T) {
+	var logs bytes.Buffer
+	agent := NewAgent(WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	sink := newTurnSink()
+	session := &agentSession{agent: agent, id: "id", turnSink: sink}
+	client := newStubPiClient()
+	client.eventsFunc = func() <-chan pi.Event {
+		panic("event stream boom")
+	}
+	done := make(chan struct{})
+
+	session.pump(t.Context(), client, done)
+
+	select {
+	case <-done:
+	default:
+		t.Fatal("panicking pump did not finish")
+	}
+	if _, ok := <-sink.events; ok {
+		t.Fatal("panicking pump left the turn event stream open")
+	}
+	if !strings.Contains(logs.String(), "session event pump") || !strings.Contains(logs.String(), "event stream boom") {
+		t.Fatalf("panic log = %q", logs.String())
 	}
 }

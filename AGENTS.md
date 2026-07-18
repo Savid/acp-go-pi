@@ -58,8 +58,8 @@ ACP_GO_PI_RUN_INTEGRATION=1 go test -race -count=1 -tags=integration -timeout=30
 
 `ACP_GO_PI_RUN_INTEGRATION=1` gates the integration tier;
 `ACP_GO_PI_RUN_LIVE_TOKENS=1` additionally opts in to tests that spend model
-tokens (`make test-integration-smoke` omits it). `make test-integration` runs
-the same live suite. Use `make test-integration-cover` for compiled
+tokens (`make test-integration-smoke` omits it). Use
+`make test-integration-cover` for compiled
 `acp-go-pi` coverage through `GOCOVERDIR`. Integration tests always launch pi
 with an isolated temp `PI_CODING_AGENT_DIR` and a scrubbed environment;
 provider credentials for the live tier are injected into that isolated

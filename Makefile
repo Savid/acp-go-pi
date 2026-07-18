@@ -3,7 +3,7 @@
 GOLANGCI_LINT_VERSION ?= v2.12.2
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
-.PHONY: build lint fmt-check fmt test coverage-check test-cross-compile test-integration-smoke test-integration-live test-integration test-integration-cover docs-audit clean tidy vuln modernize-check audit test/cover help
+.PHONY: build lint fmt-check fmt test coverage-check test-cross-compile test-integration-smoke test-integration-live test-integration-cover docs-audit clean tidy vuln modernize-check audit test/cover help
 
 ## build: compile all packages
 build:
@@ -52,9 +52,6 @@ test-integration-smoke:
 ## test-integration-live: run full live integration tests
 test-integration-live:
 	ACP_GO_PI_RUN_INTEGRATION=1 ACP_GO_PI_RUN_LIVE_TOKENS=1 go test -race -count=1 -tags=integration -timeout=900s -parallel=4 -v ./integration/...
-
-## test-integration: alias for live integration tests
-test-integration: test-integration-live
 
 ## test-integration-cover: run live integration tests with compiled binary coverage
 test-integration-cover:

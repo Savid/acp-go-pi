@@ -44,6 +44,11 @@ func (s *agentSession) startPump(client piClient) {
 
 func (s *agentSession) pump(ctx context.Context, client piClient, done chan struct{}) {
 	defer close(done)
+	defer func() {
+		handleAgentGoroutinePanic(ctx, agentLogger(s.agent), "session event pump", func(any) {
+			s.closeActiveTurnSink()
+		}, recover())
+	}()
 
 	events := client.Events()
 	uiRequests := client.UIRequests()

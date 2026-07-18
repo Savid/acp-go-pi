@@ -325,6 +325,7 @@ func (s *errorSessionStore) Delete(context.Context, SessionKey) error {
 type stubPiClient struct {
 	mu           sync.Mutex
 	events       chan pi.Event
+	eventsFunc   func() <-chan pi.Event
 	uiRequests   chan pi.UIRequest
 	done         chan struct{}
 	err          error
@@ -355,8 +356,14 @@ func newStubPiClient() *stubPiClient {
 	return &stubPiClient{events: make(chan pi.Event), uiRequests: make(chan pi.UIRequest), done: make(chan struct{})}
 }
 
-func (c *stubPiClient) Start(context.Context) error     { return c.startErr }
-func (c *stubPiClient) Events() <-chan pi.Event         { return c.events }
+func (c *stubPiClient) Start(context.Context) error { return c.startErr }
+func (c *stubPiClient) Events() <-chan pi.Event {
+	if c.eventsFunc != nil {
+		return c.eventsFunc()
+	}
+
+	return c.events
+}
 func (c *stubPiClient) UIRequests() <-chan pi.UIRequest { return c.uiRequests }
 func (c *stubPiClient) Done() <-chan struct{}           { return c.done }
 func (c *stubPiClient) Err() error                      { return c.err }

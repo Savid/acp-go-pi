@@ -277,6 +277,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 
 				go func() {
 					defer s.dialogWG.Done()
+					defer recoverAgentGoroutine(context.WithoutCancel(turnCtx), agentLogger(s.agent), "UI dialog handler")
 
 					s.handleUIDialog(turnCtx, request)
 				}()
