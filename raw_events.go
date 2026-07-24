@@ -1,6 +1,10 @@
 package piacp
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 )
@@ -44,6 +48,89 @@ func rawMessageConfigFromMeta(meta map[string]any) rawMessageConfig {
 
 func (c rawMessageConfig) Enabled() bool {
 	return c.All
+}
+
+// imageBlockTypeMarker is the fast-path probe for native image content
+// inside a raw event line.
+var imageBlockTypeMarker = []byte(`"image"`)
+
+// redactedImageMarker replaces a raw event line that carries image content
+// but cannot be parsed for structured redaction.
+const redactedImageMarker = `{"redacted":"unparseable native event carrying image content"}`
+
+// marshalRedactedEvent re-encodes a redacted event; a package variable so a
+// test can force the re-encode to fail.
+var marshalRedactedEvent = json.Marshal
+
+// redactRawEventImages replaces embedded image payloads inside one native
+// event line with safe metadata (MIME, decoded size, checksum) so raw
+// diagnostics never carry a second copy of image bytes.
+func redactRawEventImages(raw []byte) []byte {
+	if !bytes.Contains(raw, imageBlockTypeMarker) {
+		return raw
+	}
+
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return []byte(redactedImageMarker)
+	}
+
+	if !redactImageNodes(value) {
+		return raw
+	}
+
+	redacted, err := marshalRedactedEvent(value)
+	if err != nil {
+		return []byte(redactedImageMarker)
+	}
+
+	return redacted
+}
+
+// redactImageNodes walks decoded JSON and strips the data payload from every
+// image content block in place, reporting whether anything changed.
+func redactImageNodes(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		changed := false
+
+		blockType, _ := typed["type"].(string)
+		data, hasData := typed["data"].(string)
+
+		if blockType == contentBlockTypeImage && hasData && data != "" {
+			delete(typed, "data")
+
+			if decoded, err := base64.StdEncoding.DecodeString(data); err == nil {
+				digest := sha256.Sum256(decoded)
+				typed[rawEventFieldSizeBytes] = len(decoded)
+				typed["sha256"] = hex.EncodeToString(digest[:])
+			} else {
+				typed[rawEventFieldTruncated] = true
+			}
+
+			changed = true
+		}
+
+		for _, item := range typed {
+			if redactImageNodes(item) {
+				changed = true
+			}
+		}
+
+		return changed
+	case []any:
+		changed := false
+
+		for _, item := range typed {
+			if redactImageNodes(item) {
+				changed = true
+			}
+		}
+
+		return changed
+	default:
+		return false
+	}
 }
 
 // rawEventMarker inspects the fully-marshalled notification payload and

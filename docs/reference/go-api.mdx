@@ -51,6 +51,7 @@ Darwin.
 | `WithSessionStore` | Install durable session storage. |
 | `WithSessionStoreLoadTimeout` | Bound store load/list operations used during resume. |
 | `WithConcurrencyLimits` | Cap active sessions and concurrent client calls. |
+| `WithImageLimits` | Decoded-byte limits for prompt image input and emitted image output (`MaxInputBytesPerImage`, `MaxInputBytesPerPrompt`, `MaxOutputBytesPerImage`, `MaxOutputBytesPerToolCall`); each defaults to 6 MiB, an explicit zero disables that policy limit, and negative values are rejected at construction. |
 | `WithTurnTimeout` | Bound one prompt turn; expiry fails the turn with cause `timeout` (default: no deadline). |
 | `WithRuntimeResourceHooks` | Host admission hooks for native-process roots and adapter scratch roots. |
 | `WithDarwinBestEffortContainment` | Explicitly accept Darwin process-group containment and its escaped-descendant risk. Invalid on other platforms. |

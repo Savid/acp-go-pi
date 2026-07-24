@@ -117,6 +117,15 @@ type Options struct {
 	// so the launched CLI reads them as its own config (e.g. settings.json,
 	// which is deep-merged under the adapter's managed keys).
 	SeedFiles map[string]string
+	// ImageLimits bounds decoded image bytes on prompt input and emitted
+	// output. Set via WithImageLimits; every field defaults to 6 MiB when the
+	// option is omitted, and an explicit zero in a supplied struct disables
+	// that policy limit.
+	ImageLimits ImageLimits
+
+	// imageLimitsSet records whether WithImageLimits supplied the struct; an
+	// omitted option leaves every field at its default.
+	imageLimitsSet bool
 }
 
 // ConcurrencyLimits controls per-agent/session backpressure. Zero fields use defaults.
@@ -134,6 +143,10 @@ func applyOptions(opts []Option) Options {
 
 	for _, opt := range opts {
 		opt(&options)
+	}
+
+	if !options.imageLimitsSet {
+		options.ImageLimits = defaultImageLimits()
 	}
 
 	return options

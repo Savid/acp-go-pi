@@ -2,6 +2,7 @@ package piacp
 
 import (
 	"context"
+	"errors"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -96,7 +97,12 @@ func (s *agentSession) publishNativeToolStart(ctx context.Context, event pi.Tool
 	return nil
 }
 
-func (s *agentSession) publishNativeToolUpdate(ctx context.Context, toolCallID string, update acp.SessionUpdate) error {
+// publishNativeToolUpdate emits one partial tool result as a complete
+// content snapshot. ACP replaces the tool call's content array wholesale on
+// every content-bearing update, so each update carries the full current
+// array; an update whose snapshot is empty is skipped rather than erasing
+// delivered content with an empty replacement.
+func (s *agentSession) publishNativeToolUpdate(ctx context.Context, toolCallID string, blocks []pi.ContentBlock) error {
 	state := s.lockToolCallState(toolCallID)
 	defer state.mu.Unlock()
 
@@ -104,14 +110,39 @@ func (s *agentSession) publishNativeToolUpdate(ctx context.Context, toolCallID s
 		return nil
 	}
 
-	return s.emitUpdates(ctx, []acp.SessionUpdate{update})
+	snapshot, failure := buildToolContent(state.content, blocks, s.agent.imageLimits())
+	if failure != nil {
+		return s.failToolImageOutputLocked(ctx, toolCallID, state, failure)
+	}
+
+	// Merging only appends, so an unchanged length means this partial adds
+	// nothing; re-transmitting the identical array would only repeat its
+	// base64 payloads.
+	if len(snapshot) == 0 || len(snapshot) == len(state.content) {
+		return nil
+	}
+
+	if err := s.emitUpdates(ctx, []acp.SessionUpdate{acp.UpdateToolCall(
+		acp.ToolCallId(toolCallID),
+		acp.WithUpdateContent(toolContentSnapshot(snapshot)),
+	)}); err != nil {
+		return err
+	}
+
+	s.recordToolContentLocked(state, snapshot)
+
+	return nil
 }
 
+// publishNativeToolTerminal emits the terminal tool update: the native
+// status plus, when the native result carries mappable content, the complete
+// final content snapshot. A result without mappable content is a status-only
+// update that leaves the delivered array intact.
 func (s *agentSession) publishNativeToolTerminal(
 	ctx context.Context,
 	toolCallID string,
 	status acp.ToolCallStatus,
-	update acp.SessionUpdate,
+	result *pi.ToolResult,
 ) error {
 	state := s.lockToolCallState(toolCallID)
 	defer state.mu.Unlock()
@@ -120,12 +151,72 @@ func (s *agentSession) publishNativeToolTerminal(
 		return nil
 	}
 
-	if err := s.emitUpdates(ctx, []acp.SessionUpdate{update}); err != nil {
+	opts := []acp.ToolCallUpdateOpt{acp.WithUpdateStatus(status)}
+
+	var snapshot []toolContentItem
+
+	if result != nil {
+		var failure *imageOutputError
+
+		snapshot, failure = buildToolContent(state.content, result.Content, s.agent.imageLimits())
+		if failure != nil {
+			return s.failToolImageOutputLocked(ctx, toolCallID, state, failure)
+		}
+
+		if len(snapshot) > 0 {
+			opts = append(opts, acp.WithUpdateContent(toolContentSnapshot(snapshot)))
+		}
+	}
+
+	if err := s.emitUpdates(ctx, []acp.SessionUpdate{
+		acp.UpdateToolCall(acp.ToolCallId(toolCallID), opts...),
+	}); err != nil {
 		return err
 	}
+
+	s.recordToolContentLocked(state, snapshot)
 
 	state.terminalPublished = true
 	state.status = status
 
 	return nil
+}
+
+// recordToolContentLocked retains the emitted snapshot for replace-semantics
+// merging and notes image delivery for the turn's durability accounting.
+func (s *agentSession) recordToolContentLocked(state *turnToolCall, snapshot []toolContentItem) {
+	if len(snapshot) == 0 {
+		return
+	}
+
+	state.content = snapshot
+
+	for _, item := range snapshot {
+		if item.imageBytes > 0 {
+			s.markTurnImageEmission()
+
+			return
+		}
+	}
+}
+
+// failToolImageOutputLocked handles an adapter-side image representation
+// failure on tool provenance: the failed tool state is emitted first, as a
+// status-only update for attribution, then the turn fails with the
+// image-output envelope.
+func (s *agentSession) failToolImageOutputLocked(
+	ctx context.Context,
+	toolCallID string,
+	state *turnToolCall,
+	failure *imageOutputError,
+) error {
+	emitErr := s.emitUpdates(ctx, []acp.SessionUpdate{acp.UpdateToolCall(
+		acp.ToolCallId(toolCallID),
+		acp.WithUpdateStatus(acp.ToolCallStatusFailed),
+	)})
+
+	state.terminalPublished = true
+	state.status = acp.ToolCallStatusFailed
+
+	return errors.Join(imageOutputTurnFailure(failure), emitErr)
 }

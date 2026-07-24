@@ -424,7 +424,7 @@ func (s *agentSession) emitRawPiEvent(ctx context.Context, raw []byte) {
 		acpFieldSessionID:     s.id,
 		rawEventFieldSequence: sequence,
 		rawEventFieldSource:   rawEventSourceValue,
-		rawEventFieldEvent:    json.RawMessage(raw),
+		rawEventFieldEvent:    json.RawMessage(redactRawEventImages(raw)),
 	}
 	if meta := turnRouteMetaFromContext(ctx); meta != nil {
 		payload["_meta"] = meta

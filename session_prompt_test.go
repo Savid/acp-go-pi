@@ -19,11 +19,12 @@ import (
 
 func TestPromptContentMapping(t *testing.T) {
 	mime := "image/png"
+	png := fixtureBase64(t, "valid.png")
 	textResource := acp.EmbeddedResourceResource{TextResourceContents: &acp.TextResourceContents{
 		Uri: "file:///a<&\"'", Text: "body <&>",
 	}}
 	imageResource := acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{
-		Uri: "file:///image", Blob: "aW1hZ2U=", MimeType: &mime,
+		Uri: "file:///image", Blob: png, MimeType: &mime,
 	}}
 	userAnnotations := &acp.Annotations{Audience: []acp.Role{acp.RoleUser}}
 	ignored := acp.TextBlock("ignored")
@@ -31,11 +32,11 @@ func TestPromptContentMapping(t *testing.T) {
 
 	mapped, err := promptToPi([]acp.ContentBlock{
 		acp.TextBlock("hello"), ignored,
-		acp.ImageBlock("aW1hZ2U=", "image/png"),
+		acp.ImageBlock(png, "image/png"),
 		acp.ResourceLinkBlock("link", " https://example.test "),
 		acp.ResourceBlock(textResource),
 		acp.ResourceBlock(imageResource),
-	})
+	}, defaultImageLimits())
 	require.NoError(t, err)
 	require.Contains(t, mapped.Message, "hello")
 	require.NotContains(t, mapped.Message, "ignored")
@@ -53,11 +54,11 @@ func TestPromptContentMapping(t *testing.T) {
 		{acp.ResourceBlock(acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{Uri: "x", Blob: "data"}})},
 	}
 	for _, blocks := range invalid {
-		_, invalidErr := promptToPi(blocks)
+		_, invalidErr := promptToPi(blocks, defaultImageLimits())
 		requireInvalidParams(t, invalidErr)
 	}
 
-	text, contextText, image, err := resourceToPi(textResource)
+	text, contextText, image, err := resourceToPi(textResource, newPromptImageBudget(defaultImageLimits()))
 	require.NoError(t, err)
 	require.NotEmpty(t, text)
 	require.NotEmpty(t, contextText)

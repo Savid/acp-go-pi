@@ -126,10 +126,14 @@ func NewAgent(opts ...Option) *Agent {
 		store:            NewInMemorySessionStore(),
 		deleted:          make(map[acp.SessionId]struct{}),
 		positionEncoding: acp.PositionEncodingKindUtf16,
-		activeLimitErr:   errors.Join(validateConcurrencyLimits(options.ConcurrencyLimits), validateContainmentOption(options)),
-		startPiProcess:   startRealPiProcess,
-		probeVersion:     pi.ProbeVersion,
-		lookPath:         exec.LookPath,
+		activeLimitErr: errors.Join(
+			validateConcurrencyLimits(options.ConcurrencyLimits),
+			validateContainmentOption(options),
+			validateImageLimits(options.ImageLimits),
+		),
+		startPiProcess: startRealPiProcess,
+		probeVersion:   pi.ProbeVersion,
+		lookPath:       exec.LookPath,
 	}
 	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
 	observeRuntimeContainment(context.Background(), options.RuntimeResourceHooks, mode)

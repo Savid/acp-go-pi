@@ -2,9 +2,12 @@ package piacp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"testing"
@@ -186,6 +189,23 @@ func appendForkParentRows(t *testing.T, store *faultySessionStore, entries ...Se
 		SessionKey{SessionID: string(forkParentID)},
 		entries,
 	))
+}
+
+// fixtureBytes reads one raster fixture from testdata.
+func fixtureBytes(t *testing.T, name string) []byte {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join("testdata", name))
+	require.NoError(t, err)
+
+	return data
+}
+
+// fixtureBase64 reads one raster fixture from testdata as standard base64.
+func fixtureBase64(t *testing.T, name string) string {
+	t.Helper()
+
+	return base64.StdEncoding.EncodeToString(fixtureBytes(t, name))
 }
 
 func messageRow(t *testing.T, message pi.AgentMessage) SessionStoreEntry {

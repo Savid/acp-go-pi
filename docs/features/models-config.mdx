@@ -27,9 +27,11 @@ natively accepts an invalid level and silently coerces it, so the adapter
 rejects unknown levels up front instead of letting them mutate silently.
 
 Each advertised model value includes harness-reported `_meta.pi` details:
-`modelId`, `contextWindow`, `maxOutputTokens`, and the known capability names
-(`reasoning`, `image`, `audio`, `pdf`, or `video`). Missing values are omitted
-rather than filled with guessed zeroes.
+`modelId`, `contextWindow`, and `maxOutputTokens`. Missing values are omitted
+rather than filled with guessed zeroes. The catalog's per-model input list is
+consumed internally to gate image prompts (see
+[Prompt streaming](/docs/core/prompt-streaming)); it is not republished as
+`_meta` capability metadata.
 
 ## Choosing defaults and per-session values
 

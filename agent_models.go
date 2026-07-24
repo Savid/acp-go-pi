@@ -3,20 +3,10 @@ package piacp
 import (
 	"context"
 	"errors"
-	"strings"
 
 	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-pi/internal/pi"
-)
-
-const (
-	modelCapabilityReasoning = "reasoning"
-
-	modelInputImage = "image"
-	modelInputAudio = "audio"
-	modelInputPDF   = "pdf"
-	modelInputVideo = "video"
 )
 
 // SetSessionMode exists only because github.com/coder/acp-go-sdk's generated
@@ -300,8 +290,10 @@ func modelDisplayName(info *pi.Model) string {
 
 // piModelInfoMeta attaches harness-reported model metadata under the model
 // select value's _meta.pi; absent metadata is omitted, never zero-filled.
+// Model modality data is not published here: the catalog input list feeds
+// only the adapter-internal selected-model image gate.
 func piModelInfoMeta(info *pi.Model) map[string]any {
-	piMeta := make(map[string]any, 4)
+	piMeta := make(map[string]any, 3)
 
 	piMeta["modelId"] = info.Provider + "/" + info.ID
 
@@ -313,28 +305,7 @@ func piModelInfoMeta(info *pi.Model) map[string]any {
 		piMeta["maxOutputTokens"] = info.MaxTokens
 	}
 
-	if capabilities := modelCapabilities(info); len(capabilities) > 0 {
-		piMeta["capabilities"] = capabilities
-	}
-
 	return map[string]any{piMetaKey: piMeta}
-}
-
-func modelCapabilities(info *pi.Model) []string {
-	capabilities := make([]string, 0, len(info.Input)+1)
-
-	if info.Reasoning {
-		capabilities = append(capabilities, modelCapabilityReasoning)
-	}
-
-	for _, input := range info.Input {
-		switch capability := strings.ToLower(input); capability {
-		case modelInputImage, modelInputAudio, modelInputPDF, modelInputVideo:
-			capabilities = append(capabilities, capability)
-		}
-	}
-
-	return capabilities
 }
 
 func configCategory(category acp.SessionConfigOptionCategory) *acp.SessionConfigOptionCategory {

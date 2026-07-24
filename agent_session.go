@@ -153,7 +153,7 @@ func (a *Agent) restoreSession(
 		return nil, nil, false, unknownSessionError()
 	}
 
-	entries, err := a.loadStoreEntries(ctx, a.sessionStore(), SessionKey{SessionID: string(sessionID)})
+	entries, err := a.loadCurrentStoreEntries(ctx, string(sessionID))
 	if err != nil {
 		return nil, nil, false, err
 	}

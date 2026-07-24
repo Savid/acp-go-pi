@@ -34,7 +34,9 @@ type storeRow struct {
 }
 
 // replayStoredSession replays mirrored native rows as ACP session updates in
-// append order for session/load.
+// append order for session/load. Replay runs the same image validation as
+// live emission: a stored artifact the store can no longer reproduce fails
+// the whole load rather than streaming a transcript with a hole in it.
 func (s *agentSession) replayStoredSession(ctx context.Context, entries []SessionStoreEntry) error {
 	for _, entry := range entries {
 		row, ok := decodeStoreRow(entry)
@@ -47,7 +49,11 @@ func (s *agentSession) replayStoredSession(ctx context.Context, entries []Sessio
 			continue
 		}
 
-		updates := messageReplayUpdates(message)
+		updates, failure := messageReplayUpdates(message, s.agent.imageLimits())
+		if failure != nil {
+			return imageOutputTurnFailure(failure)
+		}
+
 		if message.Role == messageRoleAssistant && len(updates) == 0 && message.ACPMessageID != "" {
 			updates = []acp.SessionUpdate{{SessionInfoUpdate: &acp.SessionSessionInfoUpdate{}}}
 		}
@@ -60,7 +66,7 @@ func (s *agentSession) replayStoredSession(ctx context.Context, entries []Sessio
 	return nil
 }
 
-func replayUpdates(entries []SessionStoreEntry) []acp.SessionUpdate {
+func replayUpdates(entries []SessionStoreEntry, limits ImageLimits) ([]acp.SessionUpdate, error) {
 	updates := make([]acp.SessionUpdate, 0, len(entries))
 
 	for _, entry := range entries {
@@ -74,10 +80,15 @@ func replayUpdates(entries []SessionStoreEntry) []acp.SessionUpdate {
 			continue
 		}
 
-		updates = append(updates, messageReplayUpdates(message)...)
+		rowUpdates, failure := messageReplayUpdates(message, limits)
+		if failure != nil {
+			return nil, imageOutputTurnFailure(failure)
+		}
+
+		updates = append(updates, rowUpdates...)
 	}
 
-	return updates
+	return updates, nil
 }
 
 // terminalAssistantMessageID returns the durable identity on the final
@@ -103,10 +114,10 @@ func terminalAssistantMessageID(entries []SessionStoreEntry) string {
 	return ""
 }
 
-func messageReplayUpdates(message pi.AgentMessage) []acp.SessionUpdate {
+func messageReplayUpdates(message pi.AgentMessage, limits ImageLimits) ([]acp.SessionUpdate, *imageOutputError) {
 	blocks, err := message.ContentBlocks()
 	if err != nil {
-		return nil
+		return nil, nil //nolint:nilerr // a row whose content does not decode replays nothing, like other malformed stored rows
 	}
 
 	switch message.Role {
@@ -128,41 +139,12 @@ func messageReplayUpdates(message pi.AgentMessage) []acp.SessionUpdate {
 			}
 		}
 
-		return updates
+		return updates, nil
 	case messageRoleAssistant:
-		updates := make([]acp.SessionUpdate, 0, len(blocks))
-		messageID := message.ACPMessageID
-
-		var messageIDPtr *string
-		if messageID != "" {
-			messageIDPtr = &messageID
-		}
-
-		for index := range blocks {
-			block := &blocks[index]
-
-			switch block.Type {
-			case contentBlockTypeText:
-				if block.Text != "" {
-					updates = append(updates, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
-						Content: acp.TextBlock(block.Text), MessageId: messageIDPtr,
-					}})
-				}
-			case contentBlockTypeThinking:
-				if block.Thinking != "" {
-					updates = append(updates, acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
-						Content: acp.TextBlock(block.Thinking), MessageId: messageIDPtr,
-					}})
-				}
-			case contentBlockTypeToolCall:
-				updates = append(updates, replayToolCallUpdate(block))
-			}
-		}
-
-		return updates
+		return assistantReplayUpdates(message, blocks, limits)
 	case messageRoleToolResult:
 		if message.ToolCallID == "" {
-			return nil
+			return nil, nil
 		}
 
 		status := acp.ToolCallStatusCompleted
@@ -170,13 +152,102 @@ func messageReplayUpdates(message pi.AgentMessage) []acp.SessionUpdate {
 			status = acp.ToolCallStatusFailed
 		}
 
+		content, failure := replayToolContent(blocks, limits)
+		if failure != nil {
+			return nil, failure
+		}
+
+		opts := []acp.ToolCallUpdateOpt{acp.WithUpdateStatus(status)}
+		if len(content) > 0 {
+			opts = append(opts, acp.WithUpdateContent(content))
+		}
+
 		return []acp.SessionUpdate{acp.UpdateToolCall(
 			acp.ToolCallId(message.ToolCallID),
-			acp.WithUpdateStatus(status),
-			acp.WithUpdateContent(toolCallContent(blocks)),
-		)}
+			opts...,
+		)}, nil
 	default:
-		return nil
+		return nil, nil
+	}
+}
+
+// assistantReplayUpdates projects one stored assistant row, including image
+// blocks, through the same validation as live emission so replay delivers
+// identical typed content.
+func assistantReplayUpdates(
+	message pi.AgentMessage,
+	blocks []pi.ContentBlock,
+	limits ImageLimits,
+) ([]acp.SessionUpdate, *imageOutputError) {
+	updates := make([]acp.SessionUpdate, 0, len(blocks))
+	messageID := message.ACPMessageID
+
+	var messageIDPtr *string
+	if messageID != "" {
+		messageIDPtr = &messageID
+	}
+
+	for index := range blocks {
+		block := &blocks[index]
+
+		switch block.Type {
+		case contentBlockTypeText:
+			if block.Text != "" {
+				updates = append(updates, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+					Content: acp.TextBlock(block.Text), MessageId: messageIDPtr,
+				}})
+			}
+		case contentBlockTypeImage:
+			if block.Data == "" {
+				return nil, sweptImageFailure()
+			}
+
+			image, failure := normalizeOutputImage(block.Data, block.MimeType, effectiveOutputImageLimit(limits.MaxOutputBytesPerImage))
+			if failure != nil {
+				return nil, replayImageFailure(failure)
+			}
+
+			updates = append(updates, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+				Content: acp.ImageBlock(image.data, image.mime), MessageId: messageIDPtr,
+			}})
+		case contentBlockTypeThinking:
+			if block.Thinking != "" {
+				updates = append(updates, acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+					Content: acp.TextBlock(block.Thinking), MessageId: messageIDPtr,
+				}})
+			}
+		case contentBlockTypeToolCall:
+			updates = append(updates, replayToolCallUpdate(block))
+		}
+	}
+
+	return updates, nil
+}
+
+// replayToolContent validates one stored tool result row's complete content
+// array under the current limits before it is replayed as a snapshot.
+func replayToolContent(blocks []pi.ContentBlock, limits ImageLimits) ([]acp.ToolCallContent, *imageOutputError) {
+	for index := range blocks {
+		if blocks[index].Type == contentBlockTypeImage && blocks[index].Data == "" {
+			return nil, sweptImageFailure()
+		}
+	}
+
+	items, failure := buildToolContent(nil, blocks, limits)
+	if failure != nil {
+		return nil, replayImageFailure(failure)
+	}
+
+	return toolContentSnapshot(items), nil
+}
+
+// sweptImageFailure reports a stored image artifact whose bytes are gone: the
+// bounded artifact window swept them, so the load fails truthfully instead
+// of omitting the artifact.
+func sweptImageFailure() *imageOutputError {
+	return &imageOutputError{
+		reason:  imageReasonStorageFailed,
+		message: "stored image artifact bytes are no longer available",
 	}
 }
 
@@ -203,27 +274,6 @@ func replayToolCallUpdate(block *pi.ContentBlock) acp.SessionUpdate {
 	}
 
 	return acp.StartToolCall(acp.ToolCallId(toolCall.ID), toolCall.Name, opts...)
-}
-
-func toolCallContent(blocks []pi.ContentBlock) []acp.ToolCallContent {
-	content := make([]acp.ToolCallContent, 0, len(blocks))
-
-	for index := range blocks {
-		block := &blocks[index]
-
-		switch block.Type {
-		case contentBlockTypeText:
-			if block.Text != "" {
-				content = append(content, acp.ToolContent(acp.TextBlock(block.Text)))
-			}
-		case contentBlockTypeImage:
-			if block.Data != "" {
-				content = append(content, acp.ToolContent(acp.ImageBlock(block.Data, block.MimeType)))
-			}
-		}
-	}
-
-	return content
 }
 
 func decodeStoreRow(entry SessionStoreEntry) (storeRow, bool) {

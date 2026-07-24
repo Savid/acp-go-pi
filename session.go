@@ -109,6 +109,7 @@ type agentSession struct {
 	rawMessages          rawMessageConfig
 	rawEventSequence     int64
 	mirroredRows         int
+	turnImagesEmitted    bool
 	closeTurnWait        time.Duration
 	nativeRootRelease    func()
 	scratchRootRelease   func()
@@ -128,6 +129,10 @@ type turnToolCall struct {
 	permissionRequested  bool
 	terminalPublished    bool
 	status               acp.ToolCallStatus
+	// content is the last emitted complete content snapshot; each later
+	// content-bearing update merges onto it so no delivered item disappears
+	// under ACP's whole-array replacement.
+	content []toolContentItem
 }
 
 // dialogCancel tracks one pending extension UI dialog so session/cancel and
@@ -145,4 +150,7 @@ type promptTurnState struct {
 	model           string
 	provider        string
 	nativeMessageID string
+	// agentImages de-duplicates assistant image artifacts across the turn's
+	// agent chunks, keyed by native message identity plus fingerprint.
+	agentImages map[string]struct{}
 }

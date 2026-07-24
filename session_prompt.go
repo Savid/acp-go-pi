@@ -19,7 +19,6 @@ const (
 	fieldPromptImage    = "prompt.image"
 	fieldPromptResource = "prompt.resource"
 
-	errMissingImageData    = "missing image data or uri"
 	errMissingResourceData = "missing resource data or uri"
 
 	assistantEventTextDelta     = "text_delta"
@@ -41,9 +40,11 @@ type piPrompt struct {
 
 // promptToPi converts ACP prompt content to pi's prompt command shape.
 // Embedded context is flattened into the message text at map time; audio is
-// rejected; images must carry embedded data because pi's prompt images take
-// base64 payloads only.
-func promptToPi(prompt []acp.ContentBlock) (piPrompt, error) {
+// rejected; images must carry embedded base64 data because pi's prompt
+// images take base64 payloads only, so an image uri is provenance and never
+// fetched. Image validation is deterministic and stops on the first failing
+// block in request order.
+func promptToPi(prompt []acp.ContentBlock, limits ImageLimits) (piPrompt, error) {
 	if len(prompt) == 0 {
 		return piPrompt{}, acp.NewInvalidParams(map[string]any{jsonFieldError: validationUnsupported, jsonFieldField: fieldPrompt})
 	}
@@ -51,6 +52,7 @@ func promptToPi(prompt []acp.ContentBlock) (piPrompt, error) {
 	textParts := make([]string, 0, len(prompt))
 	contextParts := make([]string, 0)
 	images := make([]pi.ImageContent, 0)
+	budget := newPromptImageBudget(limits)
 
 	for _, block := range prompt {
 		switch {
@@ -61,15 +63,15 @@ func promptToPi(prompt []acp.ContentBlock) (piPrompt, error) {
 
 			textParts = append(textParts, block.Text.Text)
 		case block.Image != nil:
-			if block.Image.Data == "" {
-				return piPrompt{}, acp.NewInvalidParams(map[string]any{jsonFieldField: fieldPromptImage, jsonFieldError: errMissingImageData})
+			if err := budget.validate(block.Image.Data, block.Image.MimeType); err != nil {
+				return piPrompt{}, err
 			}
 
 			images = append(images, pi.NewImageContent(block.Image.Data, block.Image.MimeType))
 		case block.ResourceLink != nil:
 			textParts = append(textParts, strings.TrimSpace(block.ResourceLink.Uri))
 		case block.Resource != nil:
-			text, contextText, image, err := resourceToPi(block.Resource.Resource)
+			text, contextText, image, err := resourceToPi(block.Resource.Resource, budget)
 			if err != nil {
 				return piPrompt{}, err
 			}
@@ -98,7 +100,7 @@ func promptToPi(prompt []acp.ContentBlock) (piPrompt, error) {
 	return piPrompt{Message: message, Images: images}, nil
 }
 
-func resourceToPi(resource acp.EmbeddedResourceResource) (string, string, *pi.ImageContent, error) {
+func resourceToPi(resource acp.EmbeddedResourceResource, budget *promptImageBudget) (string, string, *pi.ImageContent, error) {
 	if resource.TextResourceContents != nil {
 		contextText := contextResourceText(resource.TextResourceContents.Uri, resource.TextResourceContents.Text)
 		text := strings.TrimSpace(resource.TextResourceContents.Uri)
@@ -113,6 +115,10 @@ func resourceToPi(resource acp.EmbeddedResourceResource) (string, string, *pi.Im
 		}
 
 		if strings.HasPrefix(mimeType, "image/") {
+			if err := budget.validate(resource.BlobResourceContents.Blob, mimeType); err != nil {
+				return "", "", nil, err
+			}
+
 			image := pi.NewImageContent(resource.BlobResourceContents.Blob, mimeType)
 
 			return "", "", &image, nil
@@ -175,8 +181,12 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		return acp.PromptResponse{}, poisonErr
 	}
 
-	mapped, err := promptToPi(params.Prompt)
+	mapped, err := promptToPi(params.Prompt, s.agent.imageLimits())
 	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	if err := s.rejectImagesForUnsupportedModel(mapped); err != nil {
 		return acp.PromptResponse{}, err
 	}
 
@@ -204,6 +214,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	s.turnFenceErr = nil
 	s.turnSettling = false
 	s.turnCommitOnCancel = false
+	s.turnImagesEmitted = false
 	s.mu.Unlock()
 	s.cancelMu.Unlock()
 
@@ -311,6 +322,10 @@ func (s *agentSession) handleTurnEvent(ctx context.Context, event pi.Event, stat
 		if typed.Message.Role == messageRoleAssistant {
 			observeAssistantMessageEnd(typed.Message, state)
 
+			if err := s.emitAssistantImages(ctx, typed.Message, state); err != nil {
+				return false, err
+			}
+
 			if err := s.emitNativeMessageIdentity(ctx, typed.Message.ACPMessageID); err != nil {
 				return false, err
 			}
@@ -324,26 +339,98 @@ func (s *agentSession) handleTurnEvent(ctx context.Context, event pi.Event, stat
 			return false, nil
 		}
 
-		return false, s.publishNativeToolUpdate(ctx, typed.ToolCallID, acp.UpdateToolCall(
-			acp.ToolCallId(typed.ToolCallID),
-			acp.WithUpdateContent(toolCallContent(typed.PartialResult.Content)),
-		))
+		return false, s.publishNativeToolUpdate(ctx, typed.ToolCallID, typed.PartialResult.Content)
 	case pi.ToolExecutionEndEvent:
 		status := acp.ToolCallStatusCompleted
 		if typed.IsError {
 			status = acp.ToolCallStatusFailed
 		}
 
-		opts := []acp.ToolCallUpdateOpt{acp.WithUpdateStatus(status)}
-		if typed.Result != nil {
-			opts = append(opts, acp.WithUpdateContent(toolCallContent(typed.Result.Content)))
-		}
-
-		return false, s.publishNativeToolTerminal(ctx, typed.ToolCallID, status,
-			acp.UpdateToolCall(acp.ToolCallId(typed.ToolCallID), opts...))
+		return false, s.publishNativeToolTerminal(ctx, typed.ToolCallID, status, typed.Result)
 	default:
 		return false, nil
 	}
+}
+
+// emitAssistantImages projects image blocks carried by a finalized assistant
+// message as agent message chunks, one image per chunk, validated and
+// de-duplicated by native message identity plus artifact fingerprint. pi's
+// streaming deltas carry only text and thinking, so the finalized message is
+// the sole live source of assistant image content.
+func (s *agentSession) emitAssistantImages(ctx context.Context, message pi.AgentMessage, state *promptTurnState) error {
+	// A content payload that does not decode carries no image blocks to
+	// project; unrelated decode problems keep their existing handling.
+	blocks, _ := message.ContentBlocks()
+	perImage := effectiveOutputImageLimit(s.agent.imageLimits().MaxOutputBytesPerImage)
+
+	var messageIDPtr *string
+
+	if message.ACPMessageID != "" {
+		messageID := message.ACPMessageID
+		messageIDPtr = &messageID
+	}
+
+	for index := range blocks {
+		block := &blocks[index]
+		if block.Type != contentBlockTypeImage {
+			continue
+		}
+
+		image, failure := normalizeOutputImage(block.Data, block.MimeType, perImage)
+		if failure != nil {
+			return imageOutputTurnFailure(failure)
+		}
+
+		key := message.ACPMessageID + ":" + image.fingerprint
+
+		if state.agentImages == nil {
+			state.agentImages = make(map[string]struct{}, 1)
+		}
+
+		if _, seen := state.agentImages[key]; seen {
+			continue
+		}
+
+		update := acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+			Content: acp.ImageBlock(image.data, image.mime), MessageId: messageIDPtr,
+		}}
+		if err := s.emitUpdatesWithNativeMessageID(ctx, []acp.SessionUpdate{update}, message.ACPMessageID); err != nil {
+			return err
+		}
+
+		state.agentImages[key] = struct{}{}
+
+		s.markTurnImageEmission()
+	}
+
+	return nil
+}
+
+// markTurnImageEmission records that the live turn delivered image bytes, so
+// a failed mirror commit afterwards is a durability loss for emitted
+// artifacts.
+func (s *agentSession) markTurnImageEmission() {
+	s.mu.Lock()
+	s.turnImagesEmitted = true
+	s.mu.Unlock()
+}
+
+func (s *agentSession) turnEmittedImages() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.turnImagesEmitted
+}
+
+// imageAwareMirrorFailure maps a failed mirror commit after image emission
+// to the storage_failed image-output envelope: the turn delivered image
+// bytes whose durable replay representation was lost.
+func (s *agentSession) imageAwareMirrorFailure(err error) error {
+	if !s.turnEmittedImages() {
+		return err
+	}
+
+	return storageFailure("session mirror commit failed after image output: " + err.Error())
 }
 
 func (s *agentSession) emitAssistantDelta(ctx context.Context, delta pi.AssistantMessageEvent) error {
@@ -446,7 +533,7 @@ func (s *agentSession) finishTurn(
 		}
 
 		if err := s.commitMirror(context.WithoutCancel(ctx)); err != nil {
-			return acp.PromptResponse{}, err
+			return acp.PromptResponse{}, s.imageAwareMirrorFailure(err)
 		}
 
 		return cancelledResponse(params.MessageId), nil
@@ -473,7 +560,7 @@ func (s *agentSession) finishTurn(
 	}
 
 	if err := s.commitMirror(context.WithoutCancel(ctx)); err != nil {
-		return acp.PromptResponse{}, err
+		return acp.PromptResponse{}, s.imageAwareMirrorFailure(err)
 	}
 
 	if err := providerTurnFailure(state); err != nil {

@@ -61,7 +61,7 @@ func (a *Agent) handleForkSession(
 		}
 	}
 
-	entries, err := a.loadStoreEntries(ctx, a.sessionStore(), SessionKey{SessionID: string(params.SessionId)})
+	entries, err := a.loadCurrentStoreEntries(ctx, string(params.SessionId))
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}

@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"testing"
@@ -22,9 +23,21 @@ func TestModelMetadataMapping(t *testing.T) {
 	require.Len(t, options, 3)
 	require.Equal(t, "One", options[0].Name)
 	require.Equal(t, "p/two", modelDisplayName(&models[3]))
-	require.Equal(t, []string{"reasoning", "image", "audio", "pdf", "video"}, modelCapabilities(&models[0]))
-	require.Empty(t, modelCapabilities(&pi.Model{}))
 	require.NotEmpty(t, piModelInfoMeta(&models[0]))
+
+	// The per-model _meta.pi payload carries exactly identity and size
+	// metadata: no capabilities array and no modality fields, even for a
+	// vision-capable reasoning model.
+	encodedMeta, err := json.Marshal(piModelInfoMeta(&models[0]))
+	require.NoError(t, err)
+	require.JSONEq(t,
+		`{"pi":{"modelId":"p/one","contextWindow":100,"maxOutputTokens":10}}`,
+		string(encodedMeta))
+
+	encodedOptions, err := json.Marshal(modelSelectOptions("p/one", models))
+	require.NoError(t, err)
+	require.NotContains(t, string(encodedOptions), `"capabilities"`)
+	require.NotContains(t, string(encodedOptions), `"input"`)
 
 	for _, level := range pi.ThinkingLevels() {
 		require.NotEmpty(t, thinkingLevelDisplayName(level))

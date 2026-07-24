@@ -88,8 +88,10 @@ Session-lifecycle requests accept options and the raw-event opt-in:
 ## Update metadata
 
 Model select values carry an informational `_meta.pi` object containing the
-model id and any context-window, maximum-output-token, and modality capability
-facts pi reported. The adapter omits unknown facts rather than inventing them.
+model id and any context-window and maximum-output-token facts pi reported. The
+adapter omits unknown facts rather than inventing them. Model input modalities
+are not published here; the catalog input list feeds only the internal
+image-prompt gate.
 
 Finalized live and replayed assistant messages carry the wrapper-persisted
 `_meta.pi.messageId` correlation described above. It is a UUID and remains

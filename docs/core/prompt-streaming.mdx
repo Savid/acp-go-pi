@@ -39,13 +39,26 @@ Raw pi RPC events are not sent by default. A host opts in per session with
 ## Prompt content validation
 
 Prompt content fails closed before the turn starts. An empty prompt (zero
-content blocks), an unsupported block type (audio or an unknown block), and an
-image block without embedded base64 data are rejected with an invalid-params
-(`-32602`) error naming the offending field (`prompt` or `prompt.image`).
-Nothing is silently dropped and nothing is forwarded to pi. Image support is
-per model: a model whose catalog entry does not list image input fails the
-turn with the provider's own error. Image URIs are not fetched: resource links
-are forwarded as text, while embedded image resources must carry blob data.
+content blocks) and an unsupported block type (audio or an unknown block) are
+rejected with an invalid-params (`-32602`) error naming the offending field
+(`prompt`). Nothing is silently dropped and nothing is forwarded to pi.
+
+Image blocks are validated in request order, stopping on the first failure,
+and every rejection is an invalid-params (`-32602`) error carrying
+`{field:"prompt.image", error, index}` (plus `sizeBytes`/`maxBytes` on a limit
+failure). The declared media type must be one of `image/png`, `image/jpeg`,
+`image/gif`, or `image/webp`, static only: animated GIF, animated WebP, and
+APNG are rejected structurally without decoding pixels. The embedded base64
+data is decoded once, the sniffed format must agree with the declared type,
+and the decoded bytes must fit the configured per-image and per-prompt limits
+(`WithImageLimits`, 6 MiB each by default). A `uri` alongside `data` is
+provenance only and is never fetched; a resource link is forwarded as text and
+an embedded image resource must carry blob data.
+
+Image support is also gated per model from pi's catalog input list: when the
+selected model authoritatively lists no image input the prompt is rejected
+before turn start (`unsupported_by_model`); when the catalog is silent the
+prompt is forwarded and pi's provider stays authoritative.
 
 ## Slash commands
 
