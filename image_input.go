@@ -100,7 +100,12 @@ type promptImageBudget struct {
 	// adapter to read, which is bounded independently of the byte aggregate a
 	// host may disable.
 	handoffBlocks int
-	handoffRoot   string
+	// firstImageField is the request member the prompt's first admitted image
+	// arrived on. A verdict about the prompt's images as a whole names that
+	// member, because routing is chosen by MIME while the field follows the
+	// inbound block type.
+	firstImageField string
+	handoffRoot     string
 	// root is the opened read root, held for the life of one prompt mapping so
 	// every handoff open in that prompt is relative to one kernel-checked
 	// descriptor.
@@ -217,6 +222,10 @@ func (b *promptImageBudget) validateBytes(field string, index int, decoded []byt
 		return promptMediaError(field, imageErrorTooLarge, index, b.total, b.perPrompt)
 	}
 
+	if b.firstImageField == "" {
+		b.firstImageField = field
+	}
+
 	return nil
 }
 
@@ -282,7 +291,10 @@ func (s *agentSession) rejectImagesForUnsupportedModel(mapped piPrompt) error {
 	}
 
 	if s.selectedModelImageSupport() == imageInputUnsupported {
-		return imagePromptError(imageErrorUnsupportedByModel, 0, 0, 0)
+		// The refusal is about the prompt's first image, which always holds media
+		// index 0: an index is claimed when a block enters the media chain, and a
+		// block that fails there ends the prompt instead of admitting an image.
+		return promptMediaError(mapped.ImageField, imageErrorUnsupportedByModel, 0, 0, 0)
 	}
 
 	return nil

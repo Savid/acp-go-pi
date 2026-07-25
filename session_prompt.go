@@ -36,6 +36,10 @@ const (
 type piPrompt struct {
 	Message string
 	Images  []pi.ImageContent
+	// ImageField is the request member the first attached image arrived on, so a
+	// refusal of the prompt's images reports the channel that carried them
+	// rather than assuming the image block form.
+	ImageField string
 }
 
 // promptToPi converts ACP prompt content to pi's prompt command shape.
@@ -104,7 +108,7 @@ func promptToPi(ctx context.Context, prompt []acp.ContentBlock, limits ImageLimi
 		return piPrompt{}, acp.NewInvalidParams(map[string]any{jsonFieldError: validationUnsupported, jsonFieldField: fieldPrompt})
 	}
 
-	return piPrompt{Message: message, Images: images}, nil
+	return piPrompt{Message: message, Images: images, ImageField: budget.firstImageField}, nil
 }
 
 func resourceToPi(resource acp.EmbeddedResourceResource, budget *promptImageBudget) (string, string, *pi.ImageContent, error) {

@@ -362,6 +362,10 @@ func TestNonImageBlobResourceRefused(t *testing.T) {
 			// are refused as resources.
 			require.Equal(t, fieldPromptResource, data[jsonFieldField])
 
+			// The refusal travels to the client and into telemetry, so it may not
+			// carry the payload it refused back out with it.
+			require.NotContains(t, string(encoded), test.blob)
+
 			if test.mimeType == "image/svg+xml" {
 				require.Equal(t, imageErrorInvalidMediaType, data[jsonFieldError])
 
@@ -369,7 +373,6 @@ func TestNonImageBlobResourceRefused(t *testing.T) {
 			}
 
 			require.Equal(t, validationUnsupported, data[jsonFieldError])
-			require.NotContains(t, encoded, test.blob)
 		})
 	}
 }
@@ -401,12 +404,25 @@ func TestSelectedModelImageSupport(t *testing.T) {
 	}
 }
 
+// mappedImagePrompt maps one prompt through the real image pipeline, so a
+// model-gate assertion runs against the provenance the mapping recorded rather
+// than against a hand-built prompt.
+func mappedImagePrompt(t *testing.T, blocks ...acp.ContentBlock) piPrompt {
+	t.Helper()
+
+	mapped, err := promptToPi(t.Context(), blocks, defaultImageLimits(), "")
+	require.NoError(t, err)
+	require.NotEmpty(t, mapped.Images)
+
+	return mapped
+}
+
 func TestRejectImagesForUnsupportedModel(t *testing.T) {
 	catalog := []pi.Model{
 		{Provider: "p", ID: "vision", Input: []string{"text", "image"}},
 		{Provider: "p", ID: "text-only", Input: []string{"text"}},
 	}
-	images := piPrompt{Images: []pi.ImageContent{pi.NewImageContent(fixtureBase64(t, "valid.png"), "image/png")}}
+	images := mappedImagePrompt(t, acp.ImageBlock(fixtureBase64(t, "valid.png"), "image/png"))
 
 	unsupported := &agentSession{model: "p/text-only", availableModels: catalog}
 	err := unsupported.rejectImagesForUnsupportedModel(images)
@@ -415,6 +431,27 @@ func TestRejectImagesForUnsupportedModel(t *testing.T) {
 
 	require.NoError(t, (&agentSession{model: "p/vision", availableModels: catalog}).rejectImagesForUnsupportedModel(images))
 	require.NoError(t, (&agentSession{model: "p/unknown", availableModels: catalog}).rejectImagesForUnsupportedModel(images))
+}
+
+// TestUnsupportedModelNamesTheChannelTheImageArrivedOn pins the field half of
+// the model gate: the same raster refused for the same reason names the resource
+// member when it rode a blob resource and the image member when it rode an image
+// block.
+func TestUnsupportedModelNamesTheChannelTheImageArrivedOn(t *testing.T) {
+	session := &agentSession{
+		model:           "p/text-only",
+		availableModels: []pi.Model{{Provider: "p", ID: "text-only", Input: []string{"text"}}},
+	}
+	png := fixtureBase64(t, "valid.png")
+	mimeType := "image/png"
+
+	blob := mappedImagePrompt(t, acp.TextBlock("look"), acp.ResourceBlock(acp.EmbeddedResourceResource{
+		BlobResourceContents: &acp.BlobResourceContents{Uri: "file:///shot.png", MimeType: &mimeType, Blob: png},
+	}))
+	requireResourceParamError(t, session.rejectImagesForUnsupportedModel(blob), imageErrorUnsupportedByModel, 0)
+
+	block := mappedImagePrompt(t, acp.TextBlock("look"), acp.ImageBlock(png, mimeType))
+	requireImageParamError(t, session.rejectImagesForUnsupportedModel(block), imageErrorUnsupportedByModel, 0)
 }
 
 func TestPromptRejectsImageForUnsupportedSelectedModel(t *testing.T) {
@@ -442,7 +479,7 @@ func TestPromptModelSwitchChangesGateNextPrompt(t *testing.T) {
 		{Provider: "p", ID: "text-only", Input: []string{"text"}},
 	}
 	session := &agentSession{model: "p/vision", availableModels: catalog}
-	images := piPrompt{Images: []pi.ImageContent{pi.NewImageContent(fixtureBase64(t, "valid.png"), "image/png")}}
+	images := mappedImagePrompt(t, acp.ImageBlock(fixtureBase64(t, "valid.png"), "image/png"))
 
 	require.NoError(t, session.rejectImagesForUnsupportedModel(images))
 

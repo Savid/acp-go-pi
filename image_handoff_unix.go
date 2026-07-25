@@ -4,9 +4,11 @@ package piacp
 
 import "syscall"
 
-// handoffOpenFlags hardens the open of an already-resolved handoff path.
-// O_NOFOLLOW refuses a final component that became a symlink after resolution,
-// and O_NONBLOCK means a component that became a FIFO or a device fails the
-// descriptor mode re-check instead of blocking the turn inside open(2). Neither
-// flag changes how a regular file reads.
-const handoffOpenFlags = syscall.O_NOFOLLOW | syscall.O_NONBLOCK
+// handoffOpenFlags carries the one flag a root-relative handoff open still
+// needs. Containment is the read root's and needs no help from an open flag: the
+// kernel refuses a name that leaves the root as part of the open itself, so
+// there is no moment at which a swapped component could be followed out.
+// O_NONBLOCK means a FIFO or a device fails the descriptor's regular-file check
+// instead of blocking the turn inside open(2), and it changes nothing about how
+// a regular file reads.
+const handoffOpenFlags = syscall.O_NONBLOCK

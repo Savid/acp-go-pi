@@ -591,10 +591,10 @@ func unknownSessionError() *acp.RequestError {
 func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *agentSession, err error) {
 	defer func() { a.recordNativeContainment(err) }()
 
-	// pi has no native config or auth root, so a configured Home is an
-	// unsupported option; every session-establishing method fails here.
-	if a.options.Home != "" {
-		return nil, unsupportedField(optionFieldHome)
+	// Every session-establishing method fails here on agent configuration a
+	// session cannot start under.
+	if configErr := a.sessionStartConfigurationError(); configErr != nil {
+		return nil, configErr
 	}
 
 	if envErr := validateEnvironment(a.options.Env, "env"); envErr != nil {

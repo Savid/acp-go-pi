@@ -75,7 +75,7 @@ failure winning:
 | `error` | Cause |
 | --- | --- |
 | `invalid_handoff` | The block is malformed as a block: no handoff root is configured, or the envelope or `file://` uri is absent, unparseable, non-local, non-absolute, wrongly versioned, missing a field, or carrying an unknown one. |
-| `path_not_allowed` | The path resolves outside the handoff root, escapes it through a symlink, is not a regular file, or is not the file that containment admitted. |
+| `path_not_allowed` | The path lies outside the handoff root, is reached through a symlink the root refuses (any absolute symlink, or one leading out of the root), or does not name a regular file. |
 | `missing_file` | A path inside the root that does not exist or cannot be opened or read. |
 | `handoff_digest_mismatch` | The file's byte count or sha256 does not match the envelope. Fail-closed: there is no fallback to the embedded form. |
 
@@ -85,18 +85,22 @@ the work rather than on the byte policy, so it holds even where
 `MaxInputBytesPerPrompt` is disabled, and it sits far above any conforming
 turn.
 
-Resolution is bounded and symlink-safe — containment is checked on the cleaned
-path, symlinks are resolved, and containment is re-checked on the resolved
-path — and the identity containment admitted is what the opened descriptor is
-checked against, so a path swapped for another file, a symlink, or a FIFO after
-resolution is rejected rather than read. The declared media type is judged
-before any byte is read. The read is capped at the effective per-image gate
-plus one byte, and a file past that bound is rejected `too_large` where it is
-read: its bytes cannot be verified against the envelope, so they are never
-carried forward, and the verdict reports the bound rather than the file's real
-size. The verified bytes then run the same gate chain as embedded
-data, minus the two gates that are meaningless without base64, and they count
-toward the per-prompt aggregate identically. Both forms over the same bytes
+Containment is the kernel's rather than a path check's: the handoff root is
+opened once per prompt and every file is opened relative to that descriptor, so
+a name that leads out of the root is refused as part of the open itself and
+there is no window between deciding a path is inside the root and reading it.
+The opened descriptor is then required to be a regular file, because a root
+bounds where a name may lead and not what kind of object it names, so a
+directory, a FIFO, or a device under the root is rejected rather than read. The
+declared media type is judged before any byte is read, and a declared
+`sizeBytes` above the effective per-image gate is `too_large` decided from the
+envelope with nothing opened at all. The read is then capped at the declared
+size plus one byte, so a file that returns more or fewer bytes than the envelope
+declared is rejected `handoff_digest_mismatch` rather than carried forward: no
+byte that could not be verified against the envelope leaves the read. The
+verified bytes then run the same gate chain as embedded data, minus the two
+gates that are meaningless without base64, and they count toward the per-prompt
+aggregate identically. Both forms over the same bytes
 produce identical native requests, and the handoff path never appears in the
 native request: pi's prompt images take base64 payloads, so nothing is
 materialized and nothing outlives the validation read. Handoff files stay owned
@@ -104,8 +108,9 @@ by the host, which may remove them the moment `session/prompt` returns.
 
 Image support is also gated per model from pi's catalog input list: when the
 selected model authoritatively lists no image input the prompt is rejected
-before turn start (`unsupported_by_model`); when the catalog is silent the
-prompt is forwarded and pi's provider stays authoritative.
+before turn start with `unsupported_by_model`, reported on the member the
+prompt's first image arrived on; when the catalog is silent the prompt is
+forwarded and pi's provider stays authoritative.
 
 ## Slash commands
 

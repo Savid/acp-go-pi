@@ -105,10 +105,11 @@ opts in with `WithInputHandoffRoot`: a handoff-form prompt image is read from
 under that root. Without the option there is no local read path at all, and a
 handoff block is rejected.
 
-The root is a read boundary, not a workspace. Resolution is bounded and
-symlink-safe, so a path outside the root or a symlink escaping it is rejected
-rather than followed, only regular files are opened, and the read is capped
-before it allocates a declared size. Every file's sha256 is verified against
+The root is a read boundary, not a workspace. Containment is enforced by the
+kernel: the root is opened once per prompt and every file is opened relative to
+that descriptor, so a name leading out of the root is refused as part of the open
+rather than followed, only regular files are read, and the read is capped at the
+declared size plus one byte. Every file's sha256 is verified against
 the host-declared digest and a mismatch fails the turn — the adapter never
 forwards bytes it could not verify. The adapter never writes, moves, or removes
 anything under the root: those files belong to the host for the lifetime of its

@@ -48,6 +48,17 @@ func TestImageLimitsNegativeRejectedAtConstruction(t *testing.T) {
 	requireInvalidParams(t, err)
 }
 
+// TestSessionEstablishmentRejectsUnvalidatedOptions pins that an embedded host
+// which never calls initialize still cannot open a session against options that
+// failed validation at construction.
+func TestSessionEstablishmentRejectsUnvalidatedOptions(t *testing.T) {
+	agent := newStubClientAgent(t, newStubPiClient(), WithImageLimits(ImageLimits{MaxOutputBytesPerImage: -1}))
+
+	_, err := agent.NewSession(t.Context(), NewSessionRequest(t.TempDir()))
+	requireInvalidParams(t, err)
+	require.ErrorContains(t, err, "MaxOutputBytesPerImage")
+}
+
 func TestEffectiveOutputImageLimit(t *testing.T) {
 	require.Equal(t, maxImageFrameBytes, effectiveOutputImageLimit(0),
 		"a disabled policy limit still clamps to the frame bound")

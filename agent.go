@@ -335,13 +335,26 @@ func (a *Agent) setConnection(conn agentClient) {
 	a.conn = conn
 }
 
+// optionsError reports a construction-time option failure as the uniform
+// invalid-params error, or nil when every option validated. Both the handshake
+// and session establishment report it, because an embedded host can open a
+// session and prompt without ever calling initialize, and options that never
+// validated must not reach a native process.
+func (a *Agent) optionsError() error {
+	if a.activeLimitErr == nil {
+		return nil
+	}
+
+	return acp.NewInvalidParams(map[string]any{jsonFieldError: a.activeLimitErr.Error()})
+}
+
 // Initialize implements ACP initialize.
 func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (resp acp.InitializeResponse, err error) {
 	_, finish := a.observe.StartACP(ctx, params.Meta, "initialize")
 	defer func() { finish(observer.ACPResult{Err: err}) }()
 
-	if a.activeLimitErr != nil {
-		return acp.InitializeResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldError: a.activeLimitErr.Error()})
+	if optionsErr := a.optionsError(); optionsErr != nil {
+		return acp.InitializeResponse{}, optionsErr
 	}
 
 	title := a.options.AgentTitle
