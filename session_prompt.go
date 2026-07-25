@@ -393,7 +393,22 @@ func (s *agentSession) emitAssistantImages(ctx context.Context, message pi.Agent
 
 		image, failure := normalizeOutputImage(block.Data, block.MimeType, perImage)
 		if failure != nil {
-			return imageOutputTurnFailure(failure)
+			// Every verdict normalization raises here is one the model can act
+			// on — bad base64, non-raster bytes, a contradicted media type, an
+			// oversize image. An assistant image has no tool call to attribute
+			// to, so the guidance takes the image's place as agent text and the
+			// turn runs on with its context.
+			guidance, _ := imageOutputGuidance(failure)
+
+			if err := s.emitUpdates(ctx, []acp.SessionUpdate{{
+				AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+					Content: acp.TextBlock(guidance), MessageId: messageIDPtr,
+				},
+			}}); err != nil {
+				return err
+			}
+
+			continue
 		}
 
 		key := message.ACPMessageID + ":" + image.fingerprint

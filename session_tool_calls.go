@@ -201,22 +201,36 @@ func (s *agentSession) recordToolContentLocked(state *turnToolCall, snapshot []t
 }
 
 // failToolImageOutputLocked handles an adapter-side image representation
-// failure on tool provenance: the failed tool state is emitted first, as a
-// status-only update for attribution, then the turn fails with the
-// image-output envelope.
+// failure on tool provenance. The tool call reports failed either way. A
+// verdict the model can act on carries its guidance as that call's own
+// content and the turn runs on with its context; the artifact window breaking
+// is emitted as a status-only update for attribution and then fails the turn
+// with the image-output envelope.
 func (s *agentSession) failToolImageOutputLocked(
 	ctx context.Context,
 	toolCallID string,
 	state *turnToolCall,
 	failure *imageOutputError,
 ) error {
-	emitErr := s.emitUpdates(ctx, []acp.SessionUpdate{acp.UpdateToolCall(
-		acp.ToolCallId(toolCallID),
-		acp.WithUpdateStatus(acp.ToolCallStatusFailed),
-	)})
+	guidance, recoverable := imageOutputGuidance(failure)
+
+	opts := []acp.ToolCallUpdateOpt{acp.WithUpdateStatus(acp.ToolCallStatusFailed)}
+	if recoverable {
+		opts = append(opts, acp.WithUpdateContent([]acp.ToolCallContent{
+			acp.ToolContent(acp.TextBlock(guidance)),
+		}))
+	}
+
+	emitErr := s.emitUpdates(ctx, []acp.SessionUpdate{
+		acp.UpdateToolCall(acp.ToolCallId(toolCallID), opts...),
+	})
 
 	state.terminalPublished = true
 	state.status = acp.ToolCallStatusFailed
+
+	if recoverable {
+		return emitErr
+	}
 
 	return errors.Join(imageOutputTurnFailure(failure), emitErr)
 }

@@ -291,39 +291,96 @@ func TestPublishNativeToolTerminalSnapshotAndStatusOnly(t *testing.T) {
 	require.Nil(t, connection.updates[0].ToolCallUpdate.Content, "a status-only update omits content entirely")
 }
 
-func TestPublishNativeToolImageFailureIsTurnFatalWithAttribution(t *testing.T) {
+func TestPublishNativeToolImageRefusalKeepsTheTurnWithAttribution(t *testing.T) {
 	session, connection := newImageOutputSession(t)
 
-	err := session.publishNativeToolUpdate(t.Context(), "call", []pi.ContentBlock{
+	// A verdict the model can act on fails the tool call, carries the guidance
+	// as that call's own content, and leaves the turn running.
+	require.NoError(t, session.publishNativeToolUpdate(t.Context(), "call", []pi.ContentBlock{
 		{Type: contentBlockTypeImage, Data: "not base64!", MimeType: "image/png"},
-	})
-	requireImageOutputFailure(t, err, imageErrorInvalidBase64)
+	}))
 
 	require.Len(t, connection.updates, 1)
 	failed := connection.updates[0].ToolCallUpdate
 	require.Equal(t, acp.ToolCallStatusFailed, *failed.Status)
-	require.Nil(t, failed.Content, "the failed tool state for attribution is status-only")
+	require.Len(t, failed.Content, 1)
+	require.Equal(t, imageGuidanceInvalidBase64, failed.Content[0].Content.Content.Text.Text)
 
 	require.NoError(t, session.publishNativeToolUpdate(t.Context(), "call", []pi.ContentBlock{
 		{Type: contentBlockTypeText, Text: "late"},
 	}), "the failed call accepts no further content")
 	require.Len(t, connection.updates, 1)
 
+	// The turn keeps making progress after the refusal.
+	require.NoError(t, session.publishNativeToolUpdate(t.Context(), "other", []pi.ContentBlock{
+		{Type: contentBlockTypeText, Text: "still here"},
+	}))
+	require.Len(t, connection.updates, 2)
+
 	terminalSession, terminalConnection := newImageOutputSession(t)
-	err = terminalSession.publishNativeToolTerminal(t.Context(), "call", acp.ToolCallStatusCompleted, &pi.ToolResult{
-		Content: []pi.ContentBlock{{Type: contentBlockTypeImage, Data: "!", MimeType: "image/png"}},
-	})
-	requireImageOutputFailure(t, err, imageErrorInvalidBase64)
+	require.NoError(t, terminalSession.publishNativeToolTerminal(
+		t.Context(), "call", acp.ToolCallStatusCompleted, &pi.ToolResult{
+			Content: []pi.ContentBlock{{Type: contentBlockTypeImage, Data: "!", MimeType: "image/png"}},
+		},
+	))
 	require.Len(t, terminalConnection.updates, 1)
 	require.Equal(t, acp.ToolCallStatusFailed, *terminalConnection.updates[0].ToolCallUpdate.Status)
+	require.Len(t, terminalConnection.updates[0].ToolCallUpdate.Content, 1)
+
+	// The artifact window breaking is not something the model can act on, so
+	// the tool call reports failed without guidance and the turn ends.
+	storageSession, storageConnection := newImageOutputSession(t)
+	storageState := storageSession.lockToolCallState("call")
+	storageErr := storageSession.failToolImageOutputLocked(t.Context(), "call", storageState, sweptImageFailure())
+	storageState.mu.Unlock()
+
+	requireImageOutputFailure(t, storageErr, imageReasonStorageFailed)
+	require.Len(t, storageConnection.updates, 1)
+	require.Nil(t, storageConnection.updates[0].ToolCallUpdate.Content,
+		"the failed tool state for a storage failure is status-only")
 
 	emitFail, emitConnection := newImageOutputSession(t)
 	emitConnection.updateErr = errors.New("emit")
-	err = emitFail.publishNativeToolUpdate(t.Context(), "call", []pi.ContentBlock{
+	err := emitFail.publishNativeToolUpdate(t.Context(), "call", []pi.ContentBlock{
 		{Type: contentBlockTypeImage, Data: "!", MimeType: "image/png"},
 	})
-	requireImageOutputFailure(t, err, imageErrorInvalidBase64)
 	require.ErrorContains(t, err, "emit")
+
+	emitFatal, emitFatalConnection := newImageOutputSession(t)
+	emitFatalConnection.updateErr = errors.New("emit")
+	fatalState := emitFatal.lockToolCallState("call")
+	fatalErr := emitFatal.failToolImageOutputLocked(t.Context(), "call", fatalState, sweptImageFailure())
+	fatalState.mu.Unlock()
+
+	requireImageOutputFailure(t, fatalErr, imageReasonStorageFailed)
+	require.ErrorContains(t, fatalErr, "emit")
+}
+
+// TestImageOutputGuidanceSplitsRecoverableFromFatal pins the blast radius of
+// every image-output verdict: an ordinary mistake that can be retried carries
+// guidance and keeps the turn, the adapter's own artifact window breaking does
+// not.
+func TestImageOutputGuidanceSplitsRecoverableFromFatal(t *testing.T) {
+	recoverable := map[string]string{
+		imageErrorTooLarge:          imageGuidanceTooLarge,
+		imageReasonNotARaster:       imageGuidanceNotRaster,
+		imageErrorInvalidBase64:     imageGuidanceInvalidBase64,
+		imageErrorMediaTypeMismatch: imageGuidanceMIMEMismatched,
+	}
+
+	for reason, guidance := range recoverable {
+		message, ok := imageOutputGuidance(&imageOutputError{reason: reason})
+		require.True(t, ok, reason)
+		require.Equal(t, guidance, message)
+
+		// The guidance says what to do next and never quotes a size, a media
+		// type, or the bytes it refused.
+		require.NotRegexp(t, `[0-9]`, message)
+		require.NotContains(t, message, "limit")
+	}
+
+	_, ok := imageOutputGuidance(&imageOutputError{reason: imageReasonStorageFailed})
+	require.False(t, ok)
 }
 
 func TestPublishNativeToolUpdateEmitFailure(t *testing.T) {
@@ -370,13 +427,22 @@ func TestEmitAssistantImages(t *testing.T) {
 	}, state))
 	require.Len(t, connection.updates, 2)
 
+	// An assistant image has no tool call to attribute to, so the guidance
+	// takes the image's place as agent text and the turn runs on.
+	require.NoError(t, session.emitAssistantImages(t.Context(), pi.AgentMessage{
+		Role:    messageRoleAssistant,
+		Content: json.RawMessage(`[{"type":"image","data":"!","mimeType":"image/png"}]`),
+	}, state))
+	require.Len(t, connection.updates, 3)
+	require.Equal(t, imageGuidanceInvalidBase64, connection.updates[2].AgentMessageChunk.Content.Text.Text)
+
+	connection.updateErr = errors.New("emit")
 	err := session.emitAssistantImages(t.Context(), pi.AgentMessage{
 		Role:    messageRoleAssistant,
 		Content: json.RawMessage(`[{"type":"image","data":"!","mimeType":"image/png"}]`),
 	}, state)
-	requireImageOutputFailure(t, err, imageErrorInvalidBase64)
+	require.ErrorContains(t, err, "emit")
 
-	connection.updateErr = errors.New("emit")
 	err = session.emitAssistantImages(t.Context(), pi.AgentMessage{
 		Role:    messageRoleAssistant,
 		Content: json.RawMessage(`[{"type":"image","data":"` + fixtureBase64(t, "valid.webp") + `","mimeType":"image/webp"}]`),
@@ -405,7 +471,16 @@ func TestHandleTurnEventEmitsAssistantImages(t *testing.T) {
 		ACPMessageID: "018f47ad-839d-7f70-b7f7-c01d6d97b676",
 		Content:      json.RawMessage(`[{"type":"image","data":"!","mimeType":"image/png"}]`),
 	}}, state)
-	requireImageOutputFailure(t, err, imageErrorInvalidBase64)
+	require.NoError(t, err, "a refused assistant image does not end the turn")
+	require.Equal(t, imageGuidanceInvalidBase64, connection.updates[2].AgentMessageChunk.Content.Text.Text)
+
+	connection.updateErr = errors.New("emit")
+	_, err = session.handleTurnEvent(t.Context(), pi.MessageEndEvent{Message: pi.AgentMessage{
+		Role:         messageRoleAssistant,
+		ACPMessageID: "018f47ad-839d-7f70-b7f7-c01d6d97b677",
+		Content:      json.RawMessage(`[{"type":"image","data":"` + png + `","mimeType":"image/png"}]`),
+	}}, state)
+	require.ErrorContains(t, err, "emit")
 }
 
 func TestImageAwareMirrorFailure(t *testing.T) {

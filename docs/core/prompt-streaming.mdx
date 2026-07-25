@@ -33,6 +33,17 @@ Two interactive flows are layered on top of the stream:
   elicitation support. Without it, the dialog is cancelled deterministically
   and the turn proceeds — see [Elicitation](/docs/features/elicitation).
 
+Native image output is validated before it reaches the wire: the bytes must
+decode, must sniff as a raster, must not contradict a declared media type that
+names a different known raster, and must fit the per-image and per-tool-call
+decoded-byte limits. An image that fails any of those is **refused, not
+dropped, and does not end the turn**. A tool image fails that tool call and
+carries fixed guidance as the call's own content; an assistant image, which has
+no tool call to attribute to, is replaced by the same guidance as agent text.
+The guidance says what to do next and never quotes the size, media type, or
+bytes it refused. Only a stored artifact the bounded window can no longer
+reproduce (`stage: "image_output"`, `reason: "storage_failed"`) ends the turn.
+
 Raw pi RPC events are not sent by default. A host opts in per session with
 `_meta.pi.rawEvent.enabled`; see [Raw events](/docs/features/raw-events).
 

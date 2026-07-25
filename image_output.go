@@ -24,11 +24,21 @@ const (
 
 	imageReasonNotARaster    = "not_a_raster"
 	imageReasonStorageFailed = "storage_failed"
+
+	// Guidance carried back in place of an image output the adapter will not
+	// ship. Each string is a fixed constant keyed only by the verdict token: it
+	// says what to do next and never describes the size, media type, or bytes
+	// that produced the verdict.
+	imageGuidanceTooLarge       = "the image is too large to send; send a smaller image and try again"
+	imageGuidanceNotRaster      = "the bytes are not a supported raster image; send a PNG, JPEG, GIF, WebP, BMP, or TIFF and try again"
+	imageGuidanceInvalidBase64  = "the image payload could not be decoded; send the image bytes again"
+	imageGuidanceMIMEMismatched = "the declared media type does not match the image; send the image again with a matching media type"
 )
 
-// imageOutputError is one adapter-side image representation failure. Every
-// occurrence is turn-fatal: the adapter never silently drops an artifact it
-// cannot read, validate, store, or emit.
+// imageOutputError is one adapter-side image representation failure. The
+// adapter never silently drops an artifact it cannot read, validate, store, or
+// emit: a verdict the model can act on is refused where the image would have
+// gone, and a storage failure is turn-fatal.
 type imageOutputError struct {
 	reason    string
 	message   string
@@ -38,6 +48,26 @@ type imageOutputError struct {
 
 func (e *imageOutputError) Error() string {
 	return e.message
+}
+
+// imageOutputGuidance classifies an image output failure. A recoverable
+// verdict is an ordinary mistake that can be retried — the bytes are too big,
+// are not an image, do not decode, or contradict their declared media type —
+// and comes back with fixed guidance. A storage failure is the adapter's own
+// artifact window breaking, which no retry addresses.
+func imageOutputGuidance(failure *imageOutputError) (string, bool) {
+	switch failure.reason {
+	case imageErrorTooLarge:
+		return imageGuidanceTooLarge, true
+	case imageReasonNotARaster:
+		return imageGuidanceNotRaster, true
+	case imageErrorInvalidBase64:
+		return imageGuidanceInvalidBase64, true
+	case imageErrorMediaTypeMismatch:
+		return imageGuidanceMIMEMismatched, true
+	default:
+		return "", false
+	}
 }
 
 // imageOutputTurnFailure maps an image output failure into the uniform
