@@ -48,12 +48,48 @@ and every rejection is an invalid-params (`-32602`) error carrying
 `{field:"prompt.image", error, index}` (plus `sizeBytes`/`maxBytes` on a limit
 failure). The declared media type must be one of `image/png`, `image/jpeg`,
 `image/gif`, or `image/webp`, static only: animated GIF, animated WebP, and
-APNG are rejected structurally without decoding pixels. The embedded base64
-data is decoded once, the sniffed format must agree with the declared type,
-and the decoded bytes must fit the configured per-image and per-prompt limits
-(`WithImageLimits`, 6 MiB each by default). A `uri` alongside `data` is
-provenance only and is never fetched; a resource link is forwarded as text and
-an embedded image resource must carry blob data.
+APNG are rejected structurally without decoding pixels. The bytes are sniffed
+once, the sniffed format must agree with the declared type, and they must fit
+the configured per-image and per-prompt limits (`WithImageLimits`, 6 MiB each
+by default). A resource link is forwarded as text; an embedded resource whose
+declared type is a raster runs the same image validation, and every other
+embedded blob resource is refused rather than flattened or inlined.
+
+An image block's bytes arrive in one of two forms, chosen per block:
+
+- **Embedded** — non-empty base64 `data`. A `uri` alongside it is provenance
+  only and is never fetched, even when a handoff envelope is also present:
+  data always wins.
+- **Handoff** — empty `data` plus a `file://` uri and the
+  `acp-go.dev/handoff` envelope described in
+  [Metadata](/docs/reference/meta). Only available when
+  `WithInputHandoffRoot` is configured, which is also the condition under
+  which the handoff capability is advertised.
+
+A block with empty `data` and neither signal is `missing_data`, exactly as
+before; `invalid_handoff` never claims a plain empty-data block.
+
+Handoff blocks resolve and verify before any embedded-form gate runs, first
+failure winning:
+
+| `error` | Cause |
+| --- | --- |
+| `invalid_handoff` | The block is malformed as a block: no handoff root is configured, or the envelope or `file://` uri is absent, unparseable, non-local, non-absolute, wrongly versioned, missing a field, or carrying an unknown one. |
+| `path_not_allowed` | The path resolves outside the handoff root, escapes it through a symlink, or is not a regular file. |
+| `missing_file` | A path inside the root that does not exist or cannot be opened or read. |
+| `handoff_digest_mismatch` | The file's byte count or sha256 does not match the envelope. Fail-closed: there is no fallback to the embedded form. |
+
+Resolution is bounded and symlink-safe — containment is checked on the cleaned
+path, symlinks are resolved, and containment is re-checked on the resolved
+path — and the read is capped at the effective per-image gate plus one byte, so
+a file larger than the gate is rejected `too_large` with its real size rather
+than read whole. The verified bytes then run the same gate chain as embedded
+data, minus the two gates that are meaningless without base64, and they count
+toward the per-prompt aggregate identically. Both forms over the same bytes
+produce identical native requests, and the handoff path never appears in the
+native request: pi's prompt images take base64 payloads, so nothing is
+materialized and nothing outlives the validation read. Handoff files stay owned
+by the host, which may remove them the moment `session/prompt` returns.
 
 Image support is also gated per model from pi's catalog input list: when the
 selected model authoritatively lists no image input the prompt is rejected

@@ -97,3 +97,19 @@ transports and invalid names are rejected up front and never reach the CLI
 agent directory — absolute paths and `..` escapes fail closed — and prompt
 content that the adapter cannot forward is rejected before the turn starts
 (see [Prompt streaming](/docs/core/prompt-streaming)).
+
+## Local read boundary
+
+The adapter reads local files on exactly one inbound path, and only when a host
+opts in with `WithInputHandoffRoot`: a handoff-form prompt image is read from
+under that root. Without the option there is no local read path at all, and a
+handoff block is rejected.
+
+The root is a read boundary, not a workspace. Resolution is bounded and
+symlink-safe, so a path outside the root or a symlink escaping it is rejected
+rather than followed, only regular files are opened, and the read is capped
+before it allocates a declared size. Every file's sha256 is verified against
+the host-declared digest and a mismatch fails the turn — the adapter never
+forwards bytes it could not verify. The adapter never writes, moves, or removes
+anything under the root: those files belong to the host for the lifetime of its
+turn. A remote uri is never fetched on any path.

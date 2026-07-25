@@ -3,6 +3,7 @@ package piacp
 import (
 	"encoding/base64"
 	"errors"
+	"slices"
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
@@ -44,12 +45,18 @@ const (
 // allowedInputImageMIME accepts exactly the four canonical static raster MIME
 // strings; variants such as image/jpg are rejected.
 func allowedInputImageMIME(mimeType string) bool {
-	switch mimeType {
-	case raster.MIMEPNG, raster.MIMEJPEG, raster.MIMEGIF, raster.MIMEWebP:
-		return true
-	default:
-		return false
-	}
+	return slices.Contains(inputImageMIMEAllowlist(), mimeType)
+}
+
+// inboundMediaTypeRoute normalizes a declared inbound MIME for the image/
+// prefix test that routes an embedded resource to the image path: trimmed,
+// stripped of any parameters, and ASCII-lowercased. The allowlist still
+// compares the declared value, so a non-canonical raster declaration routes to
+// the image path and is rejected there as invalid_media_type.
+func inboundMediaTypeRoute(declared string) string {
+	essence, _, _ := strings.Cut(declared, ";")
+
+	return strings.ToLower(strings.TrimSpace(essence))
 }
 
 func imagePromptError(errValue string, index int, sizeBytes int64, maxBytes int64) *acp.RequestError {
@@ -72,35 +79,76 @@ func imagePromptError(errValue string, index int, sizeBytes int64, maxBytes int6
 
 // promptImageBudget validates prompt images in request order and stops on the
 // first failure. Image blocks and embedded image blob resources share one
-// stable index sequence and one per-prompt decoded-byte budget.
+// stable index sequence and one per-prompt decoded-byte budget, whichever form
+// carried their bytes.
 type promptImageBudget struct {
-	perImage  int64
-	perPrompt int64
-	total     int64
-	nextIndex int
+	perImage    int64
+	perPrompt   int64
+	total       int64
+	nextIndex   int
+	handoffRoot string
 }
 
-func newPromptImageBudget(limits ImageLimits) *promptImageBudget {
+func newPromptImageBudget(limits ImageLimits, handoffRoot string) *promptImageBudget {
 	return &promptImageBudget{
-		perImage:  limits.MaxInputBytesPerImage,
-		perPrompt: limits.MaxInputBytesPerPrompt,
+		perImage:    effectiveInputImageLimit(limits.MaxInputBytesPerImage),
+		perPrompt:   limits.MaxInputBytesPerPrompt,
+		handoffRoot: handoffRoot,
 	}
 }
 
-// validate runs the full structural pipeline for one prompt image: required
-// data, canonical MIME, one base64 decode, decode-free container inspection,
-// animation rejection, declared-versus-sniffed agreement, then the per-image
-// and aggregate decoded-byte limits. Corruption in container regions the
-// structural walk never touches is deliberately forwarded; the native
-// provider outcome stands for those bytes.
+// validateBlock validates one ACP prompt image block in whichever form it
+// carries and returns the base64 payload for the native request. Non-empty
+// data is the embedded form even when a handoff envelope rides alongside it;
+// empty data plus handoff intent runs the handoff pre-gate ahead of every
+// embedded-form gate; empty data with neither is missing_data.
+func (b *promptImageBudget) validateBlock(block *acp.ContentBlockImage) (string, error) {
+	index := b.nextImageIndex()
+
+	if block.Data != "" {
+		if err := b.validateEmbedded(index, block.Data, block.MimeType); err != nil {
+			return "", err
+		}
+
+		return block.Data, nil
+	}
+
+	if !handoffIntent(block) {
+		return "", imagePromptError(imageErrorMissingData, index, 0, 0)
+	}
+
+	data, size, failure := b.handoffBytes(block)
+	if failure != nil {
+		return "", imageHandoffError(failure, index)
+	}
+
+	if err := b.validateBytes(index, data, block.MimeType, size); err != nil {
+		return "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(data), nil
+}
+
+// validate runs the embedded-form pipeline for one image blob resource:
+// required data, canonical MIME, one base64 decode, then the shared gate chain.
 func (b *promptImageBudget) validate(data string, mimeType string) error {
-	index := b.nextIndex
-	b.nextIndex++
+	index := b.nextImageIndex()
 
 	if data == "" {
 		return imagePromptError(imageErrorMissingData, index, 0, 0)
 	}
 
+	return b.validateEmbedded(index, data, mimeType)
+}
+
+func (b *promptImageBudget) nextImageIndex() int {
+	index := b.nextIndex
+	b.nextIndex++
+
+	return index
+}
+
+func (b *promptImageBudget) validateEmbedded(index int, data string, mimeType string) error {
 	if !allowedInputImageMIME(mimeType) {
 		return imagePromptError(imageErrorInvalidMediaType, index, 0, 0)
 	}
@@ -108,6 +156,22 @@ func (b *promptImageBudget) validate(data string, mimeType string) error {
 	decoded, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
 		return imagePromptError(imageErrorInvalidBase64, index, 0, 0)
+	}
+
+	return b.validateBytes(index, decoded, mimeType, int64(len(decoded)))
+}
+
+// validateBytes runs the gate chain shared by both input forms over decoded
+// bytes: canonical MIME, decode-free container inspection, animation
+// rejection, declared-versus-sniffed agreement, then the per-image and
+// aggregate decoded-byte limits. size is the byte count the limits account
+// for; it exceeds len(decoded) only for a handoff file read up to the bound,
+// where the file's real size is the truthful number. Corruption in container
+// regions the structural walk never touches is deliberately forwarded; the
+// native provider outcome stands for those bytes.
+func (b *promptImageBudget) validateBytes(index int, decoded []byte, mimeType string, size int64) error {
+	if !allowedInputImageMIME(mimeType) {
+		return imagePromptError(imageErrorInvalidMediaType, index, 0, 0)
 	}
 
 	info, err := raster.Inspect(decoded)
@@ -127,8 +191,7 @@ func (b *promptImageBudget) validate(data string, mimeType string) error {
 		return imagePromptError(imageErrorMediaTypeMismatch, index, 0, 0)
 	}
 
-	size := int64(len(decoded))
-	if b.perImage > 0 && size > b.perImage {
+	if size > b.perImage {
 		return imagePromptError(imageErrorTooLarge, index, size, b.perImage)
 	}
 

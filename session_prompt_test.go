@@ -36,7 +36,7 @@ func TestPromptContentMapping(t *testing.T) {
 		acp.ResourceLinkBlock("link", " https://example.test "),
 		acp.ResourceBlock(textResource),
 		acp.ResourceBlock(imageResource),
-	}, defaultImageLimits())
+	}, defaultImageLimits(), "")
 	require.NoError(t, err)
 	require.Contains(t, mapped.Message, "hello")
 	require.NotContains(t, mapped.Message, "ignored")
@@ -54,11 +54,11 @@ func TestPromptContentMapping(t *testing.T) {
 		{acp.ResourceBlock(acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{Uri: "x", Blob: "data"}})},
 	}
 	for _, blocks := range invalid {
-		_, invalidErr := promptToPi(blocks, defaultImageLimits())
+		_, invalidErr := promptToPi(blocks, defaultImageLimits(), "")
 		requireInvalidParams(t, invalidErr)
 	}
 
-	text, contextText, image, err := resourceToPi(textResource, newPromptImageBudget(defaultImageLimits()))
+	text, contextText, image, err := resourceToPi(textResource, newPromptImageBudget(defaultImageLimits(), ""))
 	require.NoError(t, err)
 	require.NotEmpty(t, text)
 	require.NotEmpty(t, contextText)

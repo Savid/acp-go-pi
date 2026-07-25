@@ -122,6 +122,11 @@ type Options struct {
 	// option is omitted, and an explicit zero in a supplied struct disables
 	// that policy limit.
 	ImageLimits ImageLimits
+	// InputHandoffRoot is the absolute directory under which handoff-form
+	// prompt images are read. Empty (the default) rejects the handoff form.
+	// The adapter only reads under it and never writes, moves, or removes
+	// anything there.
+	InputHandoffRoot string
 
 	// imageLimitsSet records whether WithImageLimits supplied the struct; an
 	// omitted option leaves every field at its default.
@@ -205,6 +210,18 @@ func WithHome(path string) Option {
 func WithScratchDir(dir string) Option {
 	return func(options *Options) {
 		options.ScratchDir = dir
+	}
+}
+
+// WithInputHandoffRoot sets the absolute directory under which handoff-form
+// prompt images are read. Omitting the option rejects the handoff form, so a
+// host that expects it can tell from the absence of the handoff capability
+// advertisement that its option never reached this adapter. The directory is
+// read-only to the adapter: handoff files stay owned by the host, which may
+// remove them as soon as session/prompt returns.
+func WithInputHandoffRoot(dir string) Option {
+	return func(options *Options) {
+		options.InputHandoffRoot = dir
 	}
 }
 

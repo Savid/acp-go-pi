@@ -26,6 +26,63 @@ cancellations require exactly `{"version":1,"turnNonce":"..."}` under that
 key. A nonce is fresh and unguessable per turn, non-empty, and at most 4096
 bytes; missing, oversized, extra, unsupported, or stale route data is rejected.
 
+### Media envelope
+
+`_meta["acp-go.dev/mediaEnvelope"]` is advertised unconditionally and reports
+the prompt-media bounds this adapter enforces, so a host can reject an
+oversize or unsupported image before it sends one:
+
+```json
+{
+  "maxBytes": 6291456,
+  "maxPromptBytes": 6291456,
+  "maxDimension": 0,
+  "imageFormats": ["image/png", "image/jpeg", "image/gif", "image/webp"],
+  "documentFormats": []
+}
+```
+
+`maxBytes` is the effective per-image decoded-byte gate and `maxPromptBytes`
+the per-prompt aggregate gate, both derived from `WithImageLimits` rather than
+restated as literals. `maxDimension` is `0` because pi enforces no
+per-dimension pixel bound; `0` means "no bound", never "zero pixels".
+`imageFormats` is the inbound allowlist in advertisement order.
+`documentFormats` is an empty array because pi maps no MIME to a native
+document representation. The envelope covers only bounds the adapter itself
+enforces: whether the selected model accepts images is a prompt-time result,
+never envelope metadata.
+
+### Handoff
+
+`_meta["acp-go.dev/handoff"] = {"versions":[1]}` is advertised **only** when
+`WithInputHandoffRoot` is configured. Its absence is the actionable signal
+that no handoff root reached this adapter, so a host never has to guess
+whether its option took effect.
+
+The same key on an inbound prompt image block carries the handoff envelope:
+
+```json
+{
+  "type": "image",
+  "mimeType": "image/png",
+  "data": "",
+  "uri": "file:///<root>/<subpath>/<digest>.png",
+  "_meta": {
+    "acp-go.dev/handoff": {
+      "version": 1,
+      "digest": "<sha256-hex>",
+      "sizeBytes": 123456
+    }
+  }
+}
+```
+
+The envelope carries exactly `version`, `digest`, and `sizeBytes`; a missing
+field, an unknown field, an unsupported version, a digest that is not 64
+lowercase hex characters, and a non-integer or negative `sizeBytes` are all
+rejected. See [Prompt streaming](/docs/core/prompt-streaming) for the
+verdicts.
+
 Every live-turn `session/update` and `_pi/rawEvent` notification carries the
 same exact `{version, turnNonce}` object in its notification `_meta`; raw-event
 payloads also carry their structural `sessionId`. Lifecycle and load-history

@@ -20,6 +20,10 @@ import (
 const (
 	metaCapabilityFork      = "fork"
 	elicitationScopeSession = "session"
+
+	// metaFieldVersions carries the supported versions of one family-global
+	// reserved capability literal.
+	metaFieldVersions = "versions"
 )
 
 const darwinPlatform = "darwin"
@@ -130,6 +134,7 @@ func NewAgent(opts ...Option) *Agent {
 			validateConcurrencyLimits(options.ConcurrencyLimits),
 			validateContainmentOption(options),
 			validateImageLimits(options.ImageLimits),
+			validateInputHandoffRoot(options.InputHandoffRoot),
 		),
 		startPiProcess: startRealPiProcess,
 		probeVersion:   pi.ProbeVersion,
@@ -347,6 +352,41 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 	a.positionEncoding = positionEncoding
 	a.mu.Unlock()
 
+	capabilityMeta := map[string]any{
+		routeMetaKey:         map[string]any{metaFieldVersions: []int{routeVersion}},
+		mediaEnvelopeMetaKey: a.mediaEnvelope(),
+		piMetaKey: map[string]any{
+			metaCapabilityFork: map[string]any{
+				"unstable": true,
+				"method":   ForkSessionMethod,
+				"request":  "acp.UnstableForkSessionRequest JSON payload only",
+				"response": "acp.UnstableForkSessionResponse JSON payload only",
+			},
+			"elicitation": map[string]any{
+				"unstable": true,
+				"scope":    elicitationScopeSession,
+				"tracks":   "in-progress ACP elicitation RFD",
+			},
+			"rawEvent": map[string]any{
+				"method":         RawEventMethod,
+				"enabledBy":      "_meta.pi.rawEvent.enabled",
+				"maxBytes":       rawEventMaxBytes,
+				"defaultEnabled": false,
+			},
+			"sessionStore": map[string]any{
+				"format": SessionStoreFormat,
+				"key":    []string{acpFieldSessionID, "subpath"},
+			},
+		},
+	}
+
+	// Absence of the handoff advertisement is the actionable signal that no
+	// handoff root reached this adapter, so the key is emitted only when one
+	// is configured.
+	if a.inputHandoffRoot() != "" {
+		capabilityMeta[handoffMetaKey] = map[string]any{metaFieldVersions: []int{handoffVersion}}
+	}
+
 	resp = acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentInfo: &acp.Implementation{
@@ -356,32 +396,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 		},
 		AuthMethods: []acp.AuthMethod{},
 		AgentCapabilities: acp.AgentCapabilities{
-			Meta: map[string]any{
-				routeMetaKey: map[string]any{"versions": []int{routeVersion}},
-				piMetaKey: map[string]any{
-					metaCapabilityFork: map[string]any{
-						"unstable": true,
-						"method":   ForkSessionMethod,
-						"request":  "acp.UnstableForkSessionRequest JSON payload only",
-						"response": "acp.UnstableForkSessionResponse JSON payload only",
-					},
-					"elicitation": map[string]any{
-						"unstable": true,
-						"scope":    elicitationScopeSession,
-						"tracks":   "in-progress ACP elicitation RFD",
-					},
-					"rawEvent": map[string]any{
-						"method":         RawEventMethod,
-						"enabledBy":      "_meta.pi.rawEvent.enabled",
-						"maxBytes":       rawEventMaxBytes,
-						"defaultEnabled": false,
-					},
-					"sessionStore": map[string]any{
-						"format": SessionStoreFormat,
-						"key":    []string{acpFieldSessionID, "subpath"},
-					},
-				},
-			},
+			Meta:        capabilityMeta,
 			LoadSession: true,
 			McpCapabilities: acp.McpCapabilities{
 				Http: true,

@@ -78,6 +78,19 @@ func validateImageLimits(limits ImageLimits) error {
 	return errors.Join(errs...)
 }
 
+// effectiveInputImageLimit resolves the configured per-image input policy
+// limit into the bound the adapter actually enforces: a disabled (zero) or
+// above-frame limit clamps to the frame bound, because decoded input bytes
+// still have to fit one JSON-RPC frame and a handoff read still has to be
+// bounded before it allocates a local file's declared size.
+func effectiveInputImageLimit(configured int64) int64 {
+	if configured <= 0 || configured > maxImageFrameBytes {
+		return maxImageFrameBytes
+	}
+
+	return configured
+}
+
 // effectiveOutputImageLimit resolves one configured output policy limit into
 // the enforceable bound: a disabled (zero) or above-frame limit clamps to the
 // frame bound because an oversize update frame is a consumer disconnect, not
@@ -92,4 +105,8 @@ func effectiveOutputImageLimit(configured int64) int64 {
 
 func (a *Agent) imageLimits() ImageLimits {
 	return a.options.ImageLimits
+}
+
+func (a *Agent) inputHandoffRoot() string {
+	return a.options.InputHandoffRoot
 }

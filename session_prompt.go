@@ -40,11 +40,11 @@ type piPrompt struct {
 
 // promptToPi converts ACP prompt content to pi's prompt command shape.
 // Embedded context is flattened into the message text at map time; audio is
-// rejected; images must carry embedded base64 data because pi's prompt
-// images take base64 payloads only, so an image uri is provenance and never
-// fetched. Image validation is deterministic and stops on the first failing
-// block in request order.
-func promptToPi(prompt []acp.ContentBlock, limits ImageLimits) (piPrompt, error) {
+// rejected. pi's prompt images take base64 payloads only, so a validated
+// handoff file's bytes are encoded into the native request and the handoff
+// path itself never leaves the validation read. Image validation is
+// deterministic and stops on the first failing block in request order.
+func promptToPi(prompt []acp.ContentBlock, limits ImageLimits, handoffRoot string) (piPrompt, error) {
 	if len(prompt) == 0 {
 		return piPrompt{}, acp.NewInvalidParams(map[string]any{jsonFieldError: validationUnsupported, jsonFieldField: fieldPrompt})
 	}
@@ -52,7 +52,7 @@ func promptToPi(prompt []acp.ContentBlock, limits ImageLimits) (piPrompt, error)
 	textParts := make([]string, 0, len(prompt))
 	contextParts := make([]string, 0)
 	images := make([]pi.ImageContent, 0)
-	budget := newPromptImageBudget(limits)
+	budget := newPromptImageBudget(limits, handoffRoot)
 
 	for _, block := range prompt {
 		switch {
@@ -63,11 +63,12 @@ func promptToPi(prompt []acp.ContentBlock, limits ImageLimits) (piPrompt, error)
 
 			textParts = append(textParts, block.Text.Text)
 		case block.Image != nil:
-			if err := budget.validate(block.Image.Data, block.Image.MimeType); err != nil {
+			data, err := budget.validateBlock(block.Image)
+			if err != nil {
 				return piPrompt{}, err
 			}
 
-			images = append(images, pi.NewImageContent(block.Image.Data, block.Image.MimeType))
+			images = append(images, pi.NewImageContent(data, block.Image.MimeType))
 		case block.ResourceLink != nil:
 			textParts = append(textParts, strings.TrimSpace(block.ResourceLink.Uri))
 		case block.Resource != nil:
@@ -114,7 +115,7 @@ func resourceToPi(resource acp.EmbeddedResourceResource, budget *promptImageBudg
 			mimeType = *resource.BlobResourceContents.MimeType
 		}
 
-		if strings.HasPrefix(mimeType, "image/") {
+		if strings.HasPrefix(inboundMediaTypeRoute(mimeType), "image/") {
 			if err := budget.validate(resource.BlobResourceContents.Blob, mimeType); err != nil {
 				return "", "", nil, err
 			}
@@ -181,7 +182,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		return acp.PromptResponse{}, poisonErr
 	}
 
-	mapped, err := promptToPi(params.Prompt, s.agent.imageLimits())
+	mapped, err := promptToPi(params.Prompt, s.agent.imageLimits(), s.agent.inputHandoffRoot())
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
