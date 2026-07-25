@@ -582,6 +582,31 @@ func TestHandoffPerImageLimitRejectsOnBytesRead(t *testing.T) {
 	})
 }
 
+// TestHandoffDeclaredMediaTypeIsJudgedBeforeTheFilesystem pins the pre-gate
+// order: a declaration this adapter was never going to accept costs it no open,
+// no read and no hash. The absent name proves the verdict needs no file at all;
+// the name outside the root proves the declared type outranks the location, so a
+// bad-MIME probe cannot learn whether the file it named is there.
+func TestHandoffDeclaredMediaTypeIsJudgedBeforeTheFilesystem(t *testing.T) {
+	png := fixtureBytes(t, "valid.png")
+	root := t.TempDir()
+	outside := handoffFileURI(t, t.TempDir(), "outside.png", png)
+
+	for _, test := range []struct {
+		name string
+		uri  string
+	}{
+		{name: "the name does not exist", uri: fileURIFor(filepath.Join(root, "absent.png"))},
+		{name: "the name leaves the root", uri: outside},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := validateHandoffBlock(t, root,
+				handoffImageBlock(test.uri, "image/svg+xml", handoffEnvelopeFor(png)), defaultImageLimits())
+			requireImageParamError(t, err, imageErrorInvalidMediaType, 0)
+		})
+	}
+}
+
 func TestHandoffOversizeReadIsRejectedWithoutForwardingBytes(t *testing.T) {
 	png := fixtureBytes(t, "valid.png")
 	bound := int64(len(png))
@@ -589,17 +614,20 @@ func TestHandoffOversizeReadIsRejectedWithoutForwardingBytes(t *testing.T) {
 
 	t.Run("a declared size past the gate is rejected before anything is opened", func(t *testing.T) {
 		root := t.TempDir()
+		outside := handoffFileURI(t, t.TempDir(), "outside.png", png)
 
-		// No file is written, so the only way this can produce too_large is by
-		// judging the caller's own declaration ahead of the open.
+		// No file is written inside the root and the second name would be refused
+		// for its location, so the only way either produces too_large is by judging
+		// the caller's own declaration ahead of the open.
 		envelope := handoffEnvelopeFor(png)
 		envelope[handoffFieldSizeBytes] = int(bound + 1)
-		uri := fileURIFor(filepath.Join(root, "valid.png"))
 
-		_, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", envelope), limits)
-		details := requireImageParamError(t, err, imageErrorTooLarge, 0)
-		require.InDelta(t, float64(bound+1), details[jsonFieldSizeBytes], 0)
-		require.InDelta(t, float64(bound), details[jsonFieldMaxBytes], 0)
+		for _, uri := range []string{fileURIFor(filepath.Join(root, "valid.png")), outside} {
+			_, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", envelope), limits)
+			details := requireImageParamError(t, err, imageErrorTooLarge, 0)
+			require.InDelta(t, float64(bound+1), details[jsonFieldSizeBytes], 0)
+			require.InDelta(t, float64(bound), details[jsonFieldMaxBytes], 0)
+		}
 	})
 
 	t.Run("a file larger than its declaration forwards nothing", func(t *testing.T) {

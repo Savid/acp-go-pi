@@ -105,6 +105,10 @@ opts in with `WithInputHandoffRoot`: a handoff-form prompt image is read from
 under that root. Without the option there is no local read path at all, and a
 handoff block is rejected.
 
+A block whose declared media type or declared size fails its gate is refused
+before the root is opened at all, so a refusal on the declaration reveals nothing
+about whether the file it named exists.
+
 The root is a read boundary, not a workspace. Containment is enforced by the
 kernel: the root is opened once per prompt and every file is opened relative to
 that descriptor, so a name leading out of the root is refused as part of the open

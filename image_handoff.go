@@ -388,9 +388,9 @@ func (b *promptImageBudget) closeHandoffRoot() {
 
 // handoffBytes runs the handoff pre-gate for one prompt image block: the block
 // count bound, envelope and uri strictness, the declared media type, the
-// declared size against the per-image gate, a bounded root-relative read, then
-// digest verification. Every path that returns bytes has verified them against
-// the envelope the caller sent.
+// declared size against the per-image gate, containment, a bounded root-relative
+// read, then digest verification. Every path that returns bytes has verified
+// them against the envelope the caller sent.
 func (b *promptImageBudget) handoffBytes(ctx context.Context, block *acp.ContentBlockImage) ([]byte, *handoffError) {
 	if b.handoffRoot == "" {
 		return nil, handoffInvalid(handoffRootUnsetMessage)
@@ -415,6 +415,25 @@ func (b *promptImageBudget) handoffBytes(ctx context.Context, block *acp.Content
 		return nil, failure
 	}
 
+	// The declaration is judged in full before the filesystem is consulted at
+	// all, as the declared type is in the embedded form. A block this adapter was
+	// never going to accept costs it no open, no read and no hash, and its
+	// refusal cannot report whether the path it named exists.
+	if !allowedInputImageMIME(block.MimeType) {
+		return nil, &handoffError{value: imageErrorInvalidMediaType}
+	}
+
+	// The size gate reads the caller's own declaration, so it can reject an
+	// oversize handoff without measuring a file the caller may not be entitled to
+	// measure.
+	if envelope.sizeBytes > b.perImage {
+		return nil, &handoffError{
+			value:     imageErrorTooLarge,
+			sizeBytes: envelope.sizeBytes,
+			maxBytes:  b.perImage,
+		}
+	}
+
 	rel, failure := handoffRelativePath(b.handoffRoot, path)
 	if failure != nil {
 		return nil, failure
@@ -423,24 +442,6 @@ func (b *promptImageBudget) handoffBytes(ctx context.Context, block *acp.Content
 	root, failure := b.handoffRootHandle()
 	if failure != nil {
 		return nil, failure
-	}
-
-	// The declared type is judged before a byte is read, as it is in the
-	// embedded form, so a block this adapter was never going to accept costs it
-	// no read and no hash.
-	if !allowedInputImageMIME(block.MimeType) {
-		return nil, &handoffError{value: imageErrorInvalidMediaType}
-	}
-
-	// The size gate reads the caller's own declaration, so it can reject an
-	// oversize handoff before opening anything and without measuring a file the
-	// caller may not be entitled to measure.
-	if envelope.sizeBytes > b.perImage {
-		return nil, &handoffError{
-			value:     imageErrorTooLarge,
-			sizeBytes: envelope.sizeBytes,
-			maxBytes:  b.perImage,
-		}
 	}
 
 	data, failure := readHandoffFile(ctx, root, rel, envelope.sizeBytes)

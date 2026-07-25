@@ -85,16 +85,21 @@ the work rather than on the byte policy, so it holds even where
 `MaxInputBytesPerPrompt` is disabled, and it sits far above any conforming
 turn.
 
-Containment is the kernel's rather than a path check's: the handoff root is
-opened once per prompt and every file is opened relative to that descriptor, so
-a name that leads out of the root is refused as part of the open itself and
-there is no window between deciding a path is inside the root and reading it.
-The opened descriptor is then required to be a regular file, because a root
-bounds where a name may lead and not what kind of object it names, so a
-directory, a FIFO, or a device under the root is rejected rather than read. The
-declared media type is judged before any byte is read, and a declared
-`sizeBytes` above the effective per-image gate is `too_large` decided from the
-envelope with nothing opened at all. The read is then capped at the declared
+The declaration is judged in full before the filesystem is consulted at all: the
+declared media type against the allowlist, then a declared `sizeBytes` above the
+effective per-image gate as `too_large`, both decided from the block with nothing
+opened. A refusal on the declaration therefore says nothing about whether the
+file it named exists.
+
+Containment comes next, and it is the kernel's rather than a path check's: the
+handoff root is opened once per prompt and every file is opened relative to that
+descriptor, so a name that leads out of the root is refused as part of the open
+itself and there is no window between deciding a path is inside the root and
+reading it. The opened descriptor is then required to be a regular file, because
+a root bounds where a name may lead and not what kind of object it names, so a
+directory, a FIFO, or a device under the root is rejected rather than read.
+
+The read is capped at the declared
 size plus one byte, so a file that returns more or fewer bytes than the envelope
 declared is rejected `handoff_digest_mismatch` rather than carried forward: no
 byte that could not be verified against the envelope leaves the read. The
