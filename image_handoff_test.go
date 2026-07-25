@@ -1,17 +1,20 @@
 package piacp
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
@@ -80,7 +83,7 @@ func requireHandoffError(t *testing.T, err error, value string, index int, messa
 func validateHandoffBlock(t *testing.T, root string, block acp.ContentBlock, limits ImageLimits) (string, error) {
 	t.Helper()
 
-	return newPromptImageBudget(limits, root).validateBlock(block.Image)
+	return newPromptImageBudget(limits, root).validateBlock(t.Context(), block.Image)
 }
 
 func TestHandoffFormSelection(t *testing.T) {
@@ -334,16 +337,15 @@ func TestHandoffPathNotAllowed(t *testing.T) {
 		require.NoError(t, os.Symlink(target, link))
 
 		_, err := validateHandoffBlock(t, root, handoffImageBlock(fileURIFor(link), "image/png", envelope), defaultImageLimits())
-		requireHandoffError(t, err, imageErrorPathNotAllowed, 0, "escapes the handoff root")
+		requireHandoffError(t, err, imageErrorPathNotAllowed, 0, "cannot be opened")
 	})
 
-	t.Run("symlink inside the root resolves", func(t *testing.T) {
+	t.Run("relative symlink inside the root resolves", func(t *testing.T) {
 		root := t.TempDir()
-		target := filepath.Join(root, "target.png")
-		require.NoError(t, os.WriteFile(target, png, 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(root, "target.png"), png, 0o600))
 
 		link := filepath.Join(root, "link.png")
-		require.NoError(t, os.Symlink(target, link))
+		require.NoError(t, os.Symlink("target.png", link))
 
 		data, err := validateHandoffBlock(t, root, handoffImageBlock(fileURIFor(link), "image/png", envelope), defaultImageLimits())
 		require.NoError(t, err)
@@ -365,7 +367,7 @@ func TestHandoffPathNotAllowed(t *testing.T) {
 		nested := fileURIFor(filepath.Join(root, "valid.png", "child.png"))
 
 		_, err := validateHandoffBlock(t, root, handoffImageBlock(nested, "image/png", envelope), defaultImageLimits())
-		requireHandoffError(t, err, imageErrorPathNotAllowed, 0, "cannot be resolved safely")
+		requireHandoffError(t, err, imageErrorPathNotAllowed, 0, "cannot be opened")
 	})
 
 	t.Run("unresolvable root", func(t *testing.T) {
@@ -380,13 +382,15 @@ func TestHandoffPathNotAllowed(t *testing.T) {
 		root := t.TempDir()
 		uri := handoffFileURI(t, root, "valid.png", png)
 
-		restore := handoffLstat
-		handoffLstat = func(string) (os.FileInfo, error) { return nil, errors.New("injected inspect failure") }
+		restore := openHandoffFile
+		openHandoffFile = func(*os.Root, string) (handoffFile, error) {
+			return failingHandoffReader{statErr: errors.New("injected inspect failure")}, nil
+		}
 
-		t.Cleanup(func() { handoffLstat = restore })
+		t.Cleanup(func() { openHandoffFile = restore })
 
 		_, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", envelope), defaultImageLimits())
-		requireHandoffError(t, err, imageErrorPathNotAllowed, 0, "cannot be inspected")
+		requireHandoffError(t, err, imageErrorMissingFile, 0, "cannot be inspected")
 	})
 }
 
@@ -403,54 +407,62 @@ func TestHandoffMissingFile(t *testing.T) {
 		requireHandoffError(t, err, imageErrorMissingFile, 0, "does not exist")
 	})
 
-	t.Run("vanished between resolution and inspection", func(t *testing.T) {
-		root := t.TempDir()
-		uri := handoffFileURI(t, root, "valid.png", png)
-
-		restore := handoffLstat
-		handoffLstat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
-
-		t.Cleanup(func() { handoffLstat = restore })
-
-		_, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", envelope), defaultImageLimits())
-		requireHandoffError(t, err, imageErrorMissingFile, 0, "does not exist")
-	})
-
 	t.Run("unopenable file", func(t *testing.T) {
 		root := t.TempDir()
 		uri := handoffFileURI(t, root, "valid.png", png)
 
-		restore := handoffOpen
-		handoffOpen = func(string) (io.ReadCloser, error) { return nil, errors.New("injected open failure") }
+		restore := openHandoffFile
+		openHandoffFile = func(*os.Root, string) (handoffFile, error) {
+			return nil, errors.New("injected open failure")
+		}
 
-		t.Cleanup(func() { handoffOpen = restore })
+		t.Cleanup(func() { openHandoffFile = restore })
 
 		_, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", envelope), defaultImageLimits())
-		requireHandoffError(t, err, imageErrorMissingFile, 0, "cannot be opened")
+		requireHandoffError(t, err, imageErrorPathNotAllowed, 0, "cannot be opened")
 	})
 
 	t.Run("unreadable file", func(t *testing.T) {
 		root := t.TempDir()
 		uri := handoffFileURI(t, root, "valid.png", png)
 
-		restore := handoffOpen
-		handoffOpen = func(string) (io.ReadCloser, error) {
-			return failingHandoffReader{err: errors.New("injected read failure")}, nil
+		restore := openHandoffFile
+		openHandoffFile = func(root *os.Root, rel string) (handoffFile, error) {
+			info, statErr := root.Stat(rel)
+			if statErr != nil {
+				return nil, statErr
+			}
+
+			return failingHandoffReader{err: errors.New("injected read failure"), info: info}, nil
 		}
 
-		t.Cleanup(func() { handoffOpen = restore })
+		t.Cleanup(func() { openHandoffFile = restore })
 
 		_, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", envelope), defaultImageLimits())
-		requireHandoffError(t, err, imageErrorMissingFile, 0, "injected read failure")
+		requireHandoffError(t, err, imageErrorMissingFile, 0, "cannot be read")
 	})
 }
 
-// failingHandoffReader is an opened handoff file whose reads fail.
-type failingHandoffReader struct{ err error }
+// failingHandoffReader is an opened handoff file whose inspection or read fails,
+// standing in for the descriptor-level failures a real filesystem only produces
+// under a race with the host that owns the file.
+type failingHandoffReader struct {
+	err     error
+	statErr error
+	info    os.FileInfo
+}
 
 func (r failingHandoffReader) Read([]byte) (int, error) { return 0, r.err }
 
 func (r failingHandoffReader) Close() error { return nil }
+
+func (r failingHandoffReader) Stat() (os.FileInfo, error) {
+	if r.statErr != nil {
+		return nil, r.statErr
+	}
+
+	return r.info, nil
+}
 
 func TestHandoffDigestMismatchFailsClosed(t *testing.T) {
 	png := fixtureBytes(t, "valid.png")
@@ -463,7 +475,7 @@ func TestHandoffDigestMismatchFailsClosed(t *testing.T) {
 		uri := handoffFileURI(t, root, "valid.png", tampered)
 
 		_, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", handoffEnvelopeFor(png)), defaultImageLimits())
-		requireHandoffError(t, err, imageErrorDigestMismatch, 0, "sha256")
+		requireHandoffError(t, err, imageErrorDigestMismatch, 0, "declared digest")
 	})
 
 	t.Run("size mismatch", func(t *testing.T) {
@@ -534,7 +546,7 @@ func TestHandoffMirrorsEmbeddedTaxonomy(t *testing.T) {
 	})
 }
 
-func TestHandoffPerImageLimitReportsRealSize(t *testing.T) {
+func TestHandoffPerImageLimitRejectsOnBytesRead(t *testing.T) {
 	png := fixtureBytes(t, "valid.png")
 	size := int64(len(png))
 
@@ -556,15 +568,347 @@ func TestHandoffPerImageLimitReportsRealSize(t *testing.T) {
 		require.InDelta(t, float64(size-1), details[jsonFieldMaxBytes], 0)
 	})
 
-	t.Run("bounded read still reports the real size", func(t *testing.T) {
+	t.Run("the verdict reports the declared size, never a measured one", func(t *testing.T) {
 		root := t.TempDir()
 		block, _ := handoffFixtureBlock(t, root, "valid.png", "image/png")
+		bound := size - 8
 
-		_, err := validateHandoffBlock(t, root, block, ImageLimits{MaxInputBytesPerImage: size - 8})
+		// The size in the verdict is the one the caller declared, so it tells a
+		// host nothing it did not already know about the file.
+		_, err := validateHandoffBlock(t, root, block, ImageLimits{MaxInputBytesPerImage: bound})
 		details := requireImageParamError(t, err, imageErrorTooLarge, 0)
 		require.InDelta(t, float64(size), details[jsonFieldSizeBytes], 0)
-		require.InDelta(t, float64(size-8), details[jsonFieldMaxBytes], 0)
+		require.InDelta(t, float64(bound), details[jsonFieldMaxBytes], 0)
 	})
+}
+
+func TestHandoffOversizeReadIsRejectedWithoutForwardingBytes(t *testing.T) {
+	png := fixtureBytes(t, "valid.png")
+	bound := int64(len(png))
+	limits := ImageLimits{MaxInputBytesPerImage: bound}
+
+	t.Run("a declared size past the gate is rejected before anything is opened", func(t *testing.T) {
+		root := t.TempDir()
+
+		// No file is written, so the only way this can produce too_large is by
+		// judging the caller's own declaration ahead of the open.
+		envelope := handoffEnvelopeFor(png)
+		envelope[handoffFieldSizeBytes] = int(bound + 1)
+		uri := fileURIFor(filepath.Join(root, "valid.png"))
+
+		_, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", envelope), limits)
+		details := requireImageParamError(t, err, imageErrorTooLarge, 0)
+		require.InDelta(t, float64(bound+1), details[jsonFieldSizeBytes], 0)
+		require.InDelta(t, float64(bound), details[jsonFieldMaxBytes], 0)
+	})
+
+	t.Run("a file larger than its declaration forwards nothing", func(t *testing.T) {
+		root := t.TempDir()
+
+		// The file on disk holds one byte more than the envelope describes,
+		// which is what a file appended to after the block was written looks
+		// like. Its bytes were never verified, so none may survive the read.
+		grown := make([]byte, bound+1)
+		copy(grown, png)
+		uri := handoffFileURI(t, root, "valid.png", grown)
+
+		mapped, err := promptToPi(t.Context(),
+			[]acp.ContentBlock{handoffImageBlock(uri, "image/png", handoffEnvelopeFor(png))},
+			ImageLimits{MaxInputBytesPerImage: bound + 1}, root)
+		requireHandoffError(t, err, imageErrorDigestMismatch, 0, "declared sizeBytes")
+		require.Empty(t, mapped.Images)
+		require.Empty(t, mapped.Message)
+	})
+}
+
+func TestHandoffBlockCountCapRejectsWithAggregateDisabled(t *testing.T) {
+	root := t.TempDir()
+	png := fixtureBytes(t, "valid.png")
+	uri := handoffFileURI(t, root, "valid.png", png)
+
+	blocks := make([]acp.ContentBlock, 0, maxHandoffBlocksPerPrompt+1)
+	for range maxHandoffBlocksPerPrompt + 1 {
+		blocks = append(blocks, handoffImageBlock(uri, "image/png", handoffEnvelopeFor(png)))
+	}
+
+	// The byte aggregate is disabled and every block is a small valid image, so
+	// the block count is the only thing that can reject any of them.
+	mapped, err := promptToPi(t.Context(), blocks, ImageLimits{MaxInputBytesPerPrompt: 0}, root)
+	details := requireImageParamError(t, err, imageErrorTooLarge, maxHandoffBlocksPerPrompt)
+	require.InDelta(t, float64(maxHandoffBlocksPerPrompt+1), details[jsonFieldSizeBytes], 0)
+	require.InDelta(t, float64(maxHandoffBlocksPerPrompt), details[jsonFieldMaxBytes], 0)
+	require.Empty(t, mapped.Images)
+
+	accepted, err := promptToPi(t.Context(), blocks[:maxHandoffBlocksPerPrompt], ImageLimits{MaxInputBytesPerPrompt: 0}, root)
+	require.NoError(t, err)
+	require.Len(t, accepted.Images, maxHandoffBlocksPerPrompt)
+}
+
+func TestHandoffFIFOInsideRootIsRejected(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "valid.png")
+	require.NoError(t, syscall.Mkfifo(path, 0o600))
+
+	png := fixtureBytes(t, "valid.png")
+	block := handoffImageBlock(fileURIFor(path), "image/png", handoffEnvelopeFor(png))
+
+	// A FIFO with no writer blocks an ordinary open until one appears, so the
+	// verdict has to arrive without the open ever waiting on it. Containment
+	// bounds where a path may lead, never what kind of object it names.
+	done := make(chan error, 1)
+	go func() {
+		_, err := validateHandoffBlock(t, root, block, defaultImageLimits())
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		requireHandoffError(t, err, imageErrorPathNotAllowed, 0, "not a regular file")
+	case <-time.After(10 * time.Second):
+		t.Fatal("opening a FIFO inside the handoff root blocked the read")
+	}
+}
+
+func TestHandoffSymlinkContainmentIsKernelEnforced(t *testing.T) {
+	png := fixtureBytes(t, "valid.png")
+	envelope := handoffEnvelopeFor(png)
+
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "secret.png")
+	require.NoError(t, os.WriteFile(outside, png, 0o600))
+
+	tests := []struct {
+		name    string
+		link    string
+		target  string
+		value   string
+		message string
+	}{
+		{
+			name:    "a relative link inside the root resolves",
+			link:    "inside.png",
+			target:  "valid.png",
+			value:   "",
+			message: "",
+		},
+		{
+			name:    "a relative link out of the root is refused",
+			link:    "escape.png",
+			target:  filepath.Join("..", filepath.Base(outsideDir), "secret.png"),
+			value:   imageErrorPathNotAllowed,
+			message: "cannot be opened",
+		},
+		{
+			name:    "an absolute link is refused even inside the root",
+			link:    "absolute.png",
+			target:  "",
+			value:   imageErrorPathNotAllowed,
+			message: "cannot be opened",
+		},
+		{
+			name:    "a link whose target was cleaned up is missing",
+			link:    "dangling.png",
+			target:  "gone.png",
+			value:   imageErrorMissingFile,
+			message: "does not exist",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(root, "valid.png"), png, 0o600))
+
+			target := test.target
+			if target == "" {
+				target = filepath.Join(root, "valid.png")
+			}
+
+			require.NoError(t, os.Symlink(target, filepath.Join(root, test.link)))
+
+			block := handoffImageBlock(fileURIFor(filepath.Join(root, test.link)), "image/png", envelope)
+
+			encoded, err := validateHandoffBlock(t, root, block, defaultImageLimits())
+			if test.value == "" {
+				require.NoError(t, err)
+				require.Equal(t, base64.StdEncoding.EncodeToString(png), encoded)
+
+				return
+			}
+
+			requireHandoffError(t, err, test.value, 0, test.message)
+		})
+	}
+}
+
+func TestHandoffTraversalOutOfTheRootIsRefused(t *testing.T) {
+	root := t.TempDir()
+	png := fixtureBytes(t, "valid.png")
+
+	outside := filepath.Join(t.TempDir(), "secret.png")
+	require.NoError(t, os.WriteFile(outside, png, 0o600))
+
+	// Percent-encoded traversal decodes before the path is ever cleaned, so it
+	// collapses to a path that was never under the root.
+	uri := "file://" + filepath.ToSlash(root) + "/%2e%2e/" + filepath.Base(filepath.Dir(outside)) + "/secret.png"
+
+	_, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", handoffEnvelopeFor(png)), defaultImageLimits())
+	requireHandoffError(t, err, imageErrorPathNotAllowed, 0, "outside the handoff root")
+}
+
+func TestHandoffReadHonoursACancelledContext(t *testing.T) {
+	root := t.TempDir()
+	png := fixtureBytes(t, "valid.png")
+	block, _ := handoffFixtureBlock(t, root, "valid.png", "image/png")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := promptToPi(ctx, []acp.ContentBlock{block}, defaultImageLimits(), root)
+	require.ErrorIs(t, err, context.Canceled)
+
+	handle, failure := newPromptImageBudget(defaultImageLimits(), root).handoffRootHandle()
+	require.Nil(t, failure)
+
+	t.Cleanup(func() { require.NoError(t, handle.Close()) })
+
+	_, readFailure := readHandoffFile(ctx, handle, "valid.png", int64(len(png)))
+	require.NotNil(t, readFailure)
+	require.Equal(t, imageErrorMissingFile, readFailure.value)
+}
+
+// rootSnapshot records every entry under root with the identity and size that
+// would change if the adapter wrote, moved, or removed anything.
+func rootSnapshot(t *testing.T, root string) map[string]string {
+	t.Helper()
+
+	snapshot := map[string]string{}
+
+	require.NoError(t, filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		info, statErr := entry.Info()
+		if statErr != nil {
+			return statErr
+		}
+
+		snapshot[path] = fmt.Sprintf("%v|%d|%v", info.Mode(), info.Size(), info.ModTime())
+
+		return nil
+	}))
+
+	return snapshot
+}
+
+func TestHandoffReadNeverMutatesTheRoot(t *testing.T) {
+	root := t.TempDir()
+	block, data := handoffFixtureBlock(t, root, "valid.png", "image/png")
+
+	before := rootSnapshot(t, root)
+
+	encoded, err := validateHandoffBlock(t, root, block, defaultImageLimits())
+	require.NoError(t, err)
+	require.Equal(t, base64.StdEncoding.EncodeToString(data), encoded)
+
+	// The root is a read root: a turn that consumed a file from it leaves the
+	// tree byte-for-byte as it found it.
+	require.Equal(t, before, rootSnapshot(t, root))
+}
+
+func TestHandoffMessagesCarryNoObservedValues(t *testing.T) {
+	root := t.TempDir()
+	png := fixtureBytes(t, "valid.png")
+	gif := fixtureBytes(t, "valid.gif")
+
+	uri := handoffFileURI(t, root, "valid.png", png)
+	outside := filepath.Join(t.TempDir(), "outside.png")
+	require.NoError(t, os.WriteFile(outside, png, 0o600))
+
+	// Every constant this file can put in front of a client. A verdict travels
+	// to the caller and into telemetry, so the set is closed by construction.
+	allowed := map[string]bool{
+		handoffRootUnsetMessage:                                                true,
+		handoffRootUnresolvedMessage:                                           true,
+		handoffOutsideRootMessage:                                              true,
+		handoffNotRegularMessage:                                               true,
+		handoffUninspectableMessage:                                            true,
+		handoffUnopenableMessage:                                               true,
+		handoffUnreadableMessage:                                               true,
+		handoffSizeMismatchMessage:                                             true,
+		handoffDigestMismatchMessage:                                           true,
+		handoffFileAbsentMessage:                                               true,
+		"handoff image requires a file uri":                                    true,
+		"handoff image uri is not a valid uri":                                 true,
+		"handoff image uri scheme must be file":                                true,
+		"handoff image uri host is not local":                                  true,
+		"handoff image uri path must be absolute":                              true,
+		"unsupported handoff metadata version":                                 true,
+		"handoff digest must be 64 lowercase hex characters":                   true,
+		"handoff sizeBytes must be a non-negative integer":                     true,
+		"handoff image requires " + handoffMetaKey + " block metadata":         true,
+		"handoff metadata must contain exactly version, digest, and sizeBytes": true,
+	}
+
+	tampered := append([]byte(nil), png...)
+	tampered[len(tampered)-1] ^= 0xFF
+	tamperedURI := handoffFileURI(t, root, "tampered.png", tampered)
+
+	cases := []acp.ContentBlock{
+		handoffImageBlock(uri, "image/png", nil),
+		handoffImageBlock("file://"+filepath.ToSlash(outside), "image/png", handoffEnvelopeFor(png)),
+		handoffImageBlock(fileURIFor(filepath.Join(root, "absent.png")), "image/png", handoffEnvelopeFor(png)),
+		handoffImageBlock(tamperedURI, "image/png", handoffEnvelopeFor(png)),
+		handoffImageBlock(uri, "image/png", handoffEnvelopeFor(gif)),
+		handoffImageBlock("http://example.test/x.png", "image/png", handoffEnvelopeFor(png)),
+	}
+
+	for _, block := range cases {
+		_, err := validateHandoffBlock(t, root, block, defaultImageLimits())
+		require.Error(t, err)
+
+		var requestErr *acp.RequestError
+		require.ErrorAs(t, err, &requestErr)
+
+		data, ok := requestErr.Data.(map[string]any)
+		require.True(t, ok)
+
+		message, ok := data[jsonFieldMessage].(string)
+		require.True(t, ok)
+		require.True(t, allowed[message], "message is not a declared constant: %q", message)
+
+		// A message added later that interpolates something observed would not
+		// be in the set above, but this also fails it outright: no verdict may
+		// carry a path, a uri, a filename, a digest, or any number measured
+		// from the filesystem.
+		require.NotContains(t, message, root)
+		require.NotContains(t, message, outside)
+		require.NotContains(t, message, "valid.png")
+		require.NotContains(t, message, "file://")
+		require.NotRegexp(t, `[0-9a-f]{16}`, message)
+	}
+}
+
+func TestTextResourceBytesCountTowardPromptAggregate(t *testing.T) {
+	text := strings.Repeat("a", 4096)
+
+	// Declaring bytes as text rather than as a blob must not buy a prompt more
+	// of them than the aggregate allows.
+	blocks := []acp.ContentBlock{
+		acp.ResourceBlock(acp.EmbeddedResourceResource{TextResourceContents: &acp.TextResourceContents{
+			Uri: "file:///a.txt", Text: text,
+		}}),
+	}
+
+	mapped, err := promptToPi(t.Context(), blocks, ImageLimits{MaxInputBytesPerPrompt: int64(len(text))}, "")
+	require.NoError(t, err)
+	require.Contains(t, mapped.Message, text)
+
+	_, err = promptToPi(t.Context(), blocks, ImageLimits{MaxInputBytesPerPrompt: int64(len(text)) - 1}, "")
+	details := requireResourceParamError(t, err, imageErrorTooLarge, 0)
+	require.InDelta(t, float64(len(text)), details[jsonFieldSizeBytes], 0)
+	require.InDelta(t, float64(len(text)-1), details[jsonFieldMaxBytes], 0)
 }
 
 func TestHandoffBytesCountTowardPromptAggregate(t *testing.T) {
@@ -581,11 +925,11 @@ func TestHandoffBytesCountTowardPromptAggregate(t *testing.T) {
 		handoffImageBlock(gifURI, "image/gif", handoffEnvelopeFor(gif)),
 	}
 
-	mapped, err := promptToPi(blocks, ImageLimits{MaxInputBytesPerPrompt: total}, root)
+	mapped, err := promptToPi(t.Context(), blocks, ImageLimits{MaxInputBytesPerPrompt: total}, root)
 	require.NoError(t, err)
 	require.Len(t, mapped.Images, 2)
 
-	_, err = promptToPi(blocks, ImageLimits{MaxInputBytesPerPrompt: total - 1}, root)
+	_, err = promptToPi(t.Context(), blocks, ImageLimits{MaxInputBytesPerPrompt: total - 1}, root)
 	details := requireImageParamError(t, err, imageErrorTooLarge, 1)
 	require.InDelta(t, float64(total), details[jsonFieldSizeBytes], 0)
 	require.InDelta(t, float64(total-1), details[jsonFieldMaxBytes], 0)
@@ -596,7 +940,7 @@ func TestHandoffSharesIndexSequenceWithEmbeddedForms(t *testing.T) {
 	png := fixtureBytes(t, "valid.png")
 	webpMime := "image/webp"
 
-	_, err := promptToPi([]acp.ContentBlock{
+	_, err := promptToPi(t.Context(), []acp.ContentBlock{
 		acp.ImageBlock(base64.StdEncoding.EncodeToString(png), "image/png"),
 		acp.ResourceBlock(acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{
 			Uri: "file:///b.webp", Blob: fixtureBase64(t, "valid.webp"), MimeType: &webpMime,
@@ -615,13 +959,13 @@ func TestHandoffNativeRequestMatchesEmbedded(t *testing.T) {
 	png := fixtureBytes(t, "valid.png")
 	uri := handoffFileURI(t, root, "nested/deep/valid.png", png)
 
-	handoff, err := promptToPi([]acp.ContentBlock{
+	handoff, err := promptToPi(t.Context(), []acp.ContentBlock{
 		acp.TextBlock("describe this"),
 		handoffImageBlock(uri, "image/png", handoffEnvelopeFor(png)),
 	}, defaultImageLimits(), root)
 	require.NoError(t, err)
 
-	embedded, err := promptToPi([]acp.ContentBlock{
+	embedded, err := promptToPi(t.Context(), []acp.ContentBlock{
 		acp.TextBlock("describe this"),
 		acp.ImageBlock(base64.StdEncoding.EncodeToString(png), "image/png"),
 	}, defaultImageLimits(), root)
@@ -658,10 +1002,51 @@ func TestHandoffErrorReportsItsCause(t *testing.T) {
 	require.EqualError(t, failure, handoffFileAbsentMessage)
 }
 
-func TestPathWithinRoot(t *testing.T) {
-	root := filepath.Join(string(filepath.Separator), "handoff", "root")
+func TestHandoffEnvelopeAcceptsNumbersFromADecoder(t *testing.T) {
+	root := t.TempDir()
+	png := fixtureBytes(t, "valid.png")
+	uri := handoffFileURI(t, root, "valid.png", png)
+	sum := sha256.Sum256(png)
 
-	require.True(t, pathWithinRoot(root, root))
-	require.True(t, pathWithinRoot(filepath.Join(root, "a.png"), root))
-	require.False(t, pathWithinRoot(filepath.Join(string(filepath.Separator), "handoff", "rootsibling"), root))
+	raw := fmt.Sprintf(`{"version":1,"digest":%q,"sizeBytes":%d}`, hex.EncodeToString(sum[:]), len(png))
+
+	// The pinned SDK decodes envelope numbers to float64, but a decoder asked
+	// for json.Number is one upstream flag away and must validate identically.
+	for _, useNumber := range []bool{false, true} {
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		if useNumber {
+			decoder.UseNumber()
+		}
+
+		var envelope map[string]any
+
+		require.NoError(t, decoder.Decode(&envelope))
+
+		encoded, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", envelope), defaultImageLimits())
+		require.NoError(t, err, "useNumber=%v", useNumber)
+		require.Equal(t, base64.StdEncoding.EncodeToString(png), encoded)
+	}
+}
+
+func TestHandoffRelativePath(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "root")
+
+	rel, failure := handoffRelativePath(root, filepath.Join(root, "sub", "a.png"))
+	require.Nil(t, failure)
+	require.Equal(t, filepath.Join("sub", "a.png"), rel)
+
+	// A sibling whose name merely starts with the root is not under it.
+	_, failure = handoffRelativePath(root, filepath.Join(string(filepath.Separator), "rootx", "a.png"))
+	require.NotNil(t, failure)
+	require.Equal(t, imageErrorPathNotAllowed, failure.value)
+
+	_, failure = handoffRelativePath(root, filepath.Join(string(filepath.Separator), "etc", "passwd"))
+	require.NotNil(t, failure)
+	require.Equal(t, imageErrorPathNotAllowed, failure.value)
+
+	// The root itself is relative to itself, and is refused later for not being
+	// a regular file rather than for being out of the root.
+	rel, failure = handoffRelativePath(root, root)
+	require.Nil(t, failure)
+	require.Equal(t, ".", rel)
 }

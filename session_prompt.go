@@ -44,7 +44,7 @@ type piPrompt struct {
 // handoff file's bytes are encoded into the native request and the handoff
 // path itself never leaves the validation read. Image validation is
 // deterministic and stops on the first failing block in request order.
-func promptToPi(prompt []acp.ContentBlock, limits ImageLimits, handoffRoot string) (piPrompt, error) {
+func promptToPi(ctx context.Context, prompt []acp.ContentBlock, limits ImageLimits, handoffRoot string) (piPrompt, error) {
 	if len(prompt) == 0 {
 		return piPrompt{}, acp.NewInvalidParams(map[string]any{jsonFieldError: validationUnsupported, jsonFieldField: fieldPrompt})
 	}
@@ -54,7 +54,13 @@ func promptToPi(prompt []acp.ContentBlock, limits ImageLimits, handoffRoot strin
 	images := make([]pi.ImageContent, 0)
 	budget := newPromptImageBudget(limits, handoffRoot)
 
+	defer budget.closeHandoffRoot()
+
 	for _, block := range prompt {
+		if err := ctx.Err(); err != nil {
+			return piPrompt{}, err
+		}
+
 		switch {
 		case block.Text != nil:
 			if textAudienceIsUserOnly(block.Text.Annotations) {
@@ -63,7 +69,7 @@ func promptToPi(prompt []acp.ContentBlock, limits ImageLimits, handoffRoot strin
 
 			textParts = append(textParts, block.Text.Text)
 		case block.Image != nil:
-			data, err := budget.validateBlock(block.Image)
+			data, err := budget.validateBlock(ctx, block.Image)
 			if err != nil {
 				return piPrompt{}, err
 			}
@@ -103,6 +109,10 @@ func promptToPi(prompt []acp.ContentBlock, limits ImageLimits, handoffRoot strin
 
 func resourceToPi(resource acp.EmbeddedResourceResource, budget *promptImageBudget) (string, string, *pi.ImageContent, error) {
 	if resource.TextResourceContents != nil {
+		if err := budget.chargeText(int64(len(resource.TextResourceContents.Text))); err != nil {
+			return "", "", nil, err
+		}
+
 		contextText := contextResourceText(resource.TextResourceContents.Uri, resource.TextResourceContents.Text)
 		text := strings.TrimSpace(resource.TextResourceContents.Uri)
 
@@ -182,7 +192,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		return acp.PromptResponse{}, poisonErr
 	}
 
-	mapped, err := promptToPi(params.Prompt, s.agent.imageLimits(), s.agent.inputHandoffRoot())
+	mapped, err := promptToPi(ctx, params.Prompt, s.agent.imageLimits(), s.agent.inputHandoffRoot())
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}

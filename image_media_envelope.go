@@ -32,7 +32,7 @@ func (a *Agent) mediaEnvelope() map[string]any {
 
 	return map[string]any{
 		mediaEnvelopeFieldMaxBytes:        effectiveInputImageLimit(limits.MaxInputBytesPerImage),
-		mediaEnvelopeFieldMaxPromptBytes:  limits.MaxInputBytesPerPrompt,
+		mediaEnvelopeFieldMaxPromptBytes:  effectiveInputPromptLimit(limits.MaxInputBytesPerPrompt),
 		mediaEnvelopeFieldMaxDimension:    mediaEnvelopeMaxDimension,
 		mediaEnvelopeFieldImageFormats:    inputImageMIMEAllowlist(),
 		mediaEnvelopeFieldDocumentFormats: mediaEnvelopeDocumentFormats,

@@ -35,6 +35,20 @@ func TestMediaEnvelopeAdvertisedShape(t *testing.T) {
 	require.Contains(t, string(encoded), `"documentFormats":[]`)
 }
 
+// paddedPNG grows a valid PNG to exactly size bytes. The structural walk stops
+// at the first IDAT chunk, so trailing bytes leave the image readable and let a
+// byte-limit case be built at any size the gates care about.
+func paddedPNG(t *testing.T, png []byte, size int64) []byte {
+	t.Helper()
+
+	require.GreaterOrEqual(t, size, int64(len(png)))
+
+	padded := make([]byte, size)
+	copy(padded, png)
+
+	return padded
+}
+
 func TestMediaEnvelopeAdvertisesTheEnforcedPerImageGate(t *testing.T) {
 	png := fixtureBytes(t, "valid.png")
 	size := int64(len(png))
@@ -59,10 +73,9 @@ func TestMediaEnvelopeAdvertisesTheEnforcedPerImageGate(t *testing.T) {
 			// The advertised bound is the one the gate enforces: a payload at
 			// the bound passes and one byte past it is rejected against the
 			// same number.
-			budget := newPromptImageBudget(limits, "")
-			require.NoError(t, budget.validateBytes(0, png, "image/png", advertised))
+			require.NoError(t, newPromptImageBudget(limits, "").validateBytes(fieldPromptImage, 0, paddedPNG(t, png, advertised), "image/png"))
 
-			err := newPromptImageBudget(limits, "").validateBytes(0, png, "image/png", advertised+1)
+			err := newPromptImageBudget(limits, "").validateBytes(fieldPromptImage, 0, paddedPNG(t, png, advertised+1), "image/png")
 			details := requireImageParamError(t, err, imageErrorTooLarge, 0)
 			require.InDelta(t, float64(advertised+1), details[jsonFieldSizeBytes], 0)
 			require.InDelta(t, float64(advertised), details[jsonFieldMaxBytes], 0)
@@ -71,16 +84,23 @@ func TestMediaEnvelopeAdvertisesTheEnforcedPerImageGate(t *testing.T) {
 }
 
 func TestMediaEnvelopeAdvertisesTheEnforcedPromptGate(t *testing.T) {
+	png := fixtureBytes(t, "valid.png")
+
 	limits := ImageLimits{MaxInputBytesPerPrompt: 4096}
 	advertised, ok := NewAgent(WithImageLimits(limits)).mediaEnvelope()[mediaEnvelopeFieldMaxPromptBytes].(int64)
 	require.True(t, ok)
 	require.Equal(t, limits.MaxInputBytesPerPrompt, advertised)
 
-	png := fixtureBytes(t, "valid.png")
-
+	// The advertised aggregate is the one the gate enforces: it is the number
+	// the aggregate rejection reports, not the configured field restated.
 	budget := newPromptImageBudget(limits, "")
-	require.NoError(t, budget.validateBytes(0, png, "image/png", advertised))
-	require.Error(t, budget.validateBytes(1, png, "image/png", 1))
+	payload := paddedPNG(t, png, 3000)
+	require.NoError(t, budget.validateBytes(fieldPromptImage, 0, payload, "image/png"))
+
+	err := budget.validateBytes(fieldPromptImage, 1, payload, "image/png")
+	details := requireImageParamError(t, err, imageErrorTooLarge, 1)
+	require.InDelta(t, float64(6000), details[jsonFieldSizeBytes], 0)
+	require.InDelta(t, float64(advertised), details[jsonFieldMaxBytes], 0)
 }
 
 func TestMediaEnvelopeImageFormatsAreTheAllowlist(t *testing.T) {

@@ -91,6 +91,16 @@ func effectiveInputImageLimit(configured int64) int64 {
 	return configured
 }
 
+// effectiveInputPromptLimit resolves the configured per-prompt aggregate input
+// limit into the bound the gate enforces. A disabled (zero) aggregate stays
+// disabled: the handoff-form block count bounds the read work instead, so
+// restating "disabled" as a byte number would reject the multi-image turn the
+// handoff form exists to carry. Advertisement and gate both read this, so the
+// number a host is told is the number it is judged by.
+func effectiveInputPromptLimit(configured int64) int64 {
+	return configured
+}
+
 // effectiveOutputImageLimit resolves one configured output policy limit into
 // the enforceable bound: a disabled (zero) or above-frame limit clamps to the
 // frame bound because an oversize update frame is a consumer disconnect, not

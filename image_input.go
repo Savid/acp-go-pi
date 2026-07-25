@@ -1,8 +1,10 @@
 package piacp
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
+	"os"
 	"slices"
 	"strings"
 
@@ -59,9 +61,13 @@ func inboundMediaTypeRoute(declared string) string {
 	return strings.ToLower(strings.TrimSpace(essence))
 }
 
-func imagePromptError(errValue string, index int, sizeBytes int64, maxBytes int64) *acp.RequestError {
+// promptMediaError reports a gated-media verdict against the request member the
+// block arrived on. Routing is chosen by MIME and the field is chosen by the
+// inbound block type, so a resource blob reports the resource channel even when
+// its declared raster type sent it through the image chain.
+func promptMediaError(field string, errValue string, index int, sizeBytes int64, maxBytes int64) *acp.RequestError {
 	data := map[string]any{
-		jsonFieldField: fieldPromptImage,
+		jsonFieldField: field,
 		jsonFieldError: errValue,
 		jsonFieldIndex: index,
 	}
@@ -77,22 +83,34 @@ func imagePromptError(errValue string, index int, sizeBytes int64, maxBytes int6
 	return acp.NewInvalidParams(data)
 }
 
+func imagePromptError(errValue string, index int, sizeBytes int64, maxBytes int64) *acp.RequestError {
+	return promptMediaError(fieldPromptImage, errValue, index, sizeBytes, maxBytes)
+}
+
 // promptImageBudget validates prompt images in request order and stops on the
 // first failure. Image blocks and embedded image blob resources share one
 // stable index sequence and one per-prompt decoded-byte budget, whichever form
 // carried their bytes.
 type promptImageBudget struct {
-	perImage    int64
-	perPrompt   int64
-	total       int64
-	nextIndex   int
-	handoffRoot string
+	perImage  int64
+	perPrompt int64
+	total     int64
+	nextIndex int
+	// handoffBlocks counts the handoff-form blocks this prompt has asked the
+	// adapter to read, which is bounded independently of the byte aggregate a
+	// host may disable.
+	handoffBlocks int
+	handoffRoot   string
+	// root is the opened read root, held for the life of one prompt mapping so
+	// every handoff open in that prompt is relative to one kernel-checked
+	// descriptor.
+	root *os.Root
 }
 
 func newPromptImageBudget(limits ImageLimits, handoffRoot string) *promptImageBudget {
 	return &promptImageBudget{
 		perImage:    effectiveInputImageLimit(limits.MaxInputBytesPerImage),
-		perPrompt:   limits.MaxInputBytesPerPrompt,
+		perPrompt:   effectiveInputPromptLimit(limits.MaxInputBytesPerPrompt),
 		handoffRoot: handoffRoot,
 	}
 }
@@ -102,11 +120,11 @@ func newPromptImageBudget(limits ImageLimits, handoffRoot string) *promptImageBu
 // data is the embedded form even when a handoff envelope rides alongside it;
 // empty data plus handoff intent runs the handoff pre-gate ahead of every
 // embedded-form gate; empty data with neither is missing_data.
-func (b *promptImageBudget) validateBlock(block *acp.ContentBlockImage) (string, error) {
+func (b *promptImageBudget) validateBlock(ctx context.Context, block *acp.ContentBlockImage) (string, error) {
 	index := b.nextImageIndex()
 
 	if block.Data != "" {
-		if err := b.validateEmbedded(index, block.Data, block.MimeType); err != nil {
+		if err := b.validateEmbedded(fieldPromptImage, index, block.Data, block.MimeType); err != nil {
 			return "", err
 		}
 
@@ -117,12 +135,12 @@ func (b *promptImageBudget) validateBlock(block *acp.ContentBlockImage) (string,
 		return "", imagePromptError(imageErrorMissingData, index, 0, 0)
 	}
 
-	data, size, failure := b.handoffBytes(block)
+	data, failure := b.handoffBytes(ctx, block)
 	if failure != nil {
 		return "", imageHandoffError(failure, index)
 	}
 
-	if err := b.validateBytes(index, data, block.MimeType, size); err != nil {
+	if err := b.validateBytes(fieldPromptImage, index, data, block.MimeType); err != nil {
 		return "", err
 	}
 
@@ -131,14 +149,16 @@ func (b *promptImageBudget) validateBlock(block *acp.ContentBlockImage) (string,
 
 // validate runs the embedded-form pipeline for one image blob resource:
 // required data, canonical MIME, one base64 decode, then the shared gate chain.
+// The bytes arrived on a resource block, so every verdict names that member
+// even though a raster declaration is what routed them here.
 func (b *promptImageBudget) validate(data string, mimeType string) error {
 	index := b.nextImageIndex()
 
 	if data == "" {
-		return imagePromptError(imageErrorMissingData, index, 0, 0)
+		return promptMediaError(fieldPromptResource, imageErrorMissingData, index, 0, 0)
 	}
 
-	return b.validateEmbedded(index, data, mimeType)
+	return b.validateEmbedded(fieldPromptResource, index, data, mimeType)
 }
 
 func (b *promptImageBudget) nextImageIndex() int {
@@ -148,56 +168,67 @@ func (b *promptImageBudget) nextImageIndex() int {
 	return index
 }
 
-func (b *promptImageBudget) validateEmbedded(index int, data string, mimeType string) error {
+func (b *promptImageBudget) validateEmbedded(field string, index int, data string, mimeType string) error {
 	if !allowedInputImageMIME(mimeType) {
-		return imagePromptError(imageErrorInvalidMediaType, index, 0, 0)
+		return promptMediaError(field, imageErrorInvalidMediaType, index, 0, 0)
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
-		return imagePromptError(imageErrorInvalidBase64, index, 0, 0)
+		return promptMediaError(field, imageErrorInvalidBase64, index, 0, 0)
 	}
 
-	return b.validateBytes(index, decoded, mimeType, int64(len(decoded)))
+	return b.validateBytes(field, index, decoded, mimeType)
 }
 
 // validateBytes runs the gate chain shared by both input forms over decoded
-// bytes: canonical MIME, decode-free container inspection, animation
-// rejection, declared-versus-sniffed agreement, then the per-image and
-// aggregate decoded-byte limits. size is the byte count the limits account
-// for; it exceeds len(decoded) only for a handoff file read up to the bound,
-// where the file's real size is the truthful number. Corruption in container
-// regions the structural walk never touches is deliberately forwarded; the
-// native provider outcome stands for those bytes.
-func (b *promptImageBudget) validateBytes(index int, decoded []byte, mimeType string, size int64) error {
-	if !allowedInputImageMIME(mimeType) {
-		return imagePromptError(imageErrorInvalidMediaType, index, 0, 0)
-	}
+// bytes: decode-free container inspection, animation rejection, declared-versus-sniffed agreement, then the per-image and
+// aggregate decoded-byte limits. Both forms deliver every byte they account
+// for — a handoff read past the per-image bound is rejected where it is read —
+// so the byte the limits count is the byte that arrived. Corruption in
+// container regions the structural walk never touches is deliberately
+// forwarded; the native provider outcome stands for those bytes.
+func (b *promptImageBudget) validateBytes(field string, index int, decoded []byte, mimeType string) error {
+	size := int64(len(decoded))
 
 	info, err := raster.Inspect(decoded)
 
 	switch {
 	case errors.Is(err, raster.ErrUnknownFormat):
-		return imagePromptError(imageErrorMediaTypeMismatch, index, 0, 0)
+		return promptMediaError(field, imageErrorMediaTypeMismatch, index, 0, 0)
 	case err != nil:
-		return imagePromptError(imageErrorInvalidDimensions, index, 0, 0)
+		return promptMediaError(field, imageErrorInvalidDimensions, index, 0, 0)
 	}
 
 	if info.Animated {
-		return imagePromptError(imageErrorAnimated, index, 0, 0)
+		return promptMediaError(field, imageErrorAnimated, index, 0, 0)
 	}
 
 	if info.MIME != mimeType {
-		return imagePromptError(imageErrorMediaTypeMismatch, index, 0, 0)
+		return promptMediaError(field, imageErrorMediaTypeMismatch, index, 0, 0)
 	}
 
 	if size > b.perImage {
-		return imagePromptError(imageErrorTooLarge, index, size, b.perImage)
+		return promptMediaError(field, imageErrorTooLarge, index, size, b.perImage)
 	}
 
 	b.total += size
 	if b.perPrompt > 0 && b.total > b.perPrompt {
-		return imagePromptError(imageErrorTooLarge, index, b.total, b.perPrompt)
+		return promptMediaError(field, imageErrorTooLarge, index, b.total, b.perPrompt)
+	}
+
+	return nil
+}
+
+// chargeText adds a text resource's bytes to the same per-prompt accumulator the
+// media forms use. Bytes are bytes: declaring them as text rather than as a blob
+// must not buy a prompt more of them than maxPromptBytes allows. It reports at
+// the position the next media block would take without consuming it, because a
+// text resource carries no media the index is meant to identify.
+func (b *promptImageBudget) chargeText(size int64) error {
+	b.total += size
+	if b.perPrompt > 0 && b.total > b.perPrompt {
+		return promptMediaError(fieldPromptResource, imageErrorTooLarge, b.nextIndex, b.total, b.perPrompt)
 	}
 
 	return nil

@@ -12,7 +12,11 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
-func requireImageParamError(t *testing.T, err error, value string, index int) map[string]any {
+// requireMediaParamError asserts one -32602 gated-media verdict, including the
+// request member it names. The member follows the block the bytes arrived on,
+// so a resource blob and an image block reporting the same gate still report
+// different fields.
+func requireMediaParamError(t *testing.T, err error, field string, value string, index int) map[string]any {
 	t.Helper()
 
 	var requestError *acp.RequestError
@@ -26,11 +30,23 @@ func requireImageParamError(t *testing.T, err error, value string, index int) ma
 	var data map[string]any
 
 	require.NoError(t, json.Unmarshal(encoded, &data))
-	require.Equal(t, fieldPromptImage, data[jsonFieldField])
+	require.Equal(t, field, data[jsonFieldField])
 	require.Equal(t, value, data[jsonFieldError])
 	require.InDelta(t, float64(index), data[jsonFieldIndex], 0)
 
 	return data
+}
+
+func requireImageParamError(t *testing.T, err error, value string, index int) map[string]any {
+	t.Helper()
+
+	return requireMediaParamError(t, err, fieldPromptImage, value, index)
+}
+
+func requireResourceParamError(t *testing.T, err error, value string, index int) map[string]any {
+	t.Helper()
+
+	return requireMediaParamError(t, err, fieldPromptResource, value, index)
 }
 
 func TestPromptImageValidationTaxonomy(t *testing.T) {
@@ -58,7 +74,7 @@ func TestPromptImageValidationTaxonomy(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			budget := newPromptImageBudget(defaultImageLimits(), "")
 			err := budget.validate(test.data, test.mimeType)
-			requireImageParamError(t, err, test.want, 0)
+			requireResourceParamError(t, err, test.want, 0)
 		})
 	}
 }
@@ -87,7 +103,7 @@ func TestPromptImagePerImageLimitBoundary(t *testing.T) {
 
 	oneUnder := newPromptImageBudget(ImageLimits{MaxInputBytesPerImage: size - 1}, "")
 	err := oneUnder.validate(data, "image/png")
-	details := requireImageParamError(t, err, imageErrorTooLarge, 0)
+	details := requireResourceParamError(t, err, imageErrorTooLarge, 0)
 	require.InDelta(t, float64(size), details[jsonFieldSizeBytes], 0)
 	require.InDelta(t, float64(size-1), details[jsonFieldMaxBytes], 0)
 }
@@ -108,7 +124,7 @@ func TestPromptImageAggregateLimitBoundary(t *testing.T) {
 	require.NoError(t, validateBoth(newPromptImageBudget(ImageLimits{MaxInputBytesPerPrompt: total}, "")))
 
 	err := validateBoth(newPromptImageBudget(ImageLimits{MaxInputBytesPerPrompt: total - 1}, ""))
-	details := requireImageParamError(t, err, imageErrorTooLarge, 1)
+	details := requireResourceParamError(t, err, imageErrorTooLarge, 1)
 	require.InDelta(t, float64(total), details[jsonFieldSizeBytes], 0)
 	require.InDelta(t, float64(total-1), details[jsonFieldMaxBytes], 0)
 }
@@ -125,7 +141,7 @@ func TestPromptToPiImageOrderAndSharedBudget(t *testing.T) {
 	webp := fixtureBase64(t, "valid.webp")
 	webpMime := "image/webp"
 
-	mapped, err := promptToPi([]acp.ContentBlock{
+	mapped, err := promptToPi(t.Context(), []acp.ContentBlock{
 		acp.TextBlock("before"),
 		acp.ImageBlock(png, "image/png"),
 		acp.ImageBlock(gif, "image/gif"),
@@ -148,20 +164,20 @@ func TestPromptToPiImageOrderAndSharedBudget(t *testing.T) {
 	pngBytes := int64(len(fixtureBytes(t, "valid.png")))
 	gifBytes := int64(len(fixtureBytes(t, "valid.gif")))
 	webpBytes := int64(len(fixtureBytes(t, "valid.webp")))
-	_, err = promptToPi([]acp.ContentBlock{
+	_, err = promptToPi(t.Context(), []acp.ContentBlock{
 		acp.ImageBlock(png, "image/png"),
 		acp.ImageBlock(gif, "image/gif"),
 		acp.ResourceBlock(acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{
 			Uri: "file:///c.webp", Blob: webp, MimeType: &webpMime,
 		}}),
 	}, ImageLimits{MaxInputBytesPerPrompt: pngBytes + gifBytes + webpBytes - 1}, "")
-	requireImageParamError(t, err, imageErrorTooLarge, 2)
+	requireResourceParamError(t, err, imageErrorTooLarge, 2)
 }
 
 func TestPromptToPiFirstFailureWins(t *testing.T) {
 	png := fixtureBase64(t, "valid.png")
 
-	_, err := promptToPi([]acp.ContentBlock{
+	_, err := promptToPi(t.Context(), []acp.ContentBlock{
 		acp.ImageBlock(png, "image/png"),
 		acp.ImageBlock(fixtureBase64(t, "animated.gif"), "image/gif"),
 		acp.ImageBlock("", "image/png"),
@@ -169,12 +185,12 @@ func TestPromptToPiFirstFailureWins(t *testing.T) {
 	requireImageParamError(t, err, imageErrorAnimated, 1)
 
 	svgMime := "image/svg+xml"
-	_, err = promptToPi([]acp.ContentBlock{
+	_, err = promptToPi(t.Context(), []acp.ContentBlock{
 		acp.ResourceBlock(acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{
 			Uri: "file:///a.svg", Blob: png, MimeType: &svgMime,
 		}}),
 	}, defaultImageLimits(), "")
-	requireImageParamError(t, err, imageErrorInvalidMediaType, 0)
+	requireResourceParamError(t, err, imageErrorInvalidMediaType, 0)
 }
 
 // TestDisabledPerImageLimitClampsTheReadBound pins that a disabled per-image
@@ -214,22 +230,22 @@ func TestGatedMediaIndexCounter(t *testing.T) {
 	}})
 
 	t.Run("a gated blob consumes the counter whatever its mime", func(t *testing.T) {
-		_, err := promptToPi([]acp.ContentBlock{
+		_, err := promptToPi(t.Context(), []acp.ContentBlock{
 			acp.ImageBlock(png, "image/png"),
 			svgBlob,
 		}, defaultImageLimits(), "")
-		requireImageParamError(t, err, imageErrorInvalidMediaType, 1)
+		requireResourceParamError(t, err, imageErrorInvalidMediaType, 1)
 
-		_, err = promptToPi([]acp.ContentBlock{
+		_, err = promptToPi(t.Context(), []acp.ContentBlock{
 			acp.ImageBlock(png, "image/png"),
 			acp.ImageBlock(png, "image/png"),
 			tiffBlob,
 		}, defaultImageLimits(), "")
-		requireImageParamError(t, err, imageErrorInvalidMediaType, 2)
+		requireResourceParamError(t, err, imageErrorInvalidMediaType, 2)
 	})
 
 	t.Run("ungated blocks never consume the counter", func(t *testing.T) {
-		_, err := promptToPi([]acp.ContentBlock{
+		_, err := promptToPi(t.Context(), []acp.ContentBlock{
 			acp.TextBlock("before"),
 			acp.ResourceLinkBlock("link", "https://example.test"),
 			acp.ResourceBlock(acp.EmbeddedResourceResource{TextResourceContents: &acp.TextResourceContents{
@@ -237,7 +253,7 @@ func TestGatedMediaIndexCounter(t *testing.T) {
 			}}),
 			svgBlob,
 		}, defaultImageLimits(), "")
-		requireImageParamError(t, err, imageErrorInvalidMediaType, 0)
+		requireResourceParamError(t, err, imageErrorInvalidMediaType, 0)
 	})
 }
 
@@ -286,12 +302,12 @@ func TestBlobResourceMediaTypeRouting(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			mimeType := test.mimeType
-			_, err := promptToPi([]acp.ContentBlock{
+			_, err := promptToPi(t.Context(), []acp.ContentBlock{
 				acp.ResourceBlock(acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{
 					Uri: "file:///a.png", Blob: png, MimeType: &mimeType,
 				}}),
 			}, defaultImageLimits(), "")
-			requireImageParamError(t, err, test.want, 0)
+			requireResourceParamError(t, err, test.want, 0)
 		})
 	}
 }
@@ -324,7 +340,7 @@ func TestNonImageBlobResourceRefused(t *testing.T) {
 				blob.MimeType = &mimeType
 			}
 
-			_, err := promptToPi([]acp.ContentBlock{
+			_, err := promptToPi(t.Context(), []acp.ContentBlock{
 				acp.ResourceBlock(acp.EmbeddedResourceResource{BlobResourceContents: blob}),
 			}, defaultImageLimits(), "")
 
@@ -340,16 +356,18 @@ func TestNonImageBlobResourceRefused(t *testing.T) {
 
 			require.NoError(t, json.Unmarshal(encoded, &data))
 
-			// An svg declaration routes to the image path and is rejected by the
-			// allowlist; every other non-image blob is refused as a resource.
+			// Every one of these arrived on a resource block, so every verdict
+			// names that member whichever gate chain the declaration routed it
+			// into: an svg declaration reaches the image allowlist, and the rest
+			// are refused as resources.
+			require.Equal(t, fieldPromptResource, data[jsonFieldField])
+
 			if test.mimeType == "image/svg+xml" {
-				require.Equal(t, fieldPromptImage, data[jsonFieldField])
 				require.Equal(t, imageErrorInvalidMediaType, data[jsonFieldError])
 
 				return
 			}
 
-			require.Equal(t, fieldPromptResource, data[jsonFieldField])
 			require.Equal(t, validationUnsupported, data[jsonFieldError])
 			require.NotContains(t, encoded, test.blob)
 		})

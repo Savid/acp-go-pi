@@ -30,7 +30,7 @@ func TestPromptContentMapping(t *testing.T) {
 	ignored := acp.TextBlock("ignored")
 	ignored.Text.Annotations = userAnnotations
 
-	mapped, err := promptToPi([]acp.ContentBlock{
+	mapped, err := promptToPi(t.Context(), []acp.ContentBlock{
 		acp.TextBlock("hello"), ignored,
 		acp.ImageBlock(png, "image/png"),
 		acp.ResourceLinkBlock("link", " https://example.test "),
@@ -54,7 +54,7 @@ func TestPromptContentMapping(t *testing.T) {
 		{acp.ResourceBlock(acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{Uri: "x", Blob: "data"}})},
 	}
 	for _, blocks := range invalid {
-		_, invalidErr := promptToPi(blocks, defaultImageLimits(), "")
+		_, invalidErr := promptToPi(t.Context(), blocks, defaultImageLimits(), "")
 		requireInvalidParams(t, invalidErr)
 	}
 
