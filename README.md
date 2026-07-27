@@ -108,6 +108,9 @@ start; use the scratch directory to place per-session on-disk state.
   explicitly seeded extension dialogs.
 - MCP stdio and HTTP server declarations through a wrapper-owned,
   dependency-free pi MCP client extension.
+- Provider logins brokered for a worker through seven `_pi/auth/*` extension
+  methods, advertised only when both a durable agent directory and a durable
+  provider-auth ledger root are configured.
 - Optional durable mirroring through a host-provided `SessionStore`.
 - Optional raw pi event extension notifications.
 - OpenTelemetry spans, metrics, trace propagation, and structured logs

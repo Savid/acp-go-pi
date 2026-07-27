@@ -46,7 +46,138 @@ const (
 	PermissionOptionAllow = "allow"
 	// PermissionOptionDeny is the select option that blocks the tool call.
 	PermissionOptionDeny = "deny"
+
+	// AuthTitleMarker prefixes every dialog title the bridge extension raises
+	// for a provider-auth exchange. The remainder is the JSON-encoded
+	// AuthMessage.
+	AuthTitleMarker = "acp-go-pi:auth:"
+
+	// AuthCommandName is the wrapper-owned slash command that carries one
+	// provider-auth request into the bridge extension. It is never advertised
+	// as an ACP available command.
+	AuthCommandName = "acp-auth"
+
+	// AuthAck answers a bridge dialog that only reports.
+	AuthAck = "ok"
 )
+
+// Provider-auth request operations the bridge extension implements.
+const (
+	AuthOpCatalog = "catalog"
+	AuthOpProbe   = "probe"
+	AuthOpLogin   = "login"
+	AuthOpRemove  = "remove"
+)
+
+// Provider-auth message kinds the bridge extension reports.
+const (
+	AuthKindCatalog = "catalog"
+	AuthKindProbe   = "probe"
+	AuthKindEvent   = "event"
+	AuthKindPrompt  = "prompt"
+	AuthKindResult  = "result"
+)
+
+// Native login method discriminators carried on an AuthRequest.
+const (
+	AuthMethodOAuth = "oauth"
+	AuthMethodAPI   = "api"
+)
+
+// AuthRequest is one provider-auth request encoded into the /acp-auth
+// command argument.
+type AuthRequest struct {
+	ID          string   `json:"id"`
+	Op          string   `json:"op"`
+	ProviderID  string   `json:"providerId,omitempty"`
+	Method      string   `json:"method,omitempty"`
+	ProviderIDs []string `json:"providerIds,omitempty"`
+}
+
+// AuthProvider is one entry of the executed native provider catalog.
+type AuthProvider struct {
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	OAuth *AuthOAuthEntry `json:"oauth"`
+	API   *AuthAPIEntry   `json:"api"`
+}
+
+// AuthOAuthEntry is a provider's native OAuth login method.
+type AuthOAuthEntry struct {
+	Name       string `json:"name"`
+	LoginLabel string `json:"loginLabel,omitempty"`
+}
+
+// AuthAPIEntry is a provider's native api-key login method.
+type AuthAPIEntry struct {
+	Name string `json:"name"`
+}
+
+// AuthNativeEvent is one native login presentation event.
+type AuthNativeEvent struct {
+	Type            string `json:"type"`
+	Message         string `json:"message,omitempty"`
+	URL             string `json:"url,omitempty"`
+	Instructions    string `json:"instructions,omitempty"`
+	UserCode        string `json:"userCode,omitempty"`
+	VerificationURI string `json:"verificationUri,omitempty"`
+	IntervalSeconds int64  `json:"intervalSeconds,omitempty"`
+	ExpiresIn       int64  `json:"expiresInSeconds,omitempty"`
+}
+
+// AuthMessage is the payload the bridge extension encodes into a marker
+// dialog title.
+type AuthMessage struct {
+	ID       string `json:"id"`
+	Kind     string `json:"kind"`
+	Prompt   string `json:"prompt,omitempty"`
+	Message  string `json:"message,omitempty"`
+	OK       bool   `json:"ok,omitempty"`
+	Cause    string `json:"cause,omitempty"`
+	Expires  int64  `json:"expires,omitempty"`
+	CredType string `json:"credentialType,omitempty"`
+
+	Providers []AuthProvider    `json:"providers,omitempty"`
+	Entries   map[string]string `json:"entries,omitempty"`
+	Event     *AuthNativeEvent  `json:"event,omitempty"`
+}
+
+// Native prompt kinds the bridge relays from one login flow.
+const (
+	AuthPromptText       = "text"
+	AuthPromptSecret     = "secret"
+	AuthPromptSelect     = "select"
+	AuthPromptManualCode = "manual_code"
+)
+
+// EncodeAuthCommand renders one provider-auth request as the prompt text that
+// invokes the bridge command.
+func EncodeAuthCommand(request AuthRequest) string {
+	// AuthRequest is strings and a string slice, so encoding cannot fail.
+	payload, _ := json.Marshal(request)
+
+	return "/" + AuthCommandName + " " + string(payload)
+}
+
+// ParseAuthTitle recognizes a bridge provider-auth dialog title and decodes
+// its payload. It reports false for every other dialog.
+func ParseAuthTitle(title string) (AuthMessage, bool) {
+	payload, found := strings.CutPrefix(title, AuthTitleMarker)
+	if !found {
+		return AuthMessage{}, false
+	}
+
+	var message AuthMessage
+	if err := json.Unmarshal([]byte(payload), &message); err != nil {
+		return AuthMessage{}, false
+	}
+
+	if strings.TrimSpace(message.ID) == "" || strings.TrimSpace(message.Kind) == "" {
+		return AuthMessage{}, false
+	}
+
+	return message, true
+}
 
 // WriteExtensions writes the wrapper-owned extensions into dir and returns
 // their absolute paths in -e load order. The MCP extension is written only

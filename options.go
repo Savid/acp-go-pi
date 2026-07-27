@@ -70,10 +70,12 @@ type Options struct {
 
 	// ExecutablePath is the pi CLI executable path. If empty, PATH is searched.
 	ExecutablePath string
-	// Home is rejected: pi has no native config or auth root for the adapter
-	// to point at. When non-empty, every session-establishing method
-	// (session/new, load, resume, fork) fails with an unsupported-option
-	// error for field "home". Use ScratchDir to place per-session scratch.
+	// Home is the durable per-instance pi agent directory
+	// (PI_CODING_AGENT_DIR) every session runs against. Empty (the default)
+	// gives each session an isolated agent directory under the scratch
+	// parent. A durable home is what makes pi's own cross-process credential
+	// refresh lock effective, and it is required before any provider-auth leg
+	// is advertised.
 	Home string
 	// ScratchDir is the parent directory for all ephemeral on-disk
 	// materialization (per-session roots, hydration temp files, probe dirs).
@@ -127,6 +129,18 @@ type Options struct {
 	// The adapter only reads under it and never writes, moves, or removes
 	// anything there.
 	InputHandoffRoot string
+	// ProviderAuthRoot is the absolute, host-owned, durable directory holding
+	// the values-free provider-auth ledger. Empty (the default) leaves the
+	// whole `_pi/auth/*` surface unadvertised, as does a root that cannot be
+	// prepared. It is never a scratch parent and carries no auth-resolution
+	// semantics of its own.
+	ProviderAuthRoot string
+	// ProviderAuthDirectHome is the exact-home consent gate for an
+	// account-level provider-auth removal or store read. pi removes through a
+	// per-provider store call, so it has no leg to gate: a non-empty value is
+	// an unsupported option and every session-establishing method fails with
+	// an unsupported-option error for field "providerAuthDirectHome".
+	ProviderAuthDirectHome string
 
 	// imageLimitsSet records whether WithImageLimits supplied the struct; an
 	// omitted option leaves every field at its default.
@@ -193,13 +207,34 @@ func WithExecutablePath(path string) Option {
 	}
 }
 
-// WithHome sets Options.Home. pi has no native config or auth root, so a
-// non-empty value is an unsupported option: every session-establishing
-// method fails at session start. Use WithScratchDir to place per-session
-// scratch.
+// WithHome sets the durable per-instance pi agent directory every session runs
+// against. Omitting it gives each session an isolated agent directory under the
+// scratch parent, which is fine for ordinary work but disables pi's
+// cross-process credential refresh lock, so the provider-auth surface stays
+// unadvertised without it.
 func WithHome(path string) Option {
 	return func(options *Options) {
 		options.Home = path
+	}
+}
+
+// WithProviderAuthRoot sets the durable directory holding the values-free
+// provider-auth ledger. Omitting it, or naming a root that cannot be prepared,
+// leaves every `_pi/auth/*` leg unadvertised: a leg that cannot record what it
+// did must not be offered.
+func WithProviderAuthRoot(path string) Option {
+	return func(options *Options) {
+		options.ProviderAuthRoot = path
+	}
+}
+
+// WithProviderAuthDirectHome names the canonical native home an account-level
+// provider-auth leg may read or clear. pi removes a credential through a
+// per-provider store call and never performs an account-level act, so it has no
+// leg to gate: a non-empty value fails session start.
+func WithProviderAuthDirectHome(path string) Option {
+	return func(options *Options) {
+		options.ProviderAuthDirectHome = path
 	}
 }
 

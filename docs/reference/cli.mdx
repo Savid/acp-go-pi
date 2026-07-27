@@ -15,7 +15,9 @@ acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt
 | --- | --- |
 | `-path` | pi CLI executable (default: search `PATH`). |
 | `-scratch-dir` | Parent directory for all ephemeral per-session scratch (isolated agent and session directories, hydration temp files). Empty means the system temp directory. |
-| `-home` | Unsupported: pi has no native config or auth root. A non-empty value fails session start. Use `-scratch-dir` instead. |
+| `-home` | Durable per-instance pi agent directory every session runs against. Empty gives each session an isolated agent directory under the scratch parent. Required, with `-provider-auth-root`, before any provider-auth leg is advertised. |
+| `-provider-auth-root` | Absolute durable directory holding the values-free provider-auth ledger. Empty, or a root that cannot be prepared, leaves the whole `_pi/auth/*` surface unadvertised. |
+| `-provider-auth-direct-home` | Declared and rejected: pi removes a credential through a per-provider store call and has no account-level leg to gate. A non-empty value fails session start. |
 | `-model` | Default model for new sessions, as `"provider/id"`. |
 | `-seed-file` | Write a host file into each session's agent directory as `<relpath>=<hostpath>`; repeatable. |
 | `-darwin-best-effort-containment` | Explicitly accept Darwin process-group containment. Invalid off Darwin. |

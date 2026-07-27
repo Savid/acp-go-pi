@@ -1,12 +1,15 @@
 ---
 title: "Authentication"
-description: "Why the adapter advertises no auth methods and how to inject pi provider credentials"
+description: "Why the adapter advertises no auth methods, how to inject pi provider credentials, and how to broker one provider login for a worker"
 ---
 
-The adapter does not broker provider accounts. pi is bring-your-own-key across
-many providers and owns authentication natively — through provider environment
-variables and an `auth.json` in its agent directory — so there is nothing for
-a host to log into through ACP.
+ACP **agent-level** auth and **per-provider** logins are separate surfaces.
+This page covers the first: pi owns authentication natively — through provider
+environment variables and an `auth.json` in its agent directory — so there is
+nothing for a host to log into through ACP itself. Brokering a provider login
+for a worker is the second surface, and it lives on the `_pi/auth/*` extension
+methods described under [Brokering a provider login](#brokering-a-provider-login)
+below.
 
 ## No ACP auth methods
 
@@ -63,3 +66,143 @@ durable session state carries conversation rows only — see
 [Session store](/docs/features/session-store). Keep secrets in environment
 options wherever possible and prefer seeding `auth.json` only when a provider
 requires pi's own credential file format.
+
+## Brokering a provider login
+
+A worker with no credential path of its own cannot type into pi's interactive
+`/login` dialog. The `_pi/auth/*` extension methods let a host drive that login
+on the worker's behalf: enumerate the provider catalog, start one flow, hand
+back the code the provider issued, report what is resident, and remove it.
+
+The adapter is a broker and never an OAuth client. pi mints, polls, exchanges,
+refreshes, and stores; the adapter relays the presentation, carries one value
+back, and keeps a durable record of which native slot each connection owns.
+
+### Enabling the surface
+
+Two options are required together, and the legs are absent without both:
+
+```go
+err := piacp.Serve(ctx, input, output,
+	piacp.WithHome("/srv/pi/agent"),
+	piacp.WithProviderAuthRoot("/srv/pi/auth"),
+)
+```
+
+`WithHome` is the durable per-instance agent directory a completed login
+installs into. pi's credential refresh takes a cross-process lock keyed on that
+directory, so a per-session agent directory would leave the lock guarding
+nothing and the credential nowhere.
+
+`WithProviderAuthRoot` is the durable directory holding the adapter's
+values-free ledger. A root that was asked for and could not be created, is not
+a directory, or is not writable leaves the surface unadvertised exactly as an
+unset one does: a leg that cannot record what it did is not offered.
+
+`WithProviderAuthDirectHome` is declared and rejected. It gates an
+account-level removal, and pi's removal is a per-provider store call, so there
+is nothing here for it to authorize; a non-empty value fails session start.
+
+### Discovering the legs
+
+When both options are configured, ACP initialize advertises the enabled leg
+names:
+
+```json
+{
+  "agentCapabilities": {
+    "_meta": {
+      "pi": {
+        "providerAuth": {
+          "methods": [
+            "_pi/auth/methods",
+            "_pi/auth/authorize",
+            "_pi/auth/callback",
+            "_pi/auth/status",
+            "_pi/auth/cancel",
+            "_pi/auth/inventory",
+            "_pi/auth/disconnect"
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+That array is the only discovery surface. There is no `credential` leg and no
+injection key: a completed login installs into the durable agent directory and
+rotates there under pi's own lock, so nothing is brokered back out and no
+credential is accepted in.
+
+### Driving one login
+
+1. **`methods`** returns the catalog and an opaque `generation` naming that
+   exact result. Each provider carries at most one `oauth` entry and at most
+   one `api` entry, and a provider whose api-key auth is ambient-only carries
+   neither. The catalog declares no prompts: pi's provider enumeration exposes
+   none, and a login that asks for something the catalog never advertised fails
+   the flow closed.
+2. **`authorize`** takes that `generation` as `methodsGeneration` plus a
+   caller-minted `authorizeRequestId`. An `oauth` method starts the native
+   login and returns its presentation — `interaction: "callback"` with a URL
+   and a `callbackInput`, or `interaction: "wait"` with a device code and a
+   poll hint. An `api` method mints nothing and returns
+   `interaction: "secret"`.
+3. **`callback`** submits the one value the flow expects: the authorization
+   code for a paste-back login, the operator's key for a secret one. It returns
+   after pi reports a terminal outcome.
+4. **`status`** reports the flow, not the connection. Its `expiresAt` is
+   credential expiry and never flow expiry.
+5. **`cancel`** disarms the adapter's deadline and dismisses the native prompt.
+   It claims nothing about the provider: an issued device code stays valid
+   there until it expires.
+6. **`inventory`** answers residence from the ledger *and* a probe of the named
+   native slot, reporting `confirmed_present`, `confirmed_absent`, or
+   `not_confirmed`. It never reports an ambient or externally established
+   credential.
+7. **`disconnect`** bumps the binding generation, removes only the exactly
+   fenced slot, and verifies absence afterwards.
+
+Repeating an `authorizeRequestId` replays the recorded presentation verbatim
+with no native call. A *different* one supersedes the flow, after which the old
+`flowId` addresses nothing.
+
+### What crosses the boundary
+
+Only four native presentation strings reach a host — `url`, `message`,
+`userCode`, and a catalog `label` — each bounded and NFC-normalised before it is
+relayed. Native error text never crosses at all: every failure becomes
+`pi_auth_failed` with a closed `cause`. A caller addressing failure (an unknown
+`flowId`, a superseded `methodsGeneration`, a `method` that is not the flow's)
+is invalid params with the field path instead.
+
+A submitted credential beginning with `!` is refused. pi executes such a value
+as a shell command and caches its stdout as the key, so a brokered value
+reaching that field would be a remote command channel into the worker.
+
+### What the ledger holds
+
+The ledger under `WithProviderAuthRoot` records provider slot identity,
+connection ID, revision, binding generation, flow ID, `authorizeRequestId`,
+state, and timestamps — nothing else. It never holds credential material,
+authorization URLs, user codes, or prompt answers, and neither does the
+[session store](/docs/features/session-store). Writes are atomic and fsynced,
+and the files are `0700`/`0600` whatever mode pi gives its own agent directory.
+
+The ledger is a crash-consistency record, not a security control: it lives
+under the worker's own UID, beside the harness that runs model-authored code as
+that same user.
+
+### Limits worth knowing
+
+- A login whose completion lands on a loopback listener is refused at mint time
+  with `cause: "unsupported_variant"` — the owner's browser cannot reach the
+  worker's socket.
+- pi's enumeration exposes login methods and display names but not the
+  environment-variable names behind an api-key method, and it exposes no prompt
+  schema at all. A native login that asks the operator anything beyond the one
+  credential value fails closed rather than being answered with something the
+  adapter invented.
+- `pi login` is not a command. The only native login path is the interactive
+  slash command, which is what these legs drive.

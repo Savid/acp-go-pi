@@ -209,11 +209,16 @@ func TestStartSessionEarlyFailureBranches(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestStartSessionRejectsHome pins the isolation contract: pi has no native
-// config or auth root, so a configured Home fails at session start with the
-// unsupported-option error for field "home" on every establishing path.
-func TestStartSessionRejectsHome(t *testing.T) {
-	agent := NewAgent(WithExecutablePath("/fake/pi"), WithHome(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
+// TestStartSessionRejectsProviderAuthDirectHome pins the consent gate: pi
+// removes a credential through a per-provider store call and has no
+// account-level leg to gate, so a configured direct home fails at session start
+// with the unsupported-option error on every establishing path.
+func TestStartSessionRejectsProviderAuthDirectHome(t *testing.T) {
+	agent := NewAgent(
+		WithExecutablePath("/fake/pi"),
+		WithProviderAuthDirectHome(t.TempDir()),
+		WithLogger(slog.New(slog.DiscardHandler)),
+	)
 	agent.versionChecked = true
 
 	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})

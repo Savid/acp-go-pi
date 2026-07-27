@@ -19,6 +19,7 @@ Initialize advertises capability descriptors under `_meta.pi`:
 | `elicitation` | Session-scoped elicitation support. |
 | `rawEvent` | The raw-event opt-in (`enabledBy`, `maxBytes`, `defaultEnabled`). |
 | `sessionStore` | Store `format` (`pi-session-jsonl-v1`) and key shape. |
+| `providerAuth` | The enabled `_pi/auth/*` leg names, present only when both `WithHome` and `WithProviderAuthRoot` are configured. It carries no `injectionKey`: pi accepts no credential injection. See [Authentication](/docs/features/authentication). |
 
 Initialize also advertises the separate reserved capability
 `_meta["acp-go.dev/route"] = {"versions":[1]}`. Prompts and active-turn

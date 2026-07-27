@@ -49,6 +49,8 @@ func TestApplyOptionsSetters(t *testing.T) {
 		WithAgentVersion("9.9.9"),
 		WithExecutablePath("/usr/bin/pi"),
 		WithHome("/srv/pi-homes"),
+		WithProviderAuthRoot("/srv/pi-auth"),
+		WithProviderAuthDirectHome("/srv/pi-direct"),
 		WithScratchDir("/srv/pi-scratch"),
 		WithDefaultModel("openai/gpt-4o"),
 		WithEnv(env),
@@ -68,6 +70,8 @@ func TestApplyOptionsSetters(t *testing.T) {
 	require.Equal(t, "9.9.9", options.AgentVersion)
 	require.Equal(t, "/usr/bin/pi", options.ExecutablePath)
 	require.Equal(t, "/srv/pi-homes", options.Home)
+	require.Equal(t, "/srv/pi-auth", options.ProviderAuthRoot)
+	require.Equal(t, "/srv/pi-direct", options.ProviderAuthDirectHome)
 	require.Equal(t, "/srv/pi-scratch", options.ScratchDir)
 	require.Equal(t, "openai/gpt-4o", options.DefaultModel)
 	require.Equal(t, env, options.Env)

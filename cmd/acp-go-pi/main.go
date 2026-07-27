@@ -84,8 +84,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	flags.SetOutput(stderr)
 
 	piPath := flags.String("path", "", "path to pi CLI")
-	piHome := flags.String("home", "", "unsupported: pi has no native config root; a non-empty value fails session start")
+	piHome := flags.String("home", "", "durable per-instance pi agent directory; empty gives each session an isolated one")
 	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
+	providerAuthRoot := flags.String("provider-auth-root", "", "durable root holding the provider-auth ledger; empty leaves the provider-auth surface unadvertised")
+	providerAuthDirectHome := flags.String("provider-auth-direct-home", "", "canonical native home an account-level provider-auth leg may read or clear; rejected by this adapter")
 	darwinBestEffort := flags.Bool("darwin-best-effort-containment", false, "opt into Darwin process-group containment with residual escape and PGID-reuse risks")
 	model := flags.String("model", "", "default pi model as provider/id")
 	seedFiles := &seedFileFlag{}
@@ -147,6 +149,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		piacp.WithExecutablePath(*piPath),
 		piacp.WithHome(*piHome),
 		piacp.WithScratchDir(*scratchDir),
+		piacp.WithProviderAuthRoot(*providerAuthRoot),
+		piacp.WithProviderAuthDirectHome(*providerAuthDirectHome),
 		piacp.WithDefaultModel(*model),
 		piacp.WithLogger(logger),
 	)

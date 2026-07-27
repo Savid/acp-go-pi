@@ -44,7 +44,9 @@ Darwin.
 | --- | --- |
 | `WithExecutablePath` | Set the pi CLI path (default: search `PATH`). |
 | `WithScratchDir` | Parent directory for all ephemeral on-disk state (isolated per-session agent and session directories, hydration temp files, probe dirs). Empty means the system temp directory; created `0700` when missing. |
-| `WithHome` | Unsupported: pi has no native config or auth root. A non-empty value is rejected at session start (`session/new`, load, resume, and fork) with the unsupported-option error for field `home`. Use `WithScratchDir` for per-session scratch. |
+| `WithHome` | Durable per-instance pi agent directory (`PI_CODING_AGENT_DIR`) every session runs against. Omitted, each session gets an isolated agent directory under the scratch parent, which disables pi's cross-process credential refresh lock and leaves the provider-auth surface unadvertised. |
+| `WithProviderAuthRoot` | Absolute, host-owned, durable directory holding the values-free provider-auth ledger. Omitted, or naming a root that cannot be prepared, leaves every `_pi/auth/*` leg unadvertised. See [Authentication](/docs/features/authentication). |
+| `WithProviderAuthDirectHome` | Declared and rejected: pi has no account-level provider-auth leg to gate. A non-empty value is rejected at session start with the unsupported-option error for field `providerAuthDirectHome`. |
 | `WithDefaultModel` | Default model for new sessions, as `"provider/id"`. |
 | `WithEnv` | Add environment variables to every pi child. Invalid names plus `PATH`, `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `LD_*`, and `DYLD_*` are rejected; ambient credentials are scrubbed. |
 | `WithSeedFiles` | Write files into each isolated agent directory. Seeded extensions, prompts, and skills in their conventional subdirectories are loaded by exact path. |

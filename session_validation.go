@@ -63,17 +63,17 @@ func validateSessionStartPaths(cwd string, additionalDirectories []string) error
 
 // sessionStartConfigurationError reports the agent configuration no session may
 // start under: an option that failed validation at construction, or a configured
-// Home, which pi has no native config or auth root for. The handshake reports
-// the option failures too, but an embedded host can open a session and prompt
-// without ever calling initialize, so unvalidated options must not survive as
-// far as a native process.
+// provider-auth direct home, which pi has no account-level leg to gate. The
+// handshake reports the option failures too, but an embedded host can open a
+// session and prompt without ever calling initialize, so unvalidated options
+// must not survive as far as a native process.
 func (a *Agent) sessionStartConfigurationError() error {
 	if optionsErr := a.optionsError(); optionsErr != nil {
 		return optionsErr
 	}
 
-	if a.options.Home != "" {
-		return unsupportedField(optionFieldHome)
+	if a.options.ProviderAuthDirectHome != "" {
+		return unsupportedField(optionFieldProviderAuthDirectHome)
 	}
 
 	return nil

@@ -93,6 +93,10 @@ type Agent struct {
 	versionMu      sync.Mutex
 	versionChecked bool
 
+	// providerAuth is nil when the surface is unconfigured or unusable, which
+	// is what leaves every leg unadvertised and method-not-found.
+	providerAuth *providerAuth
+
 	startPiProcess func(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error)
 	probeVersion   func(ctx context.Context, executablePath string, containment pi.ContainmentSpec) (string, error)
 	lookPath       func(file string) (string, error)
@@ -141,6 +145,8 @@ func NewAgent(opts ...Option) *Agent {
 		lookPath:       exec.LookPath,
 	}
 	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
+	agent.providerAuth = newProviderAuth(agent)
+
 	observeRuntimeContainment(context.Background(), options.RuntimeResourceHooks, mode)
 
 	if mode == RuntimeContainmentBestEffort {
@@ -400,6 +406,11 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 		capabilityMeta[handoffMetaKey] = map[string]any{metaFieldVersions: []int{handoffVersion}}
 	}
 
+	if a.providerAuth != nil {
+		piCapabilities, _ := capabilityMeta[piMetaKey].(map[string]any)
+		piCapabilities[providerAuthCapabilityKey] = a.providerAuth.capability()
+	}
+
 	resp = acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentInfo: &acp.Implementation{
@@ -452,6 +463,10 @@ func (a *Agent) Logout(_ context.Context, _ acp.LogoutRequest) (acp.LogoutRespon
 func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	if err := a.ensureOpen(); err != nil {
 		return nil, err
+	}
+
+	if result, handled, err := a.handleAuthExtensionMethod(ctx, method, params); handled {
+		return result, err
 	}
 
 	switch method {

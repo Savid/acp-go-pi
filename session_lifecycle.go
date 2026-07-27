@@ -301,8 +301,17 @@ func (s *agentSession) nextRuntimeLaunch(previous pi.LaunchSpec, lastSessionFile
 		return pi.LaunchSpec{}, errors.Join(cause, materializeRemoveAll(dirs.Root))
 	}
 
-	if copyErr := copyGenerationAgentDir(previous.AgentDir, dirs.AgentDir); copyErr != nil {
-		return fail(fmt.Errorf("copy pi agent generation: %w", copyErr))
+	if homeErr := s.agent.applyDurableHome(&dirs); homeErr != nil {
+		return fail(homeErr)
+	}
+
+	// A durable home is the same directory across generations: there is nothing
+	// to copy and no path to rebase, and copying it forward would strand the
+	// credential store pi refreshes under its own lock.
+	if dirs.AgentDir != previous.AgentDir {
+		if copyErr := copyGenerationAgentDir(previous.AgentDir, dirs.AgentDir); copyErr != nil {
+			return fail(fmt.Errorf("copy pi agent generation: %w", copyErr))
+		}
 	}
 
 	spec := previous
@@ -683,6 +692,12 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 
 		ctx, finish = s.agent.observe.StartPiProcess(ctx, "close")
 		defer func() { finish(err) }()
+	}
+
+	// Pending logins are terminalized before the native interrupt so a flow is
+	// never abandoned to a process already being torn down.
+	if s.agent != nil && s.agent.providerAuth != nil {
+		s.agent.providerAuth.closeSession(ctx, s.id)
 	}
 
 	s.cancelPendingInteractions()

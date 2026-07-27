@@ -25,7 +25,7 @@ const (
 	acpFieldSessionID = "sessionId"
 	acpFieldValue     = "value"
 
-	optionFieldHome = "home"
+	optionFieldProviderAuthDirectHome = "providerAuthDirectHome"
 
 	validationRequired    = "required"
 	validationUnsupported = "unsupported"

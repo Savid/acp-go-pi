@@ -208,6 +208,12 @@ func availableCommandsFromNative(commands []pi.SlashCommand) []acp.AvailableComm
 			continue
 		}
 
+		// The provider-auth bridge command is wrapper-owned plumbing, not a
+		// command a host or a model may invoke.
+		if command.Name == pi.AuthCommandName {
+			continue
+		}
+
 		available = append(available, acp.AvailableCommand{
 			Name:        command.Name,
 			Description: command.Description,

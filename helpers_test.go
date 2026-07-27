@@ -352,7 +352,9 @@ type stubPiClient struct {
 	abortErr     error
 	abortFunc    func(context.Context) error
 	promptErr    error
+	promptFunc   func(context.Context, string) error
 	respondErr   error
+	respondFunc  func(pi.UIResponse)
 	responses    []pi.UIResponse
 	stats        pi.SessionStats
 	statsErr     error
@@ -390,11 +392,22 @@ func (c *stubPiClient) Err() error                      { return c.err }
 func (c *stubPiClient) RespondUI(response pi.UIResponse) error {
 	c.mu.Lock()
 	c.responses = append(c.responses, response)
+	respond := c.respondFunc
 	c.mu.Unlock()
+
+	if respond != nil {
+		respond(response)
+	}
 
 	return c.respondErr
 }
-func (c *stubPiClient) Prompt(context.Context, string, []pi.ImageContent) error { return c.promptErr }
+func (c *stubPiClient) Prompt(ctx context.Context, message string, _ []pi.ImageContent) error {
+	if c.promptFunc != nil {
+		return c.promptFunc(ctx, message)
+	}
+
+	return c.promptErr
+}
 func (c *stubPiClient) Abort(ctx context.Context) error {
 	if c.abortFunc != nil {
 		return c.abortFunc(ctx)

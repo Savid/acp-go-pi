@@ -15,6 +15,13 @@ JSON-RPC method-not-found error.
 | Method | Direction |
 | --- | --- |
 | `_pi/session/fork` | client to agent |
+| `_pi/auth/methods` | client to agent |
+| `_pi/auth/authorize` | client to agent |
+| `_pi/auth/callback` | client to agent |
+| `_pi/auth/status` | client to agent |
+| `_pi/auth/cancel` | client to agent |
+| `_pi/auth/inventory` | client to agent |
+| `_pi/auth/disconnect` | client to agent |
 | `_pi/rawEvent` | agent to client |
 
 ### `_pi/session/fork`
@@ -27,6 +34,15 @@ with `ForkSessionRequest` and called through `CallForkSession`. Stable
 method is the only fork route. Forking a session that has no conversation
 entries yet is rejected with a structured invalid-params error, because pi
 cannot duplicate an empty branch.
+
+### `_pi/auth/*`
+
+The seven provider-auth legs broker one pi provider login for a worker. They
+are present only when both `WithHome` and `WithProviderAuthRoot` are
+configured, and an unadvertised leg returns method-not-found. Every request and
+result object is closed: an unknown, duplicate, or misplaced field is rejected
+with invalid params naming the field path. There is no `credential` leg and no
+injection key. See [Authentication](/docs/features/authentication).
 
 ### No `_pi/rateLimits`
 

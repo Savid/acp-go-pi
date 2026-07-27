@@ -199,3 +199,29 @@ func TestWriteMCPConfigEncodeFailure(t *testing.T) {
 	_, err := WriteMCPConfig(t.TempDir(), MCPConfig{})
 	require.ErrorContains(t, err, "encode mcp config")
 }
+
+func TestEncodeAuthCommand(t *testing.T) {
+	t.Parallel()
+
+	text := EncodeAuthCommand(AuthRequest{ID: "id-1", Op: AuthOpProbe, ProviderIDs: []string{"anthropic"}})
+	require.Equal(t, `/acp-auth {"id":"id-1","op":"probe","providerIds":["anthropic"]}`, text)
+}
+
+func TestParseAuthTitle(t *testing.T) {
+	t.Parallel()
+
+	message, ok := ParseAuthTitle(AuthTitleMarker + `{"id":"id-1","kind":"result","ok":true}`)
+	require.True(t, ok)
+	require.Equal(t, AuthMessage{ID: "id-1", Kind: AuthKindResult, OK: true}, message)
+
+	for _, title := range []string{
+		"acp-go-pi:permission:{}",
+		AuthTitleMarker + "not json",
+		AuthTitleMarker + `{"kind":"result"}`,
+		AuthTitleMarker + `{"id":" ","kind":"result"}`,
+		AuthTitleMarker + `{"id":"id-1"}`,
+	} {
+		_, ok := ParseAuthTitle(title)
+		require.False(t, ok, title)
+	}
+}
