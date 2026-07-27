@@ -3,32 +3,13 @@
 package pi
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
-
-type processTree struct {
-	mu           sync.Mutex
-	pgid         int
-	process      *os.Process
-	containment  containmentRecord
-	control      *os.File
-	supervised   bool
-	boundary     *os.File
-	status       *bufio.Reader
-	boundaryOnce sync.Once
-	boundaryErr  error
-	direct       *directChildWait
-	cleanupOnce  sync.Once //nolint:unused // Darwin cleanup memoizes the best-effort boundary.
-	cleanupErr   error     //nolint:unused // Darwin cleanup memoizes the best-effort boundary.
-}
 
 var activateProcessContainmentRecord = activateContainmentRecord
 var processHandleVanishedLeader = handleVanishedProcessGroupLeader

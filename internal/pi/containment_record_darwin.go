@@ -53,6 +53,12 @@ var (
 	containmentRecordSysctl     = unix.SysctlKinfoProc
 )
 
+// containmentRecord locates the registry entry that tracks one native launch
+// through the best-effort boundary.
+type containmentRecord struct {
+	path string
+}
+
 type containmentRecordData struct {
 	SchemaVersion        int    `json:"schema_version"` //nolint:tagliatelle // Registry schema uses snake_case.
 	Vendor               string `json:"vendor"`

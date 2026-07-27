@@ -104,10 +104,6 @@ type processTreeCommand struct {
 	containment containmentRecord
 }
 
-type containmentRecord struct {
-	path string //nolint:unused // Darwin records persist the generation identity here.
-}
-
 func (c *processTreeCommand) releaseInherited() {
 	for _, file := range c.inherited {
 		_ = file.Close()
