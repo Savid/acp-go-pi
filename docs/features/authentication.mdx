@@ -188,6 +188,12 @@ relayed. Native error text never crosses at all: every failure becomes
 `flowId`, a superseded `methodsGeneration`, a `method` that is not the flow's)
 is invalid params with the field path instead.
 
+`connectionId` crosses the other way. It is caller-minted and bounded to at most
+128 bytes of `A-Z`, `a-z`, `0-9`, `-`, and `_`; `authorize` and `disconnect`
+each check it before the value is compared or recorded, and anything outside
+that shape is invalid params naming `connectionId`. It is never normalised,
+because `disconnect` compares it byte for byte with what `authorize` recorded.
+
 A submitted credential beginning with `!` is refused. pi executes such a value
 as a shell command and caches its stdout as the key, so a brokered value
 reaching that field would be a remote command channel into the worker.

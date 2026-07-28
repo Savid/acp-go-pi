@@ -389,7 +389,7 @@ func decodeAuthorizeRequest(fields map[string]json.RawMessage) (authorizeRequest
 		return request, err
 	}
 
-	if request.connectionID, err = authRequiredString(fields, authFieldConnectionID); err != nil {
+	if request.connectionID, err = authRequiredConnectionID(fields); err != nil {
 		return request, err
 	}
 
@@ -973,7 +973,7 @@ func (p *providerAuth) disconnect(ctx context.Context, params json.RawMessage) (
 		return nil, err
 	}
 
-	connectionID, err := authRequiredString(fields, authFieldConnectionID)
+	connectionID, err := authRequiredConnectionID(fields)
 	if err != nil {
 		return nil, err
 	}

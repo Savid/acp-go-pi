@@ -267,6 +267,18 @@ func requireAuthFailed(t *testing.T, err error, cause string) {
 	require.Equal(t, cause, data["cause"])
 }
 
+func requireInvalidAuthField(t *testing.T, err error, field string, context ...any) {
+	t.Helper()
+
+	var requestError *acp.RequestError
+	require.ErrorAs(t, err, &requestError, context...)
+	require.Equal(t, -32602, requestError.Code, context...)
+
+	data, ok := requestError.Data.(map[string]any)
+	require.True(t, ok, context...)
+	require.Equal(t, field, data[jsonFieldField], context...)
+}
+
 func TestNewProviderAuthRequiresBothPreconditions(t *testing.T) {
 	t.Parallel()
 

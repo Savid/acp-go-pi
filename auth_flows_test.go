@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -1913,4 +1914,76 @@ func TestSettleRefusesAConfirmationWhoseGenerationMovedUnderIt(t *testing.T) {
 	defer harness.broker.mu.Unlock()
 
 	require.Equal(t, authStatePending, flow.state)
+}
+
+// adversarialConnectionIDs are the caller-minted values the bound refuses. Each
+// is a shape the id would otherwise carry into a durable ledger entry and into
+// the adapter's own logs, and the two replacement-rune spellings are one Go
+// string reached from two different wire encodings, which aliases one
+// connection onto another's entry.
+func adversarialConnectionIDs() map[string]string {
+	return map[string]string{
+		"empty":              "",
+		"path separators":    "../../../etc/passwd",
+		"windows separators": `..\..\connection`,
+		"newline":            "connection\n1",
+		"nul":                "connection\x00 1",
+		"bidi override":      "connection\u202e1",
+		"space":              "connection 1",
+		"colon":              "connection:1",
+		"replacement rune":   "connection-�",
+		"non ascii":          "connection-é",
+		"unbounded":          strings.Repeat("c", authConnectionIDMaxBytes+1),
+	}
+}
+
+func TestConnectionIDIsRefusedAtEverySurfaceEntry(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	generation := harness.seedCatalog(t.Context(), defaultAuthProviders())
+	scriptManualCodeLogin(harness, "code-1", pi.AuthMessage{OK: true})
+
+	_, err := harness.call(t.Context(), AuthAuthorizeMethod,
+		authorizeParams(harness, "anthropic", generation, authMethodTypeOAuth))
+	require.NoError(t, err)
+
+	for name, connectionID := range adversarialConnectionIDs() {
+		authorize := authorizeParams(harness, "anthropic", generation, authMethodTypeOAuth)
+		authorize[authFieldConnectionID] = connectionID
+		authorize[authFieldAuthorizeRequestID] = "req-" + name
+
+		_, authorizeErr := harness.call(t.Context(), AuthAuthorizeMethod, authorize)
+		requireInvalidAuthField(t, authorizeErr, authFieldConnectionID, name)
+
+		_, disconnectErr := harness.call(t.Context(), AuthDisconnectMethod, map[string]any{
+			authFieldSessionID:         string(harness.session.id),
+			authFieldProviderID:        "anthropic",
+			authFieldConnectionID:      connectionID,
+			authFieldBindingGeneration: 1,
+		})
+		requireInvalidAuthField(t, disconnectErr, authFieldConnectionID, name)
+	}
+
+	// Every refusal landed before the leg superseded the live flow or read the
+	// entry the live binding names, so nothing recorded a value the bound
+	// rejects.
+	live, ok, readErr := harness.broker.ledger.read("anthropic")
+	require.NoError(t, readErr)
+	require.True(t, ok)
+	require.Equal(t, "conn-1", live.ConnectionID)
+	require.Equal(t, int64(1), live.BindingGeneration)
+}
+
+func TestConnectionIDAcceptsTheOpaqueTokenAConsumerMints(t *testing.T) {
+	t.Parallel()
+
+	for _, connectionID := range []string{
+		"pac_2f1c9b4e-8d3a-4c17-9f21-0b6e5a7c8d90",
+		"conn-1",
+		"C0",
+		strings.Repeat("c", authConnectionIDMaxBytes),
+	} {
+		require.True(t, authValidConnectionID(connectionID), connectionID)
+	}
 }
