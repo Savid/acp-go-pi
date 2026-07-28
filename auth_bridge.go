@@ -273,7 +273,9 @@ func (p *providerAuth) answerPrompt(
 
 	switch message.Prompt {
 	case pi.AuthPromptManualCode:
-		p.park(flow, dialogID, message.Message)
+		if !p.park(flow, dialogID, message.Message) {
+			session.respondUIDialog(ctx, pi.UICancelResponse(dialogID))
+		}
 
 		return
 	case pi.AuthPromptText:
@@ -300,19 +302,28 @@ func (p *providerAuth) answerPrompt(
 }
 
 // park records the dialog the callback leg answers and makes the flow's
-// presentation decidable.
-func (p *providerAuth) park(flow *authFlow, dialogID string, message string) {
+// presentation decidable, reporting whether the flow took it. A flow that
+// already terminalized takes none: its release has run, so a prompt recorded
+// now would stay open for the life of the process with nothing left to answer
+// it, and the caller dismisses it instead.
+func (p *providerAuth) park(flow *authFlow, dialogID string, message string) bool {
 	p.mu.Lock()
-	flow.parkedDialog = dialogID
-	flow.presentInteraction = authInteractionCallback
 
-	if text, ok := authDisplayText(message, authMaxMessageBytes); ok && !flow.presentMessageNative {
-		flow.presentMessage = text
-		flow.presentMessageNative = true
+	taken := !authTerminal(flow.state)
+	if taken {
+		flow.parkedDialog = dialogID
+		flow.presentInteraction = authInteractionCallback
+
+		if text, ok := authDisplayText(message, authMaxMessageBytes); ok && !flow.presentMessageNative {
+			flow.presentMessage = text
+			flow.presentMessageNative = true
+		}
 	}
 	p.mu.Unlock()
 
 	p.markDecidable(flow)
+
+	return taken
 }
 
 func (p *providerAuth) takeSecret(flow *authFlow) (string, bool) {
@@ -361,6 +372,14 @@ func (p *providerAuth) markReady(flow *authFlow) {
 // startLogin drives one native login through the bridge. It runs off the leg
 // that started it because a manual-code flow stays open across two legs: the
 // presentation is answered by authorize and the code arrives on callback.
+//
+// The exchange is keyed by the flow id, which makes this a single-writer
+// registration only because every leg that can reach it is serialized before it
+// gets here: authorize is the sole caller for an oauth flow and holds that
+// key's admission, callback is the sole caller for an api-key flow and holds
+// the flow's claim. Two admitted legs would register two exchanges under one
+// key, and the release deferred below would then delete whichever one is
+// current rather than its own.
 func (p *providerAuth) startLogin(session *agentSession, flow *authFlow, method string) {
 	exchange := p.registerExchange(flow.id, flow)
 

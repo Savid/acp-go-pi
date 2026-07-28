@@ -236,5 +236,16 @@ that same user.
   user code approvable, and an approval landing afterwards would write a
   credential into the durable agent directory under a ledger entry no leg will
   ever confirm.
+- Two legs addressing the same flow, the same `(sessionId, providerId)`, or the
+  same provider's credential slot are admitted one at a time. A repeated
+  `authorizeRequestId` arriving while the first is still minting waits and
+  replays it instead of starting a second login; a second `callback` for one
+  flow is refused with `cause: "flow_state"`; and a `disconnect` never
+  interleaves with a login completion, so a `removed` ledger entry never names a
+  credential that is still resident. A caller that gives up while its leg is
+  queued gets `cause: "timeout"`.
+- Closing the session ends the flows it owns. An `authorize` still in flight when
+  `session/close` runs is refused with the uniform unknown-session error rather
+  than leaving a login running against a process already being torn down.
 - `pi login` is not a command. The only native login path is the interactive
   slash command, which is what these legs drive.

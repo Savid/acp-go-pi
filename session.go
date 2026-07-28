@@ -64,6 +64,14 @@ type agentSession struct {
 	// refuses rather than letting pi open the operator's desktop.
 	browserShim *pi.BrowserShim
 
+	// authClosed marks this session's provider-auth admission as closed. It is
+	// guarded by providerAuth.mu rather than by this session's own mutex,
+	// because the broker sets it in the same critical section in which it takes
+	// the flows it is about to cancel. It lives on the instance and not in a
+	// table keyed by session id, so a session reloaded under an id that was
+	// closed before is admitted afresh.
+	authClosed bool
+
 	sessionFilePath string
 	permissionMode  string
 

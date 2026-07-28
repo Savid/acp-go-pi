@@ -704,7 +704,7 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 	// before the native interrupt, so a flow is never abandoned to a process
 	// already being torn down.
 	if s.agent != nil && s.agent.providerAuth != nil {
-		s.agent.providerAuth.closeSession(ctx, s.id)
+		s.agent.providerAuth.closeSession(ctx, s)
 	}
 
 	s.mu.Lock()

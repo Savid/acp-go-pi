@@ -542,11 +542,11 @@ func TestParkKeepsNativePresentationText(t *testing.T) {
 
 	harness := newAuthHarness(t)
 
-	flow := &authFlow{decidable: make(chan struct{}), presentMessage: "label"}
+	flow := &authFlow{state: authStatePending, decidable: make(chan struct{}), presentMessage: "label"}
 	harness.broker.park(flow, "dialog-1", "line\nbreak")
 	require.Equal(t, "label", flow.presentMessage)
 
-	native := &authFlow{decidable: make(chan struct{}), presentMessage: "instructions", presentMessageNative: true}
+	native := &authFlow{state: authStatePending, decidable: make(chan struct{}), presentMessage: "instructions", presentMessageNative: true}
 	harness.broker.park(native, "dialog-2", "paste the code")
 	require.Equal(t, "instructions", native.presentMessage)
 }
@@ -559,7 +559,7 @@ func TestParkAdoptsPromptTextWhenNoneWasSupplied(t *testing.T) {
 
 	harness := newAuthHarness(t)
 
-	flow := &authFlow{decidable: make(chan struct{}), presentMessage: "label"}
+	flow := &authFlow{state: authStatePending, decidable: make(chan struct{}), presentMessage: "label"}
 	harness.broker.park(flow, "dialog-1", "Paste the authorization code here")
 
 	require.Equal(t, "Paste the authorization code here", flow.presentMessage)

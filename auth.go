@@ -80,9 +80,27 @@ func authMethodNames() []string {
 // providerAuth is the agent-scoped broker behind the provider-auth legs. It
 // owns the current method catalog, the per-session flow records, the durable
 // values-free ledger, and the in-flight exchanges with the bridge extension.
+//
+// Every inbound ACP request runs on its own goroutine and only notifications
+// are processed in sequence, so two legs addressing the same flow, the same
+// session, or the same provider's credential slot run at the same time: an
+// authorize and its repeat, two callbacks, a disconnect and the login
+// completion it is racing, a session close and the authorize that has not
+// published yet. Each of those sequences is a read of broker or ledger state, a
+// native call of unbounded length, and a write decided by what the read saw, so
+// the window of every check-then-set here is the whole native call. The
+// admission gates in auth_admission.go are what make those sequences atomic
+// against each other; nothing about them is visible to -race, because each
+// individual field access is already locked.
 type providerAuth struct {
 	agent  *Agent
 	ledger *authLedger
+
+	// authorizeGate serialises authorize per (sessionId, providerId); slotGate
+	// serialises everything that rewrites one provider's native credential
+	// slot. Neither is taken while mu is held.
+	authorizeGate *authGate[authFlowKey]
+	slotGate      *authGate[string]
 
 	mu         sync.Mutex
 	generation string
@@ -92,7 +110,11 @@ type providerAuth struct {
 	// retained holds the most recent flow per key whatever its state, so the
 	// idempotency key stays answerable after the flow has terminalized. Only a
 	// session close drops an entry.
-	retained  map[authFlowKey]*authFlow
+	retained map[authFlowKey]*authFlow
+	// retired holds the authorizeRequestIds a supersede made unanswerable, so a
+	// delayed retry of one fails on its own key instead of cancelling the flow
+	// that replaced it.
+	retired   map[authFlowKey]map[string]struct{}
 	exchanges map[string]*authExchange
 }
 
@@ -120,12 +142,15 @@ func newProviderAuth(agent *Agent) *providerAuth {
 	}
 
 	return &providerAuth{
-		agent:     agent,
-		ledger:    ledger,
-		flows:     make(map[authFlowKey]*authFlow),
-		byID:      make(map[string]*authFlow),
-		retained:  make(map[authFlowKey]*authFlow),
-		exchanges: make(map[string]*authExchange),
+		agent:         agent,
+		ledger:        ledger,
+		authorizeGate: newAuthGate[authFlowKey](),
+		slotGate:      newAuthGate[string](),
+		flows:         make(map[authFlowKey]*authFlow),
+		byID:          make(map[string]*authFlow),
+		retained:      make(map[authFlowKey]*authFlow),
+		retired:       make(map[authFlowKey]map[string]struct{}),
+		exchanges:     make(map[string]*authExchange),
 	}
 }
 
@@ -266,9 +291,25 @@ func authFlowTransition(cause string, materialInFlight bool) (string, string) {
 }
 
 // authSession resolves the session a leg addresses. An unknown, unloaded, or
-// tombstoned session gets the uniform unknown-session rejection.
+// tombstoned session gets the uniform unknown-session rejection, and so does a
+// session whose provider-auth admission this broker has already closed: an
+// ordinary late leg is refused here cheaply, before it costs a native call.
+// This is the fast path, not the authoritative one — publishFlow is what
+// decides a leg that was already past this point when the close landed.
 func (p *providerAuth) authSession(id string) (*agentSession, error) {
-	return p.agent.session(acp.SessionId(id))
+	session, err := p.agent.session(acp.SessionId(id))
+	if err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if session.authClosed {
+		return nil, unknownSessionError()
+	}
+
+	return session, nil
 }
 
 // authParamFields walks a leg's params object once, rejecting an unknown field,

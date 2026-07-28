@@ -1255,13 +1255,13 @@ func TestCloseSessionCancelsPendingFlows(t *testing.T) {
 
 	flow := harness.broker.byID[flowID]
 
-	harness.broker.closeSession(t.Context(), harness.session.id)
+	harness.broker.closeSession(t.Context(), harness.session)
 	require.Equal(t, authStateCancelled, harness.broker.flowState(flow))
 	require.Equal(t, authReasonSessionClosed, flow.reason)
 
 	// A second pass finds nothing and a foreign session id touches nothing.
-	harness.broker.closeSession(t.Context(), harness.session.id)
-	harness.broker.closeSession(t.Context(), acp.SessionId("other"))
+	harness.broker.closeSession(t.Context(), harness.session)
+	harness.broker.closeSession(t.Context(), &agentSession{id: "other"})
 }
 
 // TestCloseSessionSkipsTerminalFlows pins that a flow already terminal keeps its
@@ -1281,7 +1281,7 @@ func TestCloseSessionDropsRetainedFlows(t *testing.T) {
 	_, err := harness.call(t.Context(), AuthAuthorizeMethod, params)
 	require.NoError(t, err)
 
-	harness.broker.closeSession(t.Context(), harness.session.id)
+	harness.broker.closeSession(t.Context(), harness.session)
 
 	harness.broker.mu.Lock()
 	defer harness.broker.mu.Unlock()
@@ -1301,7 +1301,7 @@ func TestCloseSessionSkipsTerminalFlows(t *testing.T) {
 	flow.reason = authReasonTransport
 	harness.broker.mu.Unlock()
 
-	harness.broker.closeSession(t.Context(), harness.session.id)
+	harness.broker.closeSession(t.Context(), harness.session)
 	require.Equal(t, authReasonTransport, flow.reason)
 }
 
@@ -1636,7 +1636,7 @@ func TestCloseSessionIgnoresOtherSessions(t *testing.T) {
 	harness := newAuthHarness(t)
 	flowID := startManualCodeFlow(t, harness, "code-1", pi.AuthMessage{OK: true})
 
-	harness.broker.closeSession(t.Context(), acp.SessionId("someone-else"))
+	harness.broker.closeSession(t.Context(), &agentSession{id: "someone-else"})
 	require.Equal(t, authStatePending, harness.broker.flowState(harness.broker.byID[flowID]))
 }
 
