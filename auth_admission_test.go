@@ -718,3 +718,186 @@ func TestOAuthCompletionWithoutAParkedPromptIsFlowState(t *testing.T) {
 	_, err := harness.broker.completeOAuth(t.Context(), harness.session, flow, "code-1")
 	requireAuthFailed(t, err, authCauseFlowState)
 }
+
+// TestAuthorizeIntentSurvivesAConcurrentDisconnect pins the last read-then-write
+// over the provider's entry that was still ungated: authorize carries the
+// provider's revision and binding generation forward, which is a read and a
+// write it decides. A disconnect's sequence is a read, a bump, two native calls
+// and a second write, so the two interleave and one loses the other's update.
+// The disconnect is parked at its native removal, which is the middle of its own
+// sequence and the one point in it that is not inside the ledger's own lock.
+func TestAuthorizeIntentSurvivesAConcurrentDisconnect(t *testing.T) {
+	harness := newAuthHarness(t)
+	generation := harness.seedCatalog(t.Context(), defaultAuthProviders())
+
+	authorized, err := harness.call(t.Context(), AuthAuthorizeMethod, authorizeParams(harness, "openai", generation, authMethodTypeAPI))
+	require.NoError(t, err)
+
+	replaced := authorizeResult(t, authorized).FlowID
+
+	removing := make(chan struct{}, 1)
+	release := make(chan struct{})
+
+	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
+		switch request.Op {
+		case pi.AuthOpRemove:
+			removing <- struct{}{}
+			<-release
+
+			harness.deliver(ctx, pi.AuthMessage{ID: request.ID, Kind: pi.AuthKindResult, OK: true})
+		case pi.AuthOpProbe:
+			harness.deliver(ctx, pi.AuthMessage{ID: request.ID, Kind: pi.AuthKindProbe, Entries: map[string]string{}})
+		}
+
+		return nil
+	})
+
+	legs := make(chan error, 1)
+
+	go callLeg(harness, AuthDisconnectMethod, disconnectParams(harness, 1), legs)
+
+	// The generation bump is recorded and the removal is under way; the removed
+	// record is still to come.
+	<-removing
+
+	successor := authorizeParams(harness, "openai", generation, authMethodTypeAPI)
+	successor[authFieldAuthorizeRequestID] = "req-2"
+
+	minted := make(chan authorizeCall, 1)
+
+	go func() { minted <- callAuthorize(harness, successor) }()
+
+	// An authorize that walked into the middle of the disconnect answers here;
+	// one waiting for the provider's slot cannot.
+	select {
+	case call := <-minted:
+		minted <- call
+	case <-time.After(authAdmissionQuiescence):
+	}
+
+	close(release)
+
+	require.NoError(t, awaitLeg(t, legs))
+
+	call := <-minted
+	require.NoError(t, call.err)
+
+	current := authorizeResult(t, call.result).FlowID
+	require.NotEqual(t, replaced, current)
+
+	record, ok, err := harness.broker.ledger.read("openai")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, current, record.FlowID, "the entry names the flow authorize returned")
+	require.Equal(t, int64(2), record.Revision)
+	require.Equal(t, int64(2), record.BindingGeneration)
+	require.Equal(t, authLedgerIntent, record.State)
+}
+
+// TestAuthorizeIntentAdmissionEndsWithTheCallersContext pins that an authorize
+// queued behind a disconnect for the same provider answers its own caller.
+func TestAuthorizeIntentAdmissionEndsWithTheCallersContext(t *testing.T) {
+	harness := newAuthHarness(t)
+	generation := harness.seedCatalog(t.Context(), defaultAuthProviders())
+
+	release, err := harness.broker.admitSlot(t.Context(), "openai", "", "")
+	require.NoError(t, err)
+
+	defer release()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// The leg's caller walks away after its key admission and before its intent
+	// write, which is the only point this leg waits for the slot at.
+	originalRand := authRandRead
+	authRandRead = func(value []byte) (int, error) {
+		cancel()
+
+		return originalRand(value)
+	}
+
+	t.Cleanup(func() { authRandRead = originalRand })
+
+	_, err = harness.call(ctx, AuthAuthorizeMethod, authorizeParams(harness, "openai", generation, authMethodTypeAPI))
+	requireAuthFailed(t, err, authCauseTimeout)
+}
+
+// TestReloadedSessionIsAdmittedAfresh pins why the closed marker lives on the
+// session instance rather than in a table keyed by session id. A load of a
+// session id that is already live registers the new instance and then closes
+// the one it replaced, so an id-keyed marker would be set on an id that is
+// live at the moment it is written, and every provider-auth leg addressing that
+// session would be refused for the life of the agent.
+func TestReloadedSessionIsAdmittedAfresh(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	flowID := startSecretFlow(t, harness)
+
+	replaced := harness.session
+
+	reloaded, err := harness.agent.startAndStoreSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	require.NoError(t, err)
+	require.Equal(t, replaced.id, reloaded.id, "the stub reinstates the same native session id")
+	require.NotSame(t, replaced, reloaded)
+
+	t.Cleanup(func() { _ = reloaded.Close(context.WithoutCancel(t.Context())) })
+
+	// The replaced instance took the close, and its flows went with it: the
+	// flowId it minted now addresses nothing.
+	_, err = harness.call(t.Context(), AuthCallbackMethod, secretCallbackParams(harness, flowID))
+	requireInvalidAuthField(t, err, authFieldFlowID)
+
+	// The reinstated id is admitted afresh, at leg entry and at publication.
+	successor := authorizeParams(harness, "openai", harness.seedCatalog(t.Context(), defaultAuthProviders()), authMethodTypeAPI)
+	successor[authFieldAuthorizeRequestID] = "req-2"
+
+	authorized, err := harness.call(t.Context(), AuthAuthorizeMethod, successor)
+	require.NoError(t, err)
+	require.Equal(t, authInteractionSecret, authorizeResult(t, authorized).Interaction)
+}
+
+// TestOAuthCallbackRefusesToInstallOverADisconnectedSlot pins the paste-back
+// arm of the same lineage check. The code is what lets pi finish the token
+// exchange and write the slot, so a flow whose generation the owner has already
+// disconnected never gets to hand it over: the parked prompt is left exactly as
+// it was and the native login is told nothing.
+func TestOAuthCallbackRefusesToInstallOverADisconnectedSlot(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	flowID := startManualCodeFlow(t, harness, "code-1", pi.AuthMessage{OK: true})
+
+	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
+		switch request.Op {
+		case pi.AuthOpRemove:
+			harness.deliver(ctx, pi.AuthMessage{ID: request.ID, Kind: pi.AuthKindResult, OK: true})
+		case pi.AuthOpProbe:
+			harness.deliver(ctx, pi.AuthMessage{ID: request.ID, Kind: pi.AuthKindProbe, Entries: map[string]string{}})
+		}
+
+		return nil
+	})
+
+	_, err := harness.call(t.Context(), AuthDisconnectMethod, map[string]any{
+		authFieldSessionID:         string(harness.session.id),
+		authFieldProviderID:        "anthropic",
+		authFieldConnectionID:      "conn-1",
+		authFieldBindingGeneration: 1,
+	})
+	require.NoError(t, err)
+
+	_, err = harness.call(t.Context(), AuthCallbackMethod, map[string]any{
+		authFieldSessionID:  string(harness.session.id),
+		authFieldProviderID: "anthropic",
+		authFieldMethod:     authMethodTypeOAuth,
+		authFieldFlowID:     flowID,
+		authFieldInput:      "code-1",
+	})
+	requireAuthFailed(t, err, authCauseBindingConflict)
+
+	harness.broker.mu.Lock()
+	defer harness.broker.mu.Unlock()
+	require.NotEmpty(t, harness.broker.byID[flowID].parkedDialog, "the code was never handed to the native login")
+}

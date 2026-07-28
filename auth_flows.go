@@ -286,26 +286,12 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 	p.supersede(ctx, key, authReasonSuperseded)
 
 	now := authNow()
-	record := authLedgerRecord{
-		ProviderID:         request.providerID,
-		ConnectionID:       request.connectionID,
-		Revision:           1,
-		BindingGeneration:  1,
-		FlowID:             flowID,
-		AuthorizeRequestID: request.authorizeRequestID,
-		State:              authLedgerIntent,
-		CreatedAt:          now.UnixMilli(),
-		UpdatedAt:          now.UnixMilli(),
-	}
 
-	if prior, ok, readErr := p.ledger.read(request.providerID); readErr == nil && ok {
-		record.Revision = prior.Revision + 1
-		record.BindingGeneration = prior.BindingGeneration
-		record.CreatedAt = prior.CreatedAt
-	}
-
-	if writeErr := p.ledger.write(record); writeErr != nil {
-		return nil, authFailed(authCauseProcess, request.providerID, request.method, "")
+	// The key admission is already held and the provider's slot is taken inside
+	// this call, so the two gates are only ever acquired in that order.
+	record, err := p.recordIntent(ctx, request, flowID, now)
+	if err != nil {
+		return nil, err
 	}
 
 	flow := &authFlow{
@@ -354,6 +340,51 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 	}
 
 	return presentation, nil
+}
+
+// recordIntent persists the flow's ledger intent, carrying the provider's
+// current revision and binding generation forward. The read and the write it
+// decides are one operation under the provider's slot: a disconnect landing
+// between them has its generation bump read back and written away, which leaves
+// the host holding a generation the entry no longer names and the fence it
+// disconnected against still passing. That is the same lost update a completion
+// takes the slot to prevent, in the same primitive.
+func (p *providerAuth) recordIntent(
+	ctx context.Context,
+	request authorizeRequest,
+	flowID string,
+	now time.Time,
+) (authLedgerRecord, error) {
+	release, err := p.admitSlot(ctx, request.providerID, request.method, flowID)
+	if err != nil {
+		return authLedgerRecord{}, err
+	}
+
+	defer release()
+
+	record := authLedgerRecord{
+		ProviderID:         request.providerID,
+		ConnectionID:       request.connectionID,
+		Revision:           1,
+		BindingGeneration:  1,
+		FlowID:             flowID,
+		AuthorizeRequestID: request.authorizeRequestID,
+		State:              authLedgerIntent,
+		CreatedAt:          now.UnixMilli(),
+		UpdatedAt:          now.UnixMilli(),
+	}
+
+	if prior, ok, readErr := p.ledger.read(request.providerID); readErr == nil && ok {
+		record.Revision = prior.Revision + 1
+		record.BindingGeneration = prior.BindingGeneration
+		record.CreatedAt = prior.CreatedAt
+	}
+
+	if writeErr := p.ledger.write(record); writeErr != nil {
+		return authLedgerRecord{}, authFailed(authCauseProcess, request.providerID, request.method, "")
+	}
+
+	return record, nil
 }
 
 // watchNativeCompletion settles a wait flow from the native login itself. pi
