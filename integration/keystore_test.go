@@ -69,17 +69,8 @@ func TestKeystoreLinuxCredentialResidence(t *testing.T) {
 	// one thing: whether the session bus that reaches the Secret Service is
 	// exported. A run that exercises one side of that fork proves nothing about
 	// the identity the matrix claims.
-	for _, configuration := range []struct {
-		name string
-		bus  bool
-	}{
-		{name: "keystore-absent"},
-		{name: "keystore-present", bus: true},
-	} {
-		t.Run(configuration.name, func(t *testing.T) {
-			runResidenceMatrix(ctx, t, container, configuration.bus)
-		})
-	}
+	runResidenceMatrix(ctx, t, container, false)
+	runResidenceMatrix(ctx, t, container, true)
 }
 
 // runResidenceMatrix executes the probe in one configuration and requires it to
@@ -88,34 +79,40 @@ func TestKeystoreLinuxCredentialResidence(t *testing.T) {
 func runResidenceMatrix(ctx context.Context, t *testing.T, container testcontainers.Container, bus bool) {
 	t.Helper()
 
+	name := "keystore-absent"
 	script := "export " + envRunIntegration + "=1 " + envRunKeystore + "=1; "
+
 	if bus {
+		name = "keystore-present"
 		script += ". " + keystoreEnvFile + "; export DBUS_SESSION_BUS_ADDRESS; "
 	}
 
 	script += "exec " + keystoreProbePath + " -test.v -test.run '^TestKeystoreResidenceMatrix$'"
 
-	// The raw exec stream is frame-multiplexed: every read carries an eight-byte
-	// header, so an unmultiplexed reader interleaves those bytes into the logs.
-	code, output, err := container.Exec(ctx, []string{"/bin/sh", "-c", script}, tcexec.Multiplexed())
-	if err != nil {
-		t.Fatalf("run residence matrix: %v", err)
-	}
+	t.Run(name, func(t *testing.T) {
+		// The raw exec stream is frame-multiplexed: every read carries an
+		// eight-byte header, so an unmultiplexed reader interleaves those bytes
+		// into the logs.
+		code, output, err := container.Exec(ctx, []string{"/bin/sh", "-c", script}, tcexec.Multiplexed())
+		if err != nil {
+			t.Fatalf("run residence matrix: %v", err)
+		}
 
-	logs, readErr := io.ReadAll(output)
-	if readErr != nil {
-		t.Fatalf("read residence output: %v", readErr)
-	}
+		logs, readErr := io.ReadAll(output)
+		if readErr != nil {
+			t.Fatalf("read residence output: %v", readErr)
+		}
 
-	t.Log(string(logs))
+		t.Log(string(logs))
 
-	if code != 0 {
-		t.Fatalf("residence matrix exited %d", code)
-	}
+		if code != 0 {
+			t.Fatalf("residence matrix exited %d", code)
+		}
 
-	if !strings.Contains(string(logs), "--- PASS: TestKeystoreResidenceMatrix") {
-		t.Fatal("the residence matrix did not run in this configuration")
-	}
+		if !strings.Contains(string(logs), "--- PASS: TestKeystoreResidenceMatrix") {
+			t.Fatal("the residence matrix did not run in this configuration")
+		}
+	})
 }
 
 // TestKeystoreLinuxArtifactCarriesNoSecretServiceClient pins the mechanism
