@@ -58,6 +58,18 @@ func integrationContainmentSpec(t *testing.T) internalpi.ContainmentSpec {
 	}
 }
 
+// integrationContainmentOption opts the in-process agent into Darwin
+// containment. Darwin containment fails closed without it, and the flag the
+// binary tier passes is the same opt-in on the other side of the process
+// boundary.
+func integrationContainmentOption() piacp.Option {
+	if runtime.GOOS == "darwin" {
+		return piacp.WithDarwinBestEffortContainment()
+	}
+
+	return func(*piacp.Options) {}
+}
+
 func TestMain(m *testing.M) {
 	previousLogger := slog.Default()
 	slog.SetDefault(integrationLogger)
@@ -179,7 +191,9 @@ func serveAgentRawForTest(t *testing.T, ctx context.Context, opts ...piacp.Optio
 
 	serveErr := make(chan error, 1)
 	go func() {
-		options := append([]piacp.Option{piacp.WithLogger(integrationLogger)}, opts...)
+		options := append([]piacp.Option{
+			piacp.WithLogger(integrationLogger), integrationContainmentOption(),
+		}, opts...)
 		serveErr <- piacp.Serve(serveCtx, c2aR, a2cW, options...)
 	}()
 
@@ -319,6 +333,10 @@ func agentBinaryPath(t *testing.T) string {
 
 func agentCommand(t *testing.T, ctx context.Context, args ...string) *exec.Cmd {
 	t.Helper()
+
+	if runtime.GOOS == "darwin" {
+		args = append([]string{"-darwin-best-effort-containment"}, args...)
+	}
 
 	return exec.CommandContext(ctx, agentBinaryPath(t), args...) // #nosec G204,G702 -- test-built wrapper binary.
 }

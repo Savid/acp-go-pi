@@ -361,7 +361,9 @@ func connectControlledAgent(
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	serveErr := make(chan error, 1)
 	go func() {
-		opts := append([]piacp.Option{piacp.WithLogger(integrationLogger)}, options...)
+		opts := append([]piacp.Option{
+			piacp.WithLogger(integrationLogger), integrationContainmentOption(),
+		}, options...)
 		serveErr <- piacp.Serve(serveCtx, c2aR, a2cW, opts...)
 	}()
 

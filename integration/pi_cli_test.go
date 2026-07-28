@@ -70,6 +70,7 @@ Use the deterministic seeded skill.
 		SkillPaths:          resources.Skills,
 		PromptTemplatePaths: resources.PromptTemplates,
 		Cwd:                 root,
+		Containment:         integrationContainmentSpec(t),
 	})
 	require.NoError(t, err)
 	client := pi.NewClient(process.Stdin(), process.Stdout())

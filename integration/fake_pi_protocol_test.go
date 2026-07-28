@@ -84,6 +84,7 @@ func startHarness(t *testing.T, ctx context.Context, executable string, withBrid
 		AgentDir:       agentDir,
 		SessionDir:     sessionDir,
 		Cwd:            root,
+		Containment:    integrationContainmentSpec(t),
 	}
 
 	if withBridge {
