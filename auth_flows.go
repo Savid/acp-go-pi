@@ -712,11 +712,19 @@ func (p *providerAuth) settle(ctx context.Context, flow *authFlow, success strin
 		return nil, err
 	}
 
+	// A secret pi accepted is resident whatever the flow did while the wait ran:
+	// the value crossed at the prompt, and pi's write needs no provider exchange
+	// a cancel could pre-empt. An oauth acceptance is not resident on those
+	// terms, because its write waits on an exchange the owner's cancel aborts.
+	resident := message.OK && flow.method.Type == authMethodTypeAPI
+
 	// The wait a native answer costs is unbounded from the owner's side, so the
 	// flow can have been cancelled, superseded, or expired while it ran. Such an
 	// answer owns no transition and confirms nothing: it arrived into a record
-	// somebody else already closed.
-	if cause, abandoned := p.abandonedCause(flow); abandoned {
+	// somebody else already closed. A resident credential is the exception —
+	// answering a no-transition cause over one the agent directory now holds
+	// would leave it bound to nothing and hide it from every residence answer.
+	if cause, abandoned := p.abandonedCause(flow); abandoned && !resident {
 		return nil, authFailed(cause, flow.providerID, flow.method.ID, flow.id)
 	}
 

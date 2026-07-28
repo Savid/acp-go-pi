@@ -312,6 +312,48 @@ func TestSettleRefusesAnAnswerIntoAClosedFlow(t *testing.T) {
 	}
 }
 
+// TestSettleReportsASecretThatLandedIntoAClosedFlow pins the secret leg against
+// the oauth one it shares settle with. Its value crossed at the prompt and pi's
+// write needs no provider exchange a cancel could pre-empt, so a native
+// acceptance that arrives after the owner closed the flow describes a credential
+// the agent directory now holds. Answering a no-transition cause over it would
+// leave that credential bound to nothing, so the confirmation is written and the
+// leg reports what landed — while the terminal record stays the owner's.
+func TestSettleReportsASecretThatLandedIntoAClosedFlow(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	flow := &authFlow{
+		id:           "flow-secret",
+		sessionID:    harness.session.id,
+		providerID:   "openai",
+		connectionID: "conn-1",
+		state:        authStateCancelled,
+		reason:       authReasonOwnerCancel,
+		method:       authCatalogMethod{ID: authMethodTypeAPI, Type: authMethodTypeAPI},
+		decidable:    make(chan struct{}),
+		ready:        make(chan struct{}),
+		result:       make(chan pi.AuthMessage, 1),
+		disarm:       make(chan struct{}),
+	}
+	flow.result <- pi.AuthMessage{Kind: pi.AuthKindResult, OK: true, CredType: "api_key"}
+
+	result, err := harness.broker.settle(t.Context(), flow, authStateSaved)
+	require.NoError(t, err)
+	require.Equal(t, authFlowIDResult{FlowID: flow.id}, result)
+
+	record, ok, readErr := harness.broker.ledger.read("openai")
+	require.NoError(t, readErr)
+	require.True(t, ok)
+	require.Equal(t, authLedgerConfirmed, record.State)
+
+	harness.broker.mu.Lock()
+	defer harness.broker.mu.Unlock()
+
+	require.Equal(t, authStateCancelled, flow.state)
+	require.Equal(t, authReasonOwnerCancel, flow.reason)
+}
+
 func startManualCodeFlow(t *testing.T, harness *authHarness, code string, result pi.AuthMessage) string {
 	t.Helper()
 
