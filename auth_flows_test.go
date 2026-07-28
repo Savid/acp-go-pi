@@ -1095,8 +1095,16 @@ func TestDisconnectFencesConnectionAndGeneration(t *testing.T) {
 		},
 	} {
 		_, err := harness.call(t.Context(), AuthDisconnectMethod, params)
-		requireAuthFailed(t, err, authCausePolicy)
+		requireAuthFailed(t, err, authCauseBindingConflict)
 	}
+
+	// The bridge assertion above already proves no native removal ran; the
+	// ledger proves the generation was not bumped either.
+	live, ok, err := harness.broker.ledger.read("anthropic")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, int64(1), live.BindingGeneration)
+	require.NotEqual(t, authLedgerRemoved, live.State)
 }
 
 // TestDisconnectVerifiesAbsence pins that a slot still occupied after removal

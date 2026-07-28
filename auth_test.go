@@ -345,7 +345,7 @@ func TestAuthCauseRetryable(t *testing.T) {
 	for _, cause := range []string{
 		authCauseNativeVeto, authCauseProviderRefused, authCauseHarvestFailed,
 		authCauseUnsupportedVariant, authCauseFlowExpired, authCauseFlowState,
-		authCauseFlowCancelled, authCausePolicy,
+		authCauseFlowCancelled, authCausePolicy, authCauseBindingConflict,
 	} {
 		require.False(t, authCauseRetryable(cause), cause)
 	}
@@ -374,7 +374,7 @@ func TestAuthFailedErrorShape(t *testing.T) {
 }
 
 // TestAuthFlowTransition pins the normative cause-to-transition table, including
-// the three causes that must consume nothing.
+// the four causes that must consume nothing.
 func TestAuthFlowTransition(t *testing.T) {
 	t.Parallel()
 
@@ -396,6 +396,7 @@ func TestAuthFlowTransition(t *testing.T) {
 		{authCauseHarvestFailed, false, authStateFailed, authReasonHarvestFailed},
 		{authCauseFlowExpired, false, authStateExpired, authReasonDeadline},
 		{authCausePolicy, false, "", ""},
+		{authCauseBindingConflict, false, "", ""},
 		{authCauseFlowState, true, "", ""},
 		{authCauseFlowCancelled, false, "", ""},
 	}
