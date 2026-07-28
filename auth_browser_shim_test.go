@@ -55,6 +55,30 @@ func TestSessionLaunchesPiBehindTheBrowserShim(t *testing.T) {
 	require.Empty(t, browserShimDirs(t, scratch))
 }
 
+// TestSessionBrowserShimIsNilWhenItCannotBeMaterialised pins the nil the
+// refusal below is stated in terms of. The refusal test supplies that nil by
+// hand, so without this the branch that actually produces it — a scratch parent
+// no shim directory can be created beneath — is never run, and the one thing
+// standing between a native login and the operator's desktop rests on a value
+// only a test ever assigns.
+func TestSessionBrowserShimIsNilWhenItCannotBeMaterialised(t *testing.T) {
+	t.Parallel()
+
+	scratch := t.TempDir()
+	usable := newStubClientAgent(t, newStubPiClient(), WithScratchDir(scratch))
+
+	shim := usable.newSessionBrowserShim()
+	require.NotNil(t, shim)
+	require.NoError(t, shim.Remove())
+
+	// A regular file is a parent no directory can be created beneath.
+	blocked := filepath.Join(scratch, "not-a-directory")
+	require.NoError(t, os.WriteFile(blocked, []byte("x"), 0o600))
+
+	agent := newStubClientAgent(t, newStubPiClient(), WithScratchDir(blocked))
+	require.Nil(t, agent.newSessionBrowserShim())
+}
+
 // TestAuthorizeRefusesOAuthWithoutABrowserShim pins the fail-closed outcome on a
 // platform where no shim can shadow the launcher: the login that would open the
 // operator's browser is refused before pi is ever asked to start it.
