@@ -129,18 +129,24 @@ func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
 		require.NoError(t, os.Mkdir(root, 0o700))
 		nativeReleases, scratchReleases := 0, 0
 		runtimeErr := errors.New("ordinary shutdown error")
+		shimParent := t.TempDir()
+		shim, shimErr := internalpi.NewBrowserShim(shimParent)
+		require.NoError(t, shimErr)
+		require.NotEmpty(t, browserShimDirs(t, shimParent))
 
 		err := finalizeSessionRuntimeResources(
 			runtimeErr,
 			func() { nativeReleases++ },
 			root,
 			func() { scratchReleases++ },
+			shim,
 		)
 
 		require.ErrorIs(t, err, runtimeErr)
 		require.Equal(t, 1, nativeReleases)
 		require.Equal(t, 1, scratchReleases)
 		require.NoDirExists(t, root)
+		require.Empty(t, browserShimDirs(t, shimParent))
 	})
 
 	t.Run("incomplete containment retains root and both admissions", func(t *testing.T) {
@@ -153,6 +159,7 @@ func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
 			func() { nativeReleases++ },
 			root,
 			func() { scratchReleases++ },
+			nil,
 		)
 
 		require.ErrorIs(t, err, internalpi.ErrProcessContainmentIncomplete)
@@ -179,6 +186,7 @@ func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
 			func() { nativeReleases++ },
 			root,
 			func() { scratchReleases++ },
+			nil,
 		)
 
 		require.ErrorIs(t, err, deleteErr)

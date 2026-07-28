@@ -34,6 +34,7 @@ func finalizeSessionRuntimeResources(
 	nativeRelease func(),
 	sessionRoot string,
 	scratchRelease func(),
+	browserShim *pi.BrowserShim,
 ) error {
 	if !pi.ProcessContainmentComplete(runtimeErr) {
 		return runtimeErr
@@ -43,9 +44,12 @@ func finalizeSessionRuntimeResources(
 		nativeRelease()
 	}
 
-	var removeErr error
+	// The shim is deleted here rather than at process exit for the same reason
+	// the session root is: a surviving descendant would otherwise fall through
+	// the removed no-ops to the real browser launcher on PATH.
+	removeErr := browserShim.Remove()
 	if sessionRoot != "" {
-		removeErr = materializeRemoveAll(sessionRoot)
+		removeErr = errors.Join(removeErr, materializeRemoveAll(sessionRoot))
 	}
 
 	if removeErr == nil && scratchRelease != nil {
@@ -744,7 +748,7 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 	}
 
 	err = finalizeSessionRuntimeResources(
-		err, s.nativeRootRelease, s.sessionRoot, s.scratchRootRelease,
+		err, s.nativeRootRelease, s.sessionRoot, s.scratchRootRelease, s.browserShim,
 	)
 
 	if s.agent != nil {

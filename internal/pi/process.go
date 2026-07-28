@@ -65,8 +65,13 @@ type LaunchSpec struct {
 	// PromptTemplatePaths are explicitly seeded prompt templates loaded despite disabled discovery.
 	PromptTemplatePaths []string
 	// Env is added to the scrubbed base environment. Wrapper-managed keys
-	// (PI_CODING_AGENT_DIR, PI_OFFLINE) always win.
+	// (PI_CODING_AGENT_DIR, PI_OFFLINE, and the browser shim's PATH and
+	// BROWSER) always win.
 	Env map[string]string
+	// BrowserShim neutralises the browser a native login leg run inside this
+	// process would otherwise open on the operator's desktop. A nil shim leaves
+	// the child's PATH and BROWSER alone.
+	BrowserShim *BrowserShim
 	// Cwd is the child working directory.
 	Cwd string
 	// ShutdownStepTimeout bounds each rung of the shutdown ladder; zero uses
@@ -113,7 +118,9 @@ func (spec LaunchSpec) Args() []string {
 }
 
 // Environ returns the scrubbed child environment: explicit basics from the
-// parent, then spec.Env, then the wrapper-managed keys, which always win.
+// parent, then spec.Env, then the wrapper-managed keys, which always win. The
+// browser shim is applied last so its PATH prefix and BROWSER value survive
+// whatever a caller asked for.
 func (spec LaunchSpec) Environ() []string {
 	env := make(map[string]string, len(baseEnvironmentKeys)+len(spec.Env)+2)
 
@@ -149,7 +156,7 @@ func (spec LaunchSpec) Environ() []string {
 		environ = append(environ, key+"="+env[key])
 	}
 
-	return environ
+	return spec.BrowserShim.Environ(environ)
 }
 
 // safeExplicitEnvKey is defense in depth for internal LaunchSpec callers.

@@ -206,6 +206,10 @@ that same user.
 - A login whose completion lands on a loopback listener is refused at mint time
   with `cause: "unsupported_variant"` — the owner's browser cannot reach the
   worker's socket.
+- An oauth login never opens a browser on the machine running the worker. The
+  session's child runs behind a directory of no-op browser launchers, and on a
+  platform where that cannot be arranged the mint is refused with
+  `cause: "policy"` — see [Security](/docs/operations/security).
 - pi's enumeration exposes login methods and display names but not the
   environment-variable names behind an api-key method, and it exposes no prompt
   schema at all. A native login that asks the operator anything beyond the one

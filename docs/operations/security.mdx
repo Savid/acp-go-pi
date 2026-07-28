@@ -20,6 +20,22 @@ session's identity. Scrubbing makes every credential path deliberate. Each
 session also runs with pi's phone-home behavior pinned off (`PI_OFFLINE=1`),
 so no update checks or telemetry leave the machine from the pi child.
 
+## Browser containment
+
+A native provider-auth login runs inside the session's own pi process, and pi
+hands the authorization URL to the platform's launcher — `open` on macOS,
+`xdg-open` and the other freedesktop launchers elsewhere — which is exec'd
+directly and never reads `BROWSER`. Each session therefore starts its child with
+a private `0700`
+directory of no-op launchers first on `PATH` and `BROWSER` pointed at one of
+them, so a URL the worker mints can never open a tab on the desktop of whoever
+happens to be at that machine. The directory is deleted with the session's
+scratch, once the process boundary is complete.
+
+Windows has no launcher image to shadow: `start` is a `cmd.exe` builtin, and
+CreateProcess resolves the system directory ahead of every `PATH` entry. There
+the oauth mint is refused with `cause: "policy"` rather than run uncontained.
+
 ## Permission enforcement
 
 The adapter's bridge extension is the session's permission system — pi ships

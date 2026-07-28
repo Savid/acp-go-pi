@@ -465,6 +465,13 @@ func (p *providerAuth) mintPresentation(ctx context.Context, session *agentSessi
 		}, ""
 	}
 
+	// An oauth mint is the one leg that makes pi reach for a browser. Without a
+	// shim shadowing the launchers it would open a tab on the operator's desktop
+	// against a URL the worker, not the operator, is authorizing.
+	if session.browserShim == nil {
+		return authAuthorizeResult{}, authCausePolicy
+	}
+
 	p.startLogin(session, flow, pi.AuthMethodOAuth)
 
 	if cause := p.awaitPresentation(ctx, flow); cause != "" {

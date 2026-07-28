@@ -634,13 +634,14 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	var (
 		dirs          sessionDirs
 		nativeRelease func()
+		browserShim   *pi.BrowserShim
 	)
 
 	keepScratch := false
 	defer func() {
 		if !keepScratch {
 			err = finalizeSessionRuntimeResources(
-				err, nativeRelease, dirs.SessionRoot, scratchRelease,
+				err, nativeRelease, dirs.SessionRoot, scratchRelease, browserShim,
 			)
 		}
 	}()
@@ -649,6 +650,8 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	if err != nil {
 		return nil, err
 	}
+
+	browserShim = a.newSessionBrowserShim()
 
 	hydratedPath := ""
 
@@ -745,6 +748,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		PromptTemplatePaths: seededResources.PromptTemplates,
 		Env:                 env,
 		Cwd:                 start.Cwd,
+		BrowserShim:         browserShim,
 	}
 
 	spec.Containment, err = a.containmentSpecForRoot(scratchParent(a.options.ScratchDir), dirs.Root, RuntimeResourceSession)
@@ -779,6 +783,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		fingerprint:           sessionStartFingerprint(start),
 		launch:                spec,
 		sessionRoot:           dirs.SessionRoot,
+		browserShim:           browserShim,
 		permissionMode:        permission,
 		autoRetry:             start.MetaOptions.AutoRetry,
 		mcpRefreshPending:     includeMCP,

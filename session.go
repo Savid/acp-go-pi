@@ -54,8 +54,16 @@ type agentSession struct {
 	// launch is the spec used to start the pi process; a crashed process is
 	// relaunched lazily on the next turn by re-selecting the same native
 	// session file.
-	launch          pi.LaunchSpec
-	sessionRoot     string
+	launch      pi.LaunchSpec
+	sessionRoot string
+
+	// browserShim shadows the browser launchers the pi process could exec. It
+	// belongs to the process, not to a runtime generation, so it survives every
+	// relaunch and is deleted only when the session's scratch is. A nil shim
+	// means no browser launch can be neutralised, and the provider-auth mint
+	// refuses rather than letting pi open the operator's desktop.
+	browserShim *pi.BrowserShim
+
 	sessionFilePath string
 	permissionMode  string
 
