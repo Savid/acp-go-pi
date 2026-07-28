@@ -215,7 +215,7 @@ func TestCancelParkedIgnoresVanishedSession(t *testing.T) {
 
 	harness := newAuthHarness(t)
 
-	flow := &authFlow{sessionID: "gone", parkedDialog: "dialog-x", ready: make(chan struct{})}
+	flow := &authFlow{sessionID: "gone", parkedDialog: "dialog-x", decidable: make(chan struct{})}
 	harness.broker.cancelParked(t.Context(), flow)
 
 	flow.parkedDialog = ""
@@ -233,6 +233,41 @@ func TestAuthExchangeRequiresLiveClient(t *testing.T) {
 
 	_, err := harness.broker.exchange(t.Context(), harness.session, authBridgeRequest{Op: authOpCatalog})
 	require.ErrorIs(t, err, errAuthBridge)
+}
+
+// TestAuthExchangeWaitsForADelayedAnswer pins that the answer is read under the
+// call's own bound rather than sampled the instant the command is
+// acknowledged: the extension answers on the pump, not on the leg's goroutine.
+func TestAuthExchangeWaitsForADelayedAnswer(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+
+	delivered := make(chan struct{})
+
+	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
+		go func() {
+			defer close(delivered)
+
+			time.Sleep(20 * time.Millisecond)
+			harness.deliver(context.WithoutCancel(ctx), pi.AuthMessage{
+				ID:      request.ID,
+				Kind:    pi.AuthKindProbe,
+				Entries: map[string]string{"anthropic": "oauth"},
+			})
+		}()
+
+		return nil
+	})
+
+	message, err := harness.broker.exchange(t.Context(), harness.session, authBridgeRequest{
+		Op:          authOpProbe,
+		ProviderIDs: []string{"anthropic"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"anthropic": "oauth"}, message.Entries)
+
+	<-delivered
 }
 
 func TestAuthExchangeReportsTokenFailure(t *testing.T) {
@@ -275,7 +310,7 @@ func TestAuthDeliverResultDropsSecondAnswer(t *testing.T) {
 	t.Parallel()
 
 	harness := newAuthHarness(t)
-	flow := &authFlow{ready: make(chan struct{}), result: make(chan pi.AuthMessage, 1)}
+	flow := &authFlow{decidable: make(chan struct{}), result: make(chan pi.AuthMessage, 1)}
 	exchange := harness.broker.registerExchange("ex-1", flow)
 
 	harness.broker.deliverResult(exchange, pi.AuthMessage{Cause: authCauseProcess})
@@ -323,12 +358,12 @@ func TestAwaitPresentationHonoursCancellation(t *testing.T) {
 	t.Parallel()
 
 	harness := newAuthHarness(t)
-	flow := &authFlow{providerID: "anthropic", ready: make(chan struct{}), result: make(chan pi.AuthMessage, 1)}
+	flow := &authFlow{providerID: "anthropic", decidable: make(chan struct{}), result: make(chan pi.AuthMessage, 1)}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	requireAuthFailed(t, harness.broker.awaitPresentation(ctx, flow), authCauseTimeout)
+	require.Equal(t, authCauseTimeout, harness.broker.awaitPresentation(ctx, flow))
 
 	_, err := harness.broker.awaitResult(ctx, flow)
 	requireAuthFailed(t, err, authCauseTimeout)
@@ -348,9 +383,9 @@ func TestAwaitPresentationHonoursDeadline(t *testing.T) {
 	})
 
 	harness := newAuthHarness(t)
-	flow := &authFlow{providerID: "anthropic", ready: make(chan struct{}), result: make(chan pi.AuthMessage, 1)}
+	flow := &authFlow{providerID: "anthropic", decidable: make(chan struct{}), result: make(chan pi.AuthMessage, 1)}
 
-	requireAuthFailed(t, harness.broker.awaitPresentation(t.Context(), flow), authCauseTimeout)
+	require.Equal(t, authCauseTimeout, harness.broker.awaitPresentation(t.Context(), flow))
 
 	_, err := harness.broker.awaitResult(t.Context(), flow)
 	requireAuthFailed(t, err, authCauseTimeout)
@@ -363,11 +398,11 @@ func TestParkKeepsNativePresentationText(t *testing.T) {
 
 	harness := newAuthHarness(t)
 
-	flow := &authFlow{ready: make(chan struct{}), presentMessage: "label"}
+	flow := &authFlow{decidable: make(chan struct{}), presentMessage: "label"}
 	harness.broker.park(flow, "dialog-1", "line\nbreak")
 	require.Equal(t, "label", flow.presentMessage)
 
-	native := &authFlow{ready: make(chan struct{}), presentMessage: "instructions", presentMessageNative: true}
+	native := &authFlow{decidable: make(chan struct{}), presentMessage: "instructions", presentMessageNative: true}
 	harness.broker.park(native, "dialog-2", "paste the code")
 	require.Equal(t, "instructions", native.presentMessage)
 }
@@ -380,7 +415,7 @@ func TestParkAdoptsPromptTextWhenNoneWasSupplied(t *testing.T) {
 
 	harness := newAuthHarness(t)
 
-	flow := &authFlow{ready: make(chan struct{}), presentMessage: "label"}
+	flow := &authFlow{decidable: make(chan struct{}), presentMessage: "label"}
 	harness.broker.park(flow, "dialog-1", "Paste the authorization code here")
 
 	require.Equal(t, "Paste the authorization code here", flow.presentMessage)

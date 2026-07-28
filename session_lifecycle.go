@@ -694,13 +694,14 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 		defer func() { finish(err) }()
 	}
 
-	// Pending logins are terminalized before the native interrupt so a flow is
-	// never abandoned to a process already being torn down.
+	s.cancelPendingInteractions()
+
+	// Pending logins are terminalized after pending dialogs are resolved and
+	// before the native interrupt, so a flow is never abandoned to a process
+	// already being torn down.
 	if s.agent != nil && s.agent.providerAuth != nil {
 		s.agent.providerAuth.closeSession(ctx, s.id)
 	}
-
-	s.cancelPendingInteractions()
 
 	s.mu.Lock()
 	cancel := s.cancel

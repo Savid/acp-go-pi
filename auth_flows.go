@@ -98,9 +98,18 @@ type authFlow struct {
 	parkedDialog  string
 	pendingSecret string
 
-	ready     chan struct{}
-	readyOnce sync.Once
-	result    chan pi.AuthMessage
+	// mintErr records why the native mint never produced a presentation, so a
+	// repeated idempotency key is answered with the same failure rather than
+	// starting a second login.
+	mintErr error
+
+	// decidable closes when the native side has said enough to publish or
+	// refuse a presentation; ready closes once the mint has settled either way.
+	decidable     chan struct{}
+	decidableOnce sync.Once
+	ready         chan struct{}
+	readyOnce     sync.Once
+	result        chan pi.AuthMessage
 
 	disarm chan struct{}
 }
@@ -204,7 +213,7 @@ func (p *providerAuth) recordDeviceCode(flow *authFlow, event pi.AuthNativeEvent
 	}
 	p.mu.Unlock()
 
-	p.markReady(flow)
+	p.markDecidable(flow)
 }
 
 // authorize starts exactly one flow per (sessionId, providerId). It records the
@@ -230,7 +239,12 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 
 	key := authFlowKey{sessionID: session.id, providerID: request.providerID}
 
-	if replay, ok := p.replayAuthorize(key, request.authorizeRequestID); ok {
+	replay, replayed, err := p.replayAuthorize(ctx, key, request.authorizeRequestID)
+	if replayed {
+		if err != nil {
+			return nil, err
+		}
+
 		return replay, nil
 	}
 
@@ -288,30 +302,49 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 		// presentation text; pi's device flows supply none.
 		presentMessage: method.Label,
 		expiresAt:      now.Add(authSafetyDeadline),
+		decidable:      make(chan struct{}),
 		ready:          make(chan struct{}),
 		result:         make(chan pi.AuthMessage, 1),
 		disarm:         make(chan struct{}),
 	}
 
+	// The flow is registered before the mint so the flowId a mint failure
+	// reports addresses a real, terminal record, and so a repeat arriving mid
+	// mint has something to wait on.
 	p.mu.Lock()
 	p.flows[key] = flow
 	p.byID[flowID] = flow
+	p.retained[key] = flow
 	p.mu.Unlock()
 
-	presentation, err := p.mintPresentation(ctx, session, flow)
-	if err != nil {
-		p.discard(ctx, flow)
-
-		return nil, err
+	presentation, cause := p.mintPresentation(ctx, session, flow)
+	if cause != "" {
+		return nil, p.failMint(ctx, flow, cause)
 	}
 
 	p.mu.Lock()
 	flow.presentation = presentation
 	p.mu.Unlock()
 
+	p.markReady(flow)
 	p.armCompleter(flow)
 
 	return presentation, nil
+}
+
+// failMint terminalizes a flow whose native mint never produced a presentation
+// and records the failure the idempotency key replays.
+func (p *providerAuth) failMint(ctx context.Context, flow *authFlow, cause string) error {
+	err := p.fail(flow, cause, false)
+
+	p.mu.Lock()
+	flow.mintErr = err
+	p.mu.Unlock()
+
+	p.markReady(flow)
+	p.cancelParked(ctx, flow)
+
+	return err
 }
 
 type authorizeRequest struct {
@@ -365,17 +398,38 @@ func decodeAuthorizeRequest(fields map[string]json.RawMessage) (authorizeRequest
 
 // replayAuthorize answers a repeated idempotency key verbatim from memory: no
 // supersede, no completer disarm, no destruction of flow state, and no native
-// call.
-func (p *providerAuth) replayAuthorize(key authFlowKey, requestID string) (authAuthorizeResult, bool) {
+// call. It resolves the retained record rather than the pending one, so the
+// answer survives the flow's terminalization for as long as the session lives,
+// and it waits out a mint still under way rather than replaying a presentation
+// nothing has published yet.
+func (p *providerAuth) replayAuthorize(
+	ctx context.Context,
+	key authFlowKey,
+	requestID string,
+) (authAuthorizeResult, bool, error) {
+	p.mu.Lock()
+	flow, ok := p.retained[key]
+	matched := ok && flow.authorizeRequestID == requestID
+	p.mu.Unlock()
+
+	if !matched {
+		return authAuthorizeResult{}, false, nil
+	}
+
+	select {
+	case <-flow.ready:
+	case <-ctx.Done():
+		return authAuthorizeResult{}, true, authFailed(authCauseTimeout, flow.providerID, flow.method.ID, flow.id)
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	flow, ok := p.flows[key]
-	if !ok || flow.authorizeRequestID != requestID {
-		return authAuthorizeResult{}, false
+	if flow.mintErr != nil {
+		return authAuthorizeResult{}, true, flow.mintErr
 	}
 
-	return flow.presentation, true
+	return flow.presentation, true, nil
 }
 
 // resolveMethod fences a method id against the generation that produced it. A
@@ -398,22 +452,23 @@ func (p *providerAuth) resolveMethod(request authorizeRequest) (authCatalogMetho
 }
 
 // mintPresentation starts the native login for an oauth method and builds the
-// wire presentation. An api-key method has nothing to mint: its value is
-// submitted through callback and applied natively there.
-func (p *providerAuth) mintPresentation(ctx context.Context, session *agentSession, flow *authFlow) (authAuthorizeResult, error) {
+// wire presentation, reporting the cause a failed mint fails with. An api-key
+// method has nothing to mint: its value is submitted through callback and
+// applied natively there.
+func (p *providerAuth) mintPresentation(ctx context.Context, session *agentSession, flow *authFlow) (authAuthorizeResult, string) {
 	if flow.method.Type == authMethodTypeAPI {
 		return authAuthorizeResult{
 			Interaction:   authInteractionSecret,
 			Message:       flow.method.Label,
 			FlowID:        flow.id,
 			FlowExpiresAt: flow.expiresAt.UnixMilli(),
-		}, nil
+		}, ""
 	}
 
 	p.startLogin(session, flow, pi.AuthMethodOAuth)
 
-	if err := p.awaitPresentation(ctx, flow); err != nil {
-		return authAuthorizeResult{}, err
+	if cause := p.awaitPresentation(ctx, flow); cause != "" {
+		return authAuthorizeResult{}, cause
 	}
 
 	return p.publishPresentation(flow)
@@ -421,7 +476,7 @@ func (p *providerAuth) mintPresentation(ctx context.Context, session *agentSessi
 
 // publishPresentation converts the folded native facts into the wire
 // presentation, failing closed when the flow never produced a renderable one.
-func (p *providerAuth) publishPresentation(flow *authFlow) (authAuthorizeResult, error) {
+func (p *providerAuth) publishPresentation(flow *authFlow) (authAuthorizeResult, string) {
 	p.mu.Lock()
 
 	cause := flow.nativeCause
@@ -438,18 +493,18 @@ func (p *providerAuth) publishPresentation(flow *authFlow) (authAuthorizeResult,
 	p.mu.Unlock()
 
 	if cause != "" {
-		return authAuthorizeResult{}, authFailed(cause, flow.providerID, flow.method.ID, flow.id)
+		return authAuthorizeResult{}, cause
 	}
 
 	if interaction == "" || result.URL == "" || result.Message == "" {
-		return authAuthorizeResult{}, authFailed(authCauseNativeVeto, flow.providerID, flow.method.ID, flow.id)
+		return authAuthorizeResult{}, authCauseNativeVeto
 	}
 
 	if interaction == authInteractionCallback {
 		result.CallbackInput = authCallbackInputCode
 	}
 
-	return result, nil
+	return result, ""
 }
 
 // armCompleter bounds the flow by its effective deadline. It is armed exactly
@@ -491,18 +546,6 @@ func (p *providerAuth) expire(flow *authFlow) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), authNativeCallTimeoutValue)
 	defer cancel()
-
-	p.cancelParked(ctx, flow)
-}
-
-// discard drops a flow that never became presentable, leaving nothing a later
-// leg could address.
-func (p *providerAuth) discard(ctx context.Context, flow *authFlow) {
-	p.mu.Lock()
-	delete(p.flows, authFlowKey{sessionID: flow.sessionID, providerID: flow.providerID})
-	delete(p.byID, flow.id)
-	flow.state = authStateFailed
-	p.mu.Unlock()
 
 	p.cancelParked(ctx, flow)
 }
@@ -893,11 +936,19 @@ func (p *providerAuth) disconnect(ctx context.Context, params json.RawMessage) (
 // closeSession cancels every pending flow the session owns, terminalizing each
 // as cancelled/session_closed and dismissing the native prompt it left open. It
 // runs before the native interrupt, so a flow is never abandoned to a process
-// already being torn down.
+// already being torn down. It is also the only thing that drops a retained
+// record: an idempotency key is answerable for as long as its session lives and
+// answers nothing after it does not.
 func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId) {
 	p.mu.Lock()
 
 	orphaned := make([]*authFlow, 0, len(p.flows))
+
+	for key := range p.retained {
+		if key.sessionID == sessionID {
+			delete(p.retained, key)
+		}
+	}
 
 	for key, flow := range p.flows {
 		if key.sessionID != sessionID {

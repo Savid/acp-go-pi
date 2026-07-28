@@ -90,7 +90,7 @@ func TestAuthMethodsRejectsBadParams(t *testing.T) {
 // TestAuthMethodsFailsClosedWhenNoCatalogCanBeProduced pins that a bridge that
 // never answers takes the leg down rather than publishing an empty catalog.
 func TestAuthMethodsFailsClosedWhenNoCatalogCanBeProduced(t *testing.T) {
-	t.Parallel()
+	shortenAuthNativeCallTimeout(t)
 
 	harness := newAuthHarness(t)
 	harness.scriptBridge(func(_ context.Context, _ pi.AuthRequest) error { return nil })

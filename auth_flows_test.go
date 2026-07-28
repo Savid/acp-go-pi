@@ -85,6 +85,34 @@ func authorizeResult(t *testing.T, value any) authAuthorizeResult {
 	return result
 }
 
+// authorizeCall is one authorize leg answered off the calling goroutine, so a
+// test can observe whether a concurrent repeat waits.
+type authorizeCall struct {
+	result any
+	err    error
+}
+
+func callAuthorize(harness *authHarness, params map[string]any) authorizeCall {
+	result, err := harness.call(context.WithoutCancel(harness.t.Context()), AuthAuthorizeMethod, params)
+
+	return authorizeCall{result: result, err: err}
+}
+
+func authFailureFlowID(t *testing.T, err error) string {
+	t.Helper()
+
+	var requestError *acp.RequestError
+	require.ErrorAs(t, err, &requestError)
+
+	data, ok := requestError.Data.(map[string]any)
+	require.True(t, ok)
+
+	flowID, ok := data[authFieldFlowID].(string)
+	require.True(t, ok)
+
+	return flowID
+}
+
 // TestAuthorizeManualCodeFlowPresentation pins the callback presentation: pi's
 // paste-back login parks its prompt and the leg returns while it waits.
 func TestAuthorizeManualCodeFlowPresentation(t *testing.T) {
@@ -150,6 +178,186 @@ func TestAuthorizeReplaysIdempotencyKeyVerbatim(t *testing.T) {
 	second, err := harness.call(t.Context(), AuthAuthorizeMethod, params)
 	require.NoError(t, err)
 	require.Equal(t, first, second)
+}
+
+// TestAuthorizeReplaysAfterTerminalization pins that the idempotency key
+// outlives the flow's terminalization: the repeat answers from the retained
+// record without superseding, bumping the ledger, or calling the harness.
+func TestAuthorizeReplaysAfterTerminalization(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	generation := harness.seedCatalog(t.Context(), defaultAuthProviders())
+	scriptManualCodeLogin(harness, "code-1", pi.AuthMessage{OK: true})
+
+	params := authorizeParams(harness, "anthropic", generation, authMethodTypeOAuth)
+
+	first, err := harness.call(t.Context(), AuthAuthorizeMethod, params)
+	require.NoError(t, err)
+
+	flowID := authorizeResult(t, first).FlowID
+
+	_, err = harness.call(t.Context(), AuthCallbackMethod, map[string]any{
+		authFieldSessionID:  string(harness.session.id),
+		authFieldProviderID: "anthropic",
+		authFieldMethod:     authMethodTypeOAuth,
+		authFieldFlowID:     flowID,
+		authFieldInput:      "code-1",
+	})
+	require.NoError(t, err)
+
+	harness.broker.mu.Lock()
+	_, pending := harness.broker.flows[authFlowKey{sessionID: harness.session.id, providerID: "anthropic"}]
+	harness.broker.mu.Unlock()
+	require.False(t, pending, "the completed flow has left the pending map")
+
+	harness.scriptBridge(func(_ context.Context, _ pi.AuthRequest) error {
+		require.FailNow(t, "a replayed authorizeRequestId must make no native call")
+
+		return nil
+	})
+
+	second, err := harness.call(t.Context(), AuthAuthorizeMethod, params)
+	require.NoError(t, err)
+	require.Equal(t, first, second)
+	require.Equal(t, authStateAuthenticated, harness.broker.flowState(harness.broker.byID[flowID]))
+
+	record, _, err := harness.broker.ledger.read("anthropic")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), record.Revision, "a replay is not a new generation")
+}
+
+// TestAuthorizeReplayWaitsForTheMint pins that a repeat arriving while the
+// native mint is still running holds until the presentation is published rather
+// than replaying an empty one.
+func TestAuthorizeReplayWaitsForTheMint(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	generation := harness.seedCatalog(t.Context(), defaultAuthProviders())
+
+	minting := make(chan struct{})
+	release := make(chan struct{})
+
+	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
+		close(minting)
+		<-release
+
+		harness.deliver(ctx, pi.AuthMessage{
+			ID:    request.ID,
+			Kind:  pi.AuthKindEvent,
+			Event: &pi.AuthNativeEvent{Type: authNativeEventAuthURL, URL: authTestURL, Instructions: "Complete login in your browser."},
+		})
+		harness.deliver(ctx, pi.AuthMessage{
+			ID:      request.ID,
+			Kind:    pi.AuthKindPrompt,
+			Prompt:  pi.AuthPromptManualCode,
+			Message: "Paste the authorization code here",
+		})
+
+		return nil
+	})
+
+	params := authorizeParams(harness, "anthropic", generation, authMethodTypeOAuth)
+
+	first := make(chan authorizeCall, 1)
+	go func() { first <- callAuthorize(harness, params) }()
+
+	<-minting
+
+	repeat := make(chan authorizeCall, 1)
+	go func() { repeat <- callAuthorize(harness, params) }()
+
+	select {
+	case <-repeat:
+		require.FailNow(t, "a repeat arriving during the mint must wait for the presentation")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+
+	minted := <-first
+	require.NoError(t, minted.err)
+
+	replayed := <-repeat
+	require.NoError(t, replayed.err)
+	require.Equal(t, minted.result, replayed.result)
+	require.Equal(t, authInteractionCallback, authorizeResult(t, replayed.result).Interaction)
+	require.NotEmpty(t, authorizeResult(t, replayed.result).FlowID)
+}
+
+// TestAuthorizeReplaysMintFailure pins that a flow whose mint never produced a
+// presentation stays addressable and terminal, and that its idempotency key
+// replays the same failure.
+func TestAuthorizeReplaysMintFailure(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	generation := harness.seedCatalog(t.Context(), defaultAuthProviders())
+
+	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
+		harness.deliver(ctx, pi.AuthMessage{
+			ID:    request.ID,
+			Kind:  pi.AuthKindEvent,
+			Event: &pi.AuthNativeEvent{Type: authNativeEventAuthURL, URL: "http://provider.test/a"},
+		})
+
+		return nil
+	})
+
+	params := authorizeParams(harness, "anthropic", generation, authMethodTypeOAuth)
+
+	_, err := harness.call(t.Context(), AuthAuthorizeMethod, params)
+	requireAuthFailed(t, err, authCauseNativeVeto)
+
+	flowID := authFailureFlowID(t, err)
+
+	status, statusErr := harness.call(t.Context(), AuthStatusMethod, map[string]any{
+		authFieldSessionID:  string(harness.session.id),
+		authFieldProviderID: "anthropic",
+		authFieldFlowID:     flowID,
+	})
+	require.NoError(t, statusErr)
+	require.Equal(t, authStatusResult{
+		FlowID: flowID,
+		State:  authStateFailed,
+		Reason: authReasonNativeVeto,
+	}, status)
+
+	harness.scriptBridge(func(_ context.Context, _ pi.AuthRequest) error {
+		require.FailNow(t, "a replayed authorizeRequestId must make no native call")
+
+		return nil
+	})
+
+	_, repeatErr := harness.call(t.Context(), AuthAuthorizeMethod, params)
+	require.Equal(t, err, repeatErr)
+}
+
+// TestAuthorizeReplayHonoursCallerCancellation pins that a caller walking away
+// from a repeat releases the leg rather than blocking on a mint nobody is
+// waiting for.
+func TestAuthorizeReplayHonoursCallerCancellation(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	key := authFlowKey{sessionID: harness.session.id, providerID: "anthropic"}
+
+	harness.broker.mu.Lock()
+	harness.broker.retained[key] = &authFlow{
+		id:                 "flow-1",
+		providerID:         "anthropic",
+		authorizeRequestID: "req-1",
+		ready:              make(chan struct{}),
+	}
+	harness.broker.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, replayed, err := harness.broker.replayAuthorize(ctx, key, "req-1")
+	require.True(t, replayed)
+	requireAuthFailed(t, err, authCauseTimeout)
 }
 
 // TestAuthorizeSupersedesPriorFlow pins that a different idempotency key
@@ -767,6 +975,28 @@ func TestCloseSessionCancelsPendingFlows(t *testing.T) {
 
 // TestCloseSessionSkipsTerminalFlows pins that a flow already terminal keeps its
 // own reason when the session closes.
+// TestCloseSessionDropsRetainedFlows pins the retained record's only exit: an
+// idempotency key answers for as long as its session lives and answers nothing
+// after it does not.
+func TestCloseSessionDropsRetainedFlows(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	generation := harness.seedCatalog(t.Context(), defaultAuthProviders())
+	scriptManualCodeLogin(harness, "code-1", pi.AuthMessage{OK: true})
+
+	params := authorizeParams(harness, "anthropic", generation, authMethodTypeOAuth)
+
+	_, err := harness.call(t.Context(), AuthAuthorizeMethod, params)
+	require.NoError(t, err)
+
+	harness.broker.closeSession(t.Context(), harness.session.id)
+
+	harness.broker.mu.Lock()
+	defer harness.broker.mu.Unlock()
+	require.Empty(t, harness.broker.retained)
+}
+
 func TestCloseSessionSkipsTerminalFlows(t *testing.T) {
 	t.Parallel()
 
@@ -1181,10 +1411,10 @@ func TestDisconnectReportsRemovalRecordFailure(t *testing.T) {
 // TestDisconnectReportsProbeFailure pins that a verification that could not run
 // fails the leg rather than recording an absence nobody established.
 func TestDisconnectReportsProbeFailure(t *testing.T) {
-	t.Parallel()
-
 	harness := newAuthHarness(t)
 	startManualCodeFlow(t, harness, "code-1", pi.AuthMessage{OK: true})
+
+	shortenAuthNativeCallTimeout(t)
 
 	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
 		if request.Op == pi.AuthOpRemove {

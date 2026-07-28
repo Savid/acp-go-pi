@@ -139,6 +139,7 @@ func NewAgent(opts ...Option) *Agent {
 			validateContainmentOption(options),
 			validateImageLimits(options.ImageLimits),
 			validateInputHandoffRoot(options.InputHandoffRoot),
+			validateProviderAuthRoot(options),
 		),
 		startPiProcess: startRealPiProcess,
 		probeVersion:   pi.ProbeVersion,

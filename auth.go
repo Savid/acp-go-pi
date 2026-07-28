@@ -88,7 +88,11 @@ type providerAuth struct {
 	catalog    map[string][]authCatalogMethod
 	flows      map[authFlowKey]*authFlow
 	byID       map[string]*authFlow
-	exchanges  map[string]*authExchange
+	// retained holds the most recent flow per key whatever its state, so the
+	// idempotency key stays answerable after the flow has terminalized. Only a
+	// session close drops an entry.
+	retained  map[authFlowKey]*authFlow
+	exchanges map[string]*authExchange
 }
 
 type authFlowKey struct {
@@ -119,6 +123,7 @@ func newProviderAuth(agent *Agent) *providerAuth {
 		ledger:    ledger,
 		flows:     make(map[authFlowKey]*authFlow),
 		byID:      make(map[string]*authFlow),
+		retained:  make(map[authFlowKey]*authFlow),
 		exchanges: make(map[string]*authExchange),
 	}
 }

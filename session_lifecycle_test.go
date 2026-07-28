@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -693,4 +694,51 @@ func TestRelaunchAdmissionFailureBranches(t *testing.T) {
 		prepareRelaunchFixture(t, session)
 		require.ErrorIs(t, session.relaunchProcess(t.Context()), wantErr)
 	})
+}
+
+// TestCloseResolvesPendingDialogsBeforeAuthFlows pins the shutdown ladder's
+// fixed step order: a pending dialog is resolved before pending logins are
+// cancelled, which is itself before the native interrupt.
+func TestCloseResolvesPendingDialogsBeforeAuthFlows(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	flowID := startManualCodeFlow(t, harness, "code-1", pi.AuthMessage{OK: true})
+
+	harness.broker.mu.Lock()
+	parked := harness.broker.byID[flowID].parkedDialog
+	harness.broker.mu.Unlock()
+	require.NotEmpty(t, parked)
+
+	var mu sync.Mutex
+
+	order := make([]string, 0, 2)
+	record := func(step string) {
+		mu.Lock()
+		order = append(order, step)
+		mu.Unlock()
+	}
+
+	harness.session.mu.Lock()
+	harness.session.pendingDialogs = map[string]*dialogCancel{
+		"pending-dialog": {cancel: func() { record("pending dialog") }},
+	}
+	harness.session.mu.Unlock()
+
+	harness.client.mu.Lock()
+	previous := harness.client.respondFunc
+	harness.client.respondFunc = func(response pi.UIResponse) {
+		if response.ID == parked {
+			record("provider auth")
+		}
+
+		previous(response)
+	}
+	harness.client.mu.Unlock()
+
+	_ = harness.session.Close(context.WithoutCancel(t.Context()))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"pending dialog", "provider auth"}, order)
 }

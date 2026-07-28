@@ -79,10 +79,13 @@ func (p *providerAuth) exchange(ctx context.Context, session *agentSession, requ
 		return pi.AuthMessage{}, err
 	}
 
+	// The extension answers on the pump, which runs independently of the leg
+	// that sent the command, so the answer is waited for under the call's own
+	// bound rather than sampled the instant the command is acknowledged.
 	select {
 	case message := <-exchange.answer:
 		return message, nil
-	default:
+	case <-callCtx.Done():
 		return pi.AuthMessage{}, errAuthBridge
 	}
 }
@@ -166,7 +169,7 @@ func (p *providerAuth) deliverResult(exchange *authExchange, message pi.AuthMess
 	default:
 	}
 
-	p.markReady(exchange.flow)
+	p.markDecidable(exchange.flow)
 }
 
 // recordEvent folds one native presentation event into the flow. Only the two
@@ -253,7 +256,7 @@ func (p *providerAuth) park(flow *authFlow, dialogID string, message string) {
 	}
 	p.mu.Unlock()
 
-	p.markReady(flow)
+	p.markDecidable(flow)
 }
 
 func (p *providerAuth) takeSecret(flow *authFlow) (string, bool) {
@@ -277,7 +280,7 @@ func (p *providerAuth) veto(flow *authFlow, cause string) {
 	}
 	p.mu.Unlock()
 
-	p.markReady(flow)
+	p.markDecidable(flow)
 }
 
 func (p *providerAuth) flowVeto(flow *authFlow) string {
@@ -287,6 +290,14 @@ func (p *providerAuth) flowVeto(flow *authFlow) string {
 	return flow.nativeCause
 }
 
+// markDecidable reports that the native side has said enough for the leg to
+// publish or refuse a presentation.
+func (p *providerAuth) markDecidable(flow *authFlow) {
+	flow.decidableOnce.Do(func() { close(flow.decidable) })
+}
+
+// markReady reports that the mint has settled either way, which is what an
+// idempotent repeat waits on before it replays.
 func (p *providerAuth) markReady(flow *authFlow) {
 	flow.readyOnce.Do(func() { close(flow.ready) })
 }
@@ -314,20 +325,22 @@ func (p *providerAuth) startLogin(session *agentSession, flow *authFlow, method 
 
 		// A native flow that ends without reporting anything leaves the leg
 		// waiting on a presentation that will never arrive.
-		p.markReady(flow)
+		p.markDecidable(flow)
 	})
 }
 
 // awaitPresentation waits for the flow to become decidable: a parked callback
-// prompt, a device-code presentation, a veto, or a terminal result.
-func (p *providerAuth) awaitPresentation(ctx context.Context, flow *authFlow) error {
+// prompt, a device-code presentation, a veto, or a terminal result. It reports
+// the cause the mint fails with, or the empty string once the flow is
+// decidable.
+func (p *providerAuth) awaitPresentation(ctx context.Context, flow *authFlow) string {
 	select {
-	case <-flow.ready:
-		return nil
+	case <-flow.decidable:
+		return ""
 	case <-ctx.Done():
-		return authFailed(authCauseTimeout, flow.providerID, flow.method.ID, flow.id)
+		return authCauseTimeout
 	case <-time.After(authNativeCallTimeoutValue):
-		return authFailed(authCauseTimeout, flow.providerID, flow.method.ID, flow.id)
+		return authCauseTimeout
 	}
 }
 

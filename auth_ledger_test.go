@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
 	"github.com/savid/acp-go-pi/internal/pi"
@@ -155,6 +156,54 @@ func TestNewAuthLedgerRejectsUnusableRoots(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestNewAuthLedgerNarrowsTheConfiguredRoot pins that the operator-configured
+// root itself is created 0700, and that a root the host left wider is chmodded
+// rather than accepted as found.
+func TestNewAuthLedgerNarrowsTheConfiguredRoot(t *testing.T) {
+	t.Parallel()
+
+	parent := t.TempDir()
+
+	missing := filepath.Join(parent, "missing")
+	_, err := newAuthLedger(Options{ProviderAuthRoot: missing, Home: "/srv/pi"})
+	require.NoError(t, err)
+
+	info, err := os.Stat(missing)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(authLedgerDirMode), info.Mode().Perm())
+
+	existing := filepath.Join(parent, "existing")
+	require.NoError(t, os.Mkdir(existing, 0o755))
+
+	_, err = newAuthLedger(Options{ProviderAuthRoot: existing, Home: "/srv/pi"})
+	require.NoError(t, err)
+
+	info, err = os.Stat(existing)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(authLedgerDirMode), info.Mode().Perm())
+}
+
+func TestValidateProviderAuthRoot(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, validateProviderAuthRoot(Options{}))
+	require.NoError(t, validateProviderAuthRoot(Options{ProviderAuthRoot: t.TempDir()}))
+	require.ErrorContains(t, validateProviderAuthRoot(Options{ProviderAuthRoot: "relative/auth"}), "absolute path")
+}
+
+// TestWithProviderAuthRootRejectsRelativePath pins that a relative root is a
+// construction-time verdict, not merely an unadvertised surface.
+func TestWithProviderAuthRootRejectsRelativePath(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewAgent(WithProviderAuthRoot("relative/auth")).Initialize(t.Context(), defaultInitializeRequest())
+
+	var requestError *acp.RequestError
+
+	require.ErrorAs(t, err, &requestError)
+	require.Equal(t, -32602, requestError.Code)
+}
+
 func TestNewAuthLedgerReportsFilesystemFailures(t *testing.T) {
 	root := t.TempDir()
 	options := Options{ProviderAuthRoot: root, Home: "/srv/pi"}
@@ -178,12 +227,58 @@ func TestNewAuthLedgerReportsFilesystemFailures(t *testing.T) {
 		ledgerCreateTemp = original.createTemp
 	})
 
-	restore("mkdir", func() { ledgerMkdirAll = func(string, os.FileMode) error { return errors.New("mkdir") } })
+	// The root and the leaf are prepared separately, so each step fails on its
+	// own path rather than on whichever comes first.
+	restore("root mkdir", func() {
+		ledgerMkdirAll = func(path string, mode os.FileMode) error {
+			if path == root {
+				return errors.New("mkdir")
+			}
+
+			return original.mkdirAll(path, mode)
+		}
+	})
+
 	_, err := newAuthLedger(options)
 	require.Error(t, err)
 
+	restore("leaf mkdir", func() {
+		ledgerMkdirAll = func(path string, mode os.FileMode) error {
+			if path != root {
+				return errors.New("mkdir")
+			}
+
+			return original.mkdirAll(path, mode)
+		}
+	})
+
+	_, err = newAuthLedger(options)
+	require.Error(t, err)
+
 	ledgerMkdirAll = original.mkdirAll
-	restore("chmod", func() { ledgerChmod = func(string, os.FileMode) error { return errors.New("chmod") } })
+	restore("root chmod", func() {
+		ledgerChmod = func(path string, mode os.FileMode) error {
+			if path == root {
+				return errors.New("chmod")
+			}
+
+			return original.chmod(path, mode)
+		}
+	})
+
+	_, err = newAuthLedger(options)
+	require.Error(t, err)
+
+	restore("leaf chmod", func() {
+		ledgerChmod = func(path string, mode os.FileMode) error {
+			if path != root {
+				return errors.New("chmod")
+			}
+
+			return original.chmod(path, mode)
+		}
+	})
+
 	_, err = newAuthLedger(options)
 	require.Error(t, err)
 
@@ -480,10 +575,10 @@ func TestInventoryReportsLedgerFailure(t *testing.T) {
 // TestInventoryReportsProbeFailure pins that an unanswerable probe fails the leg
 // rather than reporting an absence nobody established.
 func TestInventoryReportsProbeFailure(t *testing.T) {
-	t.Parallel()
-
 	harness := newAuthHarness(t)
 	startManualCodeFlow(t, harness, "code-1", pi.AuthMessage{OK: true})
+
+	shortenAuthNativeCallTimeout(t)
 
 	harness.scriptBridge(func(_ context.Context, _ pi.AuthRequest) error { return nil })
 

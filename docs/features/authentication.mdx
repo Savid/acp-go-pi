@@ -95,9 +95,13 @@ directory, so a per-session agent directory would leave the lock guarding
 nothing and the credential nowhere.
 
 `WithProviderAuthRoot` is the durable directory holding the adapter's
-values-free ledger. A root that was asked for and could not be created, is not
-a directory, or is not writable leaves the surface unadvertised exactly as an
-unset one does: a leg that cannot record what it did is not offered.
+values-free ledger. It takes an absolute path, and the adapter creates it mode
+`0700`, narrowing a directory that already exists. A root that was asked for
+and could not be created, is not a directory, or is not writable leaves the
+surface unadvertised exactly as an unset one does: a leg that cannot record
+what it did is not offered. A *relative* root is a configuration failure the
+agent reports at construction, alongside a relative `WithInputHandoffRoot` and
+a negative `ImageLimits` field.
 
 `WithProviderAuthDirectHome` is declared and rejected. It gates an
 account-level removal, and pi's removal is a per-provider store call, so there
@@ -164,9 +168,12 @@ credential is accepted in.
 7. **`disconnect`** bumps the binding generation, removes only the exactly
    fenced slot, and verifies absence afterwards.
 
-Repeating an `authorizeRequestId` replays the recorded presentation verbatim
-with no native call. A *different* one supersedes the flow, after which the old
-`flowId` addresses nothing.
+Repeating an `authorizeRequestId` replays the recorded presentation and
+`flowId` verbatim with no native call, for as long as the session lives — a
+repeat arriving while the first mint is still running waits for it, and one
+arriving after the flow has completed, failed, or been cancelled still answers.
+A *different* one supersedes the flow, after which the old `flowId` addresses
+nothing.
 
 ### What crosses the boundary
 

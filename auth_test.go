@@ -231,6 +231,17 @@ func defaultAuthProviders() []pi.AuthProvider {
 	}
 }
 
+// shortenAuthNativeCallTimeout bounds one bridge exchange tightly, for a test
+// that deliberately leaves a bridge command unanswered.
+func shortenAuthNativeCallTimeout(t *testing.T) {
+	t.Helper()
+
+	original := authNativeCallTimeoutValue
+	authNativeCallTimeoutValue = 20 * time.Millisecond
+
+	t.Cleanup(func() { authNativeCallTimeoutValue = original })
+}
+
 func requireAuthFailed(t *testing.T, err error, cause string) {
 	t.Helper()
 

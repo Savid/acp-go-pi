@@ -94,13 +94,36 @@ func authLedgerRootConfigured(options Options) bool {
 	return options.ProviderAuthRoot != ""
 }
 
+// validateProviderAuthRoot rejects a relative provider-auth root at agent
+// construction. An empty root is valid and leaves the surface unadvertised.
+func validateProviderAuthRoot(options Options) error {
+	root := options.ProviderAuthRoot
+	if root == "" || filepath.IsAbs(root) {
+		return nil
+	}
+
+	return errors.New("provider auth root must be an absolute path")
+}
+
 // newAuthLedger resolves and validates the configured durable root. A root that
 // does not exist and cannot be created, is not a directory, or is not writable
 // leaves the provider-auth surface unadvertised, exactly as an unset one does.
 func newAuthLedger(options Options) (*authLedger, error) {
+	if err := validateProviderAuthRoot(options); err != nil {
+		return nil, err
+	}
+
 	root := options.ProviderAuthRoot
-	if !filepath.IsAbs(root) {
-		return nil, errors.New("provider auth root must be an absolute path")
+
+	// The operator-configured root is the directory the host consents to, so it
+	// is the one this narrows: a pre-existing root is chmodded rather than left
+	// as the host found it.
+	if err := ledgerMkdirAll(root, authLedgerDirMode); err != nil {
+		return nil, fmt.Errorf("create provider auth root: %w", err)
+	}
+
+	if err := ledgerChmod(root, authLedgerDirMode); err != nil {
+		return nil, fmt.Errorf("restrict provider auth root: %w", err)
 	}
 
 	dir := filepath.Join(root, authLedgerVendorDir, authLedgerHomeKey(options.Home), authLedgerLeafDir)
