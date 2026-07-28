@@ -14,20 +14,18 @@ import (
 	"time"
 
 	"github.com/testcontainers/testcontainers-go"
+	tcexec "github.com/testcontainers/testcontainers-go/exec"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 const (
-	envRunKeystore = "ACP_GO_PI_RUN_KEYSTORE"
-
+	envRunKeystore    = "ACP_GO_PI_RUN_KEYSTORE"
 	keystoreEnvFile   = "/run/acp-go-pi-keystore/env"
 	keystoreRoundTrip = "/usr/local/bin/roundtrip.sh"
-
-	// keystoreProbePath is where the fixture holds internal/pi's Linux test
-	// binary: the facts this tier settles are the ones only Linux can answer.
-	keystoreProbePath = "/usr/local/bin/pi.test"
+	keystoreProbePath = "/usr/local/bin/residence.test"
 )
 
+// requireRunKeystore gates the tier on both env vars.
 func requireRunKeystore(t *testing.T) {
 	t.Helper()
 	requireRunIntegration(t)
@@ -63,37 +61,60 @@ func TestKeystoreLinuxCredentialResidence(t *testing.T) {
 
 	container := startKeystoreFixture(ctx, t)
 
-	if err := container.CopyFileToContainer(ctx, buildLinuxPiProbe(t), keystoreProbePath, 0o755); err != nil {
+	if err := container.CopyFileToContainer(ctx, buildResidenceProbe(t), keystoreProbePath, 0o755); err != nil {
 		t.Fatalf("copy residence probe: %v", err)
 	}
 
-	matrix := keystoreProbePath + " -test.v -test.run '^TestKeystoreResidenceMatrix$'"
-
-	for name, command := range map[string]string{
-		"keystore-present": ". " + keystoreEnvFile + "; export DBUS_SESSION_BUS_ADDRESS; exec " + matrix,
-		"keystore-absent":  "unset DBUS_SESSION_BUS_ADDRESS; exec " + matrix,
+	// Both Linux configurations run in this one container and differ by exactly
+	// one thing: whether the session bus that reaches the Secret Service is
+	// exported. A run that exercises one side of that fork proves nothing about
+	// the identity the matrix claims.
+	for _, configuration := range []struct {
+		name string
+		bus  bool
+	}{
+		{name: "keystore-absent"},
+		{name: "keystore-present", bus: true},
 	} {
-		t.Run(name, func(t *testing.T) {
-			code, output, err := container.Exec(ctx, []string{"/bin/sh", "-c", command})
-			if err != nil {
-				t.Fatalf("run residence matrix: %v", err)
-			}
-
-			logs, readErr := io.ReadAll(output)
-			if readErr != nil {
-				t.Fatalf("read residence output: %v", readErr)
-			}
-
-			t.Log(string(logs))
-
-			if code != 0 {
-				t.Fatalf("residence matrix exited %d", code)
-			}
-
-			if strings.Contains(string(logs), "SKIP") {
-				t.Fatalf("the residence matrix skipped inside the fixture: %s", logs)
-			}
+		t.Run(configuration.name, func(t *testing.T) {
+			runResidenceMatrix(ctx, t, container, configuration.bus)
 		})
+	}
+}
+
+// runResidenceMatrix executes the probe in one configuration and requires it to
+// have reported a pass. An exit status alone goes green on a skip, which is the
+// silent success this tier exists to prevent.
+func runResidenceMatrix(ctx context.Context, t *testing.T, container testcontainers.Container, bus bool) {
+	t.Helper()
+
+	script := "export " + envRunIntegration + "=1 " + envRunKeystore + "=1; "
+	if bus {
+		script += ". " + keystoreEnvFile + "; export DBUS_SESSION_BUS_ADDRESS; "
+	}
+
+	script += "exec " + keystoreProbePath + " -test.v -test.run '^TestKeystoreResidenceMatrix$'"
+
+	// The raw exec stream is frame-multiplexed: every read carries an eight-byte
+	// header, so an unmultiplexed reader interleaves those bytes into the logs.
+	code, output, err := container.Exec(ctx, []string{"/bin/sh", "-c", script}, tcexec.Multiplexed())
+	if err != nil {
+		t.Fatalf("run residence matrix: %v", err)
+	}
+
+	logs, readErr := io.ReadAll(output)
+	if readErr != nil {
+		t.Fatalf("read residence output: %v", readErr)
+	}
+
+	t.Log(string(logs))
+
+	if code != 0 {
+		t.Fatalf("residence matrix exited %d", code)
+	}
+
+	if !strings.Contains(string(logs), "--- PASS: TestKeystoreResidenceMatrix") {
+		t.Fatal("the residence matrix did not run in this configuration")
 	}
 }
 
@@ -159,21 +180,22 @@ func startKeystoreFixture(ctx context.Context, t *testing.T) testcontainers.Cont
 	return container
 }
 
-// buildLinuxPiProbe compiles internal/pi's test binary for the fixture's
-// platform. The tests it carries cannot run on the host: one needs a live
-// Secret Service beside it, the other needs Linux's own launcher resolution.
-// GOWORK=off keeps the probe built from this module's own requirements.
-func buildLinuxPiProbe(t *testing.T) string {
+// buildResidenceProbe compiles the package that owns the credential read path
+// for the fixture's platform, under the tag that guards the matrix. The tests it
+// carries cannot run on the host: one needs a live Secret Service beside it, the
+// other needs Linux's own launcher resolution. GOWORK=off keeps the probe built
+// from this module's own requirements.
+func buildResidenceProbe(t *testing.T) string {
 	t.Helper()
 
-	out := filepath.Join(t.TempDir(), "pi.test")
+	out := filepath.Join(t.TempDir(), "residence.test")
 
 	command := exec.CommandContext(t.Context(), "go", "test", "-c", "-tags=integration", "-o", out, "./internal/pi")
-	command.Dir = repoRoot()
+	command.Dir = ".."
 	command.Env = append(os.Environ(), "GOWORK=off", "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
 
 	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("build linux pi probe: %v: %s", err, output)
+		t.Fatalf("build residence probe: %v: %s", err, output)
 	}
 
 	return out

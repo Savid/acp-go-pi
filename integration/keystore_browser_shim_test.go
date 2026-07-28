@@ -26,7 +26,7 @@ func TestKeystoreLinuxLoginNeverExecsABrowserLauncher(t *testing.T) {
 
 	container := startKeystoreFixture(ctx, t)
 
-	if err := container.CopyFileToContainer(ctx, buildLinuxPiProbe(t), keystoreProbePath, 0o755); err != nil {
+	if err := container.CopyFileToContainer(ctx, buildResidenceProbe(t), keystoreProbePath, 0o755); err != nil {
 		t.Fatalf("copy launcher probe: %v", err)
 	}
 
