@@ -113,7 +113,14 @@ func TestPiCLIBridgeExtensionLoads(t *testing.T) {
 
 	commands, err := h.client.GetCommands(ctx)
 	require.NoError(t, err)
-	require.Empty(t, commands, "the bridge extension deliberately registers no commands")
+	// The bridge owns exactly one slash command, the one carrying an auth leg.
+	// Asserting its presence rather than an exact set keeps a built-in the
+	// harness gains on a newer pi from reading as a wrapper regression.
+	names := make([]string, 0, len(commands))
+	for _, command := range commands {
+		names = append(names, command.Name)
+	}
+	require.Contains(t, names, pi.AuthCommandName)
 
 	require.NoError(t, h.client.SetAutoRetry(ctx, false))
 
