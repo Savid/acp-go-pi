@@ -22,7 +22,10 @@ const (
 
 	keystoreEnvFile   = "/run/acp-go-pi-keystore/env"
 	keystoreRoundTrip = "/usr/local/bin/roundtrip.sh"
-	keystoreProbePath = "/usr/local/bin/residence.test"
+
+	// keystoreProbePath is where the fixture holds internal/pi's Linux test
+	// binary: the facts this tier settles are the ones only Linux can answer.
+	keystoreProbePath = "/usr/local/bin/pi.test"
 )
 
 func requireRunKeystore(t *testing.T) {
@@ -58,33 +61,9 @@ func TestKeystoreLinuxCredentialResidence(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			FromDockerfile: testcontainers.FromDockerfile{
-				Context:    filepath.Join(".", "keystore"),
-				Dockerfile: "Dockerfile",
-				KeepImage:  true,
-			},
-			// Readiness is a store/lookup round trip executed in the container.
-			// A log line and a bus-name check both report ready against a
-			// service that answers no lookup.
-			WaitingFor: wait.ForExec([]string{keystoreRoundTrip}).WithStartupTimeout(3 * time.Minute),
-		},
-		Started: true,
-	})
-	if err != nil {
-		t.Fatalf("start keystore fixture: %v", err)
-	}
+	container := startKeystoreFixture(ctx, t)
 
-	t.Cleanup(func() {
-		if err := container.Terminate(context.WithoutCancel(ctx)); err != nil {
-			t.Errorf("terminate keystore fixture: %v", err)
-		}
-	})
-
-	probe := buildResidenceProbe(t)
-
-	if err := container.CopyFileToContainer(ctx, probe, keystoreProbePath, 0o755); err != nil {
+	if err := container.CopyFileToContainer(ctx, buildLinuxPiProbe(t), keystoreProbePath, 0o755); err != nil {
 		t.Fatalf("copy residence probe: %v", err)
 	}
 
@@ -147,20 +126,54 @@ func TestKeystoreLinuxArtifactCarriesNoSecretServiceClient(t *testing.T) {
 	}
 }
 
-// buildResidenceProbe compiles the package that owns pi's credential-residence
-// facts for the fixture's platform. The matrix cannot run on the host: only the
-// container has a Secret Service to answer it.
-func buildResidenceProbe(t *testing.T) string {
+// startKeystoreFixture builds and starts the container this tier runs inside.
+// The base image is pinned by digest in the fixture's own Dockerfile, and
+// KeepImage keeps the build off the clock of every test after the first.
+func startKeystoreFixture(ctx context.Context, t *testing.T) testcontainers.Container {
 	t.Helper()
 
-	out := filepath.Join(t.TempDir(), "residence.test")
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			FromDockerfile: testcontainers.FromDockerfile{
+				Context:    filepath.Join(".", "keystore"),
+				Dockerfile: "Dockerfile",
+				KeepImage:  true,
+			},
+			// Readiness is a store/lookup round trip executed in the container.
+			// A log line and a bus-name check both report ready against a
+			// service that answers no lookup.
+			WaitingFor: wait.ForExec([]string{keystoreRoundTrip}).WithStartupTimeout(3 * time.Minute),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start keystore fixture: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := container.Terminate(context.WithoutCancel(ctx)); err != nil {
+			t.Errorf("terminate keystore fixture: %v", err)
+		}
+	})
+
+	return container
+}
+
+// buildLinuxPiProbe compiles internal/pi's test binary for the fixture's
+// platform. The tests it carries cannot run on the host: one needs a live
+// Secret Service beside it, the other needs Linux's own launcher resolution.
+// GOWORK=off keeps the probe built from this module's own requirements.
+func buildLinuxPiProbe(t *testing.T) string {
+	t.Helper()
+
+	out := filepath.Join(t.TempDir(), "pi.test")
 
 	command := exec.CommandContext(t.Context(), "go", "test", "-c", "-tags=integration", "-o", out, "./internal/pi")
 	command.Dir = repoRoot()
-	command.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
+	command.Env = append(os.Environ(), "GOWORK=off", "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
 
 	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("build residence probe: %v: %s", err, output)
+		t.Fatalf("build linux pi probe: %v: %s", err, output)
 	}
 
 	return out

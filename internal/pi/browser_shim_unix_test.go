@@ -4,6 +4,7 @@ package pi
 
 import (
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,6 +94,20 @@ func browserShimDirIn(t *testing.T, parent string) string {
 	return matches[0]
 }
 
+// browserLauncherRun is the shell body a fake harness runs: it resolves and
+// execs every launcher name in turn, printing the path each name resolved to
+// before handing it a URL. Every name is exercised because which one opens the
+// operator's desktop is a property of the platform, not of the harness.
+func browserLauncherRun() string {
+	steps := make([]string, 0, len(browserLauncherNames)*2)
+
+	for _, name := range browserLauncherNames {
+		steps = append(steps, "command -v "+name, name+` "https://example.invalid/"`)
+	}
+
+	return strings.Join(steps, "\n")
+}
+
 // TestLoginNeverExecsABrowserLauncher is the proof the shim exists for: a pi
 // process that execs a browser launcher by bare name never reaches a real one.
 // The probe directory holds launchers that record every invocation, the control
@@ -107,10 +122,17 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(probe, name), []byte(body), 0o700))
 	}
 
-	control := exec.Command("/bin/sh", "-c", `open "https://example.invalid/"`)
+	control := exec.Command("/bin/sh", "-c", browserLauncherRun())
 	control.Env = []string{"PATH=" + probe}
 	require.NoError(t, control.Run())
-	require.FileExists(t, marker)
+
+	recorded, err := os.ReadFile(marker) // #nosec G304 -- the path is this test's own temp dir.
+	require.NoError(t, err)
+
+	for _, name := range browserLauncherNames {
+		require.Contains(t, string(recorded), filepath.Join(probe, name))
+	}
+
 	require.NoError(t, os.Remove(marker))
 
 	// The child inherits PATH from this process, so the probe is what an
@@ -121,7 +143,7 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 	shim, err := NewBrowserShim(parent)
 	require.NoError(t, err)
 
-	script := writeScript(t, `command -v open; open "https://example.invalid/"`)
+	script := writeScript(t, browserLauncherRun())
 	process := startScriptProcess(t, LaunchSpec{
 		ExecutablePath: script,
 		AgentDir:       t.TempDir(),
@@ -140,11 +162,19 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 
 	require.NoFileExists(t, marker)
 
-	// The launcher the child did resolve was the shim's, not something further
+	// The launchers the child did resolve were the shim's, not something further
 	// along PATH that simply happened to be missing.
-	resolved := make([]byte, 512)
-	read, _ := process.Stdout().Read(resolved)
-	require.Equal(t, filepath.Join(browserShimDirIn(t, parent), browserLauncherNames[0]), strings.TrimSpace(string(resolved[:read])))
+	resolved, err := io.ReadAll(process.Stdout())
+	require.NoError(t, err)
+
+	dir := browserShimDirIn(t, parent)
+
+	want := make([]string, 0, len(browserLauncherNames))
+	for _, name := range browserLauncherNames {
+		want = append(want, filepath.Join(dir, name))
+	}
+
+	require.Equal(t, want, strings.Fields(string(resolved)))
 
 	require.NoError(t, shim.Remove())
 }
