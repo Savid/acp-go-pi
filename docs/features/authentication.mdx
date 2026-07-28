@@ -145,8 +145,8 @@ credential is accepted in.
    exact result. Each provider carries at most one `oauth` entry and at most
    one `api` entry, and a provider whose api-key auth is ambient-only carries
    neither. The catalog declares no prompts: pi's provider enumeration exposes
-   none, and a login that asks for something the catalog never advertised fails
-   the flow closed.
+   none, so `authorize` carries no `inputs` and the adapter answers a native
+   question with a fixed value of its own or not at all.
 2. **`authorize`** takes that `generation` as `methodsGeneration` plus a
    caller-minted `authorizeRequestId`. An `oauth` method starts the native
    login and returns its presentation — `interaction: "callback"` with a URL
@@ -155,12 +155,16 @@ credential is accepted in.
    `interaction: "secret"`.
 3. **`callback`** submits the one value the flow expects: the authorization
    code for a paste-back login, the operator's key for a secret one. It returns
-   after pi reports a terminal outcome.
+   after pi reports a terminal outcome. A `wait` flow expects no value and takes
+   no `callback`: it settles from the native login itself, and `status` is where
+   a host reads that.
 4. **`status`** reports the flow, not the connection. Its `expiresAt` is
    credential expiry and never flow expiry.
-5. **`cancel`** disarms the adapter's deadline and dismisses the native prompt.
-   It claims nothing about the provider: an issued device code stays valid
-   there until it expires.
+5. **`cancel`** disarms the adapter's deadline, dismisses the native prompt, and
+   aborts the native login. It claims nothing about the provider: an issued
+   device code stays valid there until it expires. A flow has exactly one
+   terminal transition, so a native answer that arrives after the owner
+   cancelled reports `flow_cancelled` and confirms nothing.
 6. **`inventory`** answers residence from the ledger *and* a probe of the named
    native slot, reporting `confirmed_present`, `confirmed_absent`, or
    `not_confirmed`. It never reports an ambient or externally established
@@ -212,8 +216,19 @@ that same user.
   `cause: "policy"` — see [Security](/docs/operations/security).
 - pi's enumeration exposes login methods and display names but not the
   environment-variable names behind an api-key method, and it exposes no prompt
-  schema at all. A native login that asks the operator anything beyond the one
-  credential value fails closed rather than being answered with something the
-  adapter invented.
+  schema at all. Because the catalog cannot advertise a question, no host answer
+  can reach one, and what the adapter answers with is fixed per question type
+  and carries no value of its own: a login-variant choice is answered with its
+  device-code branch, the only branch whose completion does not land on a socket
+  the owner's browser cannot reach; a free-text question is answered empty,
+  which declines the optional value and leaves the login on the vendor default
+  it already has; a credential question is answered only by the value the flow
+  was given; and everything else fails the flow closed with
+  `cause: "native_veto"`.
+- A terminal flow aborts its native login. pi's device logins park no prompt, so
+  a cancelled or expired flow that only dismissed prompts would leave an issued
+  user code approvable, and an approval landing afterwards would write a
+  credential into the durable agent directory under a ledger entry no leg will
+  ever confirm.
 - `pi login` is not a command. The only native login path is the interactive
   slash command, which is what these legs drive.

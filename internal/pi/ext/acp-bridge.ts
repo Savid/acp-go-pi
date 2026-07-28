@@ -53,6 +53,26 @@ async function announce(ctx: ExtensionCommandContext, payload: unknown): Promise
 	await ctx.ui.select(AUTH_MARKER + JSON.stringify(payload), [AUTH_ACK]);
 }
 
+// watchAbort raises the one dialog the wrapper leaves unanswered for the life
+// of a login. Answering it aborts the login, which is what stops a device-code
+// poll: those flows return no control to this extension between the
+// presentation and the provider's approval, so without an abort a flow the
+// wrapper has already terminalized keeps a live user code approvable at the
+// provider for the whole native timeout. The controller's own abort resolves
+// the dialog too, which releases it when the login ends on its own.
+function watchAbort(ctx: ExtensionCommandContext, id: string): AbortController {
+	const controller = new AbortController();
+
+	void ctx.ui
+		.select(AUTH_MARKER + JSON.stringify({ id, kind: "cancel" }), [AUTH_ACK], { signal: controller.signal })
+		.then((answer) => {
+			if (answer !== undefined) controller.abort();
+		})
+		.catch(() => controller.abort());
+
+	return controller;
+}
+
 /** Ask the wrapper for one value. An unanswered dialog aborts the flow. */
 async function ask(ctx: ExtensionCommandContext, payload: unknown): Promise<string> {
 	const answer = await ctx.ui.input(AUTH_MARKER + JSON.stringify(payload));
@@ -125,17 +145,30 @@ async function runLogin(ctx: ExtensionCommandContext, request: AuthRequest) {
 		request.method === "oauth" ? provider.auth.oauth?.login.bind(provider.auth.oauth) : provider.auth.apiKey?.login?.bind(provider.auth.apiKey);
 	if (!login) return { id: request.id, kind: "result", ok: false, cause: "native_veto" };
 
-	// notify() is synchronous and the presentation must reach the wrapper before
-	// the prompt that waits on it, so events queue here and drain in order ahead
-	// of every prompt and the terminal result.
+	// notify() is synchronous and returns no promise, so an event is queued and
+	// drained on a chain of its own. The chain starts the moment the event
+	// arrives rather than at the next prompt: a device-code login notifies its
+	// presentation and then polls to completion without ever prompting, so a
+	// queue drained only at a prompt boundary strands the one message the
+	// authorize leg is waiting for. The chain still serialises, so events reach
+	// the wrapper in order and ahead of any prompt that follows them.
 	const queued: AuthEvent[] = [];
-	const drain = async () => {
-		while (queued.length > 0) {
-			await announce(ctx, { id: request.id, kind: "event", event: queued.shift() });
-		}
+	let pump: Promise<void> = Promise.resolve();
+	const drain = () => {
+		pump = pump
+			.then(async () => {
+				while (queued.length > 0) {
+					await announce(ctx, { id: request.id, kind: "event", event: queued.shift() });
+				}
+			})
+			.catch(() => {});
+
+		return pump;
 	};
 
+	const abort = watchAbort(ctx, request.id);
 	const interaction = {
+		signal: abort.signal,
 		async prompt(prompt: AuthPrompt): Promise<string> {
 			await drain();
 
@@ -150,6 +183,7 @@ async function runLogin(ctx: ExtensionCommandContext, request: AuthRequest) {
 		},
 		notify(event: AuthEvent) {
 			queued.push(event);
+			void drain();
 		},
 	};
 
@@ -158,11 +192,13 @@ async function runLogin(ctx: ExtensionCommandContext, request: AuthRequest) {
 		credential = await login(interaction);
 	} catch {
 		await drain();
+		abort.abort();
 
 		return { id: request.id, kind: "result", ok: false, cause: "provider_refused" };
 	}
 
 	await drain();
+	abort.abort();
 
 	if (rejectsShellCredential(credential)) {
 		return { id: request.id, kind: "result", ok: false, cause: "native_veto" };

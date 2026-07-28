@@ -64,6 +64,254 @@ func scriptManualCodeLogin(harness *authHarness, code string, result pi.AuthMess
 	})
 }
 
+// scriptDeviceCodeLogin models pi's xai shape: the login raises its abort
+// watch, notifies one device-code presentation, and then polls the provider,
+// returning nothing to the extension until the provider settles or the wrapper
+// answers the watch.
+func scriptDeviceCodeLogin(harness *authHarness, settled <-chan pi.AuthMessage) {
+	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
+		if request.Op != pi.AuthOpLogin {
+			return nil
+		}
+
+		watch := harness.deliver(ctx, pi.AuthMessage{ID: request.ID, Kind: pi.AuthKindCancel})
+
+		harness.deliver(ctx, pi.AuthMessage{
+			ID:   request.ID,
+			Kind: pi.AuthKindEvent,
+			Event: &pi.AuthNativeEvent{
+				Type:            authNativeEventDeviceCode,
+				UserCode:        authTestUserCode,
+				VerificationURI: authTestVerify,
+				IntervalSeconds: 5,
+			},
+		})
+
+		select {
+		case message := <-settled:
+			message.ID = request.ID
+			message.Kind = pi.AuthKindResult
+			harness.deliver(ctx, message)
+		case <-harness.answered(watch):
+			harness.deliver(ctx, pi.AuthMessage{ID: request.ID, Kind: pi.AuthKindResult, Cause: authCauseProviderRefused})
+		case <-ctx.Done():
+		}
+
+		return nil
+	})
+}
+
+func startDeviceCodeFlow(t *testing.T, harness *authHarness, settled <-chan pi.AuthMessage) authAuthorizeResult {
+	t.Helper()
+
+	generation := harness.seedCatalog(t.Context(), defaultAuthProviders())
+	scriptDeviceCodeLogin(harness, settled)
+
+	authorized, err := harness.call(t.Context(), AuthAuthorizeMethod, authorizeParams(harness, "anthropic", generation, authMethodTypeOAuth))
+	require.NoError(t, err)
+
+	return authorizeResult(t, authorized)
+}
+
+func (h *authHarness) statusOf(flowID string) authStatusResult {
+	result, err := h.call(h.t.Context(), AuthStatusMethod, map[string]any{
+		authFieldSessionID:  string(h.session.id),
+		authFieldProviderID: "anthropic",
+		authFieldFlowID:     flowID,
+	})
+	require.NoError(h.t, err)
+
+	status, ok := result.(authStatusResult)
+	require.True(h.t, ok)
+
+	return status
+}
+
+// TestWaitFlowSettlesFromTheNativeLogin pins the completion path a wait flow
+// has at all. pi exposes no poll route, so status reads nothing of its own: the
+// login's own terminal answer is the only completion signal, and without
+// something reading it the flow could only ever expire while the credential it
+// earned sat resident in pi's durable agent directory.
+func TestWaitFlowSettlesFromTheNativeLogin(t *testing.T) {
+	harness := newAuthHarness(t)
+
+	settled := make(chan pi.AuthMessage, 1)
+	presentation := startDeviceCodeFlow(t, harness, settled)
+
+	require.Equal(t, authInteractionWait, presentation.Interaction)
+	require.Equal(t, authTestUserCode, presentation.UserCode)
+	require.Equal(t, authTestVerify, presentation.URL)
+	require.Equal(t, int64(5000), presentation.PollIntervalMs)
+	require.Empty(t, presentation.CallbackInput)
+	require.Equal(t, authStatePending, harness.statusOf(presentation.FlowID).State)
+
+	settled <- pi.AuthMessage{OK: true, Expires: 1783945909169}
+
+	require.Eventually(t, func() bool {
+		return harness.statusOf(presentation.FlowID).State == authStateAuthenticated
+	}, 5*time.Second, 5*time.Millisecond)
+
+	require.Equal(t, authStatusResult{
+		FlowID:    presentation.FlowID,
+		State:     authStateAuthenticated,
+		ExpiresAt: 1783945909169,
+	}, harness.statusOf(presentation.FlowID))
+
+	record, ok, err := harness.broker.ledger.read("anthropic")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, authLedgerConfirmed, record.State)
+}
+
+// TestWaitFlowReportsANativeRefusal pins the other half: a login that ends
+// badly terminalizes the flow rather than leaving it pending until the safety
+// deadline.
+func TestWaitFlowReportsANativeRefusal(t *testing.T) {
+	harness := newAuthHarness(t)
+
+	settled := make(chan pi.AuthMessage, 1)
+	presentation := startDeviceCodeFlow(t, harness, settled)
+
+	settled <- pi.AuthMessage{Cause: authCauseProviderRefused}
+
+	require.Eventually(t, func() bool {
+		return harness.statusOf(presentation.FlowID).State == authStateFailed
+	}, 5*time.Second, 5*time.Millisecond)
+
+	require.Equal(t, authReasonProviderRefused, harness.statusOf(presentation.FlowID).Reason)
+}
+
+// TestTerminalFlowAbortsTheNativeLogin pins the one thing that stops a device
+// poll. pi's device logins park no prompt, so dismissing a prompt aborts
+// nothing: a cancelled flow left its login polling a live user code, and an
+// approval landing after the flow ended would write a credential into pi's
+// durable agent directory under a ledger entry no leg will ever confirm.
+func TestTerminalFlowAbortsTheNativeLogin(t *testing.T) {
+	harness := newAuthHarness(t)
+
+	settled := make(chan pi.AuthMessage)
+	presentation := startDeviceCodeFlow(t, harness, settled)
+
+	flow := harness.broker.byID[presentation.FlowID]
+
+	harness.broker.mu.Lock()
+	watch := flow.abortDialog
+	harness.broker.mu.Unlock()
+	require.NotEmpty(t, watch)
+
+	_, err := harness.call(t.Context(), AuthCancelMethod, map[string]any{
+		authFieldSessionID:  string(harness.session.id),
+		authFieldProviderID: "anthropic",
+		authFieldFlowID:     presentation.FlowID,
+	})
+	require.NoError(t, err)
+
+	answer := harness.awaitAnswer(watch)
+	require.NotNil(t, answer.Value)
+	require.Equal(t, pi.AuthAck, *answer.Value)
+	require.False(t, answer.Cancelled)
+
+	status := harness.statusOf(presentation.FlowID)
+	require.Equal(t, authStateCancelled, status.State)
+	require.Equal(t, authReasonOwnerCancel, status.Reason)
+}
+
+// TestAbortWatchArrivingAfterTheFlowEndedIsAnsweredAtOnce pins the race the
+// abort handle has with a mint that already failed: a watch registered against
+// a flow nobody can still terminalize would leave the login running with
+// nothing left to stop it.
+func TestAbortWatchArrivingAfterTheFlowEndedIsAnsweredAtOnce(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	flowID := startManualCodeFlow(t, harness, "code-1", pi.AuthMessage{OK: true})
+	flow := harness.broker.byID[flowID]
+
+	harness.broker.terminalize(flow, authStateCancelled, authReasonOwnerCancel, 0)
+
+	exchange := harness.broker.registerExchange("ex-abort", flow)
+	require.NotNil(t, exchange)
+
+	dialog := harness.deliver(t.Context(), pi.AuthMessage{ID: "ex-abort", Kind: pi.AuthKindCancel})
+	answer := harness.awaitAnswer(dialog)
+	require.NotNil(t, answer.Value)
+	require.Equal(t, pi.AuthAck, *answer.Value)
+}
+
+// TestTerminalizeKeepsTheFirstTerminalTransition pins the record itself: a flow
+// has one terminal transition, and a later one is dropped rather than
+// overwriting the owner's.
+func TestTerminalizeKeepsTheFirstTerminalTransition(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	flowID := startManualCodeFlow(t, harness, "code-1", pi.AuthMessage{OK: true})
+	flow := harness.broker.byID[flowID]
+
+	harness.broker.terminalize(flow, authStateCancelled, authReasonOwnerCancel, 0)
+	harness.broker.terminalize(flow, authStateFailed, authReasonTransport, 0)
+
+	status := harness.statusOf(flowID)
+	require.Equal(t, authStateCancelled, status.State)
+	require.Equal(t, authReasonOwnerCancel, status.Reason)
+}
+
+// TestAbortWatchWithoutAFlowIsDismissed pins that a watch raised on a plain
+// command exchange is dismissed rather than left open forever.
+func TestAbortWatchWithoutAFlowIsDismissed(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	harness.broker.registerExchange("ex-1", nil)
+
+	harness.deliver(t.Context(), pi.AuthMessage{ID: "ex-1", Kind: pi.AuthKindCancel})
+	require.True(t, harness.lastResponse().Cancelled)
+}
+
+// TestSettleRefusesAnAnswerIntoAClosedFlow pins that a native answer arriving
+// after the flow terminalized confirms nothing and transitions nothing. The
+// ledger entry it would have written binds a resident credential to a
+// connection generation the owner already closed.
+func TestSettleRefusesAnAnswerIntoAClosedFlow(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		state string
+		cause string
+	}{
+		{name: "cancelled", state: authStateCancelled, cause: authCauseFlowCancelled},
+		{name: "expired", state: authStateExpired, cause: authCauseFlowState},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			harness := newAuthHarness(t)
+			flow := &authFlow{
+				id:         "flow-closed",
+				sessionID:  harness.session.id,
+				providerID: "anthropic",
+				state:      testCase.state,
+				method:     authCatalogMethod{ID: authMethodTypeOAuth, Type: authMethodTypeOAuth},
+				decidable:  make(chan struct{}),
+				ready:      make(chan struct{}),
+				result:     make(chan pi.AuthMessage, 1),
+				disarm:     make(chan struct{}),
+			}
+			flow.result <- pi.AuthMessage{Kind: pi.AuthKindResult, OK: true}
+
+			_, err := harness.broker.settle(t.Context(), flow, authStateAuthenticated)
+			requireAuthFailed(t, err, testCase.cause)
+
+			_, ok, readErr := harness.broker.ledger.read("anthropic")
+			require.NoError(t, readErr)
+			require.False(t, ok)
+		})
+	}
+}
+
 func startManualCodeFlow(t *testing.T, harness *authHarness, code string, result pi.AuthMessage) string {
 	t.Helper()
 

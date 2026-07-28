@@ -167,6 +167,18 @@ func (h *authHarness) awaitAnswer(dialogID string) pi.UIResponse {
 	}
 }
 
+// answered reports the channel that closes once the broker writes back the one
+// answer a dialog gets, for a waiter that must not block.
+func (h *authHarness) answered(dialogID string) <-chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	answer := h.answers[dialogID]
+	require.NotNil(h.t, answer)
+
+	return answer.done
+}
+
 func (h *authHarness) responses() []pi.UIResponse {
 	h.client.mu.Lock()
 	defer h.client.mu.Unlock()

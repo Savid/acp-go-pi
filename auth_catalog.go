@@ -274,6 +274,35 @@ func isLoopbackHostname(host string) bool {
 	}
 }
 
+// authHeadlessOptionID is the native id of the device-code branch of a login
+// variant select, normalised: pi's catalog spells it `device_code` on one
+// provider and `device-code` on another.
+const authHeadlessOptionID = "device-code"
+
+// authHeadlessOption picks the one branch of a native login-variant select this
+// adapter can broker. Every other branch of those selects completes on a
+// loopback listener the owner's browser cannot reach, which recordAuthURL
+// refuses anyway, so this is not a preference the adapter invented: it is the
+// only branch that survives the adapter's own veto. An option set with no such
+// branch, or with more than one, is answered by nobody and vetoes the flow.
+func authHeadlessOption(options []string) (string, bool) {
+	chosen := ""
+
+	for _, option := range options {
+		if strings.ReplaceAll(strings.ToLower(option), "_", "-") != authHeadlessOptionID {
+			continue
+		}
+
+		if chosen != "" {
+			return "", false
+		}
+
+		chosen = option
+	}
+
+	return chosen, chosen != ""
+}
+
 // validateAuthInputs checks the values of an authorize request, not merely its
 // key set. pi's provider enumeration exposes no prompt schema — a native login
 // asks for whatever it asks for at flow time — so the catalog declares no

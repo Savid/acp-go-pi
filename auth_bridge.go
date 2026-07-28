@@ -143,6 +143,8 @@ func (p *providerAuth) handleAuthDialog(ctx context.Context, session *agentSessi
 		p.recordEvent(ctx, session, exchange, message, request.ID)
 	case pi.AuthKindPrompt:
 		p.answerPrompt(ctx, session, exchange, message, request.ID)
+	case pi.AuthKindCancel:
+		p.armAbort(ctx, session, exchange, request.ID)
 	default:
 		session.respondUIDialog(ctx, pi.UICancelResponse(request.ID))
 	}
@@ -207,11 +209,50 @@ func (p *providerAuth) recordEvent(
 	session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, pi.AuthAck))
 }
 
-// answerPrompt answers one native login prompt. A manual-code prompt is parked
-// for the callback leg; the flow's own submitted secret answers the single
-// credential prompt of an api-key login; every other prompt fails the flow
-// closed, because pi's catalog cannot declare prompts and an answer this
-// adapter invented is one nobody authorized.
+// armAbort records the dialog whose answer aborts the native login. It is the
+// one dialog this adapter leaves open: while the flow is pending the login must
+// keep running, and answering it later is what stops a device poll a terminal
+// flow can no longer report on.
+func (p *providerAuth) armAbort(ctx context.Context, session *agentSession, exchange *authExchange, dialogID string) {
+	flow := exchange.flow
+	if flow == nil {
+		session.respondUIDialog(ctx, pi.UICancelResponse(dialogID))
+
+		return
+	}
+
+	p.mu.Lock()
+	terminal := authTerminal(flow.state)
+
+	if !terminal {
+		flow.abortDialog = dialogID
+	}
+	p.mu.Unlock()
+
+	// A flow that terminalized before its abort handle arrived would keep the
+	// login running with nothing left to stop it.
+	if terminal {
+		session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, pi.AuthAck))
+	}
+}
+
+// answerPrompt answers one native login prompt. pi's provider enumeration
+// exposes no prompt schema, so the catalog declares no prompts, `authorize`
+// carries no `inputs`, and this adapter holds no answer a host authorized. What
+// it answers with is therefore fixed per prompt type and supplies no value of
+// its own:
+//
+//   - a manual-code prompt is parked for the callback leg;
+//   - the flow's own submitted secret answers the single credential prompt of
+//     an api-key login;
+//   - a login-variant select is answered with its headless branch, the only
+//     branch whose completion does not land on a socket the owner's browser
+//     cannot reach;
+//   - a text prompt is answered empty, which declines the optional value and
+//     leaves the login on whatever default it already has — for the one text
+//     prompt in pi's oauth catalog, the vendor's own host rather than a
+//     customer-chosen one;
+//   - every other prompt fails the flow closed.
 func (p *providerAuth) answerPrompt(
 	ctx context.Context,
 	session *agentSession,
@@ -231,9 +272,20 @@ func (p *providerAuth) answerPrompt(
 		p.park(flow, dialogID, message.Message)
 
 		return
-	case pi.AuthPromptText, pi.AuthPromptSecret:
+	case pi.AuthPromptText:
+		answer, _ := p.takeSecret(flow)
+		session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, answer))
+
+		return
+	case pi.AuthPromptSecret:
 		if secret, ok := p.takeSecret(flow); ok {
 			session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, secret))
+
+			return
+		}
+	case pi.AuthPromptSelect:
+		if option, ok := authHeadlessOption(message.Options); ok {
+			session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, option))
 
 			return
 		}
@@ -344,11 +396,15 @@ func (p *providerAuth) awaitPresentation(ctx context.Context, flow *authFlow) st
 	}
 }
 
-// awaitResult waits for the terminal answer of a login already under way.
+// awaitResult waits for the terminal answer of a login already under way. A
+// flow that terminalizes while the wait runs ends it: the owner has already
+// closed the record, so there is nothing left for the native answer to decide.
 func (p *providerAuth) awaitResult(ctx context.Context, flow *authFlow) (pi.AuthMessage, error) {
 	select {
 	case message := <-flow.result:
 		return message, nil
+	case <-flow.disarm:
+		return pi.AuthMessage{}, authFailed(authCauseFlowCancelled, flow.providerID, flow.method.ID, flow.id)
 	case <-ctx.Done():
 		return pi.AuthMessage{}, authFailed(authCauseTimeout, flow.providerID, flow.method.ID, flow.id)
 	case <-time.After(authLoginTimeoutValue):
@@ -373,16 +429,21 @@ func (p *providerAuth) answerParked(ctx context.Context, session *agentSession, 
 	return true
 }
 
-// cancelParked dismisses a still-open native prompt so a cancelled or
-// superseded flow does not leave the extension blocked for the life of the
-// process.
-func (p *providerAuth) cancelParked(ctx context.Context, flow *authFlow) {
+// releaseNativeLogin ends every hold a terminal flow still has on its native
+// login: the prompt it left parked, and the login itself. Dismissing the prompt
+// alone leaves a device flow polling — those flows park nothing — so an issued
+// user code would stay approvable, and an approval landing after the flow ended
+// would write a credential into pi's durable agent directory under a ledger
+// entry no leg will ever confirm.
+func (p *providerAuth) releaseNativeLogin(ctx context.Context, flow *authFlow) {
 	p.mu.Lock()
-	dialogID := flow.parkedDialog
+	parked := flow.parkedDialog
+	abort := flow.abortDialog
 	flow.parkedDialog = ""
+	flow.abortDialog = ""
 	p.mu.Unlock()
 
-	if dialogID == "" {
+	if parked == "" && abort == "" {
 		return
 	}
 
@@ -391,5 +452,11 @@ func (p *providerAuth) cancelParked(ctx context.Context, flow *authFlow) {
 		return
 	}
 
-	session.respondUIDialog(ctx, pi.UICancelResponse(dialogID))
+	if parked != "" {
+		session.respondUIDialog(ctx, pi.UICancelResponse(parked))
+	}
+
+	if abort != "" {
+		session.respondUIDialog(ctx, pi.UIValueResponse(abort, pi.AuthAck))
+	}
 }

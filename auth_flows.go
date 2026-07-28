@@ -95,7 +95,10 @@ type authFlow struct {
 	presentPollMs        int64
 	nativeCause          string
 
-	parkedDialog  string
+	parkedDialog string
+	// abortDialog is the dialog the bridge leaves open for the life of one
+	// native login. Answering it aborts that login.
+	abortDialog   string
 	pendingSecret string
 
 	// mintErr records why the native mint never produced a presentation, so a
@@ -329,7 +332,22 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 	p.markReady(flow)
 	p.armCompleter(flow)
 
+	if presentation.Interaction == authInteractionWait {
+		p.watchNativeCompletion(flow)
+	}
+
 	return presentation, nil
+}
+
+// watchNativeCompletion settles a wait flow from the native login itself. pi
+// exposes no poll route, so status has nothing of its own to read: the login's
+// own terminal answer is the only completion signal there is. Without something
+// reading it a wait flow could only ever expire, while the credential it earned
+// sat resident in pi's agent directory under a ledger entry stuck at intent.
+func (p *providerAuth) watchNativeCompletion(flow *authFlow) {
+	p.goSafe("provider auth wait completion", func() {
+		_, _ = p.settle(context.Background(), flow, authStateAuthenticated)
+	})
 }
 
 // failMint terminalizes a flow whose native mint never produced a presentation
@@ -342,7 +360,7 @@ func (p *providerAuth) failMint(ctx context.Context, flow *authFlow, cause strin
 	p.mu.Unlock()
 
 	p.markReady(flow)
-	p.cancelParked(ctx, flow)
+	p.releaseNativeLogin(ctx, flow)
 
 	return err
 }
@@ -548,13 +566,17 @@ func (p *providerAuth) expire(flow *authFlow) {
 	flow.state = authStateExpired
 	flow.reason = authReasonDeadline
 
+	// The completer is what fired, so closing its channel disarms nothing — it
+	// is what makes the disarm channel a reliable report that the flow is
+	// terminal, which is what every wait on a native answer selects on.
+	stopAuthCompleter(flow)
 	delete(p.flows, authFlowKey{sessionID: flow.sessionID, providerID: flow.providerID})
 	p.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), authNativeCallTimeoutValue)
 	defer cancel()
 
-	p.cancelParked(ctx, flow)
+	p.releaseNativeLogin(ctx, flow)
 }
 
 // supersede terminalizes the flow a new authorize replaces, dismissing the
@@ -584,7 +606,7 @@ func (p *providerAuth) supersede(ctx context.Context, key authFlowKey, reason st
 	stopAuthCompleter(flow)
 	p.mu.Unlock()
 
-	p.cancelParked(ctx, flow)
+	p.releaseNativeLogin(ctx, flow)
 }
 
 func stopAuthCompleter(flow *authFlow) {
@@ -690,6 +712,14 @@ func (p *providerAuth) settle(ctx context.Context, flow *authFlow, success strin
 		return nil, err
 	}
 
+	// The wait a native answer costs is unbounded from the owner's side, so the
+	// flow can have been cancelled, superseded, or expired while it ran. Such an
+	// answer owns no transition and confirms nothing: it arrived into a record
+	// somebody else already closed.
+	if cause, abandoned := p.abandonedCause(flow); abandoned {
+		return nil, authFailed(cause, flow.providerID, flow.method.ID, flow.id)
+	}
+
 	if veto := p.flowVeto(flow); veto != "" {
 		return nil, p.fail(flow, veto, true)
 	}
@@ -740,6 +770,23 @@ func authNativeCause(cause string) string {
 	}
 }
 
+// abandonedCause reports the cause a leg answers with when the flow reached a
+// terminal state while the native answer this leg waited on was still in
+// flight. Neither answer carries a transition: the record is already closed.
+func (p *providerAuth) abandonedCause(flow *authFlow) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	switch {
+	case !authTerminal(flow.state):
+		return "", false
+	case flow.state == authStateCancelled:
+		return authCauseFlowCancelled, true
+	default:
+		return authCauseFlowState, true
+	}
+}
+
 // fail returns the leg's closed error and performs the transition its cause
 // pairs with. A cause with no transition consumes nothing.
 func (p *providerAuth) fail(flow *authFlow, cause string, materialInFlight bool) error {
@@ -750,9 +797,19 @@ func (p *providerAuth) fail(flow *authFlow, cause string, materialInFlight bool)
 	return authFailed(cause, flow.providerID, flow.method.ID, flow.id)
 }
 
+// terminalize records the flow's one terminal transition and releases the
+// native login it still holds. A flow that already reached a terminal state
+// keeps it: a native answer still in flight when the owner cancelled arrives
+// into a record the owner already closed, and it is no longer the flow's
+// outcome.
 func (p *providerAuth) terminalize(flow *authFlow, state string, reason string, credentialExpiresAt int64) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+
+	if authTerminal(flow.state) {
+		p.mu.Unlock()
+
+		return
+	}
 
 	flow.state = state
 	flow.reason = reason
@@ -760,6 +817,12 @@ func (p *providerAuth) terminalize(flow *authFlow, state string, reason string, 
 
 	stopAuthCompleter(flow)
 	delete(p.flows, authFlowKey{sessionID: flow.sessionID, providerID: flow.providerID})
+	p.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), authNativeCallTimeoutValue)
+	defer cancel()
+
+	p.releaseNativeLogin(ctx, flow)
 }
 
 func (p *providerAuth) flowState(flow *authFlow) string {
@@ -830,7 +893,7 @@ func (p *providerAuth) cancel(ctx context.Context, params json.RawMessage) (any,
 	delete(p.flows, authFlowKey{sessionID: flow.sessionID, providerID: flow.providerID})
 	p.mu.Unlock()
 
-	p.cancelParked(ctx, flow)
+	p.releaseNativeLogin(ctx, flow)
 
 	return authFlowIDResult{FlowID: flow.id}, nil
 }
@@ -979,6 +1042,6 @@ func (p *providerAuth) closeSession(ctx context.Context, sessionID acp.SessionId
 	p.mu.Unlock()
 
 	for _, flow := range orphaned {
-		p.cancelParked(ctx, flow)
+		p.releaseNativeLogin(ctx, flow)
 	}
 }

@@ -76,6 +76,9 @@ const (
 	AuthKindEvent   = "event"
 	AuthKindPrompt  = "prompt"
 	AuthKindResult  = "result"
+	// AuthKindCancel names the one dialog the wrapper leaves unanswered while a
+	// native login runs. Answering it aborts that login.
+	AuthKindCancel = "cancel"
 )
 
 // Native login method discriminators carried on an AuthRequest.
@@ -140,6 +143,10 @@ type AuthMessage struct {
 	Providers []AuthProvider    `json:"providers,omitempty"`
 	Entries   map[string]string `json:"entries,omitempty"`
 	Event     *AuthNativeEvent  `json:"event,omitempty"`
+	// Options carries a native select prompt's option ids, which is the only
+	// thing that tells the adapter which branch of a login-variant choice it
+	// can broker.
+	Options []string `json:"options,omitempty"`
 }
 
 // Native prompt kinds the bridge relays from one login flow.
