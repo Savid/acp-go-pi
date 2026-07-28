@@ -54,8 +54,17 @@ test-integration-live:
 	ACP_GO_PI_RUN_INTEGRATION=1 ACP_GO_PI_RUN_LIVE_TOKENS=1 go test -race -count=1 -tags=integration -timeout=900s -parallel=4 -v ./integration/...
 
 ## test-integration-attended: run provider-auth flows a human must approve in real time
+# A selector that matches nothing exits 0 with "no tests to run", so the exit
+# status alone reports a quarter of an hour of attended work that never
+# happened. Require a top-level pass line as well. The run streams through tee
+# rather than a redirect because a human is watching it for the login URL.
 test-integration-attended:
-	ACP_GO_PI_RUN_INTEGRATION=1 ACP_GO_PI_RUN_ATTENDED=1 go test -race -count=1 -tags=integration -timeout=1200s -v -run TestAttended ./integration/...
+	@log=$$(mktemp); rc=$$(mktemp); \
+	{ ACP_GO_PI_RUN_INTEGRATION=1 ACP_GO_PI_RUN_ATTENDED=1 go test -race -count=1 -tags=integration -timeout=1200s -v -run TestAttended ./integration/... 2>&1; echo $$? >"$$rc"; } | tee "$$log"; \
+	status=$$(cat "$$rc"); passed=$$(grep -c '^--- PASS: TestAttended' "$$log"); \
+	rm -f "$$log" "$$rc"; \
+	[ "$$status" -eq 0 ] || exit "$$status"; \
+	[ "$$passed" -gt 0 ] || { echo 'no attended provider-auth login ran: -run TestAttended selected nothing'; exit 1; }
 
 ## test-integration-keystore: run credential-residence tests against the container fixture
 test-integration-keystore:

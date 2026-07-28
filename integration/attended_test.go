@@ -19,13 +19,24 @@ import (
 
 const envRunAttended = "ACP_GO_PI_RUN_ATTENDED"
 
-func requireRunAttended(t *testing.T) {
+// requireRunAttended gates the tier and resolves the pi binary it drives. Once
+// the gate is set a missing CLI fails rather than skips: the operator set it
+// intending to spend a quarter of an hour at a real login prompt, and a
+// sub-second skip scrolls past them in the -v stream.
+func requireRunAttended(t *testing.T) string {
 	t.Helper()
 	requireRunIntegration(t)
 
 	if os.Getenv(envRunAttended) != "1" {
 		t.Skipf("set %s=1 to run provider-auth flows a human must approve", envRunAttended)
 	}
+
+	path, err := resolvePiPath()
+	if err != nil {
+		t.Fatalf("%s=1 requires the pi CLI (%v); install pi or set %s", envRunAttended, err, envHarnessPath)
+	}
+
+	return path
 }
 
 // attendedPrompt asks the operator for one value on the terminal. The tier
@@ -63,14 +74,14 @@ func attendedPrompt(t *testing.T, question string) string {
 // back; nothing here can be automated, which is the whole reason this tier is
 // separate from the unattended ones.
 func TestAttendedProviderAuthOAuthFlow(t *testing.T) {
-	requireRunAttended(t)
+	piPath := requireRunAttended(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
 	home := t.TempDir()
 	agent := startAgentBinary(t, ctx,
-		"-path", smokePiPath(t),
+		"-path", piPath,
 		"-scratch-dir", t.TempDir(),
 		"-home", home,
 		"-provider-auth-root", t.TempDir(),

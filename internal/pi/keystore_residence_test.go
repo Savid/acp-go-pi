@@ -56,6 +56,9 @@ const (
 // own auth.json in every configuration of this tier — keystore-absent Linux,
 // keystore-present Linux, and macOS. Each configuration seeds the platform
 // keystore it has, and the identity below must hold identically in all three.
+// The directory is materialized through the session write path, so the
+// filename, the mode and the resulting directory shape are the wrapper's
+// behavior rather than this test's own choices.
 func TestKeystoreResidenceMatrix(t *testing.T) {
 	requireResidenceTier(t)
 	seedResidenceKeystore(t)
@@ -63,7 +66,10 @@ func TestKeystoreResidenceMatrix(t *testing.T) {
 	agentDir := t.TempDir()
 	authPath := filepath.Join(agentDir, AuthFileName)
 
-	require.NoError(t, os.WriteFile(authPath, []byte(`{"anthropic":{"type":"oauth","refresh":"`+keystoreResidenceCanary+`","access":"","expires":0}}`), 0o600))
+	require.NoError(t, AgentDir{
+		Root:     agentDir,
+		AuthJSON: []byte(`{"anthropic":{"type":"oauth","refresh":"` + keystoreResidenceCanary + `","access":"","expires":0}}`),
+	}.Write())
 
 	info, err := os.Stat(authPath)
 	require.NoError(t, err)
@@ -76,8 +82,14 @@ func TestKeystoreResidenceMatrix(t *testing.T) {
 
 	entries, err := os.ReadDir(agentDir)
 	require.NoError(t, err)
-	require.Len(t, entries, 1, "the agent directory holds one credential file and no keystore sidecar")
-	require.Equal(t, AuthFileName, entries[0].Name())
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+
+	require.ElementsMatch(t, []string{AuthFileName, SettingsFileName, seedManifestFileName}, names,
+		"the agent directory holds what the session write path wrote and no keystore sidecar")
 }
 
 // requireResidenceTier answers to both tier gates. On Linux it additionally

@@ -10,3 +10,11 @@ runs:
         go-version-file: go.mod
         check-latest: true
         cache: true
+
+    # The Go suite runs the wrapper-owned TypeScript extension against a fake
+    # extension host, so node is a prerequisite of the suite itself and not of
+    # the docs job alone.
+    - name: Set up Node
+      uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+      with:
+        node-version: 24
