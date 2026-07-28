@@ -248,10 +248,14 @@ func (p *providerAuth) armAbort(ctx context.Context, session *agentSession, exch
 //   - a login-variant select is answered with its headless branch, the only
 //     branch whose completion does not land on a socket the owner's browser
 //     cannot reach;
-//   - a text prompt is answered empty, which declines the optional value and
-//     leaves the login on whatever default it already has — for the one text
-//     prompt in pi's oauth catalog, the vendor's own host rather than a
-//     customer-chosen one;
+//   - a text prompt is answered with the flow's submitted secret while one is
+//     still unspent, and empty otherwise. Every api-key login in pi's catalog
+//     that asks a text question asks its credential question first, so by then
+//     the secret is spent and the text question declines onto whatever default
+//     the login already has — for the one text prompt in pi's oauth catalog,
+//     the vendor's own host rather than a customer-chosen one. Nothing here
+//     enforces that ordering: a login that asked a text question before its
+//     credential question would be answered with the credential;
 //   - every other prompt fails the flow closed.
 func (p *providerAuth) answerPrompt(
 	ctx context.Context,

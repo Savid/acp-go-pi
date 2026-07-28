@@ -123,3 +123,16 @@ if (!result) {
 }
 
 console.log(`ABORTED ${result.payload.ok === false}`);
+
+// The probe's answer is what every residence claim on the Go side is derived
+// from, so its shape is a boundary contract: an entry for every provider asked
+// about, and the value — not the key — saying whether a credential is there.
+await command(JSON.stringify({ id: "probe-2", op: "probe", providerIds: ["probe", "absent"] }), ctx);
+
+const probe = find((payload) => payload.kind === "probe" && payload.id === "probe-2");
+if (!probe) {
+	console.log("NO-PROBE");
+	process.exit(1);
+}
+
+console.log(`PROBED ${JSON.stringify(probe.payload.entries)}`);

@@ -15,9 +15,12 @@ import (
 // notify, then a poll that returns control only when the provider settles or
 // the login aborts. Three of pi's seven oauth providers have exactly that
 // shape, and the Go suite cannot see them, because it scripts the bridge's
-// messages rather than running it. The two properties pinned here are the two
-// that leg depends on: the presentation reaches the wrapper while the login is
-// still polling, and answering the abort watch stops that poll.
+// messages rather than running it. The three properties pinned here are the
+// ones the legs depend on: the presentation reaches the wrapper while the login
+// is still polling, answering the abort watch stops that poll, and the probe
+// answers every provider it was asked about — an omitted entry would make key
+// presence the residence signal, which no reader on the Go side can see it is
+// relying on.
 func TestBridgeExtensionDeliversADeviceCodePresentation(t *testing.T) {
 	t.Parallel()
 
@@ -44,4 +47,5 @@ func TestBridgeExtensionDeliversADeviceCodePresentation(t *testing.T) {
 	require.Contains(t, lines, "WATCHING")
 	require.Contains(t, lines, "ABORTED")
 	require.Contains(t, lines, "true")
+	require.Contains(t, string(output), `PROBED {"probe":"api_key","absent":""}`)
 }

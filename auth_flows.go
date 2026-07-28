@@ -724,6 +724,9 @@ func (p *providerAuth) settle(ctx context.Context, flow *authFlow, success strin
 	// somebody else already closed. A resident credential is the exception —
 	// answering a no-transition cause over one the agent directory now holds
 	// would leave it bound to nothing and hide it from every residence answer.
+	// The exception carries the leg as far as confirm and no further: whether
+	// its binding is still the one the provider's entry names is confirm's own
+	// question, not this one's.
 	if cause, abandoned := p.abandonedCause(flow); abandoned && !resident {
 		return nil, authFailed(cause, flow.providerID, flow.method.ID, flow.id)
 	}
@@ -746,7 +749,13 @@ func (p *providerAuth) settle(ctx context.Context, flow *authFlow, success strin
 }
 
 // confirm records the post-mutation confirmation that binds the resident
-// credential to this connection generation.
+// credential to this connection generation. A leg that outlived its own flow
+// still gets here, because a credential the agent directory now holds must not
+// be left bound to nothing — but the entry may meanwhile have passed to the
+// binding that replaced this one, and that binding owns it. The write is a
+// compare-and-set on the lineage this flow was minted against, and a leg that
+// loses it answers for the record somebody else already closed rather than
+// renaming its own over the successor's.
 func (p *providerAuth) confirm(flow *authFlow) error {
 	record := authLedgerRecord{
 		ProviderID:         flow.providerID,
@@ -760,11 +769,20 @@ func (p *providerAuth) confirm(flow *authFlow) error {
 		UpdatedAt:          authNow().UnixMilli(),
 	}
 
-	if err := p.ledger.write(record); err != nil {
+	current, err := p.ledger.writeIfCurrent(record)
+	if err != nil {
 		return p.fail(flow, authCauseProcess, true)
 	}
 
-	return nil
+	if current {
+		return nil
+	}
+
+	if cause, abandoned := p.abandonedCause(flow); abandoned {
+		return authFailed(cause, flow.providerID, flow.method.ID, flow.id)
+	}
+
+	return p.fail(flow, authCauseBindingConflict, true)
 }
 
 // authNativeCause maps the bridge's closed cause tag onto the leg's cause enum
@@ -997,7 +1015,7 @@ func (p *providerAuth) disconnect(ctx context.Context, params json.RawMessage) (
 		return nil, err
 	}
 
-	if _, present := resident[providerID]; present {
+	if authSlotResident(resident, providerID) {
 		return nil, authFailed(authCauseHarvestFailed, providerID, "", "")
 	}
 

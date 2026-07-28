@@ -1814,3 +1814,103 @@ func TestCallbackTimesOutAwaitingNativeAcceptance(t *testing.T) {
 		Reason: authReasonAcceptanceUnknown,
 	}, status)
 }
+
+// TestSettleLeavesASupersededFlowsSuccessorLedgerEntry pins the far edge of the
+// resident-credential exception. The secret landed, so the leg still reaches
+// confirm rather than leaving the credential bound to nothing — but a fresh
+// authorize has meanwhile minted the provider's next revision, and that binding
+// owns the entry. Renaming the closed flow's lineage over it would leave the
+// host holding a generation the entry no longer names, which fails every later
+// disconnect as a binding conflict and makes the credential unremovable.
+func TestSettleLeavesASupersededFlowsSuccessorLedgerEntry(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+
+	successor := authLedgerRecord{
+		ProviderID:        "openai",
+		ConnectionID:      "conn-1",
+		Revision:          2,
+		BindingGeneration: 1,
+		FlowID:            "flow-successor",
+		State:             authLedgerIntent,
+	}
+	require.NoError(t, harness.broker.ledger.write(successor))
+
+	flow := &authFlow{
+		id:                "flow-secret",
+		sessionID:         harness.session.id,
+		providerID:        "openai",
+		connectionID:      "conn-1",
+		revision:          1,
+		bindingGeneration: 1,
+		state:             authStateCancelled,
+		reason:            authReasonSuperseded,
+		method:            authCatalogMethod{ID: authMethodTypeAPI, Type: authMethodTypeAPI},
+		decidable:         make(chan struct{}),
+		ready:             make(chan struct{}),
+		result:            make(chan pi.AuthMessage, 1),
+		disarm:            make(chan struct{}),
+	}
+	flow.result <- pi.AuthMessage{Kind: pi.AuthKindResult, OK: true, CredType: "api_key"}
+
+	_, err := harness.broker.settle(t.Context(), flow, authStateSaved)
+	requireAuthFailed(t, err, authCauseFlowCancelled)
+
+	record, ok, readErr := harness.broker.ledger.read("openai")
+	require.NoError(t, readErr)
+	require.True(t, ok)
+	require.Equal(t, successor, record)
+}
+
+// TestSettleRefusesAConfirmationWhoseGenerationMovedUnderIt pins the same
+// compare-and-set against a flow nobody closed. A disconnect bumps the binding
+// generation before it touches anything else, so a login still running when the
+// owner disconnects holds a binding the entry no longer names — and the caller
+// has to hear that a fresh authorize is the remedy rather than a success.
+func TestSettleRefusesAConfirmationWhoseGenerationMovedUnderIt(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+
+	bumped := authLedgerRecord{
+		ProviderID:        "openai",
+		ConnectionID:      "conn-1",
+		Revision:          1,
+		BindingGeneration: 2,
+		FlowID:            "flow-secret",
+		State:             authLedgerIntent,
+	}
+	require.NoError(t, harness.broker.ledger.write(bumped))
+
+	flow := &authFlow{
+		id:                "flow-secret",
+		sessionID:         harness.session.id,
+		providerID:        "openai",
+		connectionID:      "conn-1",
+		revision:          1,
+		bindingGeneration: 1,
+		state:             authStatePending,
+		method:            authCatalogMethod{ID: authMethodTypeAPI, Type: authMethodTypeAPI},
+		decidable:         make(chan struct{}),
+		ready:             make(chan struct{}),
+		result:            make(chan pi.AuthMessage, 1),
+		disarm:            make(chan struct{}),
+	}
+	flow.result <- pi.AuthMessage{Kind: pi.AuthKindResult, OK: true, CredType: "api_key"}
+
+	_, err := harness.broker.settle(t.Context(), flow, authStateSaved)
+	requireAuthFailed(t, err, authCauseBindingConflict)
+
+	record, ok, readErr := harness.broker.ledger.read("openai")
+	require.NoError(t, readErr)
+	require.True(t, ok)
+	require.Equal(t, bumped, record)
+
+	// A binding conflict consumes nothing, so the flow is exactly as pending as
+	// it was.
+	harness.broker.mu.Lock()
+	defer harness.broker.mu.Unlock()
+
+	require.Equal(t, authStatePending, flow.state)
+}

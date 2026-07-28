@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 )
 
 // Ledger record states. The proof a residence answer can carry is a total
@@ -84,6 +85,10 @@ var ledgerCreateTemp = func(dir string, pattern string) (ledgerFile, error) {
 // could not be found again after the crash that makes it matter answers
 // nothing.
 type authLedger struct {
+	// mu makes a read and the write it decided one operation. Without it a
+	// compare-and-set is two independent syscalls and the entry can move
+	// between them.
+	mu  sync.Mutex
 	dir string
 }
 
@@ -170,6 +175,13 @@ func (l *authLedger) path(providerID string) string {
 }
 
 func (l *authLedger) read(providerID string) (authLedgerRecord, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.readEntry(providerID)
+}
+
+func (l *authLedger) readEntry(providerID string) (authLedgerRecord, bool, error) {
 	contents, err := ledgerReadFile(l.path(providerID))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -191,6 +203,42 @@ func (l *authLedger) read(providerID string) (authLedgerRecord, bool, error) {
 // directory, fsynced, renamed over its target, with the directory fsynced
 // after. Persisted here means fsynced, never merely written.
 func (l *authLedger) write(record authLedgerRecord) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.writeEntry(record)
+}
+
+// writeIfCurrent commits a record only while the stored entry still names the
+// lineage this record was minted against, and reports whether it did. A leg
+// whose native answer outlived its own flow arrives after a supersede has
+// minted the provider's next revision or a disconnect has bumped its
+// generation, and an unconditional rename would put the closed flow's binding
+// back over the one that replaced it — leaving the host holding a generation
+// the entry no longer names and a credential no disconnect can ever fence.
+func (l *authLedger) writeIfCurrent(record authLedgerRecord) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	current, ok, err := l.readEntry(record.ProviderID)
+	if err != nil {
+		return false, err
+	}
+
+	if ok && (current.ConnectionID != record.ConnectionID ||
+		current.Revision != record.Revision ||
+		current.BindingGeneration != record.BindingGeneration) {
+		return false, nil
+	}
+
+	if err := l.writeEntry(record); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func (l *authLedger) writeEntry(record authLedgerRecord) error {
 	contents, err := ledgerMarshal(record)
 	if err != nil {
 		return fmt.Errorf("encode provider auth ledger entry: %w", err)
@@ -240,6 +288,9 @@ func (l *authLedger) syncDir() error {
 }
 
 func (l *authLedger) list() ([]authLedgerRecord, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	entries, err := ledgerReadDir(l.dir)
 	if err != nil {
 		return nil, fmt.Errorf("list provider auth ledger: %w", err)
@@ -327,7 +378,7 @@ func (p *providerAuth) inventory(ctx context.Context, params json.RawMessage) (a
 	entries := make([]authInventoryEntry, 0, len(live))
 
 	for _, record := range live {
-		_, present := resident[record.ProviderID]
+		present := authSlotResident(resident, record.ProviderID)
 
 		entries = append(entries, authInventoryEntry{
 			ProviderID:        record.ProviderID,
@@ -358,6 +409,14 @@ func (p *providerAuth) probeSlots(ctx context.Context, session *agentSession, pr
 	}
 
 	return message.Entries, nil
+}
+
+// authSlotResident reports whether the probe answered that the provider holds a
+// credential. The bridge answers every provider the request named, so residence
+// is the entry's value and never the presence of its key — reading the key
+// alone would report every provider in the request as resident.
+func authSlotResident(entries map[string]string, providerID string) bool {
+	return entries[providerID] != ""
 }
 
 // authProofSource is the total function of ledger state and native probe. A

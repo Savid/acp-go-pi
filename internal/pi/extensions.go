@@ -140,9 +140,13 @@ type AuthMessage struct {
 	Expires  int64  `json:"expires,omitempty"`
 	CredType string `json:"credentialType,omitempty"`
 
-	Providers []AuthProvider    `json:"providers,omitempty"`
-	Entries   map[string]string `json:"entries,omitempty"`
-	Event     *AuthNativeEvent  `json:"event,omitempty"`
+	Providers []AuthProvider `json:"providers,omitempty"`
+	// Entries answers one probe: for every provider the request named, the type
+	// of the credential stored for it, or the empty string where nothing is
+	// stored. The answer is total, so the value carries residence and the key
+	// carries only the address.
+	Entries map[string]string `json:"entries,omitempty"`
+	Event   *AuthNativeEvent  `json:"event,omitempty"`
 	// Options carries a native select prompt's option ids, which is the only
 	// thing that tells the adapter which branch of a login-variant choice it
 	// can broker.

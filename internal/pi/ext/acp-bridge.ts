@@ -118,11 +118,15 @@ function catalogPayload(id: string) {
 	return { id, kind: "catalog", providers };
 }
 
+// The probe answers every provider it was asked about, holding the empty string
+// where nothing is stored. The value is the residence signal; emitting only the
+// occupied providers would make the presence of a key the signal instead, which
+// is a coupling the reader on the Go side of this boundary cannot see it is
+// relying on.
 function probePayload(id: string, providerIds: string[]) {
 	const entries: Record<string, string> = {};
 	for (const providerId of providerIds) {
-		const credential = readStoredCredential(providerId);
-		if (credential) entries[providerId] = credential.type;
+		entries[providerId] = readStoredCredential(providerId)?.type ?? "";
 	}
 
 	return { id, kind: "probe", entries };

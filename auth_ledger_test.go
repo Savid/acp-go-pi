@@ -601,3 +601,129 @@ func TestNewAuthLedgerRejectsNonDirectory(t *testing.T) {
 	_, err := newAuthLedger(Options{ProviderAuthRoot: t.TempDir(), Home: "/srv/pi"})
 	require.ErrorContains(t, err, "not a directory")
 }
+
+// TestResidenceIsTheProbeEntryValueNotItsKey pins which half of the bridge's
+// probe answer carries residence. The bridge answers every provider the request
+// named, holding the empty string where nothing is stored, so a reader that
+// tested key presence would report every provider it asked about as resident —
+// telling the host a credential is present after the removal it just performed,
+// and refusing that removal as harvest_failed on the way.
+func TestResidenceIsTheProbeEntryValueNotItsKey(t *testing.T) {
+	t.Parallel()
+
+	harness := newAuthHarness(t)
+	flowID := startManualCodeFlow(t, harness, "code-1", pi.AuthMessage{OK: true})
+
+	scriptManualCodeLogin(harness, "code-1", pi.AuthMessage{OK: true})
+
+	_, err := harness.call(t.Context(), AuthCallbackMethod, map[string]any{
+		authFieldSessionID:  string(harness.session.id),
+		authFieldProviderID: "anthropic",
+		authFieldMethod:     authMethodTypeOAuth,
+		authFieldFlowID:     flowID,
+		authFieldInput:      "code-1",
+	})
+	require.NoError(t, err)
+
+	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
+		harness.deliver(ctx, pi.AuthMessage{
+			ID:      request.ID,
+			Kind:    pi.AuthKindProbe,
+			Entries: map[string]string{"anthropic": ""},
+		})
+
+		return nil
+	})
+
+	absent, err := harness.call(t.Context(), AuthInventoryMethod, map[string]any{authFieldSessionID: string(harness.session.id)})
+	require.NoError(t, err)
+	require.Equal(t, authProofConfirmedAbsent, inventoryResult(t, absent).Entries[0].ProofSource)
+
+	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
+		switch request.Op {
+		case pi.AuthOpRemove:
+			harness.deliver(ctx, pi.AuthMessage{ID: request.ID, Kind: pi.AuthKindResult, OK: true})
+		case pi.AuthOpProbe:
+			harness.deliver(ctx, pi.AuthMessage{
+				ID:      request.ID,
+				Kind:    pi.AuthKindProbe,
+				Entries: map[string]string{"anthropic": ""},
+			})
+		}
+
+		return nil
+	})
+
+	_, err = harness.call(t.Context(), AuthDisconnectMethod, map[string]any{
+		authFieldSessionID:         string(harness.session.id),
+		authFieldProviderID:        "anthropic",
+		authFieldConnectionID:      "conn-1",
+		authFieldBindingGeneration: 1,
+	})
+	require.NoError(t, err)
+
+	record, ok, readErr := harness.broker.ledger.read("anthropic")
+	require.NoError(t, readErr)
+	require.True(t, ok)
+	require.Equal(t, authLedgerRemoved, record.State)
+}
+
+// TestAuthLedgerWriteIfCurrentGuardsTheStoredLineage pins the compare half of
+// the compare-and-set: a record whose lineage no longer matches the stored
+// entry is refused rather than renamed over it, while a first entry and a
+// repeat of the same lineage both commit.
+func TestAuthLedgerWriteIfCurrentGuardsTheStoredLineage(t *testing.T) {
+	t.Parallel()
+
+	ledger := testLedger(t)
+
+	minted := authLedgerRecord{ProviderID: "openai", ConnectionID: "conn-1", Revision: 1, BindingGeneration: 1, State: authLedgerIntent}
+
+	written, err := ledger.writeIfCurrent(minted)
+	require.NoError(t, err)
+	require.True(t, written)
+
+	confirmed := minted
+	confirmed.State = authLedgerConfirmed
+
+	written, err = ledger.writeIfCurrent(confirmed)
+	require.NoError(t, err)
+	require.True(t, written)
+
+	for _, stale := range []authLedgerRecord{
+		{ProviderID: "openai", ConnectionID: "conn-2", Revision: 1, BindingGeneration: 1, State: authLedgerConfirmed},
+		{ProviderID: "openai", ConnectionID: "conn-1", Revision: 0, BindingGeneration: 1, State: authLedgerConfirmed},
+		{ProviderID: "openai", ConnectionID: "conn-1", Revision: 1, BindingGeneration: 0, State: authLedgerConfirmed},
+	} {
+		written, err = ledger.writeIfCurrent(stale)
+		require.NoError(t, err)
+		require.False(t, written)
+	}
+
+	record, ok, err := ledger.read("openai")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, confirmed, record)
+}
+
+func TestAuthLedgerWriteIfCurrentFailures(t *testing.T) {
+	ledger := testLedger(t)
+
+	t.Cleanup(func() {
+		ledgerReadFile = os.ReadFile
+		ledgerCreateTemp = func(dir string, pattern string) (ledgerFile, error) { return os.CreateTemp(dir, pattern) }
+	})
+
+	ledgerReadFile = func(string) ([]byte, error) { return nil, errors.New("io") }
+
+	written, err := ledger.writeIfCurrent(authLedgerRecord{ProviderID: "openai"})
+	require.Error(t, err)
+	require.False(t, written)
+
+	ledgerReadFile = os.ReadFile
+	ledgerCreateTemp = func(string, string) (ledgerFile, error) { return nil, errors.New("create") }
+
+	written, err = ledger.writeIfCurrent(authLedgerRecord{ProviderID: "openai"})
+	require.Error(t, err)
+	require.False(t, written)
+}
