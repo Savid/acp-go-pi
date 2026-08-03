@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
@@ -93,6 +94,10 @@ type Options struct {
 	// per session) rather than relying on ambient variables. Process-loader,
 	// shell-loader, PATH, and Node loader keys are rejected at session start.
 	Env map[string]string
+	// ExtraPathDirs are absolute directories prepended, in order, to the PATH
+	// of every launched pi process. Per-session directories from
+	// _meta.pi.options.extraPathDirs are prepended ahead of these.
+	ExtraPathDirs []string
 
 	// Logger receives structured diagnostic logs. If nil, the default logger is used.
 	Logger *slog.Logger
@@ -291,6 +296,19 @@ func WithDefaultModel(model string) Option {
 func WithEnv(env map[string]string) Option {
 	return func(options *Options) {
 		options.Env = cloneStringMap(env)
+	}
+}
+
+// WithExtraPathDirs prepends absolute directories, in the order given, to the
+// PATH of every launched pi process, so their executables resolve ahead of
+// every inherited entry. It is the sanctioned counterpart to the rejected raw
+// PATH key: a caller places its own executable in front of the child without
+// being able to replace the search order wholesale. Every directory must be
+// absolute and free of the platform list separator; a bad entry fails session
+// start. Per-session directories are prepended ahead of these.
+func WithExtraPathDirs(dirs ...string) Option {
+	return func(options *Options) {
+		options.ExtraPathDirs = slices.Clone(dirs)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -68,6 +69,10 @@ type LaunchSpec struct {
 	// (PI_CODING_AGENT_DIR, PI_OFFLINE, and the browser shim's PATH and
 	// BROWSER) always win.
 	Env map[string]string
+	// ExtraPathDirs are absolute directories prepended, in order, to the PATH
+	// the child inherits, so a host-owned executable resolves ahead of every
+	// inherited entry.
+	ExtraPathDirs []string
 	// BrowserShim neutralises the browser a native login leg run inside this
 	// process would otherwise open on the operator's desktop. A nil shim leaves
 	// the child's PATH and BROWSER alone.
@@ -118,9 +123,10 @@ func (spec LaunchSpec) Args() []string {
 }
 
 // Environ returns the scrubbed child environment: explicit basics from the
-// parent, then spec.Env, then the wrapper-managed keys, which always win. The
-// browser shim is applied last so its PATH prefix and BROWSER value survive
-// whatever a caller asked for.
+// parent, then spec.Env, then spec.ExtraPathDirs ahead of the inherited PATH,
+// then the wrapper-managed keys, which always win. The browser shim is applied
+// last so its PATH prefix and BROWSER value survive whatever a caller asked
+// for.
 func (spec LaunchSpec) Environ() []string {
 	env := make(map[string]string, len(baseEnvironmentKeys)+len(spec.Env)+2)
 
@@ -134,6 +140,10 @@ func (spec LaunchSpec) Environ() []string {
 		if safeExplicitEnvKey(key) {
 			env[key] = value
 		}
+	}
+
+	if search := prependPathDirs(env[envPath], spec.ExtraPathDirs); search != "" {
+		env[envPath] = search
 	}
 
 	env["PI_OFFLINE"] = "1"
@@ -157,6 +167,31 @@ func (spec LaunchSpec) Environ() []string {
 	}
 
 	return spec.BrowserShim.Environ(environ)
+}
+
+// prependPathDirs returns search with dirs ahead of every entry it already
+// carries, in the order given. It is defense in depth for internal LaunchSpec
+// callers: public options reject a malformed directory before launch, and
+// dropping one here keeps a relative entry or an embedded list separator from
+// rewriting the child's search order.
+func prependPathDirs(search string, dirs []string) string {
+	entries := make([]string, 0, len(dirs)+1)
+
+	for _, dir := range dirs {
+		if filepath.IsAbs(dir) && !strings.ContainsRune(dir, os.PathListSeparator) {
+			entries = append(entries, dir)
+		}
+	}
+
+	if len(entries) == 0 {
+		return search
+	}
+
+	if search != "" {
+		entries = append(entries, search)
+	}
+
+	return strings.Join(entries, string(os.PathListSeparator))
 }
 
 // safeExplicitEnvKey is defense in depth for internal LaunchSpec callers.

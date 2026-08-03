@@ -2,6 +2,9 @@ package piacp
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
@@ -15,6 +18,7 @@ const (
 	metaOptionsKey         = "options"
 	metaModelKey           = "model"
 	metaEnvKey             = "env"
+	metaExtraPathDirsKey   = "extraPathDirs"
 	metaOutputSchemaKey    = "outputSchema"
 	metaThinkingLevelKey   = "thinkingLevel"
 	metaPermissionKey      = "permission"
@@ -37,6 +41,11 @@ type PiOptions struct {
 	Model string `json:"model,omitempty"`
 	// Env adds environment variables for this pi session's process.
 	Env map[string]string `json:"env,omitempty"`
+	// ExtraPathDirs are absolute directories prepended, in order, to the PATH
+	// of this session's pi process, so the first entry resolves ahead of every
+	// other. A raw PATH in Env stays rejected: this is the whole sanctioned
+	// surface for placing a host-owned executable in front of the child.
+	ExtraPathDirs []string `json:"extraPathDirs,omitempty"`
 	// OutputSchema requests JSON Schema structured output. pi has no native
 	// structured-output surface, so setting it fails closed at session start.
 	OutputSchema map[string]any `json:"outputSchema,omitempty"`
@@ -63,6 +72,10 @@ func (options PiOptions) Meta() map[string]any {
 
 	if len(options.Env) > 0 {
 		values[metaEnvKey] = cloneStringMap(options.Env)
+	}
+
+	if len(options.ExtraPathDirs) > 0 {
+		values[metaExtraPathDirsKey] = slices.Clone(options.ExtraPathDirs)
 	}
 
 	if options.OutputSchema != nil {
@@ -183,6 +196,13 @@ func parsePiOptions(value any) (PiOptions, error) {
 			}
 
 			options.Env = env
+		case metaExtraPathDirsKey:
+			dirs, err := stringSliceOption(item, metaOptionPath(key))
+			if err != nil {
+				return PiOptions{}, err
+			}
+
+			options.ExtraPathDirs = dirs
 		case metaOutputSchemaKey:
 			schema, ok := item.(map[string]any)
 			if !ok {
@@ -246,6 +266,10 @@ func validatePiOptions(options PiOptions) (PiOptions, error) {
 		return PiOptions{}, err
 	}
 
+	if err := validateExtraPathDirs(options.ExtraPathDirs, metaOptionPath(metaExtraPathDirsKey)); err != nil {
+		return PiOptions{}, err
+	}
+
 	return options, nil
 }
 
@@ -257,6 +281,24 @@ func validateEnvironment(env map[string]string, path string) error {
 
 		if blockedEnvKey(key) {
 			return fmt.Errorf("%s.%s is not allowed", path, key)
+		}
+	}
+
+	return nil
+}
+
+// validateExtraPathDirs rejects every entry that could not be prepended to the
+// child's PATH as exactly one search directory. A relative entry resolves
+// against a working directory this adapter does not own, and an embedded list
+// separator would splice in directories the caller never named.
+func validateExtraPathDirs(dirs []string, path string) error {
+	for index, dir := range dirs {
+		if !filepath.IsAbs(dir) {
+			return fmt.Errorf("%s[%d] %s: %q", path, index, validationAbsolutePath, dir)
+		}
+
+		if strings.ContainsRune(dir, os.PathListSeparator) {
+			return fmt.Errorf("%s[%d] must not contain %q: %q", path, index, string(os.PathListSeparator), dir)
 		}
 	}
 
@@ -287,6 +329,27 @@ func stringMapOption(value any, path string) (map[string]string, error) {
 			}
 
 			result[key] = text
+		}
+
+		return result, nil
+	default:
+		return nil, unsupportedField(path)
+	}
+}
+
+func stringSliceOption(value any, path string) ([]string, error) {
+	switch typed := value.(type) {
+	case []string:
+		return slices.Clone(typed), nil
+	case []any:
+		result := make([]string, 0, len(typed))
+		for index, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				return nil, unsupportedField(fmt.Sprintf("%s[%d]", path, index))
+			}
+
+			result = append(result, text)
 		}
 
 		return result, nil
@@ -333,4 +396,16 @@ func blockedEnvKey(key string) bool {
 
 func sessionAdditionalDirectories(primary []string) []string {
 	return append([]string(nil), primary...)
+}
+
+// sessionExtraPathDirs orders the PATH prefix one session's pi process runs
+// with. Per-session directories lead the agent-wide ones for the same reason
+// per-session env overrides agent-wide env: the narrower scope is the later
+// decision.
+func sessionExtraPathDirs(session []string, agent []string) []string {
+	if len(session) == 0 && len(agent) == 0 {
+		return nil
+	}
+
+	return append(slices.Clone(session), agent...)
 }

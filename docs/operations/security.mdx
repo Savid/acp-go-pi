@@ -20,6 +20,15 @@ session's identity. Scrubbing makes every credential path deliberate. Each
 session also runs with pi's phone-home behavior pinned off (`PI_OFFLINE=1`),
 so no update checks or telemetry leave the machine from the pi child.
 
+A raw `PATH` in either environment surface stays rejected: replacing the search
+order wholesale is a loader-injection vector, not a configuration knob. A host
+that needs its own executable in front of the child names directories instead,
+through `WithExtraPathDirs` or `_meta.pi.options.extraPathDirs`. Those are
+prepended to the inherited `PATH` — per-session entries first, then agent-wide
+ones — and each must be an absolute directory carrying no list separator, so a
+caller adds to the search order without being able to rewrite it. The browser
+shim below still takes the front of `PATH`.
+
 ## Browser containment
 
 A native provider-auth login runs inside the session's own pi process, and pi

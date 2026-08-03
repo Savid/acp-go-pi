@@ -62,11 +62,12 @@ func validateSessionStartPaths(cwd string, additionalDirectories []string) error
 }
 
 // sessionStartConfigurationError reports the agent configuration no session may
-// start under: an option that failed validation at construction, or a configured
-// provider-auth direct home, which pi has no account-level leg to gate. The
-// handshake reports the option failures too, but an embedded host can open a
-// session and prompt without ever calling initialize, so unvalidated options
-// must not survive as far as a native process.
+// start under: an option that failed validation at construction, a configured
+// provider-auth direct home, which pi has no account-level leg to gate, or a
+// launch option that would reach the child environment malformed. The handshake
+// reports the option failures too, but an embedded host can open a session and
+// prompt without ever calling initialize, so unvalidated options must not
+// survive as far as a native process.
 func (a *Agent) sessionStartConfigurationError() error {
 	if optionsErr := a.optionsError(); optionsErr != nil {
 		return optionsErr
@@ -74,6 +75,20 @@ func (a *Agent) sessionStartConfigurationError() error {
 
 	if a.options.ProviderAuthDirectHome != "" {
 		return unsupportedField(optionFieldProviderAuthDirectHome)
+	}
+
+	if envErr := validateEnvironment(a.options.Env, optionFieldEnv); envErr != nil {
+		return acp.NewInvalidParams(map[string]any{
+			jsonFieldError: envErr.Error(),
+			jsonFieldField: optionFieldEnv,
+		})
+	}
+
+	if pathErr := validateExtraPathDirs(a.options.ExtraPathDirs, optionFieldExtraPathDirs); pathErr != nil {
+		return acp.NewInvalidParams(map[string]any{
+			jsonFieldError: pathErr.Error(),
+			jsonFieldField: optionFieldExtraPathDirs,
+		})
 	}
 
 	return nil

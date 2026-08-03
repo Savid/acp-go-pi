@@ -131,6 +131,60 @@ func TestLaunchSpecEnviron(t *testing.T) {
 	require.IsIncreasing(t, environ)
 }
 
+func TestLaunchSpecEnvironPrependsExtraPathDirs(t *testing.T) {
+	separator := string(os.PathListSeparator)
+
+	t.Setenv("PATH", "/usr/bin"+separator+"/bin")
+
+	spec := LaunchSpec{
+		AgentDir:      "/agent",
+		ExtraPathDirs: []string{"/session/bin", "/agent-wide/bin"},
+		Env:           map[string]string{"PATH": "/tmp/hijack-bin"},
+	}
+
+	require.Contains(
+		t,
+		spec.Environ(),
+		"PATH=/session/bin"+separator+"/agent-wide/bin"+separator+"/usr/bin"+separator+"/bin",
+	)
+	require.IsIncreasing(t, spec.Environ())
+}
+
+func TestLaunchSpecEnvironExtraPathDirsWithoutAmbientPath(t *testing.T) {
+	require.NoError(t, os.Unsetenv("PATH"))
+	t.Cleanup(func() { t.Setenv("PATH", "/usr/bin") })
+
+	spec := LaunchSpec{AgentDir: "/agent", ExtraPathDirs: []string{"/session/bin"}}
+
+	require.Contains(t, spec.Environ(), "PATH=/session/bin")
+}
+
+func TestLaunchSpecEnvironKeepsBrowserShimAheadOfExtraPathDirs(t *testing.T) {
+	separator := string(os.PathListSeparator)
+
+	t.Setenv("PATH", "/usr/bin")
+
+	spec := LaunchSpec{
+		AgentDir:      "/agent",
+		ExtraPathDirs: []string{"/session/bin"},
+		BrowserShim:   &BrowserShim{shim: &browserShim{dir: "/shim"}},
+	}
+
+	require.Contains(t, spec.Environ(), "PATH=/shim"+separator+"/session/bin"+separator+"/usr/bin")
+}
+
+func TestPrependPathDirsDropsUnusableEntries(t *testing.T) {
+	t.Parallel()
+
+	separator := string(os.PathListSeparator)
+
+	require.Equal(t, "/usr/bin", prependPathDirs("/usr/bin", nil))
+	require.Empty(t, prependPathDirs("", nil))
+	require.Equal(t, "/usr/bin", prependPathDirs("/usr/bin", []string{"relative/bin", ""}))
+	require.Equal(t, "/usr/bin", prependPathDirs("/usr/bin", []string{"/a" + separator + "/b"}))
+	require.Equal(t, "/opt/bin"+separator+"/usr/bin", prependPathDirs("/usr/bin", []string{"relative/bin", "/opt/bin"}))
+}
+
 func TestSafeExplicitEnvKeyBoundary(t *testing.T) {
 	require.False(t, safeExplicitEnvKey(""))
 	require.True(t, safeExplicitEnvKey("A1"))

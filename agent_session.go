@@ -597,13 +597,6 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		return nil, configErr
 	}
 
-	if envErr := validateEnvironment(a.options.Env, "env"); envErr != nil {
-		return nil, acp.NewInvalidParams(map[string]any{
-			jsonFieldError: envErr.Error(),
-			jsonFieldField: "env",
-		})
-	}
-
 	readinessStarted := time.Now()
 	versionErr := a.ensureVersion(ctx)
 	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery, RuntimeStartupReadiness, readinessStarted, versionErr)
@@ -747,6 +740,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		SkillPaths:          seededResources.Skills,
 		PromptTemplatePaths: seededResources.PromptTemplates,
 		Env:                 env,
+		ExtraPathDirs:       sessionExtraPathDirs(start.MetaOptions.ExtraPathDirs, a.options.ExtraPathDirs),
 		Cwd:                 start.Cwd,
 		BrowserShim:         browserShim,
 	}

@@ -49,6 +49,7 @@ Darwin.
 | `WithProviderAuthDirectHome` | Declared and rejected: pi has no account-level provider-auth leg to gate. A non-empty value is rejected at session start with the unsupported-option error for field `providerAuthDirectHome`. |
 | `WithDefaultModel` | Default model for new sessions, as `"provider/id"`. |
 | `WithEnv` | Add environment variables to every pi child. Invalid names plus `PATH`, `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `LD_*`, and `DYLD_*` are rejected; ambient credentials are scrubbed. |
+| `WithExtraPathDirs` | Prepend absolute directories, in order, to the `PATH` of every pi child. The sanctioned counterpart to the rejected raw `PATH` key; a relative entry or an embedded list separator fails session start. |
 | `WithSeedFiles` | Write files into each isolated agent directory. Seeded extensions, prompts, and skills in their conventional subdirectories are loaded by exact path. |
 | `WithSessionStore` | Install durable session storage. |
 | `WithSessionStoreLoadTimeout` | Bound store load/list operations used during resume. |

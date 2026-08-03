@@ -244,6 +244,48 @@ func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
 	}
 }
 
+func TestStartSessionOrdersExtraPathDirs(t *testing.T) {
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: "id"}
+	agent := newStubClientAgent(t, client, WithExtraPathDirs("/agent-wide/bin"))
+
+	var launched pi.LaunchSpec
+	agent.startPiProcess = func(_ context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
+		launched = spec
+
+		return newStubProcess(false), client, nil
+	}
+
+	session, err := agent.startSession(t.Context(), sessionStart{
+		Cwd:         "/cwd",
+		MetaOptions: PiOptions{ExtraPathDirs: []string{"/session/bin"}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, session.Close(t.Context())) })
+
+	require.Equal(t, []string{"/session/bin", "/agent-wide/bin"}, launched.ExtraPathDirs)
+	require.NotContains(t, launched.Env, "PATH")
+}
+
+func TestStartSessionRejectsUnusableGlobalExtraPathDir(t *testing.T) {
+	for _, dir := range []string{"relative/bin", "", "/opt/bin" + string(os.PathListSeparator) + "/srv/bin"} {
+		t.Run(dir, func(t *testing.T) {
+			client := newStubPiClient()
+			agent := newStubClientAgent(t, client, WithExtraPathDirs(dir))
+			starts := 0
+			agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+				starts++
+
+				return newStubProcess(false), client, nil
+			}
+
+			_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+			requireInvalidParams(t, err)
+			require.Zero(t, starts)
+		})
+	}
+}
+
 func TestStartSessionLoadsExplicitSeedResourcesAndProviderEnv(t *testing.T) {
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "id"}

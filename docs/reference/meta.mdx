@@ -122,6 +122,7 @@ Session-lifecycle requests accept options and the raw-event opt-in:
       "options": {
         "model": "openai/gpt-4o",
         "env": { "ANTHROPIC_API_KEY": "sk-ant-..." },
+        "extraPathDirs": ["/var/run/host/session-42/bin"],
         "thinkingLevel": "medium",
         "permission": "ask",
         "autoRetry": true
@@ -138,6 +139,7 @@ Session-lifecycle requests accept options and the raw-event opt-in:
 | --- | --- |
 | `model` | Session model as `"provider/id"`; catalog-validated. |
 | `env` | Extra environment variables for this session's pi process. |
+| `extraPathDirs` | Absolute directories prepended, in order, to this session's `PATH`, ahead of the directories `WithExtraPathDirs` supplies and everything inherited. Each entry must be absolute and free of the platform list separator. |
 | `thinkingLevel` | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; adapter-validated. |
 | `permission` | Permission mode: `ask` (default) or `allow`. |
 | `autoRetry` | Opt in to pi's native automatic retry of transient provider errors (5xx, timeouts). Default `false`: a native failure surfaces once, immediately, with the real cause. |

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -320,6 +321,7 @@ func (s *agentSession) nextRuntimeLaunch(previous pi.LaunchSpec, lastSessionFile
 
 	spec := previous
 	spec.Env = cloneStringMap(previous.Env)
+	spec.ExtraPathDirs = slices.Clone(previous.ExtraPathDirs)
 	spec.AgentDir = dirs.AgentDir
 	spec.SessionDir = dirs.SessionDir
 

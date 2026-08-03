@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"encoding/json"
+	"slices"
 
 	"github.com/coder/acp-go-sdk"
 )
@@ -323,6 +324,16 @@ func WithPiEnv(env map[string]string) PiOption {
 	}
 }
 
+// WithPiExtraPathDirs configures absolute directories prepended, in the order
+// given, to the PATH of the session's pi process.
+func WithPiExtraPathDirs(dirs ...string) PiOption {
+	cloned := slices.Clone(dirs)
+
+	return func(options *PiOptions) {
+		options.ExtraPathDirs = slices.Clone(cloned)
+	}
+}
+
 // WithPiOutputSchema configures JSON Schema structured output. pi has no
 // native structured-output surface, so sessions carrying it fail closed at
 // session start.
@@ -361,6 +372,7 @@ func WithPiAutoRetry(enabled bool) PiOption {
 func clonePiOptions(options PiOptions) PiOptions {
 	cloned := options
 	cloned.Env = cloneStringMap(options.Env)
+	cloned.ExtraPathDirs = slices.Clone(options.ExtraPathDirs)
 	cloned.OutputSchema = cloneAnyMap(options.OutputSchema)
 
 	return cloned
