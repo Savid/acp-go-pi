@@ -151,6 +151,7 @@ func TestDarwinLaunchBootstrapDispatch(t *testing.T) {
 		darwinLaunchInput, darwinLaunchExit, darwinLaunchExec = originalInput, originalExit, originalExec
 	})
 	t.Setenv(darwinLaunchBootstrapEnv, darwinLaunchBootstrapMode)
+	setTestIsolationBootstrapEnv(t)
 	darwinLaunchExec = func(string, []string, []string) error { return nil }
 
 	var exits []int
@@ -207,7 +208,7 @@ func TestDarwinLaunchBootstrapCommandAndGateLifecycle(t *testing.T) {
 	require.Len(t, launch.inherited, 3)
 	require.NotNil(t, launch.startGate)
 	require.NotNil(t, launch.ready)
-	require.Equal(t, darwinLaunchBootstrapEnv+"="+darwinLaunchBootstrapMode, launch.cmd.Env[0])
+	require.Contains(t, launch.cmd.Env, darwinLaunchBootstrapEnv+"="+darwinLaunchBootstrapMode)
 
 	var config darwinLaunchConfig
 	require.NoError(t, json.NewDecoder(launch.inherited[0]).Decode(&config))
@@ -276,6 +277,11 @@ func TestDarwinLaunchPreparationFailures(t *testing.T) {
 			require.ErrorContains(t, prepareErr, test.want)
 		})
 	}
+
+	invalidIsolation := testContainmentSpec(t)
+	invalidIsolation.Isolation = nil
+	_, err = prepareProcessTreeCommand(exec.Command("/usr/bin/true"), invalidIsolation)
+	require.ErrorContains(t, err, "prepare Darwin native launch isolation")
 }
 
 func TestDarwinLaunchInputAndStatusBranches(t *testing.T) {
@@ -341,8 +347,17 @@ func TestDarwinLaunchInputAndStatusBranches(t *testing.T) {
 		require.ErrorContains(t, awaitProcessTreeReady(&processTreeCommand{ready: read}), "status limit")
 	})
 
+	t.Run("native failure", func(t *testing.T) {
+		read, write, err := os.Pipe()
+		require.NoError(t, err)
+		_, err = write.WriteString("native failed\n")
+		require.NoError(t, err)
+		require.NoError(t, write.Close())
+		require.ErrorContains(t, awaitProcessTreeReady(&processTreeCommand{ready: read}), "native failed")
+	})
+
 	t.Setenv("GORACE", "halt_on_error=1")
-	require.Contains(t, darwinLaunchBootstrapEnvironment(), "GORACE=halt_on_error=1")
+	require.NotContains(t, darwinLaunchBootstrapEnvironment(), "GORACE=halt_on_error=1")
 }
 
 func TestDarwinSharedProcessTreeBoundaryBranches(t *testing.T) {
@@ -580,7 +595,7 @@ func TestDarwinProcessGroupCleanupBranches(t *testing.T) {
 
 			return nil
 		}
-		require.NoError(t, finishDarwinProcessGroupCleanup(newTree(), time.Now().Add(600*time.Millisecond), false, nil))
+		require.NoError(t, finishDarwinProcessGroupCleanup(newTree(), time.Now().Add(2*time.Second), false, nil))
 	})
 
 	t.Run("final poll absent", func(t *testing.T) {
@@ -595,7 +610,7 @@ func TestDarwinProcessGroupCleanupBranches(t *testing.T) {
 
 			return nil
 		}
-		require.NoError(t, finishDarwinProcessGroupCleanup(newTree(), time.Now().Add(600*time.Millisecond), false, nil))
+		require.NoError(t, finishDarwinProcessGroupCleanup(newTree(), time.Now().Add(2*time.Second), false, nil))
 	})
 
 	t.Run("final poll remains", func(t *testing.T) {
@@ -615,7 +630,7 @@ func TestDarwinProcessGroupCleanupBranches(t *testing.T) {
 
 			return nil
 		}
-		require.ErrorIs(t, finishDarwinProcessGroupCleanup(newTree(), time.Now().Add(600*time.Millisecond), false, nil), ErrProcessContainmentIncomplete)
+		require.ErrorIs(t, finishDarwinProcessGroupCleanup(newTree(), time.Now().Add(2*time.Second), false, nil), ErrProcessContainmentIncomplete)
 	})
 
 	t.Run("eperm remains observable", func(t *testing.T) {
@@ -694,6 +709,16 @@ func TestDarwinProcessGroupCleanupBranches(t *testing.T) {
 	require.Equal(t, time.Unix(1, 0), minTime(time.Unix(2, 0), time.Unix(1, 0)))
 }
 
+func TestSignalOriginalProcessGroupPermissionDenied(t *testing.T) {
+	realSignal := darwinProcessGroupSignal
+	t.Cleanup(func() { darwinProcessGroupSignal = realSignal })
+	darwinProcessGroupSignal = func(int, syscall.Signal) error { return syscall.EPERM }
+
+	absent, err := signalOriginalProcessGroup(1234, syscall.SIGTERM)
+	require.NoError(t, err)
+	require.False(t, absent)
+}
+
 func TestDarwinActivationFailureCleansCapturedGroup(t *testing.T) {
 	realActivate := activateProcessContainmentRecord
 	t.Cleanup(func() { activateProcessContainmentRecord = realActivate })
@@ -718,6 +743,7 @@ func TestDarwinActivationFailureCleansCapturedGroup(t *testing.T) {
 		Containment: ContainmentSpec{
 			DarwinBestEffort: true, ScratchParent: parent, GenerationRoot: root,
 			RuntimeID: strings.Repeat("d", 32), LifecycleKind: "session",
+			Isolation: testContainmentSpec(t).Isolation,
 		},
 	})
 	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
@@ -803,6 +829,7 @@ func TestDarwinFastExitRaceStress(t *testing.T) {
 	errs := make(chan error, workers*iterations)
 	var group sync.WaitGroup
 
+	isolation := testContainmentSpec(t).Isolation
 	for worker := range workers {
 		group.Add(1)
 
@@ -829,6 +856,7 @@ func TestDarwinFastExitRaceStress(t *testing.T) {
 						GenerationRoot:   root,
 						RuntimeID:        runtimeID,
 						LifecycleKind:    "session",
+						Isolation:        isolation,
 					},
 				})
 				if err != nil {

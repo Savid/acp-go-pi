@@ -14,6 +14,14 @@ import (
 // Option configures the pi ACP agent.
 type Option func(*Options)
 
+// ProcessIsolation is the mandatory operating-system identity and complete
+// base environment for every native pi process and launch supervisor.
+type ProcessIsolation struct {
+	UID             uint32
+	GID             uint32
+	BaseEnvironment map[string]string
+}
+
 // RuntimeResourceKind identifies the lifecycle scope consuming a host-managed resource.
 type RuntimeResourceKind string
 
@@ -71,6 +79,9 @@ type Options struct {
 
 	// ExecutablePath is the pi CLI executable path. If empty, PATH is searched.
 	ExecutablePath string
+	// ProcessIsolation is the mandatory child identity and complete base
+	// environment. It is installed with WithProcessIsolation.
+	ProcessIsolation *ProcessIsolation
 	// Home is the durable per-instance pi agent directory
 	// (PI_CODING_AGENT_DIR) every session runs against. Empty (the default)
 	// gives each session an isolated agent directory under the scratch
@@ -149,7 +160,8 @@ type Options struct {
 
 	// imageLimitsSet records whether WithImageLimits supplied the struct; an
 	// omitted option leaves every field at its default.
-	imageLimitsSet bool
+	imageLimitsSet       bool
+	testOnlyNoCredential bool
 }
 
 // ConcurrencyLimits controls per-agent/session backpressure. Zero fields use defaults.
@@ -167,6 +179,12 @@ func applyOptions(opts []Option) Options {
 
 	for _, opt := range opts {
 		opt(&options)
+	}
+
+	if options.ProcessIsolation != nil {
+		cloned := *options.ProcessIsolation
+		cloned.BaseEnvironment = cloneStringMap(options.ProcessIsolation.BaseEnvironment)
+		options.ProcessIsolation = &cloned
 	}
 
 	if !options.imageLimitsSet {
@@ -209,6 +227,18 @@ func WithAgentVersion(version string) Option {
 func WithExecutablePath(path string) Option {
 	return func(options *Options) {
 		options.ExecutablePath = path
+	}
+}
+
+// WithProcessIsolation requires every native process, probe, and supervisor
+// to run as the supplied non-root identity with no supplementary groups. The
+// base environment is a complete replacement for the adapter environment;
+// WithEnv and session environment values overlay it.
+func WithProcessIsolation(isolation ProcessIsolation) Option {
+	return func(options *Options) {
+		cloned := isolation
+		cloned.BaseEnvironment = cloneStringMap(isolation.BaseEnvironment)
+		options.ProcessIsolation = &cloned
 	}
 }
 
@@ -291,8 +321,8 @@ func WithDefaultModel(model string) Option {
 
 // WithEnv adds environment variables to every launched pi process. pi children
 // run with a scrubbed environment, so provider API keys must travel here.
-// PATH, NODE_OPTIONS, BASH_ENV, ENV, LD_*, DYLD_*, and invalid names are
-// rejected at session start.
+// NODE_OPTIONS, BASH_ENV, ENV, LD_*, DYLD_*, and invalid names are rejected at
+// session start. PATH is an explicit overlay on the isolation policy PATH.
 func WithEnv(env map[string]string) Option {
 	return func(options *Options) {
 		options.Env = cloneStringMap(env)

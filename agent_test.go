@@ -19,7 +19,10 @@ import (
 
 func TestAgentDirectSurfaceAndVersionChecks(t *testing.T) {
 	agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
-	_, err := agent.Authenticate(t.Context(), acp.AuthenticateRequest{MethodId: "native"})
+	resolved, err := agent.lookPath("sh")
+	require.NoError(t, err)
+	require.NotEmpty(t, resolved)
+	_, err = agent.Authenticate(t.Context(), acp.AuthenticateRequest{MethodId: "native"})
 	requireInvalidParams(t, err)
 	_, err = agent.Logout(t.Context(), acp.LogoutRequest{})
 	require.NoError(t, err)
@@ -47,6 +50,8 @@ func TestAgentDirectSurfaceAndVersionChecks(t *testing.T) {
 	old := NewAgent(testContainmentOption(), WithExecutablePath("/fake/pi"), WithLogger(slog.New(slog.DiscardHandler)))
 	old.probeVersion = func(context.Context, string, pi.ContainmentSpec) (string, error) { return "0.1.0", nil }
 	require.Error(t, old.ensureVersion(t.Context()))
+	withoutIsolation := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	require.Error(t, withoutIsolation.ensureVersion(t.Context()))
 
 	require.NoError(t, agent.Close())
 	_, err = agent.HandleExtensionMethod(t.Context(), "_pi/unknown", nil)
@@ -81,7 +86,7 @@ func TestContainmentModePlatformMatrix(t *testing.T) {
 
 	agentRuntimePlatform = "freebsd"
 	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{}))
-	unavailable := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	unavailable := NewAgent(testProcessIsolationOption(), WithLogger(slog.New(slog.DiscardHandler)))
 	require.ErrorIs(t, unavailable.ensureVersion(t.Context()), ErrProcessContainmentIncomplete)
 
 	var configured Options
@@ -202,6 +207,7 @@ func TestServeReturnsIncompleteFailedSpawnWithoutInstalledSession(t *testing.T) 
 
 	newServeAgent = func(opts ...Option) *Agent {
 		agent := NewAgent(append(opts,
+			testContainmentOption(),
 			WithExecutablePath("/fake/pi"),
 			WithScratchDir(t.TempDir()),
 			WithLogger(slog.New(slog.DiscardHandler)),

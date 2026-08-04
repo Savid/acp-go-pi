@@ -95,7 +95,12 @@ func turnSupervisorBootstrap() {
 		return
 	}
 
-	config, control, ready, err := turnSupervisorInput()
+	_, err := inheritedProcessIsolation()
+	var config, control io.ReadCloser
+	var ready io.WriteCloser
+	if err == nil {
+		config, control, ready, err = turnSupervisorInput()
+	}
 	if err == nil {
 		err = turnSupervisorRun(config, control, ready)
 	}
@@ -185,7 +190,15 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 	}
 
 	helper := turnSupervisorCommand(executable) // #nosec G204 -- the current executable hosts the private supervisor mode.
-	helper.Env = turnSupervisorEnvironment()
+	helper.Env, err = supervisorEnvironment(native.Env, containment.Isolation, turnSupervisorModeEnv, turnSupervisorMode)
+	if err != nil {
+		_ = configFile.Close()
+		_ = controlRead.Close()
+		_ = controlWrite.Close()
+		_ = readyRead.Close()
+		_ = readyWrite.Close()
+		return nil, fmt.Errorf("prepare pi turn supervisor isolation: %w", err)
+	}
 	helper.ExtraFiles = []*os.File{configFile, controlRead, readyWrite}
 	helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	helper.Stdin = native.Stdin
@@ -236,18 +249,12 @@ func writeTurnSupervisorConfig(file io.WriteSeeker, config turnSupervisorConfig)
 	return nil
 }
 
-func turnSupervisorEnvironment() []string {
-	env := withoutTurnSupervisorMode(os.Environ())
-
-	return append(env, turnSupervisorModeEnv+"="+turnSupervisorMode)
+func turnSupervisorNativeEnvironment(configured []string) []string {
+	return withoutTurnSupervisorMode(configured)
 }
 
-func turnSupervisorNativeEnvironment(configured []string) []string {
-	if configured == nil {
-		configured = os.Environ()
-	}
-
-	return withoutTurnSupervisorMode(configured)
+func turnSupervisorEnvironment() []string {
+	return []string{turnSupervisorModeEnv + "=" + turnSupervisorMode}
 }
 
 func withoutTurnSupervisorMode(configured []string) []string {

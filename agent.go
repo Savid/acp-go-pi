@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os/exec"
 	"runtime"
 	"sync"
 
@@ -26,7 +25,10 @@ const (
 	metaFieldVersions = "versions"
 )
 
-const darwinPlatform = "darwin"
+const (
+	darwinPlatform  = "darwin"
+	windowsPlatform = "windows"
+)
 
 var agentRuntimePlatform = runtime.GOOS
 
@@ -143,7 +145,9 @@ func NewAgent(opts ...Option) *Agent {
 		),
 		startPiProcess: startRealPiProcess,
 		probeVersion:   pi.ProbeVersion,
-		lookPath:       exec.LookPath,
+		lookPath: func(file string) (string, error) {
+			return pi.ResolveExecutable(file, internalProcessIsolation(options.ProcessIsolation, options.testOnlyNoCredential), options.Env)
+		},
 	}
 	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
 	agent.providerAuth = newProviderAuth(agent)
@@ -172,7 +176,7 @@ func (a *Agent) ContainmentMode() RuntimeContainmentMode {
 
 func containmentMode(options Options) RuntimeContainmentMode {
 	switch agentRuntimePlatform {
-	case "linux", "windows":
+	case "linux", windowsPlatform:
 		if options.DarwinBestEffortContainment {
 			return RuntimeContainmentUnavailable
 		}
@@ -485,6 +489,10 @@ func (a *Agent) ensureVersion(ctx context.Context) error {
 
 	if a.versionChecked {
 		return nil
+	}
+
+	if err := validateProcessIsolationOption(a.options.ProcessIsolation); err != nil {
+		return err
 	}
 
 	if a.ContainmentMode() == RuntimeContainmentUnavailable {

@@ -2130,6 +2130,7 @@ func TestDarwinSetsidEscapeIsDiagnosableAndExplicitlyCleaned(t *testing.T) {
 		Containment: ContainmentSpec{
 			DarwinBestEffort: true, ScratchParent: parent, GenerationRoot: root,
 			RuntimeID: runtimeID, LifecycleKind: "session",
+			Isolation: testContainmentSpec(t).Isolation,
 		},
 	})
 	require.NoError(t, err)

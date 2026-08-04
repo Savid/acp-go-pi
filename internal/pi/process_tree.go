@@ -74,6 +74,7 @@ type ContainmentSpec struct {
 	GenerationRoot   string
 	RuntimeID        string
 	LifecycleKind    string
+	Isolation        *ProcessIsolation
 }
 
 // ErrProcessContainmentIncomplete means the selected native boundary did not

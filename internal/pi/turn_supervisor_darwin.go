@@ -54,7 +54,16 @@ func darwinLaunchBootstrap() {
 		return
 	}
 
-	configFile, gate, status, err := darwinLaunchInput()
+	_, err := inheritedProcessIsolation()
+
+	var (
+		configFile, gate io.ReadCloser
+		status           io.WriteCloser
+	)
+	if err == nil {
+		configFile, gate, status, err = darwinLaunchInput()
+	}
+
 	if err == nil {
 		err = runDarwinLaunchBootstrap(configFile, gate)
 	}
@@ -148,10 +157,6 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 		return nil, errors.New("prepare Darwin native launch: command is incomplete")
 	}
 
-	if native.Env == nil {
-		config.Env = scrubDarwinInternalEnvironment(os.Environ())
-	}
-
 	configFile, createErr := darwinLaunchCreateTemp(containment.GenerationRoot, ".launch-")
 	if createErr != nil {
 		return nil, fmt.Errorf("create Darwin native launch config: %w", createErr)
@@ -214,7 +219,18 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 
 	helper := darwinLaunchCommand(executable) // #nosec G204 -- the current executable hosts the private launch bootstrap.
 	helper.Dir = native.Dir
-	helper.Env = darwinLaunchBootstrapEnvironment()
+
+	helper.Env, executableErr = supervisorEnvironment(native.Env, containment.Isolation, darwinLaunchBootstrapEnv, darwinLaunchBootstrapMode)
+	if executableErr != nil {
+		_ = configFile.Close()
+		_ = gateRead.Close()
+		_ = gateWrite.Close()
+		_ = statusRead.Close()
+		_ = statusWrite.Close()
+
+		return nil, fmt.Errorf("prepare Darwin native launch isolation: %w", executableErr)
+	}
+
 	helper.Stdin = native.Stdin
 	helper.Stdout = native.Stdout
 	helper.Stderr = native.Stderr
@@ -230,18 +246,6 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 	}, nil
 }
 
-func darwinLaunchBootstrapEnvironment() []string {
-	environment := []string{darwinLaunchBootstrapEnv + "=" + darwinLaunchBootstrapMode}
-
-	for _, entry := range os.Environ() {
-		if strings.HasPrefix(entry, "GORACE=") {
-			environment = append(environment, entry)
-		}
-	}
-
-	return environment
-}
-
 func scrubDarwinInternalEnvironment(environment []string) []string {
 	scrubbed := make([]string, 0, len(environment))
 	for _, entry := range environment {
@@ -254,6 +258,10 @@ func scrubDarwinInternalEnvironment(environment []string) []string {
 	}
 
 	return scrubbed
+}
+
+func darwinLaunchBootstrapEnvironment() []string {
+	return []string{darwinLaunchBootstrapEnv + "=" + darwinLaunchBootstrapMode}
 }
 
 func awaitProcessTreeReady(launch *processTreeCommand) error {

@@ -191,7 +191,7 @@ func TestValidateMCPServersRejectionBranches(t *testing.T) {
 }
 
 func TestStartSessionEarlyFailureBranches(t *testing.T) {
-	missingExec := NewAgent(WithScratchDir(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
+	missingExec := NewAgent(testContainmentOption(), WithScratchDir(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
 	missingExec.versionChecked = true
 	missingExec.lookPath = func(string) (string, error) { return "", errors.New("missing") }
 	_, err := missingExec.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
@@ -226,7 +226,7 @@ func TestStartSessionRejectsProviderAuthDirectHome(t *testing.T) {
 }
 
 func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
-	for _, key := range []string{"PATH", "NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BAD-NAME"} {
+	for _, key := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BAD-NAME"} {
 		t.Run(key, func(t *testing.T) {
 			client := newStubPiClient()
 			agent := newStubClientAgent(t, client, WithEnv(map[string]string{key: "unsafe"}))

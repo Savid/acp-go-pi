@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"errors"
 	"path/filepath"
 
 	"github.com/coder/acp-go-sdk"
@@ -77,6 +78,10 @@ func (a *Agent) sessionStartConfigurationError() error {
 		return unsupportedField(optionFieldProviderAuthDirectHome)
 	}
 
+	if isolationErr := validateProcessIsolationOption(a.options.ProcessIsolation); isolationErr != nil {
+		return isolationErr
+	}
+
 	if envErr := validateEnvironment(a.options.Env, optionFieldEnv); envErr != nil {
 		return acp.NewInvalidParams(map[string]any{
 			jsonFieldError: envErr.Error(),
@@ -89,6 +94,22 @@ func (a *Agent) sessionStartConfigurationError() error {
 			jsonFieldError: pathErr.Error(),
 			jsonFieldField: optionFieldExtraPathDirs,
 		})
+	}
+
+	return nil
+}
+
+func validateProcessIsolationOption(isolation *ProcessIsolation) error {
+	if isolation == nil {
+		return errors.New("process isolation policy is required")
+	}
+
+	if isolation.UID == 0 || isolation.GID == 0 {
+		return errors.New("process isolation UID and GID must be nonzero")
+	}
+
+	if agentRuntimePlatform == windowsPlatform {
+		return errors.New("process isolation is unsupported on windows")
 	}
 
 	return nil

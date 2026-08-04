@@ -41,7 +41,7 @@ func TestProbeVersion(t *testing.T) {
 		t.Parallel()
 
 		_, err := ProbeVersion(t.Context(), filepath.Join(t.TempDir(), "missing"), testContainmentSpec(t))
-		require.ErrorContains(t, err, "probe pi version")
+		require.ErrorContains(t, err, "resolve pi version executable")
 	})
 
 	t.Run("running probe cancellation is wrapped", func(t *testing.T) {
@@ -114,9 +114,12 @@ func TestProbeVersionStageBranches(t *testing.T) {
 	t.Run("prepare command", func(t *testing.T) {
 		restoreVersionSeams(t)
 		versionPrepareTreeCommand = func(*exec.Cmd, ContainmentSpec) (*processTreeCommand, error) { return nil, wantErr }
-		_, err := ProbeVersion(t.Context(), "/usr/bin/true", ContainmentSpec{})
-		require.ErrorContains(t, err, "prepare pi version probe")
+		_, probeErr := ProbeVersion(t.Context(), "/usr/bin/true", testContainmentSpec(t))
+		require.ErrorContains(t, probeErr, "prepare pi version probe")
 	})
+
+	_, err = ProbeVersion(t.Context(), "/usr/bin/true", ContainmentSpec{})
+	require.ErrorContains(t, err, "validate pi version process isolation")
 
 	t.Run("prepare record", func(t *testing.T) {
 		restoreVersionSeams(t)
@@ -124,7 +127,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 			return &processTreeCommand{cmd: cmd}, nil
 		}
 		versionPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, wantErr }
-		_, err := ProbeVersion(t.Context(), "/usr/bin/true", ContainmentSpec{})
+		_, err := ProbeVersion(t.Context(), "/usr/bin/true", testContainmentSpec(t))
 		require.ErrorContains(t, err, "prepare pi version containment record")
 	})
 
@@ -136,7 +139,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 		}
 		versionPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
 		versionAfterPrepare = cancel
-		_, err := ProbeVersion(ctx, "/usr/bin/true", ContainmentSpec{})
+		_, err := ProbeVersion(ctx, "/usr/bin/true", testContainmentSpec(t))
 		require.ErrorIs(t, err, context.Canceled)
 	})
 
@@ -147,7 +150,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 		}
 		versionPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
 		versionStartTree = func(*processTreeCommand) (*processTree, error) { return nil, wantErr }
-		_, err := ProbeVersion(t.Context(), "/usr/bin/true", ContainmentSpec{})
+		_, err := ProbeVersion(t.Context(), "/usr/bin/true", testContainmentSpec(t))
 		require.ErrorContains(t, err, "probe pi version")
 	})
 
@@ -175,7 +178,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 				return closedVersionTree(test.waitErr), nil
 			}
 			versionTreeTerminateAndWait = func(*processTree, time.Duration) error { return test.containmentErr }
-			version, err := ProbeVersion(t.Context(), "/usr/bin/true", ContainmentSpec{})
+			version, err := ProbeVersion(t.Context(), "/usr/bin/true", testContainmentSpec(t))
 			if test.wantErr {
 				require.Error(t, err)
 			} else {
@@ -189,6 +192,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 		restoreVersionSeams(t)
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan struct{})
+		started := make(chan struct{})
 		versionPrepareTreeCommand = func(cmd *exec.Cmd, _ ContainmentSpec) (*processTreeCommand, error) {
 			return &processTreeCommand{cmd: cmd}, nil
 		}
@@ -196,6 +200,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 		versionStartTree = func(launch *processTreeCommand) (*processTree, error) {
 			_, err := launch.cmd.Stdout.Write([]byte("0.80.6"))
 			require.NoError(t, err)
+			close(started)
 
 			return &processTree{direct: &directChildWait{done: done}}, nil
 		}
@@ -206,10 +211,10 @@ func TestProbeVersionStageBranches(t *testing.T) {
 		}
 		versionTreeTerminateAndWait = func(*processTree, time.Duration) error { return nil }
 		go func() {
-			time.Sleep(time.Millisecond)
+			<-started
 			cancel()
 		}()
-		version, err := ProbeVersion(ctx, "/usr/bin/true", ContainmentSpec{})
+		version, err := ProbeVersion(ctx, "/usr/bin/true", testContainmentSpec(t))
 		require.NoError(t, err)
 		require.Equal(t, "0.80.6", version)
 	})

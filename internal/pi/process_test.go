@@ -96,7 +96,8 @@ func TestLaunchSpecEnviron(t *testing.T) {
 	require.NoError(t, os.Unsetenv("TMPDIR"))
 
 	spec := LaunchSpec{
-		AgentDir: "/agent",
+		AgentDir:    "/agent",
+		Containment: ContainmentSpec{Isolation: &ProcessIsolation{UID: 1, GID: 1, BaseEnvironment: map[string]string{"PATH": "/usr/bin", "HOME": "/home/policy"}}},
 		Env: map[string]string{
 			"ANTHROPIC_API_KEY": "explicit-key",
 			"OPENAI_API_KEY":    "explicit-openai-key",
@@ -117,8 +118,8 @@ func TestLaunchSpecEnviron(t *testing.T) {
 		env[key] = value
 	}
 
-	require.Equal(t, "/usr/bin", env["PATH"])
-	require.Equal(t, "/home/user", env["HOME"])
+	require.Equal(t, "/tmp/hijack-bin", env["PATH"])
+	require.Equal(t, "/home/policy", env["HOME"])
 	require.Equal(t, "explicit-key", env["ANTHROPIC_API_KEY"])
 	require.Equal(t, "explicit-openai-key", env["OPENAI_API_KEY"])
 	require.Equal(t, "1", env["PI_OFFLINE"])
@@ -126,7 +127,7 @@ func TestLaunchSpecEnviron(t *testing.T) {
 	require.NotContains(t, env, "NODE_OPTIONS")
 	require.NotContains(t, env, "LD_PRELOAD")
 	require.NotContains(t, env, "BAD-NAME")
-	require.Equal(t, "/usr/bin", env["PATH"])
+	require.Equal(t, "/tmp/hijack-bin", env["PATH"])
 	require.NotContains(t, env, "TMPDIR")
 	require.IsIncreasing(t, environ)
 }
@@ -138,6 +139,7 @@ func TestLaunchSpecEnvironPrependsExtraPathDirs(t *testing.T) {
 
 	spec := LaunchSpec{
 		AgentDir:      "/agent",
+		Containment:   ContainmentSpec{Isolation: &ProcessIsolation{UID: 1, GID: 1, BaseEnvironment: map[string]string{"PATH": "/usr/bin"}}},
 		ExtraPathDirs: []string{"/session/bin", "/agent-wide/bin"},
 		Env:           map[string]string{"PATH": "/tmp/hijack-bin"},
 	}
@@ -145,16 +147,13 @@ func TestLaunchSpecEnvironPrependsExtraPathDirs(t *testing.T) {
 	require.Contains(
 		t,
 		spec.Environ(),
-		"PATH=/session/bin"+separator+"/agent-wide/bin"+separator+"/usr/bin"+separator+"/bin",
+		"PATH=/session/bin"+separator+"/agent-wide/bin"+separator+"/tmp/hijack-bin",
 	)
 	require.IsIncreasing(t, spec.Environ())
 }
 
 func TestLaunchSpecEnvironExtraPathDirsWithoutAmbientPath(t *testing.T) {
-	require.NoError(t, os.Unsetenv("PATH"))
-	t.Cleanup(func() { t.Setenv("PATH", "/usr/bin") })
-
-	spec := LaunchSpec{AgentDir: "/agent", ExtraPathDirs: []string{"/session/bin"}}
+	spec := LaunchSpec{AgentDir: "/agent", ExtraPathDirs: []string{"/session/bin"}, Containment: ContainmentSpec{Isolation: &ProcessIsolation{UID: 1, GID: 1, BaseEnvironment: map[string]string{}}}}
 
 	require.Contains(t, spec.Environ(), "PATH=/session/bin")
 }
@@ -166,6 +165,7 @@ func TestLaunchSpecEnvironKeepsBrowserShimAheadOfExtraPathDirs(t *testing.T) {
 
 	spec := LaunchSpec{
 		AgentDir:      "/agent",
+		Containment:   ContainmentSpec{Isolation: &ProcessIsolation{UID: 1, GID: 1, BaseEnvironment: map[string]string{"PATH": "/usr/bin"}}},
 		ExtraPathDirs: []string{"/session/bin"},
 		BrowserShim:   &BrowserShim{shim: &browserShim{dir: "/shim"}},
 	}
@@ -255,7 +255,7 @@ func TestStartProcessStageFailures(t *testing.T) {
 	t.Run("prepare command", func(t *testing.T) {
 		restoreProcessSeams(t)
 		processPrepareTreeCommand = func(*exec.Cmd, ContainmentSpec) (*processTreeCommand, error) { return nil, wantErr }
-		_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true"})
+		_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true", Containment: testContainmentSpec(t)})
 		require.ErrorContains(t, err, "prepare pi process")
 	})
 
@@ -265,7 +265,7 @@ func TestStartProcessStageFailures(t *testing.T) {
 			return &processTreeCommand{cmd: cmd}, nil
 		}
 		processPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, wantErr }
-		_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true"})
+		_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true", Containment: testContainmentSpec(t)})
 		require.ErrorContains(t, err, "prepare pi containment record")
 	})
 
@@ -277,7 +277,7 @@ func TestStartProcessStageFailures(t *testing.T) {
 		}
 		processPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
 		processAfterPrepare = cancel
-		_, err := StartProcess(ctx, LaunchSpec{ExecutablePath: "/usr/bin/true"})
+		_, err := StartProcess(ctx, LaunchSpec{ExecutablePath: "/usr/bin/true", Containment: testContainmentSpec(t)})
 		require.ErrorIs(t, err, context.Canceled)
 	})
 
@@ -288,7 +288,7 @@ func TestStartProcessStageFailures(t *testing.T) {
 		}
 		processPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
 		processStartTree = func(*processTreeCommand) (*processTree, error) { return nil, wantErr }
-		_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true"})
+		_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true", Containment: testContainmentSpec(t)})
 		require.ErrorContains(t, err, "start pi process")
 	})
 
@@ -301,7 +301,7 @@ func TestStartProcessStageFailures(t *testing.T) {
 		processStartTree = func(*processTreeCommand) (*processTree, error) { return &processTree{}, nil }
 		processDirectChildWait = func(*processTree) *directChildWait { return nil }
 		processTreeKill = func(*processTree) error { return nil }
-		process, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true"})
+		process, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true", Containment: testContainmentSpec(t)})
 		require.NoError(t, err)
 		<-process.Exited()
 		require.ErrorIs(t, process.WaitErr(), ErrProcessContainmentIncomplete)
@@ -390,9 +390,11 @@ func TestStartProcessValidation(t *testing.T) {
 
 	_, err := StartProcess(t.Context(), LaunchSpec{})
 	require.ErrorContains(t, err, "executable path is required")
+	_, err = StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true"})
+	require.ErrorContains(t, err, "validate pi process isolation")
 
 	_, err = StartProcess(t.Context(), LaunchSpec{ExecutablePath: filepath.Join(t.TempDir(), "missing"), Containment: testContainmentSpec(t)})
-	require.ErrorContains(t, err, "start pi process")
+	require.ErrorContains(t, err, "resolve pi executable")
 }
 
 func TestStartProcessPipeFailures(t *testing.T) {
@@ -402,7 +404,7 @@ func TestStartProcessPipeFailures(t *testing.T) {
 	processPipe = func() (*os.File, *os.File, error) {
 		return nil, nil, os.ErrPermission
 	}
-	_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/bin/sh"})
+	_, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/bin/sh", Containment: testContainmentSpec(t)})
 	require.ErrorContains(t, err, "create stdin pipe")
 
 	calls := 0
@@ -414,7 +416,7 @@ func TestStartProcessPipeFailures(t *testing.T) {
 
 		return realPipe()
 	}
-	_, err = StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/bin/sh"})
+	_, err = StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/bin/sh", Containment: testContainmentSpec(t)})
 	require.ErrorContains(t, err, "create stdout pipe")
 }
 
@@ -585,9 +587,10 @@ func TestProcessEnvironmentIsScrubbed(t *testing.T) {
 	}
 
 	<-process.Exited()
+	require.NoError(t, process.WaitErr())
 
 	environ := string(output)
-	require.Contains(t, environ, "TEST_EXPLICIT_VALUE=ok")
+	require.Contains(t, environ, "TEST_EXPLICIT_VALUE=ok", "stderr: %s", process.StderrTail())
 	require.Contains(t, environ, "PI_OFFLINE=1")
 	require.Contains(t, environ, "PI_CODING_AGENT_DIR=")
 	require.NotContains(t, environ, "TEST_AMBIENT_SECRET")

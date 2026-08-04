@@ -52,11 +52,22 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 }
 
 func testContainmentOption() Option {
-	if runtime.GOOS == "darwin" {
-		return WithDarwinBestEffortContainment()
+	return func(options *Options) {
+		testProcessIsolationOption()(options)
+		if runtime.GOOS == "darwin" {
+			WithDarwinBestEffortContainment()(options)
+		}
 	}
+}
 
-	return func(*Options) {}
+func testProcessIsolationOption() Option {
+	return func(options *Options) {
+		WithProcessIsolation(ProcessIsolation{
+			UID: uint32(os.Geteuid()), GID: uint32(os.Getegid()),
+			BaseEnvironment: map[string]string{"PATH": os.Getenv("PATH"), "HOME": os.Getenv("HOME")},
+		})(options)
+		options.testOnlyNoCredential = true
+	}
 }
 
 // newFailingCloseProcess returns a stub process whose shutdown and close

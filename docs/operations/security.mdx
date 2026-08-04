@@ -13,20 +13,20 @@ prompt text, tool payloads, or raw pi event bodies.
 
 ## Environment scrubbing
 
-Every pi child runs with a scrubbed environment: ambient shell variables are
+Every pi child runs with the complete replacement environment supplied by
+`ProcessIsolation.BaseEnvironment`: ambient shell variables are
 not inherited. pi treats ambient provider keys as live authentication, so
 without scrubbing an exported `OPENAI_API_KEY` would silently become a
 session's identity. Scrubbing makes every credential path deliberate. Each
 session also runs with pi's phone-home behavior pinned off (`PI_OFFLINE=1`),
 so no update checks or telemetry leave the machine from the pi child.
 
-A raw `PATH` in either environment surface stays rejected: replacing the search
-order wholesale is a loader-injection vector, not a configuration knob. A host
-that needs its own executable in front of the child names directories instead,
-through `WithExtraPathDirs` or `_meta.pi.options.extraPathDirs`. Those are
-prepended to the inherited `PATH` — per-session entries first, then agent-wide
-ones — and each must be an absolute directory carrying no list separator, so a
-caller adds to the search order without being able to rewrite it. The browser
+A raw `PATH` in `WithEnv` or the session environment explicitly replaces the
+isolation policy search order. A host that only needs its own executable in
+front of the child can instead use `WithExtraPathDirs` or
+`_meta.pi.options.extraPathDirs`. Those are prepended to the effective `PATH` —
+per-session entries first, then agent-wide ones — and each must be an absolute
+directory carrying no list separator. The browser
 shim below still takes the front of `PATH`.
 
 ## Browser containment

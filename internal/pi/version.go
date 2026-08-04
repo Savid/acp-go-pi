@@ -31,17 +31,34 @@ func ProbeVersion(ctx context.Context, executablePath string, containment Contai
 		return "", contextErr
 	}
 
-	cmd := execCommand(executablePath, "--version")
+	if err := validateProcessIsolation(containment.Isolation); err != nil {
+		return "", fmt.Errorf("validate pi version process isolation: %w", err)
+	}
+
+	environment := (LaunchSpec{Containment: containment}).Environ()
+
+	resolved, err := lookPathInEnvironment(executablePath, environment)
+	if err != nil {
+		return "", fmt.Errorf("resolve pi version executable: %w", err)
+	}
+
+	cmd := execCommand(resolved, "--version")
 
 	var output bytes.Buffer
 
 	cmd.Stdout = &output
 	cmd.WaitDelay = defaultShutdownStepTimeout
-	cmd.Env = (LaunchSpec{Containment: containment}).Environ()
+	cmd.Env = environment
 
 	launch, err := versionPrepareTreeCommand(cmd, containment)
 	if err != nil {
 		return "", fmt.Errorf("prepare pi version probe: %w", err)
+	}
+
+	if isolationErr := applyProcessIsolation(launch.cmd, containment.Isolation); isolationErr != nil {
+		launch.close()
+
+		return "", fmt.Errorf("apply pi version process isolation: %w", isolationErr)
 	}
 
 	launch.containment, err = versionPrepareContainmentRecord(containment)

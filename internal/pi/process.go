@@ -32,10 +32,6 @@ const (
 	privateEnvPrefix = "ACP_" + "GO_PI_INTERNAL_"
 )
 
-// baseEnvironmentKeys are the only parent environment variables a pi child
-// inherits. Everything else is scrubbed: pi treats ambient provider API keys
-// as live auth, so credentials must flow through explicit env additions.
-var baseEnvironmentKeys = []string{envPath, "HOME", "TMPDIR", "LANG", "LC_ALL", "TERM"}
 var processPipe = os.Pipe
 var processPrepareTreeCommand = prepareProcessTreeCommand
 var processPrepareContainmentRecord = prepareContainmentRecord
@@ -122,16 +118,15 @@ func (spec LaunchSpec) Args() []string {
 	return args
 }
 
-// Environ returns the scrubbed child environment: explicit basics from the
-// parent, then spec.Env, then spec.ExtraPathDirs ahead of the inherited PATH,
+// Environ returns the child environment: the isolation policy's complete base,
+// then spec.Env, then spec.ExtraPathDirs ahead of the policy PATH,
 // then the wrapper-managed keys, which always win. The browser shim is applied
 // last so its PATH prefix and BROWSER value survive whatever a caller asked
 // for.
 func (spec LaunchSpec) Environ() []string {
-	env := make(map[string]string, len(baseEnvironmentKeys)+len(spec.Env)+2)
-
-	for _, key := range baseEnvironmentKeys {
-		if value, ok := os.LookupEnv(key); ok {
+	env := make(map[string]string, len(spec.Env)+2)
+	if spec.Containment.Isolation != nil {
+		for key, value := range spec.Containment.Isolation.BaseEnvironment {
 			env[key] = value
 		}
 	}
@@ -212,7 +207,7 @@ func safeExplicitEnvKey(key string) bool {
 	}
 
 	upper := strings.ToUpper(key)
-	if upper == envPath || upper == envNodeOptions || upper == envBashEnv || upper == envShellEnv {
+	if upper == envNodeOptions || upper == envBashEnv || upper == envShellEnv {
 		return false
 	}
 
@@ -264,6 +259,17 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 		return nil, fmt.Errorf("pi executable path is required")
 	}
 
+	if err := validateProcessIsolation(spec.Containment.Isolation); err != nil {
+		return nil, fmt.Errorf("validate pi process isolation: %w", err)
+	}
+
+	environment := spec.Environ()
+
+	executable, err := lookPathInEnvironment(spec.ExecutablePath, environment)
+	if err != nil {
+		return nil, fmt.Errorf("resolve pi executable: %w", err)
+	}
+
 	stdinRead, stdinWrite, err := processPipe()
 	if err != nil {
 		return nil, fmt.Errorf("create stdin pipe: %w", err)
@@ -281,9 +287,9 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 	// Cancellation is joined below only after the original process boundary has
 	// been captured. An exec.Cmd context watcher would be a second, racing
 	// signal owner and could rediscover a reused process-group id.
-	cmd := exec.Command(spec.ExecutablePath, spec.Args()...) // #nosec G204 -- launches the operator-configured pi binary with wrapper-built args.
+	cmd := exec.Command(executable, spec.Args()...) // #nosec G204 -- launches the policy-resolved pi binary with wrapper-built args.
 	cmd.Dir = spec.Cwd
-	cmd.Env = spec.Environ()
+	cmd.Env = environment
 	cmd.Stdin = stdinRead
 	cmd.Stdout = stdoutWrite
 	cmd.Stderr = stderr
@@ -293,6 +299,13 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 		closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)
 
 		return nil, fmt.Errorf("prepare pi process: %w", err)
+	}
+
+	if isolationErr := applyProcessIsolation(launch.cmd, spec.Containment.Isolation); isolationErr != nil {
+		launch.close()
+		closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)
+
+		return nil, fmt.Errorf("apply pi process isolation: %w", isolationErr)
 	}
 
 	launch.containment, err = processPrepareContainmentRecord(spec.Containment)

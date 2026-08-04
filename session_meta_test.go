@@ -57,7 +57,6 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: true}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"A": true}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"1BAD": "x"}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"PATH": "x"}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: true}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{"type": "object"}}}},
@@ -90,9 +89,10 @@ func TestEnvironmentValidation(t *testing.T) {
 	for _, name := range []string{"", "1A", "A-B", "A B", "é"} {
 		require.False(t, validEnvName(name))
 	}
-	for _, name := range []string{"PATH", "path", "NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_DARWIN_LAUNCH", "acp_go_pi_internal_turn_supervisor"} {
+	for _, name := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_DARWIN_LAUNCH", "acp_go_pi_internal_turn_supervisor"} {
 		require.True(t, blockedEnvKey(name))
 	}
+	require.False(t, blockedEnvKey("PATH"))
 }
 
 func TestExtraPathDirsValidation(t *testing.T) {
