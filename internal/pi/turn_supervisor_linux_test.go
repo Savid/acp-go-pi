@@ -84,7 +84,9 @@ func restoreTurnSupervisorSeams(t *testing.T) {
 	setrlimit := turnSupervisorSetrlimit
 	acquireLock := turnSupervisorAcquireLock
 	sealConfig := turnSupervisorSealConfig
+	effectiveUID := turnSupervisorEffectiveUID
 	syscallKillOriginal := syscallKill
+	turnSupervisorEffectiveUID = func() int { return 0 }
 	t.Cleanup(func() {
 		turnSupervisorExecutable = executable
 		turnSupervisorMemfd = memfd
@@ -112,8 +114,48 @@ func restoreTurnSupervisorSeams(t *testing.T) {
 		turnSupervisorSetrlimit = setrlimit
 		turnSupervisorAcquireLock = acquireLock
 		turnSupervisorSealConfig = sealConfig
+		turnSupervisorEffectiveUID = effectiveUID
 		syscallKill = syscallKillOriginal
 	})
+}
+
+func TestTurnSupervisorRequiresDistinctTrustedRoot(t *testing.T) {
+	restoreTurnSupervisorSeams(t)
+
+	turnSupervisorEffectiveUID = func() int { return 1000 }
+	if err := validateTurnSupervisorIdentity(supervisorTestIsolation()); err == nil || !strings.Contains(err.Error(), "trusted root") {
+		t.Fatalf("non-root identity validation = %v", err)
+	}
+	if _, err := prepareProcessTreeCommand(exec.Command("/bin/true"), ContainmentSpec{Isolation: supervisorTestIsolation()}); err == nil || !strings.Contains(err.Error(), "trusted root") {
+		t.Fatalf("non-root parent preparation = %v", err)
+	}
+	config := encodeSupervisorConfig(t, turnSupervisorConfig{Path: "/bin/true", Args: []string{"/bin/true"}, Isolation: *supervisorTestIsolation()})
+	if err := runTurnSupervisor(config, strings.NewReader(""), io.Discard); err == nil || !strings.Contains(err.Error(), "trusted root") {
+		t.Fatalf("non-root supervisor bootstrap = %v", err)
+	}
+
+	turnSupervisorEffectiveUID = func() int { return 0 }
+	isolation := supervisorTestIsolation()
+	isolation.UID = 0
+	if err := validateTurnSupervisorIdentity(isolation); err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("shared root identity validation = %v", err)
+	}
+
+	isolation.UID = 11
+	if err := validateTurnSupervisorIdentity(isolation); err != nil {
+		t.Fatalf("distinct trusted identity validation = %v", err)
+	}
+}
+
+func TestTurnSupervisorProductionIdentityRejectsNonRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires a non-root process")
+	}
+
+	_, err := prepareProcessTreeCommand(exec.Command("/bin/true"), ContainmentSpec{Isolation: supervisorTestIsolation()})
+	if err == nil || !strings.Contains(err.Error(), "trusted root") {
+		t.Fatalf("non-root production preparation = %v", err)
+	}
 }
 
 type recordingReadCloser struct {
@@ -275,7 +317,7 @@ func TestTurnSupervisorNativeChildHasSecurityLimits(t *testing.T) {
 	)
 	if os.Getenv(phaseEnv) == "child" {
 		restoreTurnSupervisorSeams(t)
-		turnSupervisorAcquireLock = func(uint32, bool, <-chan struct{}, <-chan os.Signal) (*agentIdentityLock, error) {
+		turnSupervisorAcquireLock = func(uint32, bool, string, <-chan struct{}, <-chan os.Signal) (*agentIdentityLock, error) {
 			return &agentIdentityLock{}, nil
 		}
 		status := os.Getenv(statusEnv)
@@ -314,7 +356,12 @@ func TestTrustedSupervisorRejectsNativeSignalsProofForgeryAndDaemonEscape(t *tes
 
 	root := os.Getenv("ACP_GO_PI_TEST_ROOT")
 	if root == "" {
-		root = t.TempDir()
+		var err error
+		root, err = os.MkdirTemp("", "acp-go-pi-trusted-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(root) })
 	}
 	statusRoot := filepath.Join(root, "native")
 	if os.Getenv(phaseEnv) != "child" {
@@ -351,7 +398,7 @@ if kill -KILL "$supervisor" 2>/dev/null; then echo kill=allowed; else echo kill=
 			Path:      "/bin/sh",
 			Args:      []string{"sh", "-c", script, "probe", status, daemon, strconv.Itoa(int(proofFile.Fd()))},
 			Env:       []string{"PATH=/usr/bin:/bin"},
-			Isolation: ProcessIsolation{UID: 65534, GID: 65534},
+			Isolation: ProcessIsolation{UID: 65534, GID: 65534, BaseEnvironment: map[string]string{}},
 		}
 		if err := runTurnSupervisor(encodeSupervisorConfig(t, config), controlRead, proofFile); err != nil {
 			t.Fatalf("run trusted supervisor: %v", err)
@@ -533,18 +580,11 @@ func TestTurnSupervisorConfigAndReadinessBranches(t *testing.T) {
 
 func TestTurnSupervisorEnvironmentReplacesInternalMode(t *testing.T) {
 	t.Setenv(turnSupervisorModeEnv, "stale")
+	t.Setenv("GORACE", "halt_on_error=1 atexit_sleep_ms=1000")
 	env := turnSupervisorEnvironment()
-	count := 0
-	for _, entry := range env {
-		if entry == turnSupervisorModeEnv+"="+turnSupervisorMode {
-			count++
-		}
-		if entry == turnSupervisorModeEnv+"=stale" {
-			t.Fatal("stale supervisor mode survived")
-		}
-	}
-	if count != 1 {
-		t.Fatalf("supervisor mode count = %d", count)
+	want := turnSupervisorModeEnv + "=" + turnSupervisorMode
+	if len(env) != 1 || env[0] != want {
+		t.Fatalf("supervisor environment = %#v, want [%q]", env, want)
 	}
 
 	native := turnSupervisorNativeEnvironment(nil)
@@ -564,7 +604,7 @@ func TestRunTurnSupervisorBranches(t *testing.T) {
 	turnSupervisorSignalNotify = func(chan<- os.Signal, ...os.Signal) {}
 	turnSupervisorSignalStop = func(chan<- os.Signal) {}
 	turnSupervisorProcessID = func() int { return 99 }
-	turnSupervisorAcquireLock = func(uint32, bool, <-chan struct{}, <-chan os.Signal) (*agentIdentityLock, error) {
+	turnSupervisorAcquireLock = func(uint32, bool, string, <-chan struct{}, <-chan os.Signal) (*agentIdentityLock, error) {
 		return &agentIdentityLock{}, nil
 	}
 
@@ -655,18 +695,18 @@ func TestRunTurnSupervisorBranches(t *testing.T) {
 	turnSupervisorSignalNotify = func(signals chan<- os.Signal, _ ...os.Signal) {
 		signals <- supervisorTestSignal("foreign")
 		signals <- syscall.SIGINT
-		_ = controlWrite.Close()
 	}
 	signalled := 0
-	turnSupervisorSignalGroup = func(_ int, signal syscall.Signal) error {
+	turnSupervisorSignalGroup = func(pid int, signal syscall.Signal) error {
 		if signal == syscall.SIGINT {
 			signalled++
 		}
 
-		return nil
+		return syscall.Kill(-pid, signal)
 	}
 	config = encodeSupervisorConfig(t, turnSupervisorConfig{Path: "/bin/sh", Args: []string{"sh", "-c", "while :; do sleep 1; done"}})
 	_ = runTurnSupervisor(config, controlRead, io.Discard)
+	_ = controlWrite.Close()
 	if signalled != 1 {
 		t.Fatalf("forwarded signals = %d", signalled)
 	}
@@ -677,7 +717,7 @@ func TestRunTurnSupervisorProofPublicationFailures(t *testing.T) {
 	turnSupervisorEnable = func() error { return nil }
 	turnSupervisorSignalNotify = func(chan<- os.Signal, ...os.Signal) {}
 	turnSupervisorSignalStop = func(chan<- os.Signal) {}
-	turnSupervisorAcquireLock = func(uint32, bool, <-chan struct{}, <-chan os.Signal) (*agentIdentityLock, error) {
+	turnSupervisorAcquireLock = func(uint32, bool, string, <-chan struct{}, <-chan os.Signal) (*agentIdentityLock, error) {
 		return &agentIdentityLock{}, nil
 	}
 	proofErr := errors.New("proof write")
@@ -718,7 +758,7 @@ func encodeSupervisorConfig(t *testing.T, config turnSupervisorConfig) io.Reader
 }
 
 func supervisorTestIsolation() *ProcessIsolation {
-	return &ProcessIsolation{UID: 11, GID: 22, TestOnlyNoCredential: true}
+	return &ProcessIsolation{UID: 11, GID: 22, BaseEnvironment: map[string]string{}, TestOnlyNoCredential: true}
 }
 
 func TestContainLinuxSupervisorDescendantsBranches(t *testing.T) {

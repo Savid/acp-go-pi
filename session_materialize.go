@@ -2,6 +2,7 @@ package piacp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -47,6 +48,11 @@ func (a *Agent) createSessionDirs() (sessionDirs, error) {
 	if err != nil {
 		return sessionDirs{}, fmt.Errorf("create session root: %w", err)
 	}
+	if err := os.Chmod(sessionRoot, 0o711); err != nil {
+		_ = materializeRemoveAll(sessionRoot)
+
+		return sessionDirs{}, fmt.Errorf("protect session root: %w", err)
+	}
 
 	dirs, err := createSessionGeneration(sessionRoot)
 	if err != nil {
@@ -73,6 +79,13 @@ func (a *Agent) applyDurableHome(dirs *sessionDirs) error {
 	home := a.options.Home
 	if home == "" {
 		return nil
+	}
+	if a.options.ProcessIsolation != nil {
+		if err := validateNativeOwnedDirectory(home, a.options.ProcessIsolation); err != nil {
+			return err
+		}
+
+		return errors.New("durable pi agent directory is unsupported with process isolation")
 	}
 
 	if err := materializeMkdirAll(home, 0o700); err != nil {

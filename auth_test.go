@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -59,9 +58,18 @@ func newAuthHarness(t *testing.T, opts ...Option) *authHarness {
 
 	client.respondFunc = harness.recordAnswer
 
-	base := make([]Option, 0, 2+len(opts))
-	base = append(base, WithProviderAuthRoot(harness.root), WithHome(harness.home))
+	base := make([]Option, 0, 1+len(opts))
+	base = append(base, WithProviderAuthRoot(harness.root))
 	agent := newStubClientAgent(t, client, append(base, opts...)...)
+	ledger, err := newAuthLedger(Options{ProviderAuthRoot: harness.root, Home: harness.home})
+	require.NoError(t, err)
+	agent.providerAuth = &providerAuth{
+		agent: agent, ledger: ledger,
+		authorizeGate: newAuthGate[authFlowKey](), slotGate: newAuthGate[string](),
+		flows: make(map[authFlowKey]*authFlow), byID: make(map[string]*authFlow),
+		retained: make(map[authFlowKey]*authFlow), retired: make(map[authFlowKey]map[string]struct{}),
+		exchanges: make(map[string]*authExchange),
+	}
 
 	session, err := agent.startAndStoreSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	require.NoError(t, err)
@@ -279,7 +287,7 @@ func requireInvalidAuthField(t *testing.T, err error, field string, context ...a
 	require.Equal(t, field, data[jsonFieldField], context...)
 }
 
-func TestNewProviderAuthRequiresBothPreconditions(t *testing.T) {
+func TestNewProviderAuthRejectsIsolatedDurableHome(t *testing.T) {
 	t.Parallel()
 
 	client := newStubPiClient()
@@ -287,7 +295,7 @@ func TestNewProviderAuthRequiresBothPreconditions(t *testing.T) {
 	require.Nil(t, newStubClientAgent(t, client).providerAuth)
 	require.Nil(t, newStubClientAgent(t, client, WithProviderAuthRoot(t.TempDir())).providerAuth)
 	require.Nil(t, newStubClientAgent(t, client, WithHome(t.TempDir())).providerAuth)
-	require.NotNil(t, newStubClientAgent(t, client, WithProviderAuthRoot(t.TempDir()), WithHome(t.TempDir())).providerAuth)
+	require.Nil(t, newStubClientAgent(t, client, WithProviderAuthRoot(t.TempDir()), WithHome(t.TempDir())).providerAuth)
 }
 
 // TestNewProviderAuthUnusableRootStaysUnadvertised pins the family rule that a
@@ -514,58 +522,32 @@ func TestAuthGoSafeRecoversPanic(t *testing.T) {
 	<-done
 }
 
-// TestDurableHomeReplacesGeneratedAgentDir pins that a configured home is what
-// pi sees as its agent directory, which is what its cross-process credential
-// lock is keyed on.
-func TestDurableHomeReplacesGeneratedAgentDir(t *testing.T) {
+func TestAuthHarnessUsesGeneratedAgentDir(t *testing.T) {
 	t.Parallel()
 
 	harness := newAuthHarness(t)
-	require.Equal(t, harness.home, harness.session.launch.AgentDir)
+	require.NotEqual(t, harness.home, harness.session.launch.AgentDir)
+	require.Contains(t, harness.session.launch.AgentDir, "acp-go-pi-runtime-")
 
-	// A relaunch keeps the same directory: copying it forward would strand the
-	// credential store the harness refreshes under its own lock.
 	spec, err := harness.session.nextRuntimeLaunch(harness.session.launch, "")
 	require.NoError(t, err)
-	require.Equal(t, harness.home, spec.AgentDir)
+	require.NotEqual(t, harness.home, spec.AgentDir)
+	require.NotEqual(t, harness.session.launch.AgentDir, spec.AgentDir)
 }
 
-func TestDurableHomeReportsCreationFailure(t *testing.T) {
-	agent := newStubClientAgent(t, newStubPiClient(), WithHome("/srv/pi-home"))
-
-	original := materializeMkdirAll
-	materializeMkdirAll = func(path string, mode os.FileMode) error {
-		if path == "/srv/pi-home" {
-			return errors.New("mkdir")
-		}
-
-		return original(path, mode)
-	}
-
-	t.Cleanup(func() { materializeMkdirAll = original })
-
+func TestDurableHomeIsRefusedWithProcessIsolation(t *testing.T) {
+	agent := newStubClientAgent(t, newStubPiClient(), WithHome(t.TempDir()))
 	agent.versionChecked = true
 
 	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-	require.Error(t, err)
+	require.ErrorContains(t, err, "durable pi agent directory is unsupported with process isolation")
 }
 
-func TestDurableHomeReportsRelaunchCreationFailure(t *testing.T) {
+func TestGeneratedAgentDirRelaunchIgnoresLedgerIdentity(t *testing.T) {
 	harness := newAuthHarness(t)
-
-	original := materializeMkdirAll
-	materializeMkdirAll = func(path string, mode os.FileMode) error {
-		if path == harness.home {
-			return errors.New("mkdir")
-		}
-
-		return original(path, mode)
-	}
-
-	t.Cleanup(func() { materializeMkdirAll = original })
-
-	_, err := harness.session.nextRuntimeLaunch(harness.session.launch, "")
-	require.Error(t, err)
+	spec, err := harness.session.nextRuntimeLaunch(harness.session.launch, "")
+	require.NoError(t, err)
+	require.NotEqual(t, harness.home, spec.AgentDir)
 }
 
 // TestAuthCommandIsNotAdvertised pins that the wrapper-owned bridge command is

@@ -105,11 +105,11 @@ func (a *Agent) containmentSpecForRoot(
 		GenerationRoot:   absoluteRoot,
 		RuntimeID:        hex.EncodeToString(identity),
 		LifecycleKind:    string(kind),
-		Isolation:        internalProcessIsolation(a.options.ProcessIsolation, a.options.testOnlyNoCredential),
+		Isolation:        internalProcessIsolation(a.options.ProcessIsolation, a.options.testOnlyNoCredential, a.options.testOnlyIdentityLockRoot),
 	}, nil
 }
 
-func internalProcessIsolation(isolation *ProcessIsolation, testOnlyNoCredential bool) *internalpi.ProcessIsolation {
+func internalProcessIsolation(isolation *ProcessIsolation, testOnlyNoCredential bool, testOnlyIdentityLockRoot string) *internalpi.ProcessIsolation {
 	if isolation == nil {
 		return nil
 	}
@@ -119,10 +119,15 @@ func internalProcessIsolation(isolation *ProcessIsolation, testOnlyNoCredential 
 		base[key] = value
 	}
 
-	return &internalpi.ProcessIsolation{
-		UID: isolation.UID, GID: isolation.GID, BaseEnvironment: base,
-		TestOnlyNoCredential: testOnlyNoCredential,
+	result := &internalpi.ProcessIsolation{
+		UID:                      isolation.UID,
+		GID:                      isolation.GID,
+		BaseEnvironment:          base,
+		TestOnlyNoCredential:     testOnlyNoCredential,
+		TestOnlyIdentityLockRoot: testOnlyIdentityLockRoot,
 	}
+
+	return result
 }
 
 func (g *runtimeGeneration) finalize(containmentErr error) error {

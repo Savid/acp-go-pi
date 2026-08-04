@@ -93,8 +93,8 @@ const turnSupervisorComplete = "complete\n"
 
 // processTreeCommand owns the platform launch wrapper and every parent-side
 // descriptor that establishes its containment boundary. Linux launches an
-// embedded subreaper, Windows launches directly into a Job Object, and
-// platforms without an unescapable boundary reject the launch.
+// embedded subreaper, opted-in Darwin uses its best-effort process group, and
+// unsupported platforms, including Windows, reject the launch.
 type processTreeCommand struct {
 	cmd             *exec.Cmd
 	inherited       []*os.File

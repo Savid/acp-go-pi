@@ -644,7 +644,10 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		return nil, err
 	}
 
-	browserShim = a.newSessionBrowserShim()
+	browserShim, err = a.newOwnedSessionBrowserShim()
+	if err != nil {
+		return nil, err
+	}
 
 	hydratedPath := ""
 
@@ -721,6 +724,9 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 
 	seededResources, err := agentDirExplicitResources(agentDir)
 	if err != nil {
+		return nil, err
+	}
+	if err := handoffGeneratedNativeTree(dirs.Root, a.options.ProcessIsolation); err != nil {
 		return nil, err
 	}
 

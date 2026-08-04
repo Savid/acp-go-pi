@@ -34,7 +34,6 @@ func restoreMainSeams(t *testing.T) {
 	realVersion := agentVersion
 	realExit := exit
 	realArgs := os.Args
-	realPlatform := mainRuntimePlatform
 
 	t.Cleanup(func() {
 		serve = realServe
@@ -42,7 +41,6 @@ func restoreMainSeams(t *testing.T) {
 		agentVersion = realVersion
 		exit = realExit
 		os.Args = realArgs
-		mainRuntimePlatform = realPlatform
 	})
 }
 
@@ -67,6 +65,7 @@ func TestSeedFileFlag(t *testing.T) {
 func TestRunSuccessAndFailures(t *testing.T) {
 	disableTelemetry(t)
 	restoreMainSeams(t)
+	stubProcessIsolationConfig(t)
 
 	agentVersion = func() string { return "test-version" }
 
@@ -85,7 +84,7 @@ func TestRunSuccessAndFailures(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	require.Equal(t, 1, run(t.Context(), nil, bytes.NewReader(nil), &stdout, &stderr))
+	require.Equal(t, 1, run(t.Context(), isolatedArgs(), bytes.NewReader(nil), &stdout, &stderr))
 	require.Contains(t, stderr.String(), "serve failed")
 
 	serve = func(context.Context, io.Reader, io.Writer, ...piacp.Option) error { return nil }
@@ -93,7 +92,7 @@ func TestRunSuccessAndFailures(t *testing.T) {
 		return errors.New("shutdown failed")
 	}
 	stderr.Reset()
-	require.Equal(t, 1, run(t.Context(), nil, bytes.NewReader(nil), &stdout, &stderr))
+	require.Equal(t, 1, run(t.Context(), isolatedArgs(), bytes.NewReader(nil), &stdout, &stderr))
 	require.Contains(t, stderr.String(), "shutdown OpenTelemetry")
 }
 
@@ -101,15 +100,17 @@ func TestRunTelemetryFailure(t *testing.T) {
 	disableTelemetry(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "unknown")
 	restoreMainSeams(t)
+	stubProcessIsolationConfig(t)
 
 	var stderr bytes.Buffer
-	require.Equal(t, 1, run(t.Context(), nil, bytes.NewReader(nil), io.Discard, &stderr))
+	require.Equal(t, 1, run(t.Context(), isolatedArgs(), bytes.NewReader(nil), io.Discard, &stderr))
 	require.Contains(t, stderr.String(), "configure OpenTelemetry")
 }
 
 func TestRunOptionsCancellationAndSignal(t *testing.T) {
 	disableTelemetry(t)
 	restoreMainSeams(t)
+	stubProcessIsolationConfig(t)
 
 	seedPath := t.TempDir() + "/settings.json"
 	require.NoError(t, os.WriteFile(seedPath, []byte(`{"theme":"dark"}`), 0o600))
@@ -130,12 +131,15 @@ func TestRunOptionsCancellationAndSignal(t *testing.T) {
 		require.Equal(t, `{"theme":"dark"}`, options.SeedFiles["settings.json"])
 		require.NotNil(t, options.Logger)
 		require.NotNil(t, options.TextMapPropagator)
+		require.NotNil(t, options.ProcessIsolation)
+		require.Equal(t, uint32(20001), options.ProcessIsolation.UID)
 
 		return nil
 	}
 
 	var stderr bytes.Buffer
 	code := run(t.Context(), []string{
+		"-process-isolation-config", testProcessIsolationConfigPath,
 		"-debug",
 		"-path", "/custom/pi",
 		"-home", "/agent/home",
@@ -150,33 +154,17 @@ func TestRunOptionsCancellationAndSignal(t *testing.T) {
 	serve = func(context.Context, io.Reader, io.Writer, ...piacp.Option) error {
 		return errors.New("ignored after cancellation")
 	}
-	require.Zero(t, run(ctx, nil, bytes.NewReader(nil), io.Discard, io.Discard))
+	require.Zero(t, run(ctx, isolatedArgs(), bytes.NewReader(nil), io.Discard, io.Discard))
 }
 
-func TestRunDarwinContainmentOptionAndSubcommand(t *testing.T) {
+func TestRunRemovedDarwinFlagAndContainmentSubcommand(t *testing.T) {
 	disableTelemetry(t)
 	restoreMainSeams(t)
 	restoreContainmentCommandSeams(t)
 
-	mainRuntimePlatform = "linux"
 	var stderr bytes.Buffer
 	require.Equal(t, 2, run(t.Context(), []string{"-darwin-best-effort-containment"}, bytes.NewReader(nil), io.Discard, &stderr))
-	require.Contains(t, stderr.String(), "valid only on darwin")
-
-	mainRuntimePlatform = "darwin"
-	shutdownOpenTelemetry = func(context.Context, func(context.Context) error) error { return nil }
-	serve = func(_ context.Context, _ io.Reader, _ io.Writer, options ...piacp.Option) error {
-		configured := piacp.Options{}
-		for _, option := range options {
-			option(&configured)
-		}
-		require.True(t, configured.DarwinBestEffortContainment)
-
-		return nil
-	}
-	stderr.Reset()
-	require.Zero(t, run(t.Context(), []string{"-darwin-best-effort-containment"}, bytes.NewReader(nil), io.Discard, &stderr))
-	require.Contains(t, stderr.String(), "containment=best_effort")
+	require.Contains(t, stderr.String(), "flag provided but not defined")
 
 	containmentDiagnoseCommand = func(string) (containmentDiagnoseOutput, error) {
 		return containmentDiagnoseOutput{Records: []containmentDiagnoseRecord{}}, nil

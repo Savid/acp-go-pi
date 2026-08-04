@@ -118,16 +118,14 @@ start; use the scratch directory to place per-session on-disk state.
 
 ## Process containment
 
-Linux and Windows provide the authoritative native process boundary. Darwin
-fails closed by default because a process-group check cannot account for
-descendants that call `setsid`. Operators who accept that limitation can opt
-in explicitly:
-
-```sh
-acp-go-pi -darwin-best-effort-containment
-```
-
-Embedded hosts use `WithDarwinBestEffortContainment`. The effective mode is
+Linux provides the authoritative native process boundary. Windows native launch
+fails closed because its process API cannot apply the mandatory Unix UID/GID
+identity boundary with empty supplementary groups; cross-compilation proves
+only that this refusal path builds, not runtime support. Darwin fails closed by
+default because a process-group check cannot account for descendants that call
+`setsid`. The standalone command is Linux-only. Embedded hosts who accept
+that limitation can opt in with `WithDarwinBestEffortContainment`. The
+effective mode is
 available from `Agent.ContainmentMode` and is reported as `authoritative`,
 `best_effort`, or `unavailable`. FreeBSD, OpenBSD, and other unsupported
 platforms continue to fail closed.

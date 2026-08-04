@@ -32,9 +32,12 @@ otherwise return normally or with context cancellation. A host that receives
 it must retain or quarantine any resources the native runtime may still
 reach. It does not mean that every descendant can be inventoried on Darwin.
 
-`Agent.ContainmentMode()` returns `RuntimeContainmentAuthoritative` on Linux
-and Windows, `RuntimeContainmentBestEffort` on an opted-in Darwin agent, and
-`RuntimeContainmentUnavailable` otherwise. Darwin fails closed unless
+`Agent.ContainmentMode()` returns `RuntimeContainmentAuthoritative` on Linux,
+`RuntimeContainmentBestEffort` on an opted-in Darwin agent, and
+`RuntimeContainmentUnavailable` otherwise. Windows native launch is unavailable
+because the mandatory Unix UID/GID identity boundary with empty supplementary
+groups cannot be applied. A Windows cross-compile proves only that this refusal
+path builds; it is not runtime support. Darwin fails closed unless
 `WithDarwinBestEffortContainment` is supplied; that option is invalid off
 Darwin.
 
@@ -43,7 +46,7 @@ Darwin.
 | Option | Purpose |
 | --- | --- |
 | `WithExecutablePath` | Set the pi CLI path (default: search `PATH`). |
-| `WithProcessIsolation` | Mandatory non-root UID/GID and complete replacement base environment for every pi process and supervisor. |
+| `WithProcessIsolation` | Mandatory non-root UID/GID and complete replacement environment for native pi processes. On Linux the embedded supervisor stays trusted root; only `pi --mode rpc` receives the configured identity, with supplementary groups cleared. |
 | `WithScratchDir` | Parent directory for all ephemeral on-disk state (isolated per-session agent and session directories, hydration temp files, probe dirs). Empty means the system temp directory; created `0700` when missing. |
 | `WithHome` | Durable per-instance pi agent directory (`PI_CODING_AGENT_DIR`) every session runs against. Omitted, each session gets an isolated agent directory under the scratch parent, which disables pi's cross-process credential refresh lock and leaves the provider-auth surface unadvertised. |
 | `WithProviderAuthRoot` | Absolute, host-owned, durable directory holding the values-free provider-auth ledger; created mode `0700`. Omitted, or naming a root that cannot be prepared, leaves every `_pi/auth/*` leg unadvertised; a relative path is rejected at construction. See [Authentication](/docs/features/authentication). |

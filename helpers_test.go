@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -67,7 +68,17 @@ func testProcessIsolationOption() Option {
 			BaseEnvironment: map[string]string{"PATH": os.Getenv("PATH"), "HOME": os.Getenv("HOME")},
 		})(options)
 		options.testOnlyNoCredential = true
+		options.testOnlyIdentityLockRoot = testIdentityLockRoot()
 	}
+}
+
+func testIdentityLockRoot() string {
+	root := filepath.Join(os.TempDir(), "acp-go-pi-agent-identities-"+strconv.Itoa(os.Getpid()))
+	if err := os.Mkdir(root, 0o700); err != nil && !os.IsExist(err) {
+		panic(err)
+	}
+
+	return root
 }
 
 // newFailingCloseProcess returns a stub process whose shutdown and close

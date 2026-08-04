@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -70,6 +69,7 @@ var (
 	turnSupervisorSetrlimit    = unix.Setrlimit
 	turnSupervisorAcquireLock  = acquireAgentIdentityLock
 	turnSupervisorSealConfig   = unix.FcntlInt
+	turnSupervisorEffectiveUID = os.Geteuid
 )
 
 func enableTurnSupervisor() error {
@@ -155,6 +155,9 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 	}
 	if err := validateProcessIsolation(containment.Isolation); err != nil {
 		return nil, fmt.Errorf("prepare pi turn supervisor isolation: %w", err)
+	}
+	if err := validateTurnSupervisorIdentity(containment.Isolation); err != nil {
+		return nil, fmt.Errorf("prepare pi turn supervisor identity: %w", err)
 	}
 
 	config := turnSupervisorConfig{
@@ -273,7 +276,6 @@ func turnSupervisorNativeEnvironment(configured []string) []string {
 func turnSupervisorEnvironment() []string {
 	return []string{
 		turnSupervisorModeEnv + "=" + turnSupervisorMode,
-		"GORACE=atexit_sleep_ms=0",
 	}
 }
 
@@ -290,19 +292,27 @@ func withoutTurnSupervisorMode(configured []string) []string {
 	return env
 }
 
-func startTurnSupervisorNative(native *exec.Cmd, isolation *ProcessIsolation) (error, error) {
-	runtime.LockOSThread()
+func startTurnSupervisorNative(native *exec.Cmd, isolation *ProcessIsolation) (<-chan error, error, error) {
+	var privilegeErr error
+	waitDone, startErr := startCommandOnCreatorThread(func() error {
+		if err := turnSupervisorEnable(); err != nil {
+			privilegeErr = err
 
-	defer runtime.UnlockOSThread()
+			return err
+		}
+		if err := applyProcessIsolation(native, isolation); err != nil {
+			privilegeErr = fmt.Errorf("apply pi native process isolation: %w", err)
 
-	if err := turnSupervisorEnable(); err != nil {
-		return err, nil
+			return privilegeErr
+		}
+
+		return native.Start()
+	}, native.Wait)
+	if privilegeErr != nil {
+		return nil, privilegeErr, nil
 	}
-	if err := applyProcessIsolation(native, isolation); err != nil {
-		return fmt.Errorf("apply pi native process isolation: %w", err), nil
-	}
 
-	return nil, native.Start()
+	return waitDone, nil, startErr
 }
 
 func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutput io.Writer) error {
@@ -317,6 +327,9 @@ func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutpu
 	if err := validateProcessIsolation(&config.Isolation); err != nil {
 		return fmt.Errorf("validate pi turn supervisor isolation: %w", err)
 	}
+	if err := validateTurnSupervisorIdentity(&config.Isolation); err != nil {
+		return fmt.Errorf("validate pi turn supervisor identity: %w", err)
+	}
 
 	signals := make(chan os.Signal, 2)
 
@@ -329,7 +342,7 @@ func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutpu
 		close(controlDone)
 	}()
 
-	identityLock, err := turnSupervisorAcquireLock(config.Isolation.UID, config.Isolation.TestOnlyNoCredential, controlDone, signals)
+	identityLock, err := turnSupervisorAcquireLock(config.Isolation.UID, config.Isolation.TestOnlyNoCredential, config.Isolation.TestOnlyIdentityLockRoot, controlDone, signals)
 	if err != nil {
 		return fmt.Errorf("acquire pi agent identity lock: %w", err)
 	}
@@ -344,7 +357,7 @@ func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutpu
 	native.Stderr = os.Stderr
 	native.SysProcAttr = processSysProcAttr()
 
-	enableErr, startErr := startTurnSupervisorNative(native, &config.Isolation)
+	waitDone, enableErr, startErr := startTurnSupervisorNative(native, &config.Isolation)
 	if enableErr != nil {
 		return fmt.Errorf("enable pi native supervisor privileges: %w", enableErr)
 	}
@@ -354,14 +367,12 @@ func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutpu
 	}
 
 	if _, err := io.WriteString(readyOutput, turnSupervisorReady); err != nil {
+		_ = turnSupervisorSignalGroup(native.Process.Pid, syscall.SIGKILL)
+		waitErr := <-waitDone
 		containErr := turnSupervisorContain(turnSupervisorProcessID(), native.Process.Pid)
-		waitErr := native.Wait()
 
 		return errors.Join(fmt.Errorf("publish pi turn supervisor readiness: %w", err), containErr, waitErr)
 	}
-
-	waitDone := make(chan error, 1)
-	go func() { waitDone <- native.Wait() }()
 
 	for {
 		select {
@@ -376,6 +387,9 @@ func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutpu
 
 			return waitErr
 		case <-controlDone:
+			_ = turnSupervisorSignalGroup(native.Process.Pid, syscall.SIGKILL)
+			waitErr := <-waitDone
+
 			if err := turnSupervisorContain(turnSupervisorProcessID(), native.Process.Pid); err != nil {
 				return err
 			}
@@ -384,7 +398,7 @@ func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutpu
 				return err
 			}
 
-			return <-waitDone
+			return waitErr
 		case received := <-signals:
 			nativeSignal, ok := received.(syscall.Signal)
 			if !ok {
@@ -399,6 +413,22 @@ func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutpu
 func publishTurnSupervisorProof(output io.Writer) error {
 	if _, err := io.WriteString(output, turnSupervisorComplete); err != nil {
 		return fmt.Errorf("publish pi turn supervisor containment proof: %w", err)
+	}
+
+	return nil
+}
+
+func validateTurnSupervisorIdentity(isolation *ProcessIsolation) error {
+	if isolation == nil {
+		return errors.New("process isolation is required")
+	}
+
+	effectiveUID := turnSupervisorEffectiveUID()
+	if effectiveUID != 0 {
+		return fmt.Errorf("trusted root identity is required, effective uid is %d", effectiveUID)
+	}
+	if isolation.UID == uint32(effectiveUID) {
+		return errors.New("native target identity must differ from the trusted supervisor")
 	}
 
 	return nil

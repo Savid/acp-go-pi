@@ -9,18 +9,61 @@ description: "Every flag the acp-go-pi binary accepts and what it maps to"
 acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt-4o
 ```
 
+## Required standalone isolation policy
+
+Normal serve mode is Linux-only and requires
+`-process-isolation-config=/absolute/path/process-isolation.json`.
+`-version` and the Darwin containment diagnostic subcommands are exempt.
+The policy must be a root-owned, single-link regular file with mode `0600`.
+Every component is opened from `/` without following symlinks, and every
+ancestor must be root-owned and not writable by group or other. Unknown JSON
+fields and trailing JSON values are rejected.
+
+```json
+{
+  "uid": 20001,
+  "gid": 20001,
+  "baseEnvironment": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": "/var/lib/acp-go-pi",
+    "USER": "acp-go-pi",
+    "LOGNAME": "acp-go-pi",
+    "LANG": "C.UTF-8"
+  },
+  "inheritEnvironment": []
+}
+```
+
+The supervisor must run as root. The UID/GID must name a nonroot account with
+that same-name private primary group, no supplementary groups, and a target-owned mode
+`0700` home matching `HOME`, reached without symlinks beneath protected
+root-owned ancestry; `/root` and `/nonexistent` are forbidden. `USER` and
+`LOGNAME` must match the account.
+`PATH` must contain existing canonical absolute directories. The child gets
+only `baseEnvironment` plus variables explicitly named in
+`inheritEnvironment`; identity, search-path, loader, interpreter, XDG/native
+home, and adapter-private variables cannot be inherited. Unset or duplicate
+inheritance entries fail startup. Darwin, Windows, and other platforms refuse
+standalone native mode rather than weakening this contract.
+
+Provision the target as a locked system account with a non-login shell, its
+same-name private group, and no sudo policy. Its UID and primary GID cannot be
+shared by another account. Password locking is not a substitute for disabling
+login paths, and a locked account still needs the validated private writable
+home for native tools.
+
 ## Flags
 
 | Flag | Purpose |
 | --- | --- |
 | `-path` | pi CLI executable (default: search `PATH`). |
+| `-process-isolation-config` | Required absolute path to the standalone Linux isolation policy described above. |
 | `-scratch-dir` | Parent directory for all ephemeral per-session scratch (isolated agent and session directories, hydration temp files). Empty means the system temp directory. |
 | `-home` | Durable per-instance pi agent directory every session runs against. Empty gives each session an isolated agent directory under the scratch parent. Required, with `-provider-auth-root`, before any provider-auth leg is advertised. |
 | `-provider-auth-root` | Absolute durable directory holding the values-free provider-auth ledger. Empty, or a root that cannot be prepared, leaves the whole `_pi/auth/*` surface unadvertised. |
 | `-provider-auth-direct-home` | Declared and rejected: pi removes a credential through a per-provider store call and has no account-level leg to gate. A non-empty value fails session start. |
 | `-model` | Default model for new sessions, as `"provider/id"`. |
 | `-seed-file` | Write a host file into each session's agent directory as `<relpath>=<hostpath>`; repeatable. |
-| `-darwin-best-effort-containment` | Explicitly accept Darwin process-group containment. Invalid off Darwin. |
 | `-debug` | Emit debug logs to stderr. |
 | `-version` | Print adapter version and exit. |
 
@@ -33,12 +76,10 @@ options such as `WithTurnTimeout`, `WithEnv`, and `WithSessionStore`.
 
 ## Darwin containment operations
 
-Darwin native startup fails closed unless
-`-darwin-best-effort-containment` is present. Opt-in prints a warning to
-stderr with `containment=best_effort`; structured library logs carry the same
-attribute. Best-effort means the adapter reaps the direct child and observes
-the captured original process group disappear after a bounded TERM-to-KILL
-ladder. It does not establish that `setsid` descendants are absent.
+The standalone command never launches native work on Darwin. These operational
+commands remain available to inspect generations left by an embedded host
+using `WithDarwinBestEffortContainment`; that embedded mode does not establish
+that `setsid` descendants are absent.
 
 Each actual Darwin native launch gets a fresh `0700` generation root and a
 128-bit runtime id. Inspect current records without changing processes or

@@ -27,6 +27,7 @@ func TestProcessIsolationEnvironmentIdentityAndLookup(t *testing.T) {
 	require.Error(t, validateProcessIsolation(&ProcessIsolation{UID: 1, GID: 1, BaseEnvironment: map[string]string{"BAD=KEY": "x"}}))
 	require.Error(t, validateProcessIsolation(&ProcessIsolation{UID: 1, GID: 1, BaseEnvironment: map[string]string{"ACP_GO_PI_INTERNAL_ISOLATION_TEST_ONLY": "true"}}))
 	require.Error(t, validateProcessIsolation(nil))
+	require.Error(t, validateProcessIsolation(&ProcessIsolation{UID: 1, GID: 1}))
 	require.Error(t, validateProcessIsolation(&ProcessIsolation{UID: 0, GID: 1}))
 	require.Error(t, validateProcessIsolation(&ProcessIsolation{UID: 1, GID: 0}))
 	_, err = isolationEnvironment(isolation, map[string]string{"BAD=KEY": "x"})
@@ -53,7 +54,7 @@ func TestProcessIsolationEnvironmentIdentityAndLookup(t *testing.T) {
 	require.Error(t, err)
 	supervisorEnv, err := supervisorEnvironment(
 		[]string{"A=B", "MODE=old", envIsolationUID + "=old", envIsolationGID + "=old", envIsolationTest + "=old"},
-		&ProcessIsolation{UID: 1, GID: 2, TestOnlyNoCredential: true}, "MODE", "1",
+		&ProcessIsolation{UID: 1, GID: 2, BaseEnvironment: map[string]string{}, TestOnlyNoCredential: true}, "MODE", "1",
 	)
 	require.NoError(t, err)
 	require.Contains(t, supervisorEnv, "A=B")

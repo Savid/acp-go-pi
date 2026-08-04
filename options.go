@@ -160,8 +160,9 @@ type Options struct {
 
 	// imageLimitsSet records whether WithImageLimits supplied the struct; an
 	// omitted option leaves every field at its default.
-	imageLimitsSet       bool
-	testOnlyNoCredential bool
+	imageLimitsSet           bool
+	testOnlyNoCredential     bool
+	testOnlyIdentityLockRoot string
 }
 
 // ConcurrencyLimits controls per-agent/session backpressure. Zero fields use defaults.

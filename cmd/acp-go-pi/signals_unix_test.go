@@ -17,6 +17,7 @@ import (
 func TestUnixSignals(t *testing.T) {
 	disableTelemetry(t)
 	restoreMainSeams(t)
+	stubProcessIsolationConfig(t)
 
 	require.Contains(t, forwardedSignals(), os.Interrupt)
 	require.Contains(t, forwardedSignals(), syscall.SIGHUP)
@@ -28,5 +29,5 @@ func TestUnixSignals(t *testing.T) {
 
 		return nil
 	}
-	require.Equal(t, 128+int(syscall.SIGHUP), run(t.Context(), nil, bytes.NewReader(nil), io.Discard, io.Discard))
+	require.Equal(t, 128+int(syscall.SIGHUP), run(t.Context(), isolatedArgs(), bytes.NewReader(nil), io.Discard, io.Discard))
 }

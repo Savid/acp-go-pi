@@ -146,7 +146,7 @@ func NewAgent(opts ...Option) *Agent {
 		startPiProcess: startRealPiProcess,
 		probeVersion:   pi.ProbeVersion,
 		lookPath: func(file string) (string, error) {
-			return pi.ResolveExecutable(file, internalProcessIsolation(options.ProcessIsolation, options.testOnlyNoCredential), options.Env)
+			return pi.ResolveExecutable(file, internalProcessIsolation(options.ProcessIsolation, options.testOnlyNoCredential, options.testOnlyIdentityLockRoot), options.Env)
 		},
 	}
 	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
@@ -176,7 +176,7 @@ func (a *Agent) ContainmentMode() RuntimeContainmentMode {
 
 func containmentMode(options Options) RuntimeContainmentMode {
 	switch agentRuntimePlatform {
-	case "linux", windowsPlatform:
+	case "linux":
 		if options.DarwinBestEffortContainment {
 			return RuntimeContainmentUnavailable
 		}

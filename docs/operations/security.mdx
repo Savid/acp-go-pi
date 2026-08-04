@@ -3,6 +3,24 @@ title: "Security"
 description: "The trust boundaries an operator relies on when running the adapter"
 ---
 
+## Standalone command boundary
+
+The standalone command launches native work only on Linux and requires the
+root-owned mode-`0600` `-process-isolation-config` policy. Resolution walks
+from an open `/` descriptor with `openat` and `O_NOFOLLOW`; every ancestor
+must be root-owned and not writable by group or other, and the final single-link
+policy inode is read through the descriptor that was validated. The configured
+account home is resolved the same way, must be a target-owned mode-`0700`
+directory beneath protected root-owned ancestry, and cannot be `/root` or
+`/nonexistent`.
+
+The adapter remains root, but its ambient environment is never copied wholesale
+to the child. Only the complete literal `baseEnvironment` plus names in
+`inheritEnvironment` reach native work. The CLI refuses Darwin, Windows, and
+other platforms; Darwin best-effort containment remains an explicit
+embedded-Go option only. `-version` and Darwin containment diagnostics launch
+no native worker and are exempt.
+
 ## Credential boundary
 
 Provider credentials reach a session only by explicit injection — environment
@@ -43,7 +61,8 @@ scratch, once the process boundary is complete.
 
 Windows has no launcher image to shadow: `start` is a `cmd.exe` builtin, and
 CreateProcess resolves the system directory ahead of every `PATH` entry. There
-the oauth mint is refused with `cause: "policy"` rather than run uncontained.
+the native pi process is already refused at the mandatory Unix UID/GID identity
+boundary, so the OAuth mint is unavailable rather than run uncontained.
 
 ## Permission enforcement
 
@@ -60,14 +79,25 @@ Each session's pi process runs in its own isolated agent directory under the
 `WithScratchDir` parent, so sessions share no config, auth, or session files.
 Linux launches each native root through a private embedded subreaper. Its
 control-descriptor boundary kills and reaps descendants, including processes
-that call `setsid`. Windows starts the root suspended, assigns it to a
-kill-on-close Job Object, and only then resumes it. These platforms report
-`containment=authoritative`.
+that call `setsid`, and reports `containment=authoritative`. Windows rejects the
+native root before spawning because its process API cannot apply the mandatory
+Unix UID/GID identity boundary with empty supplementary groups. A Windows
+cross-compile proves only that this refusal path builds; it does not establish
+runtime support.
 
-FreeBSD, OpenBSD, and unsupported platforms reject native startup. Darwin also
-rejects startup by default. `WithDarwinBestEffortContainment` or
-`-darwin-best-effort-containment` is an explicit operator acceptance of a
-weaker boundary; it reports `containment=best_effort` and prints a warning.
+The Linux supervisor stays root and runs from `/` with a closed private
+environment. Sealed launch configuration carries the target identity and native
+environment; only `pi --mode rpc` receives the configured UID/GID with no
+supplementary groups. Before native start the supervisor acquires the
+root-owned `/run/acp-go/agent-identities/<uid>.lock` and holds it until the
+descendant wait queue is empty. Pi inherits none of the launch, control, proof,
+or lock descriptors, so it cannot signal its supervisor, forge completion, or
+overlap another native tree using the same host identity.
+
+FreeBSD, OpenBSD, Windows, and unsupported platforms reject native startup.
+Embedded Darwin hosts also reject startup by default.
+`WithDarwinBestEffortContainment` is an explicit operator acceptance of a
+weaker boundary; it reports `containment=best_effort` and emits a warning.
 The option is invalid on every other platform.
 
 Darwin best-effort places the direct child in a new process group, installs one

@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"runtime"
 	"slices"
 	"strings"
 
@@ -67,7 +66,6 @@ var serve = piacp.Serve
 var exit = os.Exit
 var shutdownOpenTelemetry = shutdownTelemetry
 var agentVersion = version
-var mainRuntimePlatform = runtime.GOOS
 
 func main() {
 	if code := run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr); code != 0 {
@@ -88,7 +86,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
 	providerAuthRoot := flags.String("provider-auth-root", "", "durable root holding the provider-auth ledger; empty leaves the provider-auth surface unadvertised")
 	providerAuthDirectHome := flags.String("provider-auth-direct-home", "", "canonical native home an account-level provider-auth leg may read or clear; rejected by this adapter")
-	darwinBestEffort := flags.Bool("darwin-best-effort-containment", false, "opt into Darwin process-group containment with residual escape and PGID-reuse risks")
+	isolationConfigPath := flags.String(processIsolationConfigFlag, "", "absolute path to the required root-owned mode-0600 Linux child-isolation policy")
 	model := flags.String("model", "", "default pi model as provider/id")
 	seedFiles := &seedFileFlag{}
 	flags.Var(seedFiles, "seed-file", "seed file written into each session's pi agent dir as <relpath>=<hostpath>; repeatable")
@@ -101,20 +99,23 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 
 	version := agentVersion()
 
-	if *darwinBestEffort && mainRuntimePlatform != "darwin" {
-		_, _ = fmt.Fprintln(stderr, "acp-go-pi: -darwin-best-effort-containment is valid only on darwin")
-
-		return 2
-	}
-
 	if *printVersion {
 		_, _ = fmt.Fprintln(stdout, version)
 
 		return 0
 	}
 
-	if *darwinBestEffort {
-		_, _ = fmt.Fprintln(stderr, "WARNING: containment=best_effort on Darwin; setsid descendants can escape and survive, marker correlation is not ownership and markers can be scrubbed, numeric PGID reuse can cause collateral signalling, and native-root permits do not bound escaped provider work")
+	if *isolationConfigPath == "" {
+		_, _ = fmt.Fprintf(stderr, "acp-go-pi: -%s is required for standalone native mode\n", processIsolationConfigFlag)
+
+		return 2
+	}
+
+	isolation, err := processIsolationConfigLoader(*isolationConfigPath)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "acp-go-pi: process isolation: %v\n", err)
+
+		return 1
 	}
 
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -153,10 +154,12 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		piacp.WithProviderAuthDirectHome(*providerAuthDirectHome),
 		piacp.WithDefaultModel(*model),
 		piacp.WithLogger(logger),
+		piacp.WithProcessIsolation(piacp.ProcessIsolation{
+			UID:             isolation.UID,
+			GID:             isolation.GID,
+			BaseEnvironment: isolation.BaseEnvironment,
+		}),
 	)
-	if *darwinBestEffort {
-		serveOptions = append(serveOptions, piacp.WithDarwinBestEffortContainment())
-	}
 
 	if len(seedFiles.files) > 0 {
 		serveOptions = append(serveOptions, piacp.WithSeedFiles(seedFiles.files))

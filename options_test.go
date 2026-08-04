@@ -2,6 +2,7 @@ package piacp
 
 import (
 	"log/slog"
+	"os"
 	"testing"
 	"time"
 
@@ -95,4 +96,25 @@ func TestApplyOptionsSetters(t *testing.T) {
 	require.Equal(t, "k", options.Env["ANTHROPIC_API_KEY"])
 	require.Equal(t, "/opt/shim/bin", options.ExtraPathDirs[0])
 	require.Equal(t, "{}", options.SeedFiles["settings.json"])
+}
+
+func TestProcessIsolationOptionClonesAndFailsClosed(t *testing.T) {
+	base := map[string]string{"PATH": "/policy/bin", "CANARY": "base"}
+	opts := applyOptions([]Option{WithProcessIsolation(ProcessIsolation{UID: 10, GID: 20, BaseEnvironment: base})})
+	base["CANARY"] = "mutated"
+	require.Equal(t, "base", opts.ProcessIsolation.BaseEnvironment["CANARY"])
+
+	internal := internalProcessIsolation(opts.ProcessIsolation, false, "")
+	opts.ProcessIsolation.BaseEnvironment["CANARY"] = "later"
+	require.Equal(t, "base", internal.BaseEnvironment["CANARY"])
+	require.Nil(t, internalProcessIsolation(nil, false, ""))
+
+	require.Error(t, validateProcessIsolationOption(nil))
+	require.Error(t, validateProcessIsolationOption(&ProcessIsolation{UID: 0, GID: 1}))
+	require.Error(t, validateProcessIsolationOption(&ProcessIsolation{UID: 1, GID: 0}))
+
+	original := agentRuntimePlatform
+	agentRuntimePlatform = "windows"
+	t.Cleanup(func() { agentRuntimePlatform = original })
+	require.Error(t, validateProcessIsolationOption(&ProcessIsolation{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}))
 }

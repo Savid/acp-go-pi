@@ -65,12 +65,15 @@ func TestContainmentModePlatformMatrix(t *testing.T) {
 
 	require.Equal(t, RuntimeContainmentUnavailable, (*Agent)(nil).ContainmentMode())
 
-	for _, platform := range []string{"linux", "windows"} {
-		agentRuntimePlatform = platform
-		require.Equal(t, RuntimeContainmentAuthoritative, containmentMode(Options{}))
-		require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{DarwinBestEffortContainment: true}))
-		require.Error(t, validateContainmentOption(Options{DarwinBestEffortContainment: true}))
-	}
+	agentRuntimePlatform = "linux"
+	require.Equal(t, RuntimeContainmentAuthoritative, containmentMode(Options{}))
+	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{DarwinBestEffortContainment: true}))
+	require.Error(t, validateContainmentOption(Options{DarwinBestEffortContainment: true}))
+
+	agentRuntimePlatform = windowsPlatform
+	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{}))
+	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{DarwinBestEffortContainment: true}))
+	require.Error(t, validateContainmentOption(Options{DarwinBestEffortContainment: true}))
 
 	agentRuntimePlatform = darwinPlatform
 	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{}))

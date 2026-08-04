@@ -123,13 +123,10 @@ type authFlowKey struct {
 	providerID string
 }
 
-// newProviderAuth builds the broker when both preconditions hold: a usable
-// durable ledger root, and an explicit durable home. pi's credential refresh
-// takes a cross-process lock keyed on the agent directory, so a login completed
-// into a per-session directory would leave the lock guarding nothing and the
-// credential nowhere.
+// newProviderAuth requires a durable agent directory and is unavailable when
+// process isolation is configured.
 func newProviderAuth(agent *Agent) *providerAuth {
-	if !authLedgerRootConfigured(agent.options) || agent.options.Home == "" {
+	if !authLedgerRootConfigured(agent.options) || agent.options.Home == "" || agent.options.ProcessIsolation != nil {
 		return nil
 	}
 

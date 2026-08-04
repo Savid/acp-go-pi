@@ -153,10 +153,11 @@ A turn resolves one of three ways:
   cancel wins even if a turn timeout fires at the same instant. Abort
   acknowledgement does not complete the selected containment boundary: the
   adapter always drives that boundary before cancellation settles. On Linux
-  an embedded subreaper reaps even session-detached descendants; on Windows a
-  Job Object supplies the authoritative boundary. Darwin best-effort only
-  reaps the direct child and observes the captured original process group
-  absent; it never establishes that escaped descendants are absent. The
+  an embedded subreaper reaps even session-detached descendants. Windows native
+  launch is unavailable because the mandatory Unix UID/GID identity boundary
+  cannot be applied. Darwin best-effort only reaps the direct child and observes
+  the captured original process group absent; it never establishes that escaped
+  descendants are absent. The
   normal native abort ladder ends at `agent_settled`; after containment, the
   adapter synchronously mirrors that durable aborted generation before the
   cancelled response. If escalation stops the runtime before

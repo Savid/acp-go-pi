@@ -1,4 +1,4 @@
-//go:build !linux && !darwin && !freebsd && !openbsd && !windows
+//go:build !linux && !darwin && !freebsd && !openbsd
 
 package pi
 
@@ -8,9 +8,11 @@ import (
 	"time"
 )
 
-type processTree struct{}
+type processTree struct {
+	direct *directChildWait
+}
 
-func (*processTree) directChildWait() *directChildWait { return nil }
+func (t *processTree) directChildWait() *directChildWait { return t.direct }
 
 func configureProcessCommandPlatform(*exec.Cmd) {}
 
@@ -25,3 +27,5 @@ func (*processTree) kill() error      { return ErrProcessContainmentIncomplete }
 func (*processTree) terminateAndWait(time.Duration) error {
 	return ErrProcessContainmentIncomplete
 }
+
+func (*processTree) descendantCount() (int, bool) { return 0, false }

@@ -24,8 +24,9 @@
 // exporter setup for command-line use. Caller-supplied providers remain
 // owned by the caller, including ForceFlush and Shutdown.
 //
-// Linux and Windows provide authoritative native process containment. Darwin
-// fails native startup closed unless [WithDarwinBestEffortContainment] is
+// Linux provides authoritative native process containment. Windows refuses
+// native launch because it cannot apply the mandatory Unix UID/GID isolation.
+// Darwin fails native startup closed unless [WithDarwinBestEffortContainment] is
 // supplied; that mode reaps the direct child and observes only the captured
 // original process group, so it does not establish escaped-descendant absence.
 package piacp

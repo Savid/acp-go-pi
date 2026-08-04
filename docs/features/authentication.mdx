@@ -11,6 +11,18 @@ for a worker is the second surface, and it lives on the `_pi/auth/*` extension
 methods described under [Brokering a provider login](#brokering-a-provider-login)
 below.
 
+## Standalone credential input
+
+The standalone root supervisor never forwards its ambient environment.
+To pass provider API-key variables, name each variable explicitly in the
+`inheritEnvironment` array of the root-owned
+`-process-isolation-config` policy. The value must be set in the supervisor
+environment or startup fails; identity, path, loader, XDG/native-home, and
+adapter-private variables cannot be inherited. File-backed or provider-broker
+credentials must live only in the explicit target-owned native home described
+by the adapter. No standalone path reads root `HOME`, root native config, or
+an unlisted root credential.
+
 ## No ACP auth methods
 
 ACP initialize reports an empty `authMethods` list. A host never calls
