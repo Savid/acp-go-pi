@@ -80,6 +80,7 @@ func restoreTurnSupervisorSeams(t *testing.T) {
 	openFile := turnSupervisorOpenFile
 	closeOnExec := turnSupervisorCloseOnExec
 	prctl := turnSupervisorPrctl
+	setrlimit := turnSupervisorSetrlimit
 	syscallKillOriginal := syscallKill
 	t.Cleanup(func() {
 		turnSupervisorExecutable = executable
@@ -105,6 +106,7 @@ func restoreTurnSupervisorSeams(t *testing.T) {
 		turnSupervisorOpenFile = openFile
 		turnSupervisorCloseOnExec = closeOnExec
 		turnSupervisorPrctl = prctl
+		turnSupervisorSetrlimit = setrlimit
 		syscallKill = syscallKillOriginal
 	})
 }
@@ -175,6 +177,12 @@ func TestTurnSupervisorBootstrapBranches(t *testing.T) {
 
 func TestInheritedTurnSupervisorInputAndEnable(t *testing.T) {
 	restoreTurnSupervisorSeams(t)
+	limitSet := false
+	turnSupervisorSetrlimit = func(resource int, limit *unix.Rlimit) error {
+		limitSet = resource == unix.RLIMIT_CORE && limit.Cur == 0 && limit.Max == 0
+
+		return nil
+	}
 	var operations []int
 	turnSupervisorPrctl = func(option int, _, _, _, _ uintptr) error {
 		operations = append(operations, option)
@@ -187,6 +195,15 @@ func TestInheritedTurnSupervisorInputAndEnable(t *testing.T) {
 	if len(operations) != 2 || operations[0] != unix.PR_SET_CHILD_SUBREAPER || operations[1] != unix.PR_SET_NO_NEW_PRIVS {
 		t.Fatalf("supervisor privilege operations = %v", operations)
 	}
+	if !limitSet {
+		t.Fatal("supervisor did not disable core dumps")
+	}
+
+	turnSupervisorSetrlimit = func(int, *unix.Rlimit) error { return errors.New("setrlimit") }
+	if err := enableTurnSupervisor(); err == nil || !strings.Contains(err.Error(), "setrlimit") {
+		t.Fatalf("core-limit failure = %v", err)
+	}
+	turnSupervisorSetrlimit = func(int, *unix.Rlimit) error { return nil }
 
 	turnSupervisorPrctl = func(int, uintptr, uintptr, uintptr, uintptr) error { return errors.New("subreaper") }
 	if err := enableTurnSupervisor(); err == nil || err.Error() != "subreaper" {
@@ -246,7 +263,7 @@ func TestInheritedTurnSupervisorInputAndEnable(t *testing.T) {
 	}
 }
 
-func TestTurnSupervisorNativeChildHasNoNewPrivileges(t *testing.T) {
+func TestTurnSupervisorNativeChildHasSecurityLimits(t *testing.T) {
 	const (
 		phaseEnv  = "ACP_GO_PI_TEST_NO_NEW_PRIVS_PHASE"
 		statusEnv = "ACP_GO_PI_TEST_NO_NEW_PRIVS_STATUS"
@@ -256,7 +273,7 @@ func TestTurnSupervisorNativeChildHasNoNewPrivileges(t *testing.T) {
 		status := os.Getenv(statusEnv)
 		config := encodeSupervisorConfig(t, turnSupervisorConfig{
 			Path: "/bin/sh",
-			Args: []string{"sh", "-c", `while read -r key value rest; do if [ "$key" = "NoNewPrivs:" ]; then printf '%s\n' "$value" > "$1"; exit 0; fi; done < /proc/self/status; exit 1`, "nnp", status},
+			Args: []string{"sh", "-c", `nnp=$(awk '$1 == "NoNewPrivs:" { print $2 }' /proc/self/status); printf '%s %s\n' "$nnp" "$(ulimit -c)" > "$1"`, "limits", status},
 			Env:  []string{"PATH=/usr/bin:/bin"},
 		})
 		controlRead, controlWrite := io.Pipe()
@@ -271,13 +288,13 @@ func TestTurnSupervisorNativeChildHasNoNewPrivileges(t *testing.T) {
 	}
 
 	status := filepath.Join(t.TempDir(), "no-new-privileges")
-	proof := exec.Command(os.Args[0], "-test.run=^TestTurnSupervisorNativeChildHasNoNewPrivileges$")
+	proof := exec.Command(os.Args[0], "-test.run=^TestTurnSupervisorNativeChildHasSecurityLimits$")
 	proof.Env = append(os.Environ(), phaseEnv+"=child", statusEnv+"="+status)
 	if output, err := proof.CombinedOutput(); err != nil {
 		t.Fatalf("native proof process: %v\n%s", err, output)
 	}
-	if value, err := os.ReadFile(status); err != nil || string(value) != "1\n" {
-		t.Fatalf("native NoNewPrivs = %q, %v", value, err)
+	if value, err := os.ReadFile(status); err != nil || string(value) != "1 0\n" {
+		t.Fatalf("native security limits = %q, %v", value, err)
 	}
 }
 
