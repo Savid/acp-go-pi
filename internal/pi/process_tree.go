@@ -96,13 +96,14 @@ const turnSupervisorComplete = "complete\n"
 // embedded subreaper, Windows launches directly into a Job Object, and
 // platforms without an unescapable boundary reject the launch.
 type processTreeCommand struct {
-	cmd         *exec.Cmd
-	inherited   []*os.File
-	startGate   *os.File
-	control     *os.File
-	ready       *os.File
-	status      *bufio.Reader
-	containment containmentRecord
+	cmd             *exec.Cmd
+	inherited       []*os.File
+	startGate       *os.File
+	control         *os.File
+	ready           *os.File
+	status          *bufio.Reader
+	containment     containmentRecord
+	nativeIsolation bool
 }
 
 func (c *processTreeCommand) releaseInherited() {

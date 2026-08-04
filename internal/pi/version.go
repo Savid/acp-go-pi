@@ -55,10 +55,12 @@ func ProbeVersion(ctx context.Context, executablePath string, containment Contai
 		return "", fmt.Errorf("prepare pi version probe: %w", err)
 	}
 
-	if isolationErr := applyProcessIsolation(launch.cmd, containment.Isolation); isolationErr != nil {
-		launch.close()
+	if !launch.nativeIsolation {
+		if isolationErr := applyProcessIsolation(launch.cmd, containment.Isolation); isolationErr != nil {
+			launch.close()
 
-		return "", fmt.Errorf("apply pi version process isolation: %w", isolationErr)
+			return "", fmt.Errorf("apply pi version process isolation: %w", isolationErr)
+		}
 	}
 
 	launch.containment, err = versionPrepareContainmentRecord(containment)

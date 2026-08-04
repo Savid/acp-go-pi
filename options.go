@@ -15,7 +15,7 @@ import (
 type Option func(*Options)
 
 // ProcessIsolation is the mandatory operating-system identity and complete
-// base environment for every native pi process and launch supervisor.
+// base environment for every native pi process.
 type ProcessIsolation struct {
 	UID             uint32
 	GID             uint32
@@ -230,8 +230,8 @@ func WithExecutablePath(path string) Option {
 	}
 }
 
-// WithProcessIsolation requires every native process, probe, and supervisor
-// to run as the supplied non-root identity with no supplementary groups. The
+// WithProcessIsolation requires every native process and probe to run as the
+// supplied non-root identity with no supplementary groups. The
 // base environment is a complete replacement for the adapter environment;
 // WithEnv and session environment values overlay it.
 func WithProcessIsolation(isolation ProcessIsolation) Option {

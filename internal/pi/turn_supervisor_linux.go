@@ -29,10 +29,11 @@ const (
 )
 
 type turnSupervisorConfig struct {
-	Path string   `json:"path"`
-	Args []string `json:"args"`
-	Dir  string   `json:"dir"`
-	Env  []string `json:"env"`
+	Path      string           `json:"path"`
+	Args      []string         `json:"args"`
+	Dir       string           `json:"dir"`
+	Env       []string         `json:"env"`
+	Isolation ProcessIsolation `json:"isolation"`
 }
 
 type linuxProcessIdentity struct {
@@ -67,6 +68,8 @@ var (
 	turnSupervisorInput        = inheritedTurnSupervisorInput
 	turnSupervisorPrctl        = unix.Prctl
 	turnSupervisorSetrlimit    = unix.Setrlimit
+	turnSupervisorAcquireLock  = acquireAgentIdentityLock
+	turnSupervisorSealConfig   = unix.FcntlInt
 )
 
 func enableTurnSupervisor() error {
@@ -74,6 +77,9 @@ func enableTurnSupervisor() error {
 		return fmt.Errorf("disable pi native core dumps: %w", err)
 	}
 	if err := turnSupervisorPrctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
+		return err
+	}
+	if err := turnSupervisorPrctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
 		return err
 	}
 
@@ -105,12 +111,10 @@ func turnSupervisorBootstrap() {
 		return
 	}
 
-	_, err := inheritedProcessIsolation()
+	var err error
 	var config, control io.ReadCloser
 	var ready io.WriteCloser
-	if err == nil {
-		config, control, ready, err = turnSupervisorInput()
-	}
+	config, control, ready, err = turnSupervisorInput()
 	if err == nil {
 		err = turnSupervisorRun(config, control, ready)
 	}
@@ -149,18 +153,22 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 	if containment.DarwinBestEffort {
 		return nil, fmt.Errorf("%w: Darwin best-effort containment is invalid on linux", ErrProcessContainmentIncomplete)
 	}
+	if err := validateProcessIsolation(containment.Isolation); err != nil {
+		return nil, fmt.Errorf("prepare pi turn supervisor isolation: %w", err)
+	}
 
 	config := turnSupervisorConfig{
-		Path: native.Path,
-		Args: append([]string(nil), native.Args...),
-		Dir:  native.Dir,
-		Env:  append([]string(nil), native.Env...),
+		Path:      native.Path,
+		Args:      append([]string(nil), native.Args...),
+		Dir:       native.Dir,
+		Env:       append([]string(nil), native.Env...),
+		Isolation: *containment.Isolation,
 	}
 	if config.Path == "" || len(config.Args) == 0 {
 		return nil, errors.New("prepare pi turn supervisor: native command is incomplete")
 	}
 
-	configFD, err := turnSupervisorMemfd(turnSupervisorFDName, unix.MFD_CLOEXEC)
+	configFD, err := turnSupervisorMemfd(turnSupervisorFDName, unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
 	if err != nil {
 		return nil, fmt.Errorf("prepare pi turn supervisor config: %w", err)
 	}
@@ -170,6 +178,11 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 		_ = configFile.Close()
 
 		return nil, writeErr
+	}
+	if _, sealErr := turnSupervisorSealConfig(configFile.Fd(), unix.F_ADD_SEALS, unix.F_SEAL_WRITE|unix.F_SEAL_GROW|unix.F_SEAL_SHRINK|unix.F_SEAL_SEAL); sealErr != nil {
+		_ = configFile.Close()
+
+		return nil, fmt.Errorf("seal pi turn supervisor config: %w", sealErr)
 	}
 
 	controlRead, controlWrite, err := turnSupervisorPipe()
@@ -200,15 +213,8 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 	}
 
 	helper := turnSupervisorCommand(executable) // #nosec G204 -- the current executable hosts the private supervisor mode.
-	helper.Env, err = supervisorEnvironment(native.Env, containment.Isolation, turnSupervisorModeEnv, turnSupervisorMode)
-	if err != nil {
-		_ = configFile.Close()
-		_ = controlRead.Close()
-		_ = controlWrite.Close()
-		_ = readyRead.Close()
-		_ = readyWrite.Close()
-		return nil, fmt.Errorf("prepare pi turn supervisor isolation: %w", err)
-	}
+	helper.Dir = "/"
+	helper.Env = turnSupervisorEnvironment()
 	helper.ExtraFiles = []*os.File{configFile, controlRead, readyWrite}
 	helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	helper.Stdin = native.Stdin
@@ -217,10 +223,11 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 	helper.WaitDelay = defaultProcessTreeWait
 
 	return &processTreeCommand{
-		cmd:       helper,
-		inherited: []*os.File{configFile, controlRead, readyWrite},
-		control:   controlWrite,
-		ready:     readyRead,
+		cmd:             helper,
+		inherited:       []*os.File{configFile, controlRead, readyWrite},
+		control:         controlWrite,
+		ready:           readyRead,
+		nativeIsolation: true,
 	}, nil
 }
 
@@ -264,7 +271,10 @@ func turnSupervisorNativeEnvironment(configured []string) []string {
 }
 
 func turnSupervisorEnvironment() []string {
-	return []string{turnSupervisorModeEnv + "=" + turnSupervisorMode}
+	return []string{
+		turnSupervisorModeEnv + "=" + turnSupervisorMode,
+		"GORACE=atexit_sleep_ms=0",
+	}
 }
 
 func withoutTurnSupervisorMode(configured []string) []string {
@@ -280,13 +290,16 @@ func withoutTurnSupervisorMode(configured []string) []string {
 	return env
 }
 
-func startTurnSupervisorNative(native *exec.Cmd) (error, error) {
+func startTurnSupervisorNative(native *exec.Cmd, isolation *ProcessIsolation) (error, error) {
 	runtime.LockOSThread()
 
 	defer runtime.UnlockOSThread()
 
 	if err := turnSupervisorEnable(); err != nil {
 		return err, nil
+	}
+	if err := applyProcessIsolation(native, isolation); err != nil {
+		return fmt.Errorf("apply pi native process isolation: %w", err), nil
 	}
 
 	return nil, native.Start()
@@ -301,11 +314,26 @@ func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutpu
 	if config.Path == "" || len(config.Args) == 0 {
 		return errors.New("pi turn supervisor config is incomplete")
 	}
+	if err := validateProcessIsolation(&config.Isolation); err != nil {
+		return fmt.Errorf("validate pi turn supervisor isolation: %w", err)
+	}
 
 	signals := make(chan os.Signal, 2)
 
 	turnSupervisorSignalNotify(signals, syscall.SIGINT, syscall.SIGTERM)
 	defer turnSupervisorSignalStop(signals)
+
+	controlDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, controlInput)
+		close(controlDone)
+	}()
+
+	identityLock, err := turnSupervisorAcquireLock(config.Isolation.UID, config.Isolation.TestOnlyNoCredential, controlDone, signals)
+	if err != nil {
+		return fmt.Errorf("acquire pi agent identity lock: %w", err)
+	}
+	defer identityLock.Close()
 
 	native := turnSupervisorCommand(config.Path, config.Args[1:]...) // #nosec G204 -- private config came from the wrapper-built pi command.
 	native.Args = append([]string(nil), config.Args...)
@@ -316,7 +344,7 @@ func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutpu
 	native.Stderr = os.Stderr
 	native.SysProcAttr = processSysProcAttr()
 
-	enableErr, startErr := startTurnSupervisorNative(native)
+	enableErr, startErr := startTurnSupervisorNative(native, &config.Isolation)
 	if enableErr != nil {
 		return fmt.Errorf("enable pi native supervisor privileges: %w", enableErr)
 	}
@@ -334,14 +362,6 @@ func runTurnSupervisor(configInput io.Reader, controlInput io.Reader, readyOutpu
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- native.Wait() }()
-
-	controlDone := make(chan struct{})
-
-	go func() {
-		_, _ = io.Copy(io.Discard, controlInput)
-
-		close(controlDone)
-	}()
 
 	for {
 		select {

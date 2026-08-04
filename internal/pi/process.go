@@ -301,11 +301,13 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 		return nil, fmt.Errorf("prepare pi process: %w", err)
 	}
 
-	if isolationErr := applyProcessIsolation(launch.cmd, spec.Containment.Isolation); isolationErr != nil {
-		launch.close()
-		closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)
+	if !launch.nativeIsolation {
+		if isolationErr := applyProcessIsolation(launch.cmd, spec.Containment.Isolation); isolationErr != nil {
+			launch.close()
+			closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)
 
-		return nil, fmt.Errorf("apply pi process isolation: %w", isolationErr)
+			return nil, fmt.Errorf("apply pi process isolation: %w", isolationErr)
+		}
 	}
 
 	launch.containment, err = processPrepareContainmentRecord(spec.Containment)
