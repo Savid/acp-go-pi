@@ -4,6 +4,7 @@ package pi
 
 import (
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -129,6 +130,84 @@ func TestLinuxProcessTreeValidationFailures(t *testing.T) {
 	if _, err := startProcessTree(&processTreeCommand{cmd: exec.Command("/bin/true"), startGate: writer}); !errors.Is(err, ErrProcessContainmentIncomplete) {
 		t.Fatalf("gate error = %v", err)
 	}
+}
+
+func TestLinuxReadinessFailureRequiresIndependentCompletion(t *testing.T) {
+	originalActivate := activateProcessContainmentRecord
+	t.Cleanup(func() { activateProcessContainmentRecord = originalActivate })
+	activateProcessContainmentRecord = func(containmentRecord, int, int) error { return nil }
+
+	start := func(t *testing.T) (<-chan error, *os.File) {
+		t.Helper()
+
+		controlRead, controlWrite, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = controlRead.Close() })
+
+		readyRead, readyWrite, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = io.WriteString(readyWrite, "invalid\n"); err != nil {
+			t.Fatal(err)
+		}
+		if err = readyWrite.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		completionRead, completionWrite, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = completionWrite.Close() })
+
+		command := exec.Command("/bin/cat")
+		command.Stdin = controlRead
+		command.Stdout = io.Discard
+		command.Stderr = io.Discard
+		command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		result := make(chan error, 1)
+		go func() {
+			_, startErr := startProcessTree(&processTreeCommand{
+				cmd: command, control: controlWrite, ready: readyRead, completion: completionRead,
+			})
+			result <- startErr
+		}()
+
+		return result, completionWrite
+	}
+
+	t.Run("missing completion", func(t *testing.T) {
+		result, completionWrite := start(t)
+		if err := completionWrite.Close(); err != nil {
+			t.Fatal(err)
+		}
+		err := <-result
+		if ProcessContainmentComplete(err) {
+			t.Fatalf("missing completion was classified complete: %v", err)
+		}
+	})
+
+	t.Run("delayed valid completion", func(t *testing.T) {
+		result, completionWrite := start(t)
+		select {
+		case err := <-result:
+			t.Fatalf("readiness failure returned before completion was published: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		if _, err := io.WriteString(completionWrite, turnSupervisorComplete); err != nil {
+			t.Fatal(err)
+		}
+		if err := completionWrite.Close(); err != nil {
+			t.Fatal(err)
+		}
+		err := <-result
+		if err == nil || !ProcessContainmentComplete(err) {
+			t.Fatalf("valid completion classification = %v", err)
+		}
+	})
 }
 
 func TestLaunchEnvironmentDarwinMarkers(t *testing.T) {

@@ -3,6 +3,7 @@
 package pi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -674,6 +675,19 @@ func TestPrepareTurnSupervisorBranches(t *testing.T) {
 		t.Fatal("readiness pipe failure was ignored")
 	}
 
+	pipeCalls = 0
+	turnSupervisorPipe = func() (*os.File, *os.File, error) {
+		pipeCalls++
+		if pipeCalls == 3 {
+			return nil, nil, errors.New("completion pipe")
+		}
+
+		return os.Pipe()
+	}
+	if _, err := prepareProcessTreeCommand(native, containment); err == nil {
+		t.Fatal("completion pipe failure was ignored")
+	}
+
 	turnSupervisorPipe = os.Pipe
 	turnSupervisorExecutable = func() (string, error) { return "", errors.New("executable") }
 	if _, err := prepareProcessTreeCommand(native, containment); err == nil {
@@ -688,7 +702,7 @@ func TestPrepareTurnSupervisorBranches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare supervisor: %v", err)
 	}
-	if launch.cmd == nil || len(launch.inherited) != 3 || launch.control == nil || launch.ready == nil {
+	if launch.cmd == nil || len(launch.inherited) != 4 || launch.control == nil || launch.ready == nil || launch.completion == nil {
 		t.Fatalf("prepared launch = %#v", launch)
 	}
 	if launch.cmd.Stdin != native.Stdin || launch.cmd.Stdout != native.Stdout || launch.cmd.Stderr != native.Stderr {
@@ -818,17 +832,14 @@ func TestTurnSupervisorConfigAndReadinessBranches(t *testing.T) {
 	}
 
 	for _, test := range []struct {
-		name             string
-		value            string
-		ok               bool
-		replayedComplete bool
+		name  string
+		value string
+		ok    bool
 	}{
 		{name: "eof"},
 		{name: "invalid", value: "bad\n"},
 		{name: "ready", value: "ready\n", ok: true},
-		{name: "early completion without readiness", value: "complete\n"},
-		{name: "early completion with invalid readiness", value: "complete\nbad\n"},
-		{name: "early completion races readiness", value: "complete\nready\n", ok: true, replayedComplete: true},
+		{name: "completion is not readiness", value: "complete\n"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			read, write, pipeErr := os.Pipe()
@@ -839,19 +850,12 @@ func TestTurnSupervisorConfigAndReadinessBranches(t *testing.T) {
 				_, _ = io.WriteString(write, test.value)
 			}
 			_ = write.Close()
-			launch := &processTreeCommand{ready: read}
-			err := awaitProcessTreeReady(launch)
+			err := awaitProcessTreeReady(&processTreeCommand{ready: read})
 			if test.ok && err != nil {
 				t.Fatalf("readiness = %v", err)
 			}
 			if !test.ok && err == nil {
 				t.Fatal("invalid readiness succeeded")
-			}
-			if test.replayedComplete {
-				line, readErr := launch.status.ReadString('\n')
-				if readErr != nil || line != turnSupervisorComplete {
-					t.Fatalf("replayed completion = %q, %v", line, readErr)
-				}
 			}
 		})
 	}
@@ -869,19 +873,44 @@ func TestProcessIsolationActualPiFastExitCompletionCanPrecedeGuardianReadiness(t
 	}
 	defer controlRead.Close()
 	defer controlWrite.Close()
-	proofRead, proofWrite, err := os.Pipe()
+	readyRead, readyWrite, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer proofRead.Close()
-	defer proofWrite.Close()
+	defer readyRead.Close()
+	defer readyWrite.Close()
+	completionRead, completionWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer completionRead.Close()
+	defer completionWrite.Close()
+	turnSupervisorOpenFile = func(fd uintptr, name string) *os.File {
+		if fd != 6 {
+			t.Fatalf("guardian completion descriptor = %d, want 6", fd)
+		}
+		duplicate, duplicateErr := unix.Dup(int(completionWrite.Fd()))
+		if duplicateErr != nil {
+			t.Fatal(duplicateErr)
+		}
+
+		return os.NewFile(uintptr(duplicate), name)
+	}
 
 	var hookErr error
 	turnSupervisorBeforeGuardianReadiness = func() {
-		poll := []unix.PollFd{{Fd: int32(proofRead.Fd()), Events: unix.POLLIN}}
-		ready, pollErr := unix.Poll(poll, 5000)
-		if pollErr != nil || ready != 1 || poll[0].Revents&unix.POLLIN == 0 {
-			hookErr = fmt.Errorf("await liveness completion before guardian readiness: ready=%d events=%#x: %w", ready, poll[0].Revents, pollErr)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			poll := []unix.PollFd{{Fd: int32(completionRead.Fd()), Events: unix.POLLIN}}
+			ready, pollErr := unix.Poll(poll, int(time.Until(deadline).Milliseconds()))
+			if errors.Is(pollErr, unix.EINTR) && time.Now().Before(deadline) {
+				continue
+			}
+			if pollErr != nil || ready != 1 || poll[0].Revents&unix.POLLIN == 0 {
+				hookErr = fmt.Errorf("await liveness completion before guardian readiness: ready=%d events=%#x: %w", ready, poll[0].Revents, pollErr)
+			}
+
+			return
 		}
 	}
 
@@ -891,40 +920,25 @@ func TestProcessIsolationActualPiFastExitCompletionCanPrecedeGuardianReadiness(t
 		Env:       []string{"PATH=/usr/bin:/bin"},
 		Isolation: *supervisorTestIsolation(),
 	})
-	if err := runTurnSupervisorGuardian(config, controlRead, proofWrite); err != nil {
+	if err := runTurnSupervisorGuardian(config, controlRead, readyWrite); err != nil {
 		t.Fatalf("fast native guardian path: %v", err)
 	}
 	if hookErr != nil {
 		t.Fatal(hookErr)
 	}
-	if err := proofWrite.Close(); err != nil {
+	if err := readyWrite.Close(); err != nil {
 		t.Fatal(err)
 	}
-	proof, err := io.ReadAll(proofRead)
-	if err != nil {
+	if err := completionWrite.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if string(proof) != turnSupervisorComplete+turnSupervisorReady {
-		t.Fatalf("fast native proof order = %q", proof)
-	}
-
-	read, write, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = write.Write(proof); err != nil {
-		t.Fatal(err)
-	}
-	if err = write.Close(); err != nil {
-		t.Fatal(err)
-	}
-	launch := &processTreeCommand{ready: read}
+	launch := &processTreeCommand{ready: readyRead}
 	if err = awaitProcessTreeReady(launch); err != nil {
-		t.Fatalf("completion-before-readiness protocol: %v", err)
+		t.Fatalf("fast native readiness: %v", err)
 	}
-	tree := &processTree{supervised: true, boundary: read, status: launch.status}
+	tree := &processTree{supervised: true, boundary: completionRead, status: bufio.NewReader(completionRead)}
 	if err = tree.completeBoundary(); err != nil {
-		t.Fatalf("replayed completion proof: %v", err)
+		t.Fatalf("independent completion proof: %v", err)
 	}
 }
 

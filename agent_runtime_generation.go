@@ -151,8 +151,22 @@ func internalProcessIsolation(isolation *ProcessIsolation, testOnlyNoCredential 
 		StandaloneOwnerID:        isolation.StandaloneOwnerID,
 		StandaloneStateRoot:      isolation.StandaloneStateRoot,
 	}
+	if testOnlyNoCredential {
+		result.IdentityLock = nil
+		result.AuthorityDomain = nil
+		result.StandaloneOwnerID = ""
+		result.StandaloneStateRoot = ""
+	}
 
 	return result
+}
+
+func (a *Agent) nativeOwnershipIsolation() *ProcessIsolation {
+	if a == nil || a.options.testOnlyNoCredential {
+		return nil
+	}
+
+	return a.options.ProcessIsolation
 }
 
 func (g *runtimeGeneration) finalize(containmentErr error) error {

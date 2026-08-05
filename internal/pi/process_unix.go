@@ -3,6 +3,7 @@
 package pi
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -56,7 +57,6 @@ func startProcessTree(launch *processTreeCommand) (*processTree, error) {
 	}
 	tree.control = launch.control
 	tree.supervised = launch.control != nil
-	tree.boundary = launch.ready
 
 	if err := activateProcessContainmentRecord(launch.containment, launch.cmd.Process.Pid, pgid); err != nil {
 		launch.abortStartGate()
@@ -87,20 +87,32 @@ func startProcessTree(launch *processTreeCommand) (*processTree, error) {
 	direct.begin()
 
 	if err := awaitProcessTreeReady(launch); err != nil {
+		cleanupErr := tree.kill()
+		transferProcessTreeCompletion(tree, launch)
+
 		launch.close()
 
-		cleanupErr := tree.kill()
 		waitErr := tree.direct.await(defaultProcessTreeWait)
+		boundaryErr := tree.completeBoundary()
 
-		return nil, errors.Join(err, cleanupErr, waitErr)
+		return nil, errors.Join(err, cleanupErr, waitErr, boundaryErr)
 	}
 
-	tree.status = launch.status
+	transferProcessTreeCompletion(tree, launch)
+
 	launch.control = nil
-	launch.ready = nil
-	launch.status = nil
 
 	return tree, nil
+}
+
+func transferProcessTreeCompletion(tree *processTree, launch *processTreeCommand) {
+	if tree == nil || launch == nil || launch.completion == nil {
+		return
+	}
+
+	tree.boundary = launch.completion
+	tree.status = bufio.NewReader(launch.completion)
+	launch.completion = nil
 }
 
 func (t *processTree) terminate() error {

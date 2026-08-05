@@ -47,14 +47,28 @@ func startStubbornProcessWithSeams(t *testing.T) *Process {
 	t.Helper()
 
 	getpgid, kill := syscallGetpgid, syscallKill
+	startTree := processStartTree
 
 	script := writeScript(t, `trap '' TERM; while :; do sleep 0.1; done`)
 
-	process, err := StartProcess(context.Background(), LaunchSpec{
-		ExecutablePath:      script,
-		AgentDir:            t.TempDir(),
-		ShutdownStepTimeout: 50 * time.Millisecond,
-	})
+	processStartTree = func(launch *processTreeCommand) (*processTree, error) {
+		tree, err := startTree(launch)
+		if tree != nil {
+			tree.supervised = false
+		}
+
+		return tree, err
+	}
+	process, err := func() (*Process, error) {
+		defer func() { processStartTree = startTree }()
+
+		return StartProcess(context.Background(), LaunchSpec{
+			ExecutablePath:      script,
+			AgentDir:            t.TempDir(),
+			ShutdownStepTimeout: 50 * time.Millisecond,
+			Containment:         testContainmentSpec(t),
+		})
+	}()
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -62,6 +76,9 @@ func startStubbornProcessWithSeams(t *testing.T) *Process {
 
 		_ = process.Kill()
 		<-process.Exited()
+		process.tree.mu.Lock()
+		process.tree.supervised = true
+		process.tree.mu.Unlock()
 		_ = process.Close()
 	})
 
@@ -70,14 +87,6 @@ func startStubbornProcessWithSeams(t *testing.T) *Process {
 
 func TestProcessSignalFailuresSurface(t *testing.T) {
 	process := startStubbornProcessWithSeams(t)
-	process.tree.mu.Lock()
-	process.tree.supervised = false
-	process.tree.mu.Unlock()
-	t.Cleanup(func() {
-		process.tree.mu.Lock()
-		process.tree.supervised = true
-		process.tree.mu.Unlock()
-	})
 
 	syscallKill = func(int, syscall.Signal) error { return syscall.EPERM }
 
@@ -382,14 +391,6 @@ func processPIDAlive(pid int) bool {
 
 func TestProcessShutdownKillFailureSurfaces(t *testing.T) {
 	process := startStubbornProcessWithSeams(t)
-	process.tree.mu.Lock()
-	process.tree.supervised = false
-	process.tree.mu.Unlock()
-	t.Cleanup(func() {
-		process.tree.mu.Lock()
-		process.tree.supervised = true
-		process.tree.mu.Unlock()
-	})
 
 	syscallKill = func(pgid int, signal syscall.Signal) error {
 		if signal == syscall.SIGKILL {

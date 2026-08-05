@@ -185,7 +185,9 @@ func TestDarwinLaunchBootstrapCommandAndGateLifecycle(t *testing.T) {
 
 	readGate, writeGate, err := os.Pipe()
 	require.NoError(t, err)
-	command := &processTreeCommand{startGate: writeGate}
+	completion, completionWrite, err := os.Pipe()
+	require.NoError(t, err)
+	command := &processTreeCommand{startGate: writeGate, completion: completion}
 	require.NoError(t, command.releaseStartGate())
 	var release [1]byte
 	_, err = io.ReadFull(readGate, release[:])
@@ -194,6 +196,8 @@ func TestDarwinLaunchBootstrapCommandAndGateLifecycle(t *testing.T) {
 	require.NoError(t, readGate.Close())
 	command.abortStartGate()
 	command.close()
+	require.ErrorIs(t, completion.Close(), os.ErrClosed)
+	require.NoError(t, completionWrite.Close())
 
 	_, closedWrite, err := os.Pipe()
 	require.NoError(t, err)
@@ -562,11 +566,17 @@ func TestDarwinLaunchBootstrapScrubsPrivateModeBeforeLinkedExec(t *testing.T) {
 	require.NoError(t, err)
 	launch.containment, err = prepareContainmentRecord(spec)
 	require.NoError(t, err)
+	completion, completionWrite, err := os.Pipe()
+	require.NoError(t, err)
+	launch.completion = completion
 
 	tree, err := startProcessTree(launch)
 	require.NoError(t, err)
+	require.NotNil(t, tree.status)
 	require.NoError(t, tree.direct.await(defaultProcessTreeWait))
 	require.NoError(t, tree.terminateAndWait(defaultProcessTreeWait))
+	require.NoError(t, tree.boundary.Close())
+	require.NoError(t, completionWrite.Close())
 }
 
 func TestDarwinOriginalGroupESRCHStopsAllFurtherSignals(t *testing.T) {

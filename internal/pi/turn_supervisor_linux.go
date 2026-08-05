@@ -241,6 +241,16 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 
 		return nil, fmt.Errorf("prepare Pi native supervisor readiness: %w", err)
 	}
+	completionRead, completionWrite, err := turnSupervisorPipe()
+	if err != nil {
+		_ = configFile.Close()
+		_ = controlRead.Close()
+		_ = controlWrite.Close()
+		_ = readyRead.Close()
+		_ = readyWrite.Close()
+
+		return nil, fmt.Errorf("prepare Pi native supervisor completion: %w", err)
+	}
 	executable, err := turnSupervisorExecutable()
 	if err != nil {
 		_ = configFile.Close()
@@ -248,13 +258,15 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 		_ = controlWrite.Close()
 		_ = readyRead.Close()
 		_ = readyWrite.Close()
+		_ = completionRead.Close()
+		_ = completionWrite.Close()
 		return nil, fmt.Errorf("resolve embedded Pi native supervisor: %w", err)
 	}
 
 	helper := turnSupervisorCommand(executable) // #nosec G204 -- the current executable hosts the private supervisor mode.
 	helper.Dir = "/"
 	helper.Env = turnSupervisorEnvironment()
-	helper.ExtraFiles = []*os.File{configFile, controlRead, readyWrite}
+	helper.ExtraFiles = []*os.File{configFile, controlRead, readyWrite, completionWrite}
 	if containment.Isolation.IdentityLock != nil {
 		identityLock, duplicateErr := containment.Isolation.IdentityLock.Duplicate()
 		if duplicateErr != nil {
@@ -263,6 +275,8 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 			_ = controlWrite.Close()
 			_ = readyRead.Close()
 			_ = readyWrite.Close()
+			_ = completionRead.Close()
+			_ = completionWrite.Close()
 			return nil, fmt.Errorf("duplicate Pi agent identity lock: %w", duplicateErr)
 		}
 		helper.ExtraFiles = append(helper.ExtraFiles, identityLock)
@@ -274,6 +288,8 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 			_ = controlWrite.Close()
 			_ = readyRead.Close()
 			_ = readyWrite.Close()
+			_ = completionRead.Close()
+			_ = completionWrite.Close()
 			return nil, fmt.Errorf("duplicate Pi agent authority domain: %w", duplicateErr)
 		}
 		helper.ExtraFiles = append(helper.ExtraFiles, authorityDomain)
@@ -289,6 +305,7 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 		inherited:       append([]*os.File(nil), helper.ExtraFiles...),
 		control:         controlWrite,
 		ready:           readyRead,
+		completion:      completionRead,
 		nativeIsolation: true,
 	}, nil
 }
@@ -297,35 +314,18 @@ func awaitProcessTreeReady(launch *processTreeCommand) error {
 	if launch.ready == nil {
 		return nil
 	}
+	defer func() {
+		_ = launch.ready.Close()
+		launch.ready = nil
+	}()
 
 	if err := launch.ready.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return fmt.Errorf("arm Pi native supervisor readiness: %w", err)
 	}
 
-	launch.status = bufio.NewReader(launch.ready)
-	line, err := launch.status.ReadString('\n')
+	line, err := bufio.NewReader(launch.ready).ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("await Pi native supervisor readiness: %w", err)
-	}
-
-	if line == turnSupervisorComplete {
-		// The liveness peer owns an independent completion descriptor so it can
-		// remain authoritative after guardian death. A native root that exits
-		// immediately can therefore complete containment before the guardian is
-		// scheduled to relay its already-published readiness. Require that
-		// readiness next, then replay the consumed completion to the boundary
-		// reader so the proof remains available to completeBoundary.
-		line, err = launch.status.ReadString('\n')
-		if err != nil {
-			return fmt.Errorf("await Pi native supervisor readiness after early completion: %w", err)
-		}
-		if line != turnSupervisorReady {
-			return fmt.Errorf("invalid Pi native supervisor readiness after early completion %q", strings.TrimSpace(line))
-		}
-
-		launch.status = bufio.NewReader(io.MultiReader(strings.NewReader(turnSupervisorComplete), launch.status))
-
-		return nil
 	}
 
 	if line != turnSupervisorReady {
@@ -408,16 +408,19 @@ func startTurnSupervisorNative(
 }
 
 func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, readyOutput io.Writer) (runErr error) {
-	completion := readyOutput
+	completion := turnSupervisorOpenFile(6, "pi-turn-supervisor-completion")
+	if completion == nil {
+		return errors.New("Pi guardian completion descriptor is unavailable")
+	}
+	defer completion.Close()
+	if err := setTurnSupervisorCloseOnExec(completion); err != nil {
+		return err
+	}
 	controlFile, ok := controlInput.(*os.File)
 	if !ok {
 		_, _ = io.WriteString(completion, "complete\n")
 
 		return errors.New("Pi guardian control input is not an inheritable file")
-	}
-	proofFile, ok := readyOutput.(*os.File)
-	if !ok {
-		return errors.New("Pi guardian proof output is not an inheritable file")
 	}
 	var config turnSupervisorConfig
 	if err := json.NewDecoder(configInput).Decode(&config); err != nil {
@@ -440,7 +443,7 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 		close(controlDone)
 	}()
 
-	authority, err := acquireTurnSupervisorAuthority(config, 6, 7, controlDone, signals)
+	authority, err := acquireTurnSupervisorAuthority(config, 7, 8, controlDone, signals)
 	if err != nil {
 		_, _ = io.WriteString(completion, "complete\n")
 
@@ -462,7 +465,7 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 	}
 
 	liveness, data, peer, err := startTurnSupervisorLiveness(
-		config, controlFile, proofFile, authority,
+		config, controlFile, completion, authority,
 	)
 	if err != nil {
 		containErr := turnSupervisorContain(turnSupervisorProcessID(), 0)

@@ -1,7 +1,6 @@
 package pi
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -101,7 +100,7 @@ type processTreeCommand struct {
 	startGate       *os.File
 	control         *os.File
 	ready           *os.File
-	status          *bufio.Reader
+	completion      *os.File
 	containment     containmentRecord
 	nativeIsolation bool
 }
@@ -152,6 +151,11 @@ func (c *processTreeCommand) close() {
 	if c.ready != nil {
 		_ = c.ready.Close()
 		c.ready = nil
+	}
+
+	if c.completion != nil {
+		_ = c.completion.Close()
+		c.completion = nil
 	}
 }
 

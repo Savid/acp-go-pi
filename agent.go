@@ -493,7 +493,7 @@ func (a *Agent) ensureVersion(ctx context.Context) error {
 		return err
 	}
 
-	probeAgentDir, err := generation.prepareVersionProbeAgentDir(a.options.ProcessIsolation)
+	probeAgentDir, err := generation.prepareVersionProbeAgentDir(a.nativeOwnershipIsolation())
 	if err != nil {
 		return generation.finalize(err)
 	}

@@ -63,8 +63,12 @@ func testContainmentOption() Option {
 
 func testProcessIsolationOption() Option {
 	return func(options *Options) {
+		uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
+		if uid == 0 {
+			uid, gid = 11, 22
+		}
 		WithProcessIsolation(ProcessIsolation{
-			UID: uint32(os.Geteuid()), GID: uint32(os.Getegid()),
+			UID: uid, GID: gid,
 			BaseEnvironment:   map[string]string{"PATH": os.Getenv("PATH"), "HOME": os.Getenv("HOME")},
 			StandaloneOwnerID: "acp-go-pi-tests", StandaloneStateRoot: os.TempDir(),
 		})(options)

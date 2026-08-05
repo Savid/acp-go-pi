@@ -723,7 +723,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		return nil, err
 	}
 
-	if handoffErr := agentSessionHandoffNativeTree(dirs.Root, a.options.ProcessIsolation); handoffErr != nil {
+	if handoffErr := agentSessionHandoffNativeTree(dirs.Root, a.nativeOwnershipIsolation()); handoffErr != nil {
 		return nil, handoffErr
 	}
 

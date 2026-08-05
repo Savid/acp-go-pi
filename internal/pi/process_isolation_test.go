@@ -13,7 +13,10 @@ func TestProcessIsolationEnvironmentIdentityAndLookup(t *testing.T) {
 	dir := t.TempDir()
 	executable := filepath.Join(dir, "pi")
 	require.NoError(t, os.WriteFile(executable, []byte("#!/bin/sh\n"), 0o700))
-	isolation := &ProcessIsolation{UID: 11, GID: 22, BaseEnvironment: map[string]string{"PATH": dir, "BASE": "one"}}
+	isolation := &ProcessIsolation{
+		UID: 11, GID: 22, BaseEnvironment: map[string]string{"PATH": dir, "BASE": "one"},
+		TestOnlyNoCredential: true,
+	}
 	environment, err := isolationEnvironment(isolation, map[string]string{"BASE": "two", "EXPLICIT": "yes"})
 	require.NoError(t, err)
 	require.Contains(t, environment, "BASE=two")

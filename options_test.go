@@ -101,6 +101,12 @@ func TestProcessIsolationOptionClonesAndFailsClosed(t *testing.T) {
 	opts.ProcessIsolation.BaseEnvironment["CANARY"] = "later"
 	require.Equal(t, "base", internal.BaseEnvironment["CANARY"])
 	require.Nil(t, internalProcessIsolation(nil, false, ""))
+	testOnly := internalProcessIsolation(&ProcessIsolation{
+		UID: 10, GID: 20, BaseEnvironment: map[string]string{},
+		StandaloneOwnerID: "test-owner", StandaloneStateRoot: "/test/state",
+	}, true, "/test/locks")
+	require.Empty(t, testOnly.StandaloneOwnerID)
+	require.Empty(t, testOnly.StandaloneStateRoot)
 
 	require.Error(t, validateProcessIsolationOption(nil))
 	require.Error(t, validateProcessIsolationOption(&ProcessIsolation{UID: 0, GID: 1}))

@@ -440,7 +440,11 @@ func TestProcessShutdownLadderStdinEOF(t *testing.T) {
 
 	script := writeScript(t, `cat >/dev/null; exit 0`)
 
-	process := startScriptProcess(t, LaunchSpec{ExecutablePath: script, AgentDir: t.TempDir()})
+	process := startScriptProcess(t, LaunchSpec{
+		ExecutablePath:      script,
+		AgentDir:            t.TempDir(),
+		ShutdownStepTimeout: 5 * time.Second,
+	})
 
 	t.Cleanup(func() { _ = process.Close() })
 

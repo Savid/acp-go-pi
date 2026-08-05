@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 
@@ -63,7 +64,11 @@ func TestProcessIsolationUnixVerificationBranches(t *testing.T) {
 	processIsolationGetegid = func() int { return 22 }
 	processIsolationGetgroups = func() ([]int, error) { return nil, nil }
 	_, err = inheritedProcessIsolation()
-	require.NoError(t, err)
+	if runtime.GOOS == "linux" {
+		require.ErrorContains(t, err, "standalone owner id")
+	} else {
+		require.NoError(t, err)
+	}
 }
 
 func TestProcessIsolationLaunchFailures(t *testing.T) {
@@ -77,6 +82,7 @@ func TestProcessIsolationLaunchFailures(t *testing.T) {
 	processIsolationGetgroups = func() ([]int, error) { return nil, wantErr }
 	containment := ContainmentSpec{Isolation: &ProcessIsolation{
 		UID: 11, GID: 22, BaseEnvironment: map[string]string{"PATH": "/usr/bin"},
+		StandaloneOwnerID: "launch-failure-test", StandaloneStateRoot: "/var/lib/acp-go-pi-test",
 	}}
 	containment.GenerationRoot = t.TempDir()
 
