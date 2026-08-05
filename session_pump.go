@@ -2,7 +2,6 @@ package piacp
 
 import (
 	"context"
-	"strings"
 
 	"github.com/savid/acp-go-pi/internal/pi"
 )
@@ -111,21 +110,6 @@ func (s *agentSession) dispatchEvent(ctx context.Context, event pi.Event) {
 }
 
 func (s *agentSession) dispatchUIRequest(ctx context.Context, request pi.UIRequest) {
-	// Provider-auth dialogs are routed before the turn-sink check: a login runs
-	// outside any turn, so a live sink is neither required nor the right owner.
-	if broker := s.agent.providerAuth; broker != nil && strings.HasPrefix(request.Title, pi.AuthTitleMarker) {
-		s.dialogWG.Add(1)
-
-		go func() {
-			defer recoverAgentGoroutine(ctx, agentLogger(s.agent), "provider auth dialog")
-			defer s.dialogWG.Done()
-
-			broker.handleAuthDialog(ctx, s, request)
-		}()
-
-		return
-	}
-
 	sink := s.activeTurnSink()
 	if sink == nil {
 		if request.IsDialog() {

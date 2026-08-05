@@ -40,7 +40,7 @@ func TestRuntimeObservationHooksComposeExactLifetimes(t *testing.T) {
 	release()
 	require.Equal(t, 1, releases)
 
-	observeRuntimeProcess(t.Context(), hooks, RuntimeProcessHomeLockSupervisor, 2)
+	observeRuntimeProcess(t.Context(), hooks, RuntimeProcessProviderDescendant, 2)
 	observeRuntimeProcessSnapshot(t.Context(), hooks, RuntimeProcessProviderDescendant, 3)
 	observeRuntimeStartupStage(t.Context(), hooks, RuntimeResourceRuntime, RuntimeStartupReadiness, time.Now(), nil)
 	observeRuntimeContainment(t.Context(), hooks, RuntimeContainmentAuthoritative)
@@ -68,7 +68,4 @@ func TestBestEffortRuntimeObservationPublishesNoProviderSnapshots(t *testing.T) 
 	observeRuntimeProcessSnapshot(t.Context(), hooks, RuntimeProcessProviderDescendant, 0)
 	observeRuntimeProcessSnapshot(t.Context(), hooks, RuntimeProcessProviderDescendant, 9)
 	require.Zero(t, called)
-
-	observeRuntimeProcessSnapshot(t.Context(), hooks, RuntimeProcessHomeLockSupervisor, 0)
-	require.Equal(t, 1, called)
 }

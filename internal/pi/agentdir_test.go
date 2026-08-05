@@ -107,24 +107,6 @@ func TestAgentDirWriteEmptyRootFailsClosed(t *testing.T) {
 	require.Contains(t, seedErr.Error(), "invalid seed file configuration")
 }
 
-func TestAgentDirWriteAuthInjection(t *testing.T) {
-	t.Parallel()
-
-	root := filepath.Join(t.TempDir(), "agent")
-
-	dir := AgentDir{Root: root, AuthJSON: []byte(`{"anthropic":{"apiKey":"k"}}`)}
-	require.NoError(t, dir.Write())
-
-	info, err := os.Stat(filepath.Join(root, AuthFileName))
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
-
-	// auth.json is injected, never seed-managed.
-	manifest, err := os.ReadFile(filepath.Join(root, seedManifestFileName)) // #nosec G304 -- test temp dir.
-	require.NoError(t, err)
-	require.NotContains(t, string(manifest), AuthFileName)
-}
-
 func TestAgentDirExplicitResources(t *testing.T) {
 	t.Parallel()
 
@@ -356,22 +338,6 @@ func TestAgentDirWriteFaultInjection(t *testing.T) {
 			require.ErrorContains(t, dir.Write(), test.wantErr)
 		})
 	}
-}
-
-func TestAgentDirWriteAuthFailure(t *testing.T) {
-	restoreAgentDirSeams(t)
-
-	realWrite := fsWriteFile
-	fsWriteFile = func(path string, data []byte, perm os.FileMode) error {
-		if filepath.Base(path) == AuthFileName {
-			return fmt.Errorf("disk full")
-		}
-
-		return realWrite(path, data, perm)
-	}
-
-	dir := AgentDir{Root: filepath.Join(t.TempDir(), "agent"), AuthJSON: []byte("{}")}
-	require.ErrorContains(t, dir.Write(), "write auth file")
 }
 
 func TestAgentDirWriteUnencodableManagedSettings(t *testing.T) {

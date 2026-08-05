@@ -26,6 +26,8 @@ var agentDirExplicitResources = func(dir pi.AgentDir) (pi.ExplicitResources, err
 	return dir.ExplicitResources()
 }
 
+var agentSessionHandoffNativeTree = handoffGeneratedNativeTree
+
 const modelFieldUnknown = "unknown"
 
 // NewSession creates and starts a pi RPC session.
@@ -627,24 +629,18 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	var (
 		dirs          sessionDirs
 		nativeRelease func()
-		browserShim   *pi.BrowserShim
 	)
 
 	keepScratch := false
 	defer func() {
 		if !keepScratch {
 			err = finalizeSessionRuntimeResources(
-				err, nativeRelease, dirs.SessionRoot, scratchRelease, browserShim,
+				err, nativeRelease, dirs.SessionRoot, scratchRelease,
 			)
 		}
 	}()
 
 	dirs, err = a.createSessionDirs()
-	if err != nil {
-		return nil, err
-	}
-
-	browserShim, err = a.newOwnedSessionBrowserShim()
 	if err != nil {
 		return nil, err
 	}
@@ -726,8 +722,9 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	if err != nil {
 		return nil, err
 	}
-	if err := handoffGeneratedNativeTree(dirs.Root, a.options.ProcessIsolation); err != nil {
-		return nil, err
+
+	if handoffErr := agentSessionHandoffNativeTree(dirs.Root, a.options.ProcessIsolation); handoffErr != nil {
+		return nil, handoffErr
 	}
 
 	// Load operator-seeded extensions before wrapper-owned extensions so the
@@ -748,7 +745,6 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		Env:                 env,
 		ExtraPathDirs:       sessionExtraPathDirs(start.MetaOptions.ExtraPathDirs, a.options.ExtraPathDirs),
 		Cwd:                 start.Cwd,
-		BrowserShim:         browserShim,
 	}
 
 	spec.Containment, err = a.containmentSpecForRoot(scratchParent(a.options.ScratchDir), dirs.Root, RuntimeResourceSession)
@@ -783,7 +779,6 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		fingerprint:           sessionStartFingerprint(start),
 		launch:                spec,
 		sessionRoot:           dirs.SessionRoot,
-		browserShim:           browserShim,
 		permissionMode:        permission,
 		autoRetry:             start.MetaOptions.AutoRetry,
 		mcpRefreshPending:     includeMCP,

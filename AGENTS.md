@@ -81,10 +81,8 @@ directory, never read from a shared mutable pi home.
   packages such as `utils`, `helpers`, or `common`.
 - The wrapper-owned TypeScript extensions under `internal/pi/ext/` are part
   of the native boundary: they must stay dependency-free (node built-ins,
-  `typebox`, the pi extension API, and `@earendil-works/pi-ai/providers/all`,
-  which the extension loader aliases and which is the only way to read pi's
-  provider catalog as the API reports it) and any protocol change there needs
-  a matching change in the Go code that parses its output.
+  `typebox`, and the pi extension API) and any protocol change there needs a
+  matching change in the Go code that parses its output.
 - Follow existing package patterns before introducing new abstractions.
 
 ## Ask Before

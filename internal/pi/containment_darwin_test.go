@@ -43,6 +43,7 @@ func restoreDarwinLaunchSeams(t *testing.T) {
 	execNative := darwinLaunchExec
 	input := darwinLaunchInput
 	openFile := darwinLaunchOpenFile
+	fcntl := darwinLaunchFcntl
 	closeOnExec := darwinLaunchCloseOnExec
 	createTemp := darwinLaunchCreateTemp
 	chmod := darwinLaunchFileChmod
@@ -58,6 +59,7 @@ func restoreDarwinLaunchSeams(t *testing.T) {
 		darwinLaunchExec = execNative
 		darwinLaunchInput = input
 		darwinLaunchOpenFile = openFile
+		darwinLaunchFcntl = fcntl
 		darwinLaunchCloseOnExec = closeOnExec
 		darwinLaunchCreateTemp = createTemp
 		darwinLaunchFileChmod = chmod
@@ -311,13 +313,39 @@ func TestDarwinLaunchInputAndStatusBranches(t *testing.T) {
 			return file
 		}
 		closedOnExec := -1
-		darwinLaunchCloseOnExec = func(fd int) { closedOnExec = fd }
+		darwinLaunchCloseOnExec = func(fd int) error {
+			closedOnExec = fd
+
+			return nil
+		}
 		config, gate, status, err := inheritedDarwinLaunchInput()
 		require.NoError(t, err)
 		require.Equal(t, int(files[2].Fd()), closedOnExec)
 		require.NoError(t, config.Close())
 		require.NoError(t, gate.Close())
 		require.NoError(t, status.Close())
+	})
+
+	t.Run("close-on-exec failure", func(t *testing.T) {
+		restoreDarwinLaunchSeams(t)
+		files := make([]*os.File, 3)
+		for index := range files {
+			file, err := os.CreateTemp(t.TempDir(), "inherited")
+			require.NoError(t, err)
+			files[index] = file
+			t.Cleanup(func() { _ = file.Close() })
+		}
+		calls := 0
+		darwinLaunchOpenFile = func(uintptr, string) *os.File {
+			file := files[calls]
+			calls++
+
+			return file
+		}
+		want := errors.New("close-on-exec")
+		darwinLaunchCloseOnExec = func(int) error { return want }
+		_, _, _, err := inheritedDarwinLaunchInput()
+		require.ErrorIs(t, err, want)
 	})
 
 	require.ErrorContains(t, awaitProcessTreeReady(&processTreeCommand{}), "status is unavailable")
@@ -358,6 +386,40 @@ func TestDarwinLaunchInputAndStatusBranches(t *testing.T) {
 
 	t.Setenv("GORACE", "halt_on_error=1")
 	require.NotContains(t, darwinLaunchBootstrapEnvironment(), "GORACE=halt_on_error=1")
+}
+
+func TestDarwinLaunchCloseOnExecChecked(t *testing.T) {
+	restoreDarwinLaunchSeams(t)
+	calls := 0
+	darwinLaunchFcntl = func(_ uintptr, command int, argument int) (int, error) {
+		calls++
+		if calls == 1 {
+			require.Equal(t, unix.F_GETFD, command)
+			require.Zero(t, argument)
+
+			return 0, nil
+		}
+		require.Equal(t, unix.F_SETFD, command)
+		require.NotZero(t, argument&unix.FD_CLOEXEC)
+
+		return 0, nil
+	}
+	require.NoError(t, setDarwinLaunchCloseOnExec(5))
+	require.Equal(t, 2, calls)
+
+	want := errors.New("fcntl")
+	darwinLaunchFcntl = func(uintptr, int, int) (int, error) { return 0, want }
+	require.ErrorIs(t, setDarwinLaunchCloseOnExec(5), want)
+	calls = 0
+	darwinLaunchFcntl = func(uintptr, int, int) (int, error) {
+		calls++
+		if calls == 1 {
+			return 0, nil
+		}
+
+		return 0, want
+	}
+	require.ErrorIs(t, setDarwinLaunchCloseOnExec(5), want)
 }
 
 func TestDarwinSharedProcessTreeBoundaryBranches(t *testing.T) {

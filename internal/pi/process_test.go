@@ -158,21 +158,6 @@ func TestLaunchSpecEnvironExtraPathDirsWithoutAmbientPath(t *testing.T) {
 	require.Contains(t, spec.Environ(), "PATH=/session/bin")
 }
 
-func TestLaunchSpecEnvironKeepsBrowserShimAheadOfExtraPathDirs(t *testing.T) {
-	separator := string(os.PathListSeparator)
-
-	t.Setenv("PATH", "/usr/bin")
-
-	spec := LaunchSpec{
-		AgentDir:      "/agent",
-		Containment:   ContainmentSpec{Isolation: &ProcessIsolation{UID: 1, GID: 1, BaseEnvironment: map[string]string{"PATH": "/usr/bin"}}},
-		ExtraPathDirs: []string{"/session/bin"},
-		BrowserShim:   &BrowserShim{shim: &browserShim{dir: "/shim"}},
-	}
-
-	require.Contains(t, spec.Environ(), "PATH=/shim"+separator+"/session/bin"+separator+"/usr/bin")
-}
-
 func TestPrependPathDirsDropsUnusableEntries(t *testing.T) {
 	t.Parallel()
 

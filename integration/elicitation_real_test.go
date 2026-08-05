@@ -49,11 +49,11 @@ func TestPiRealQuestionToolElicitation(t *testing.T) {
 	client := &recordingClient{elicitationValue: realElicitationMarker}
 	conn := connectAgentWithInitForTest(t, ctx, client, formElicitationInit(),
 		piacp.WithExecutablePath(smokePiPath(t)),
-		piacp.WithScratchDir(t.TempDir()),
+		piacp.WithScratchDir(integrationScratchDir(t)),
 		piacp.WithDefaultModel("question-test/question-model"),
 		piacp.WithSeedFiles(map[string]string{"models.json": string(modelsJSON)}),
 	)
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir(),
+	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t),
 		piacp.WithSessionPiOptions(piacp.NewPiOptions(piacp.WithPiPermission("ask"))),
 	))
 	require.NoError(t, err)

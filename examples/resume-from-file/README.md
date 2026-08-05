@@ -19,5 +19,5 @@ The first pi session header row carries `id` and `cwd`; when present,
 `session/load`, and the prompt uses normal ACP `session/prompt`.
 
 Pass `-prompt "..."` to change the smoke-test turn, `-path` to point at a
-specific `pi` CLI, and `-home` to set the parent root for isolated pi session
-state. `-auth-file` explicitly seeds credentials into that isolated session.
+specific `pi` CLI, and `-scratch-dir` to set the parent root for isolated pi
+session state. `-auth-file` explicitly seeds credentials into that isolated session.

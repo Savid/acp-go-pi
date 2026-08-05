@@ -82,10 +82,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	flags.SetOutput(stderr)
 
 	piPath := flags.String("path", "", "path to pi CLI")
-	piHome := flags.String("home", "", "durable per-instance pi agent directory; empty gives each session an isolated one")
 	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
-	providerAuthRoot := flags.String("provider-auth-root", "", "durable root holding the provider-auth ledger; empty leaves the provider-auth surface unadvertised")
-	providerAuthDirectHome := flags.String("provider-auth-direct-home", "", "canonical native home an account-level provider-auth leg may read or clear; rejected by this adapter")
 	isolationConfigPath := flags.String(processIsolationConfigFlag, "", "absolute path to the required root-owned mode-0600 Linux child-isolation policy")
 	model := flags.String("model", "", "default pi model as provider/id")
 	seedFiles := &seedFileFlag{}
@@ -148,16 +145,15 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	serveOptions = append(serveOptions,
 		piacp.WithAgentVersion(version),
 		piacp.WithExecutablePath(*piPath),
-		piacp.WithHome(*piHome),
 		piacp.WithScratchDir(*scratchDir),
-		piacp.WithProviderAuthRoot(*providerAuthRoot),
-		piacp.WithProviderAuthDirectHome(*providerAuthDirectHome),
 		piacp.WithDefaultModel(*model),
 		piacp.WithLogger(logger),
 		piacp.WithProcessIsolation(piacp.ProcessIsolation{
-			UID:             isolation.UID,
-			GID:             isolation.GID,
-			BaseEnvironment: isolation.BaseEnvironment,
+			UID:                 isolation.UID,
+			GID:                 isolation.GID,
+			BaseEnvironment:     isolation.BaseEnvironment,
+			StandaloneOwnerID:   isolation.StandaloneOwnerID,
+			StandaloneStateRoot: isolation.StandaloneStateRoot,
 		}),
 	)
 

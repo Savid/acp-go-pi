@@ -27,6 +27,7 @@ const (
 
 const (
 	darwinPlatform  = "darwin"
+	linuxPlatform   = "linux"
 	windowsPlatform = "windows"
 )
 
@@ -94,13 +95,8 @@ type Agent struct {
 
 	versionMu      sync.Mutex
 	versionChecked bool
-
-	// providerAuth is nil when the surface is unconfigured or unusable, which
-	// is what leaves every leg unadvertised and method-not-found.
-	providerAuth *providerAuth
-
 	startPiProcess func(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error)
-	probeVersion   func(ctx context.Context, executablePath string, containment pi.ContainmentSpec) (string, error)
+	probeVersion   func(ctx context.Context, executablePath string, agentDir string, containment pi.ContainmentSpec) (string, error)
 	lookPath       func(file string) (string, error)
 }
 
@@ -141,7 +137,6 @@ func NewAgent(opts ...Option) *Agent {
 			validateContainmentOption(options),
 			validateImageLimits(options.ImageLimits),
 			validateInputHandoffRoot(options.InputHandoffRoot),
-			validateProviderAuthRoot(options),
 		),
 		startPiProcess: startRealPiProcess,
 		probeVersion:   pi.ProbeVersion,
@@ -150,7 +145,6 @@ func NewAgent(opts ...Option) *Agent {
 		},
 	}
 	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
-	agent.providerAuth = newProviderAuth(agent)
 
 	observeRuntimeContainment(context.Background(), options.RuntimeResourceHooks, mode)
 
@@ -176,7 +170,7 @@ func (a *Agent) ContainmentMode() RuntimeContainmentMode {
 
 func containmentMode(options Options) RuntimeContainmentMode {
 	switch agentRuntimePlatform {
-	case "linux":
+	case linuxPlatform:
 		if options.DarwinBestEffortContainment {
 			return RuntimeContainmentUnavailable
 		}
@@ -411,11 +405,6 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 		capabilityMeta[handoffMetaKey] = map[string]any{metaFieldVersions: []int{handoffVersion}}
 	}
 
-	if a.providerAuth != nil {
-		piCapabilities, _ := capabilityMeta[piMetaKey].(map[string]any)
-		piCapabilities[providerAuthCapabilityKey] = a.providerAuth.capability()
-	}
-
 	resp = acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentInfo: &acp.Implementation{
@@ -448,8 +437,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 	return resp, nil
 }
 
-// Authenticate rejects agent-handled auth methods because pi owns auth
-// natively (auth.json plus provider environment variables).
+// Authenticate rejects agent-handled auth methods.
 func (a *Agent) Authenticate(ctx context.Context, params acp.AuthenticateRequest) (resp acp.AuthenticateResponse, err error) {
 	_, finish := a.observe.StartACP(ctx, params.Meta, "authenticate")
 	defer func() { finish(observer.ACPResult{Err: err}) }()
@@ -468,10 +456,6 @@ func (a *Agent) Logout(_ context.Context, _ acp.LogoutRequest) (acp.LogoutRespon
 func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	if err := a.ensureOpen(); err != nil {
 		return nil, err
-	}
-
-	if result, handled, err := a.handleAuthExtensionMethod(ctx, method, params); handled {
-		return result, err
 	}
 
 	switch method {
@@ -509,12 +493,17 @@ func (a *Agent) ensureVersion(ctx context.Context) error {
 		return err
 	}
 
+	probeAgentDir, err := generation.prepareVersionProbeAgentDir(a.options.ProcessIsolation)
+	if err != nil {
+		return generation.finalize(err)
+	}
+
 	nativeRelease, err := acquireNativeRoot(ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery)
 	if err != nil {
 		return generation.finalize(err)
 	}
 
-	version, err := a.probeVersion(ctx, executable, containment)
+	version, err := a.probeVersion(ctx, executable, probeAgentDir, containment)
 	err = generation.finalize(err)
 	releaseNativeRootWhenComplete(nativeRelease, err)
 

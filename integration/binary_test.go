@@ -25,9 +25,9 @@ func TestPiACPAgentBinaryClosedInput(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	cmd := agentCommand(t, ctx,
+	cmd := standaloneAgentCommand(t, ctx,
 		"-path", fakePiExecutable(t, fakeScenario{}),
-		"-scratch-dir", t.TempDir(),
+		"-scratch-dir", integrationScratchDir(t),
 	)
 	cmd.Stdin = strings.NewReader("")
 
@@ -64,7 +64,7 @@ func TestPiACPAgentBinaryFakeConversation(t *testing.T) {
 
 	agent := startAgentBinary(t, ctx,
 		"-path", fakePiExecutable(t, fakeTurnScenario()),
-		"-scratch-dir", t.TempDir(),
+		"-scratch-dir", integrationScratchDir(t),
 	)
 
 	client := &recordingClient{}
@@ -73,7 +73,7 @@ func TestPiACPAgentBinaryFakeConversation(t *testing.T) {
 	_, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err, "stderr: %s", agent.stderrString())
 
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir()))
+	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t)))
 	require.NoError(t, err, "stderr: %s", agent.stderrString())
 
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "test-turn", "hello via binary"))
@@ -105,7 +105,7 @@ func TestPiACPAgentBinaryOrphanReapOnCrash(t *testing.T) {
 
 	// The scratch path appears in the child's --session-dir argv, so it
 	// doubles as a unique process-search marker.
-	scratchDir := t.TempDir()
+	scratchDir := integrationScratchDir(t)
 
 	agent := startAgentBinary(t, ctx,
 		"-path", fakePiExecutable(t, scenario),
@@ -118,7 +118,7 @@ func TestPiACPAgentBinaryOrphanReapOnCrash(t *testing.T) {
 	_, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err, "stderr: %s", agent.stderrString())
 
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir()))
+	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t)))
 	require.NoError(t, err, "stderr: %s", agent.stderrString())
 
 	go func() {
@@ -172,7 +172,7 @@ func TestPiACPAgentBinaryLiveConversation(t *testing.T) {
 
 	args := []string{
 		"-path", livePiPath(t),
-		"-scratch-dir", t.TempDir(),
+		"-scratch-dir", integrationScratchDir(t),
 		"-seed-file", "auth.json=" + authPath,
 	}
 	if model := os.Getenv(envPiModel); model != "" {
@@ -187,7 +187,7 @@ func TestPiACPAgentBinaryLiveConversation(t *testing.T) {
 	_, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err, "stderr: %s", agent.stderrString())
 
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir()))
+	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t)))
 	require.NoError(t, err, "stderr: %s", agent.stderrString())
 
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,

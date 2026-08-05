@@ -35,7 +35,6 @@ func finalizeSessionRuntimeResources(
 	nativeRelease func(),
 	sessionRoot string,
 	scratchRelease func(),
-	browserShim *pi.BrowserShim,
 ) error {
 	if !pi.ProcessContainmentComplete(runtimeErr) {
 		return runtimeErr
@@ -45,12 +44,9 @@ func finalizeSessionRuntimeResources(
 		nativeRelease()
 	}
 
-	// The shim is deleted here rather than at process exit for the same reason
-	// the session root is: a surviving descendant would otherwise fall through
-	// the removed no-ops to the real browser launcher on PATH.
-	removeErr := browserShim.Remove()
+	var removeErr error
 	if sessionRoot != "" {
-		removeErr = errors.Join(removeErr, materializeRemoveAll(sessionRoot))
+		removeErr = materializeRemoveAll(sessionRoot)
 	}
 
 	if removeErr == nil && scratchRelease != nil {
@@ -306,17 +302,8 @@ func (s *agentSession) nextRuntimeLaunch(previous pi.LaunchSpec, lastSessionFile
 		return pi.LaunchSpec{}, errors.Join(cause, materializeRemoveAll(dirs.Root))
 	}
 
-	if homeErr := s.agent.applyDurableHome(&dirs); homeErr != nil {
-		return fail(homeErr)
-	}
-
-	// A durable home is the same directory across generations: there is nothing
-	// to copy and no path to rebase, and copying it forward would strand the
-	// credential store pi refreshes under its own lock.
-	if dirs.AgentDir != previous.AgentDir {
-		if copyErr := copyGenerationAgentDir(previous.AgentDir, dirs.AgentDir); copyErr != nil {
-			return fail(fmt.Errorf("copy pi agent generation: %w", copyErr))
-		}
+	if copyErr := copyGenerationAgentDir(previous.AgentDir, dirs.AgentDir); copyErr != nil {
+		return fail(fmt.Errorf("copy pi agent generation: %w", copyErr))
 	}
 
 	spec := previous
@@ -702,13 +689,6 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 
 	s.cancelPendingInteractions()
 
-	// Pending logins are terminalized after pending dialogs are resolved and
-	// before the native interrupt, so a flow is never abandoned to a process
-	// already being torn down.
-	if s.agent != nil && s.agent.providerAuth != nil {
-		s.agent.providerAuth.closeSession(ctx, s)
-	}
-
 	s.mu.Lock()
 	cancel := s.cancel
 	proc := s.proc
@@ -750,7 +730,7 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 	}
 
 	err = finalizeSessionRuntimeResources(
-		err, s.nativeRootRelease, s.sessionRoot, s.scratchRootRelease, s.browserShim,
+		err, s.nativeRootRelease, s.sessionRoot, s.scratchRootRelease,
 	)
 
 	if s.agent != nil {

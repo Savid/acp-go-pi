@@ -20,6 +20,10 @@ var (
 	runtimeGenerationChmod               = os.Chmod
 	runtimeGenerationRemoveAll           = os.RemoveAll
 	runtimeGenerationRandRead            = rand.Read
+	runtimeGenerationWriteProbeAgentDir  = func(path string) error {
+		return (internalpi.AgentDir{Root: path}).Write()
+	}
+	runtimeGenerationHandoffNativeTree = handoffGeneratedNativeTree
 )
 
 type runtimeGeneration struct {
@@ -27,6 +31,23 @@ type runtimeGeneration struct {
 	release func()
 	once    sync.Once
 	err     error
+}
+
+func (g *runtimeGeneration) prepareVersionProbeAgentDir(isolation *ProcessIsolation) (string, error) {
+	if g == nil || !filepath.IsAbs(g.root) || filepath.Clean(g.root) != g.root {
+		return "", errors.New("version probe runtime generation root is invalid")
+	}
+
+	agentDir := filepath.Join(g.root, "probe-agent")
+	if err := runtimeGenerationWriteProbeAgentDir(agentDir); err != nil {
+		return "", fmt.Errorf("materialize version probe agent directory: %w", err)
+	}
+
+	if err := runtimeGenerationHandoffNativeTree(g.root, isolation); err != nil {
+		return "", fmt.Errorf("handoff version probe agent directory: %w", err)
+	}
+
+	return agentDir, nil
 }
 
 func (a *Agent) createRuntimeGeneration(
@@ -125,6 +146,10 @@ func internalProcessIsolation(isolation *ProcessIsolation, testOnlyNoCredential 
 		BaseEnvironment:          base,
 		TestOnlyNoCredential:     testOnlyNoCredential,
 		TestOnlyIdentityLockRoot: testOnlyIdentityLockRoot,
+		IdentityLock:             isolation.IdentityLock,
+		AuthorityDomain:          isolation.AuthorityDomain,
+		StandaloneOwnerID:        isolation.StandaloneOwnerID,
+		StandaloneStateRoot:      isolation.StandaloneStateRoot,
 	}
 
 	return result

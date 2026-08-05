@@ -16,15 +16,15 @@ func testContainmentSpec(t *testing.T) ContainmentSpec {
 	if pathEnvironment == "" {
 		pathEnvironment = "/usr/bin:/bin"
 	}
+	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
+	if uid == 0 {
+		uid, gid = 11, 22
+	}
 	isolation := &ProcessIsolation{
-		UID: uint32(os.Geteuid()), GID: uint32(os.Getegid()),
+		UID: uid, GID: gid,
 		BaseEnvironment:      map[string]string{"PATH": pathEnvironment, "HOME": os.Getenv("HOME")},
 		TestOnlyNoCredential: true,
 	}
-	if runtime.GOOS != "darwin" {
-		return ContainmentSpec{Isolation: isolation}
-	}
-
 	parent := t.TempDir()
 	root, err := os.MkdirTemp(parent, "acp-go-pi-runtime-*")
 	if err != nil {
@@ -36,13 +36,24 @@ func testContainmentSpec(t *testing.T) ContainmentSpec {
 	}
 
 	return ContainmentSpec{
-		DarwinBestEffort: true,
+		DarwinBestEffort: runtime.GOOS == "darwin",
 		ScratchParent:    parent,
 		GenerationRoot:   filepath.Clean(root),
 		RuntimeID:        hex.EncodeToString(identity),
 		LifecycleKind:    "discovery",
 		Isolation:        isolation,
 	}
+}
+
+func testVersionProbeSpec(t *testing.T) (string, ContainmentSpec) {
+	t.Helper()
+	containment := testContainmentSpec(t)
+	agentDir := filepath.Join(containment.GenerationRoot, "probe-agent")
+	if err := (AgentDir{Root: agentDir}).Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	return agentDir, containment
 }
 
 func setTestIsolationBootstrapEnv(t *testing.T) {

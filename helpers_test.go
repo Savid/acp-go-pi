@@ -40,7 +40,7 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
 	agent := NewAgent(append(base, opts...)...)
-	agent.probeVersion = func(context.Context, string, pi.ContainmentSpec) (string, error) {
+	agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
 		return pi.DefaultMinimumVersion, nil
 	}
 
@@ -65,7 +65,8 @@ func testProcessIsolationOption() Option {
 	return func(options *Options) {
 		WithProcessIsolation(ProcessIsolation{
 			UID: uint32(os.Geteuid()), GID: uint32(os.Getegid()),
-			BaseEnvironment: map[string]string{"PATH": os.Getenv("PATH"), "HOME": os.Getenv("HOME")},
+			BaseEnvironment:   map[string]string{"PATH": os.Getenv("PATH"), "HOME": os.Getenv("HOME")},
+			StandaloneOwnerID: "acp-go-pi-tests", StandaloneStateRoot: os.TempDir(),
 		})(options)
 		options.testOnlyNoCredential = true
 		options.testOnlyIdentityLockRoot = testIdentityLockRoot()

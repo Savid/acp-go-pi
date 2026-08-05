@@ -60,14 +60,14 @@ func TestPiACPRuntimeMCPRefresh(t *testing.T) {
 	store := piacp.NewInMemorySessionStore()
 	options := []piacp.Option{
 		piacp.WithExecutablePath(smokePiPath(t)),
-		piacp.WithScratchDir(t.TempDir()),
+		piacp.WithScratchDir(integrationScratchDir(t)),
 		piacp.WithDefaultModel("runtime-test/tool-model"),
 		piacp.WithSeedFiles(map[string]string{"models.json": string(modelsJSON)}),
 		piacp.WithSessionStore(store),
 	}
 	conn, stopFirst := connectControlledAgent(t, ctx, client, options...)
 
-	cwd := t.TempDir()
+	cwd := integrationWorkspaceDir(t)
 	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(cwd,
 		piacp.WithSessionMCPServers(
 			piacp.HTTPMCPServer("runtime", mcp.server.URL, nil),
@@ -359,11 +359,12 @@ func connectControlledAgent(
 	c2aR, c2aW := io.Pipe()
 	a2cR, a2cW := io.Pipe()
 	serveCtx, cancelServe := context.WithCancel(ctx)
+	baseOptions := []piacp.Option{
+		piacp.WithLogger(integrationLogger), integrationContainmentOption(), integrationProcessIsolationOption(t),
+	}
 	serveErr := make(chan error, 1)
 	go func() {
-		opts := append([]piacp.Option{
-			piacp.WithLogger(integrationLogger), integrationContainmentOption(),
-		}, options...)
+		opts := append(baseOptions, options...)
 		serveErr <- piacp.Serve(serveCtx, c2aR, a2cW, opts...)
 	}()
 

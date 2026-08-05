@@ -2,7 +2,6 @@ package piacp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +14,7 @@ const defaultSessionStoreLoadTimeout = 10 * time.Second
 var (
 	materializeMkdirAll  = os.MkdirAll
 	materializeMkdirTemp = os.MkdirTemp
+	materializeChmod     = os.Chmod
 	materializeRemoveAll = os.RemoveAll
 	materializeWriteFile = os.WriteFile
 	materializeStat      = os.Stat
@@ -34,10 +34,7 @@ type sessionDirs struct {
 }
 
 // createSessionDirs creates a fresh isolated per-session root under the
-// scratch parent (ScratchDir, or the system temp directory when unset). A
-// configured Home replaces the generated agent directory with the operator's
-// durable one, which is what pi's cross-process credential lock is keyed on;
-// session storage and every scratch generation stay under the removable root.
+// scratch parent (ScratchDir, or the system temp directory when unset).
 func (a *Agent) createSessionDirs() (sessionDirs, error) {
 	parent, err := ensureScratchParent(a.options.ScratchDir)
 	if err != nil {
@@ -48,10 +45,11 @@ func (a *Agent) createSessionDirs() (sessionDirs, error) {
 	if err != nil {
 		return sessionDirs{}, fmt.Errorf("create session root: %w", err)
 	}
-	if err := os.Chmod(sessionRoot, 0o711); err != nil {
+
+	if chmodErr := materializeChmod(sessionRoot, 0o711); chmodErr != nil {
 		_ = materializeRemoveAll(sessionRoot)
 
-		return sessionDirs{}, fmt.Errorf("protect session root: %w", err)
+		return sessionDirs{}, fmt.Errorf("protect session root: %w", chmodErr)
 	}
 
 	dirs, err := createSessionGeneration(sessionRoot)
@@ -63,38 +61,7 @@ func (a *Agent) createSessionDirs() (sessionDirs, error) {
 
 	dirs.SessionRoot = sessionRoot
 
-	if err := a.applyDurableHome(&dirs); err != nil {
-		_ = materializeRemoveAll(sessionRoot)
-
-		return sessionDirs{}, err
-	}
-
 	return dirs, nil
-}
-
-// applyDurableHome points a generation's agent directory at the configured
-// durable home. The home outlives every generation, so it is never created
-// under the removable session root and never copied forward.
-func (a *Agent) applyDurableHome(dirs *sessionDirs) error {
-	home := a.options.Home
-	if home == "" {
-		return nil
-	}
-	if a.options.ProcessIsolation != nil {
-		if err := validateNativeOwnedDirectory(home, a.options.ProcessIsolation); err != nil {
-			return err
-		}
-
-		return errors.New("durable pi agent directory is unsupported with process isolation")
-	}
-
-	if err := materializeMkdirAll(home, 0o700); err != nil {
-		return fmt.Errorf("create durable agent directory: %w", err)
-	}
-
-	dirs.AgentDir = home
-
-	return nil
 }
 
 func createSessionGeneration(sessionRoot string) (sessionDirs, error) {

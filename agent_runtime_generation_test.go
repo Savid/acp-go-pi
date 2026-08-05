@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	internalpi "github.com/savid/acp-go-pi/internal/pi"
@@ -20,6 +21,8 @@ func restoreRuntimeGenerationSeams(t *testing.T) {
 	chmod := runtimeGenerationChmod
 	removeAll := runtimeGenerationRemoveAll
 	randRead := runtimeGenerationRandRead
+	writeProbeAgentDir := runtimeGenerationWriteProbeAgentDir
+	handoffNativeTree := runtimeGenerationHandoffNativeTree
 	t.Cleanup(func() {
 		runtimeGenerationEnsureScratchParent = ensureParent
 		runtimeGenerationAbs = abs
@@ -27,7 +30,141 @@ func restoreRuntimeGenerationSeams(t *testing.T) {
 		runtimeGenerationChmod = chmod
 		runtimeGenerationRemoveAll = removeAll
 		runtimeGenerationRandRead = randRead
+		runtimeGenerationWriteProbeAgentDir = writeProbeAgentDir
+		runtimeGenerationHandoffNativeTree = handoffNativeTree
 	})
+}
+
+func TestRuntimeGenerationPreparesVersionProbeAgentDir(t *testing.T) {
+	wantErr := errors.New("injected version probe residence failure")
+	if _, err := (*runtimeGeneration)(nil).prepareVersionProbeAgentDir(nil); err == nil {
+		t.Fatal("nil runtime generation accepted")
+	}
+
+	t.Run("materialization", func(t *testing.T) {
+		restoreRuntimeGenerationSeams(t)
+		runtimeGenerationWriteProbeAgentDir = func(string) error { return wantErr }
+		_, err := (&runtimeGeneration{root: filepath.Join(t.TempDir(), "acp-go-pi-runtime-probe")}).prepareVersionProbeAgentDir(nil)
+		require.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("ownership handoff", func(t *testing.T) {
+		restoreRuntimeGenerationSeams(t)
+		root := filepath.Join(t.TempDir(), "acp-go-pi-runtime-probe")
+		runtimeGenerationWriteProbeAgentDir = func(path string) error {
+			require.Equal(t, filepath.Join(root, "probe-agent"), path)
+
+			return nil
+		}
+		runtimeGenerationHandoffNativeTree = func(string, *ProcessIsolation) error { return wantErr }
+		_, err := (&runtimeGeneration{root: root}).prepareVersionProbeAgentDir(nil)
+		require.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("success", func(t *testing.T) {
+		restoreRuntimeGenerationSeams(t)
+		root := filepath.Join(t.TempDir(), "acp-go-pi-runtime-probe")
+		isolation := &ProcessIsolation{UID: 11, GID: 22}
+		wrote, handedOff := false, false
+		runtimeGenerationWriteProbeAgentDir = func(path string) error {
+			require.Equal(t, filepath.Join(root, "probe-agent"), path)
+			wrote = true
+
+			return nil
+		}
+		runtimeGenerationHandoffNativeTree = func(path string, got *ProcessIsolation) error {
+			require.True(t, wrote)
+			require.Equal(t, root, path)
+			require.Same(t, isolation, got)
+			handedOff = true
+
+			return nil
+		}
+		agentDir, err := (&runtimeGeneration{root: root}).prepareVersionProbeAgentDir(isolation)
+		require.NoError(t, err)
+		require.True(t, handedOff)
+		require.Equal(t, filepath.Join(root, "probe-agent"), agentDir)
+	})
+}
+
+func TestEnsureVersionProbeResidenceLifetime(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		probeErr   error
+		wantRetain bool
+	}{
+		{name: "success removes and releases"},
+		{name: "incomplete containment quarantines", probeErr: internalpi.ErrProcessContainmentIncomplete, wantRetain: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scratch := t.TempDir()
+			reserved, releasedScratch := 0, 0
+			acquired, releasedNative := 0, 0
+			agent := NewAgent(
+				testContainmentOption(),
+				WithExecutablePath("/fake/pi"),
+				WithScratchDir(scratch),
+				WithRuntimeResourceHooks(RuntimeResourceHooks{
+					ReserveScratchRoot: func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
+						require.Equal(t, RuntimeResourceDiscovery, kind)
+						reserved++
+
+						return func() { releasedScratch++ }, nil
+					},
+					AcquireNativeRoot: func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
+						require.Equal(t, RuntimeResourceDiscovery, kind)
+						acquired++
+
+						return func() { releasedNative++ }, nil
+					},
+				}),
+			)
+
+			var generationRoot string
+			agent.probeVersion = func(_ context.Context, _ string, agentDir string, containment internalpi.ContainmentSpec) (string, error) {
+				generationRoot = containment.GenerationRoot
+				require.Equal(t, filepath.Join(generationRoot, "probe-agent"), agentDir)
+				require.Equal(t, scratch, filepath.Dir(generationRoot))
+				require.Equal(t, agentDir, environmentValue(internalpi.LaunchSpec{AgentDir: agentDir, Containment: containment}.Environ(), "PI_CODING_AGENT_DIR"))
+				settings, err := os.ReadFile(filepath.Join(agentDir, internalpi.SettingsFileName))
+				require.NoError(t, err)
+				require.JSONEq(t, `{}`, string(settings))
+
+				return internalpi.DefaultMinimumVersion, test.probeErr
+			}
+
+			err := agent.ensureVersion(t.Context())
+			if test.probeErr != nil {
+				require.ErrorIs(t, err, test.probeErr)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, 1, reserved)
+			require.Equal(t, 1, acquired)
+
+			_, statErr := os.Stat(generationRoot)
+			if test.wantRetain {
+				require.NoError(t, statErr)
+				require.Zero(t, releasedScratch)
+				require.Zero(t, releasedNative)
+			} else {
+				require.ErrorIs(t, statErr, os.ErrNotExist)
+				require.Equal(t, 1, releasedScratch)
+				require.Equal(t, 1, releasedNative)
+			}
+		})
+	}
+}
+
+func environmentValue(environment []string, key string) string {
+	prefix := key + "="
+	for _, entry := range environment {
+		if value, ok := strings.CutPrefix(entry, prefix); ok {
+			return value
+		}
+	}
+
+	return ""
 }
 
 func TestRuntimeGenerationConstructionFailures(t *testing.T) {

@@ -21,11 +21,21 @@ func TestPiCLIVersionProbe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	version, err := pi.ProbeVersion(ctx, path, integrationContainmentSpec(t))
+	agentDir, containment := integrationVersionProbeSpec(t)
+	policyHome := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(policyHome, "sentinel"), []byte("unchanged"), 0o600))
+	containment.Isolation.BaseEnvironment["HOME"] = policyHome
+	version, err := pi.ProbeVersion(ctx, path, agentDir, containment)
 	require.NoError(t, err)
 	require.NotEmpty(t, version)
 	require.NoError(t, pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion),
 		"installed pi %s is older than the supported minimum %s", version, pi.DefaultMinimumVersion)
+	require.FileExists(t, filepath.Join(agentDir, pi.SettingsFileName))
+	require.NoDirExists(t, filepath.Join(policyHome, ".pi"))
+	entries, err := os.ReadDir(policyHome)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, "sentinel", entries[0].Name())
 }
 
 // TestPiCLIExplicitSeedResources proves the real CLI honors exact seeded
@@ -38,7 +48,8 @@ func TestPiCLIExplicitSeedResources(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	root := t.TempDir()
+	containment := integrationContainmentSpec(t)
+	root := containment.GenerationRoot
 	agentDir := filepath.Join(root, "agent")
 	sessionDir := filepath.Join(root, "sessions")
 	require.NoError(t, os.MkdirAll(sessionDir, 0o700))
@@ -70,7 +81,7 @@ Use the deterministic seeded skill.
 		SkillPaths:          resources.Skills,
 		PromptTemplatePaths: resources.PromptTemplates,
 		Cwd:                 root,
-		Containment:         integrationContainmentSpec(t),
+		Containment:         containment,
 	})
 	require.NoError(t, err)
 	client := pi.NewClient(process.Stdin(), process.Stdout())
@@ -90,7 +101,9 @@ Use the deterministic seeded skill.
 		names = append(names, command.Name)
 	}
 	slices.Sort(names)
-	require.Equal(t, []string{"seed-command", "seed-prompt", "skill:seed-skill"}, names)
+	expected := append(expectedBuiltinCommandNames(t, path), "seed-command", "seed-prompt", "skill:seed-skill")
+	slices.Sort(expected)
+	require.Equal(t, expected, names)
 	require.Empty(t, process.StderrTail())
 }
 
@@ -110,17 +123,6 @@ func TestPiCLIBridgeExtensionLoads(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, state.SessionID)
 	require.False(t, state.IsStreaming)
-
-	commands, err := h.client.GetCommands(ctx)
-	require.NoError(t, err)
-	// The bridge owns exactly one slash command, the one carrying an auth leg.
-	// Asserting its presence rather than an exact set keeps a built-in the
-	// harness gains on a newer pi from reading as a wrapper regression.
-	names := make([]string, 0, len(commands))
-	for _, command := range commands {
-		names = append(names, command.Name)
-	}
-	require.Contains(t, names, pi.AuthCommandName)
 
 	require.NoError(t, h.client.SetAutoRetry(ctx, false))
 

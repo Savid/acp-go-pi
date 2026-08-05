@@ -127,7 +127,7 @@ echo $! > %s
 echo 0.80.6
 `, strconv.Quote(pidFile))), 0o700))
 
-	version, err := ProbeVersion(t.Context(), script, testContainmentSpec(t))
+	version, err := probeVersionWithTestSpec(t, t.Context(), script)
 	require.NoError(t, err)
 	require.Equal(t, "0.80.6", version)
 
@@ -253,11 +253,12 @@ func TestLinuxSupervisorPreparationFailuresSurfaceAtCallers(t *testing.T) {
 	_, err := StartProcess(t.Context(), LaunchSpec{
 		ExecutablePath: "/bin/true",
 		AgentDir:       t.TempDir(),
+		Containment:    testContainmentSpec(t),
 	})
 	require.ErrorIs(t, err, want)
 	require.ErrorContains(t, err, "prepare pi process")
 
-	_, err = ProbeVersion(t.Context(), "/bin/true", testContainmentSpec(t))
+	_, err = probeVersionWithTestSpec(t, t.Context(), "/bin/true")
 	require.ErrorIs(t, err, want)
 	require.ErrorContains(t, err, "prepare pi version probe")
 }
@@ -273,6 +274,7 @@ func TestLinuxSupervisorAdapterDeathContainsDetachedDescendant(t *testing.T) {
 		process, err := StartProcess(context.Background(), LaunchSpec{
 			ExecutablePath: os.Getenv(detachedNativePathEnv),
 			AgentDir:       os.Getenv(detachedAgentDirEnv),
+			Containment:    testContainmentSpec(t),
 			Env: map[string]string{
 				"PI_DETACHED_PID_FILE": os.Getenv(detachedPIDFileEnv),
 				"PI_DETACHED_SENTINEL": os.Getenv(detachedSentinelEnv),
@@ -320,7 +322,7 @@ func TestLinuxSupervisorAdapterDeathContainsDetachedDescendant(t *testing.T) {
 	}, 2200*time.Millisecond, 20*time.Millisecond, "adapter-death descendant reached delayed side effect")
 }
 
-func TestLinuxSupervisorDeathCannotForgeContainmentProof(t *testing.T) {
+func TestLinuxSupervisorPeerDeathRetainsContainmentProof(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "detached.pid")
 	sentinel := filepath.Join(dir, "leaked")
@@ -328,6 +330,7 @@ func TestLinuxSupervisorDeathCannotForgeContainmentProof(t *testing.T) {
 	process, err := StartProcess(context.Background(), LaunchSpec{
 		ExecutablePath: script,
 		AgentDir:       dir,
+		Containment:    testContainmentSpec(t),
 		Env: map[string]string{
 			"PI_DETACHED_PID_FILE": pidFile,
 			"PI_DETACHED_SENTINEL": sentinel,
@@ -340,12 +343,8 @@ func TestLinuxSupervisorDeathCannotForgeContainmentProof(t *testing.T) {
 	require.NoError(t, process.cmd.Process.Kill())
 	<-process.Exited()
 
-	err = process.Close()
-	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
-	require.False(t, ProcessContainmentComplete(err))
-	require.True(t, processPIDAlive(pid), "escaped child unexpectedly served as proof after supervisor death")
-
-	require.NoError(t, syscall.Kill(pid, syscall.SIGKILL))
+	require.True(t, ProcessContainmentComplete(process.WaitErr()))
+	require.NoError(t, process.Close())
 	require.Eventually(t, func() bool { return !processPIDAlive(pid) }, 5*time.Second, 10*time.Millisecond)
 }
 

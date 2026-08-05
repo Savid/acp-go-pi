@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -26,7 +27,7 @@ var versionTreeKill = func(tree *processTree) error { return tree.kill() }
 var versionTreeTerminateAndWait = func(tree *processTree, timeout time.Duration) error { return tree.terminateAndWait(timeout) }
 
 // ProbeVersion runs `pi --version` and returns the reported version string.
-func ProbeVersion(ctx context.Context, executablePath string, containment ContainmentSpec) (string, error) {
+func ProbeVersion(ctx context.Context, executablePath string, agentDir string, containment ContainmentSpec) (string, error) {
 	if contextErr := ctx.Err(); contextErr != nil {
 		return "", contextErr
 	}
@@ -35,7 +36,13 @@ func ProbeVersion(ctx context.Context, executablePath string, containment Contai
 		return "", fmt.Errorf("validate pi version process isolation: %w", err)
 	}
 
-	environment := (LaunchSpec{Containment: containment}).Environ()
+	expectedAgentDir := filepath.Join(containment.GenerationRoot, "probe-agent")
+	if !filepath.IsAbs(containment.GenerationRoot) || filepath.Clean(containment.GenerationRoot) != containment.GenerationRoot ||
+		agentDir != expectedAgentDir {
+		return "", errors.New("pi version probe requires its isolated agent directory beneath the runtime generation root")
+	}
+
+	environment := (LaunchSpec{AgentDir: agentDir, Containment: containment}).Environ()
 
 	resolved, err := lookPathInEnvironment(executablePath, environment)
 	if err != nil {

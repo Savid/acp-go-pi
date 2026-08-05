@@ -74,17 +74,19 @@ type harness struct {
 func startHarness(t *testing.T, ctx context.Context, executable string, withBridge bool) *harness {
 	t.Helper()
 
-	root := t.TempDir()
+	containment := integrationContainmentSpec(t)
+	root := containment.GenerationRoot
 	agentDir := filepath.Join(root, "agent")
 	sessionDir := filepath.Join(root, "sessions")
 	require.NoError(t, os.MkdirAll(sessionDir, 0o700))
+	require.NoError(t, (pi.AgentDir{Root: agentDir}).Write())
 
 	spec := pi.LaunchSpec{
 		ExecutablePath: executable,
 		AgentDir:       agentDir,
 		SessionDir:     sessionDir,
 		Cwd:            root,
-		Containment:    integrationContainmentSpec(t),
+		Containment:    containment,
 	}
 
 	if withBridge {
@@ -157,7 +159,8 @@ func TestFakePiVersionProbe(t *testing.T) {
 	requireRunIntegration(t)
 	t.Parallel()
 
-	version, err := pi.ProbeVersion(t.Context(), fakePiExecutable(t, fakeScenario{}), integrationContainmentSpec(t))
+	agentDir, containment := integrationVersionProbeSpec(t)
+	version, err := pi.ProbeVersion(t.Context(), fakePiExecutable(t, fakeScenario{}), agentDir, containment)
 	require.NoError(t, err)
 	require.Equal(t, fakePiVersion, version)
 	require.NoError(t, pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion))
@@ -196,10 +199,18 @@ func TestFakePiMatchesRealPi(t *testing.T) {
 	require.Equal(t, states[1].Model, states[0].Model, "credential-less model placeholder must match")
 
 	leafIDs := make([]string, 0, 2)
-	for _, h := range pair {
+	for index, h := range pair {
 		commands, err := h.client.GetCommands(ctx)
 		require.NoError(t, err)
-		require.Empty(t, commands)
+		commandNames := make([]string, 0, len(commands))
+		for _, command := range commands {
+			commandNames = append(commandNames, command.Name)
+		}
+		expectedCommands := []string{}
+		if index == 1 {
+			expectedCommands = expectedBuiltinCommandNames(t, realPath)
+		}
+		require.Equal(t, expectedCommands, commandNames)
 
 		models, err := h.client.GetAvailableModels(ctx)
 		require.NoError(t, err)

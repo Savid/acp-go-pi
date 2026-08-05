@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +33,13 @@ const (
 )
 
 const fakePiVersion = "0.80.6"
+
+var (
+	fakePiTargetBinaryOnce sync.Once
+	fakePiTargetBinaryRoot string
+	fakePiTargetBinaryPath string
+	fakePiTargetBinaryErr  error
+)
 
 // Native strings observed live from pi 0.80.6.
 const (
@@ -192,21 +200,45 @@ func fakePiExecutable(t *testing.T, scenario fakeScenario) string {
 		t.Fatalf("resolve test binary: %v", err)
 	}
 
-	dir := t.TempDir()
+	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
+		fakePiTargetBinaryOnce.Do(func() {
+			fakePiTargetBinaryRoot, fakePiTargetBinaryErr = os.MkdirTemp("/tmp", "acp-go-pi-integration-binary-")
+			if fakePiTargetBinaryErr != nil {
+				return
+			}
+			if fakePiTargetBinaryErr = os.Chmod(fakePiTargetBinaryRoot, 0o755); fakePiTargetBinaryErr != nil {
+				return
+			}
+			data, readErr := os.ReadFile(testBinary) // #nosec G304 -- copies the running integration executable.
+			if readErr != nil {
+				fakePiTargetBinaryErr = readErr
+
+				return
+			}
+			fakePiTargetBinaryPath = filepath.Join(fakePiTargetBinaryRoot, "integration.test")
+			fakePiTargetBinaryErr = os.WriteFile(fakePiTargetBinaryPath, data, 0o755) // #nosec G306 -- target-executable test helper.
+		})
+		if fakePiTargetBinaryErr != nil {
+			t.Fatalf("copy target-accessible integration binary: %v", fakePiTargetBinaryErr)
+		}
+		testBinary = fakePiTargetBinaryPath
+	}
+
+	dir := integrationScratchDir(t)
 
 	scenarioPath := filepath.Join(dir, "scenario.json")
 	data, err := json.Marshal(scenario)
 	if err != nil {
 		t.Fatalf("encode fake scenario: %v", err)
 	}
-	if err := os.WriteFile(scenarioPath, data, 0o600); err != nil {
+	if err := os.WriteFile(scenarioPath, data, 0o644); err != nil { // #nosec G306 -- deterministic target-readable test scenario.
 		t.Fatalf("write fake scenario: %v", err)
 	}
 
 	path := filepath.Join(dir, "pi")
 	script := fmt.Sprintf("#!/bin/sh\n%s=1 %s=%q exec %q -test.run '^TestFakePiExecutable$' -- \"$@\"\n",
 		envFakePiHelper, envFakePiMode, scenarioPath, testBinary)
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { // #nosec G306 -- private per-test executable shim.
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil { // #nosec G306 -- target-executable test shim.
 		t.Fatalf("write fake pi executable: %v", err)
 	}
 

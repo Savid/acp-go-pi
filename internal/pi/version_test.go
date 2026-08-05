@@ -40,7 +40,7 @@ func TestProbeVersion(t *testing.T) {
 	t.Run("exec failure is wrapped", func(t *testing.T) {
 		t.Parallel()
 
-		_, err := ProbeVersion(t.Context(), filepath.Join(t.TempDir(), "missing"), testContainmentSpec(t))
+		_, err := probeVersionWithTestSpec(t, t.Context(), filepath.Join(t.TempDir(), "missing"))
 		require.ErrorContains(t, err, "resolve pi version executable")
 	})
 
@@ -66,13 +66,20 @@ func probeVersionTestScript(t *testing.T, ctx context.Context, script string) (s
 	t.Helper()
 
 	for attempt := 0; ; attempt++ {
-		version, err := ProbeVersion(ctx, script, testContainmentSpec(t))
+		version, err := probeVersionWithTestSpec(t, ctx, script)
 		if err == nil || attempt >= 50 || !errors.Is(err, syscall.ETXTBSY) {
 			return version, err
 		}
 
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func probeVersionWithTestSpec(t *testing.T, ctx context.Context, executable string) (string, error) {
+	t.Helper()
+	agentDir, containment := testVersionProbeSpec(t)
+
+	return ProbeVersion(ctx, executable, agentDir, containment)
 }
 
 func restoreVersionSeams(t *testing.T) {
@@ -108,18 +115,21 @@ func TestProbeVersionStageBranches(t *testing.T) {
 
 	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err := ProbeVersion(cancelled, "/usr/bin/true", ContainmentSpec{})
+	_, err := ProbeVersion(cancelled, "/usr/bin/true", "", ContainmentSpec{})
 	require.ErrorIs(t, err, context.Canceled)
 
 	t.Run("prepare command", func(t *testing.T) {
 		restoreVersionSeams(t)
 		versionPrepareTreeCommand = func(*exec.Cmd, ContainmentSpec) (*processTreeCommand, error) { return nil, wantErr }
-		_, probeErr := ProbeVersion(t.Context(), "/usr/bin/true", testContainmentSpec(t))
+		_, probeErr := probeVersionWithTestSpec(t, t.Context(), "/usr/bin/true")
 		require.ErrorContains(t, probeErr, "prepare pi version probe")
 	})
 
-	_, err = ProbeVersion(t.Context(), "/usr/bin/true", ContainmentSpec{})
+	_, err = ProbeVersion(t.Context(), "/usr/bin/true", "", ContainmentSpec{})
 	require.ErrorContains(t, err, "validate pi version process isolation")
+	containment := testContainmentSpec(t)
+	_, err = ProbeVersion(t.Context(), "/usr/bin/true", filepath.Join(containment.GenerationRoot, "wrong"), containment)
+	require.ErrorContains(t, err, "isolated agent directory")
 
 	t.Run("prepare record", func(t *testing.T) {
 		restoreVersionSeams(t)
@@ -127,7 +137,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 			return &processTreeCommand{cmd: cmd}, nil
 		}
 		versionPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, wantErr }
-		_, err := ProbeVersion(t.Context(), "/usr/bin/true", testContainmentSpec(t))
+		_, err := probeVersionWithTestSpec(t, t.Context(), "/usr/bin/true")
 		require.ErrorContains(t, err, "prepare pi version containment record")
 	})
 
@@ -139,7 +149,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 		}
 		versionPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
 		versionAfterPrepare = cancel
-		_, err := ProbeVersion(ctx, "/usr/bin/true", testContainmentSpec(t))
+		_, err := probeVersionWithTestSpec(t, ctx, "/usr/bin/true")
 		require.ErrorIs(t, err, context.Canceled)
 	})
 
@@ -150,7 +160,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 		}
 		versionPrepareContainmentRecord = func(ContainmentSpec) (containmentRecord, error) { return containmentRecord{}, nil }
 		versionStartTree = func(*processTreeCommand) (*processTree, error) { return nil, wantErr }
-		_, err := ProbeVersion(t.Context(), "/usr/bin/true", testContainmentSpec(t))
+		_, err := probeVersionWithTestSpec(t, t.Context(), "/usr/bin/true")
 		require.ErrorContains(t, err, "probe pi version")
 	})
 
@@ -178,7 +188,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 				return closedVersionTree(test.waitErr), nil
 			}
 			versionTreeTerminateAndWait = func(*processTree, time.Duration) error { return test.containmentErr }
-			version, err := ProbeVersion(t.Context(), "/usr/bin/true", testContainmentSpec(t))
+			version, err := probeVersionWithTestSpec(t, t.Context(), "/usr/bin/true")
 			if test.wantErr {
 				require.Error(t, err)
 			} else {
@@ -214,7 +224,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 			<-started
 			cancel()
 		}()
-		version, err := ProbeVersion(ctx, "/usr/bin/true", testContainmentSpec(t))
+		version, err := probeVersionWithTestSpec(t, ctx, "/usr/bin/true")
 		require.NoError(t, err)
 		require.Equal(t, "0.80.6", version)
 	})

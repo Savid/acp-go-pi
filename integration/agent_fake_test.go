@@ -55,7 +55,7 @@ func newFakeSession(
 ) acp.SessionId {
 	t.Helper()
 
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir(), opts...))
+	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t), opts...))
 	require.NoError(t, err)
 	require.NotEmpty(t, session.SessionId)
 
@@ -101,7 +101,7 @@ func TestAgentFakeCancelDuringStream(t *testing.T) {
 	client := &recordingClient{}
 	store := piacp.NewInMemorySessionStore()
 	conn := connectFakeAgentForTest(t, ctx, client, scenario, piacp.WithSessionStore(store))
-	cwd := t.TempDir()
+	cwd := integrationWorkspaceDir(t)
 	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(cwd))
 	require.NoError(t, err)
 	sessionID := session.SessionId
@@ -384,7 +384,7 @@ func TestAgentFakeElicitationRelay(t *testing.T) {
 	client := &recordingClient{elicitationValue: "ELICIT_VALUE_SENTINEL"}
 	conn := connectAgentWithInitForTest(t, ctx, client, formElicitationInit(),
 		piacp.WithExecutablePath(fakePiExecutable(t, scenario)),
-		piacp.WithScratchDir(t.TempDir()),
+		piacp.WithScratchDir(integrationScratchDir(t)),
 	)
 	sessionID := newFakeSession(t, ctx, conn)
 
@@ -461,18 +461,18 @@ func TestAgentFakeMCPValidation(t *testing.T) {
 			Headers: []acp.HttpHeader{},
 		},
 	}
-	_, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir(),
+	_, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t),
 		piacp.WithSessionMCPServers(sseServer)))
 	require.Error(t, err, "SSE MCP transport is rejected at session start")
 
-	_, err = conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir(),
+	_, err = conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t),
 		piacp.WithSessionMCPServers(
 			piacp.StdioMCPServer("dup", "/bin/true", nil, nil),
 			piacp.StdioMCPServer("dup", "/bin/true", nil, nil),
 		)))
 	require.Error(t, err, "duplicate MCP server names are rejected")
 
-	_, err = conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir(),
+	_, err = conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t),
 		piacp.WithSessionMCPServers(piacp.StdioMCPServer("", "/bin/true", nil, nil))))
 	require.Error(t, err, "empty MCP server names are rejected")
 
@@ -501,7 +501,7 @@ func TestAgentFakeMCPConnectFailureFailsSessionStart(t *testing.T) {
 
 	// A failing MCP server connection makes pi exit loudly at startup; the
 	// wrapper maps that to a structured session/new failure.
-	_, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir(),
+	_, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t),
 		piacp.WithSessionMCPServers(piacp.HTTPMCPServer("broken", "http://127.0.0.1:1/mcp", nil))))
 	require.Error(t, err)
 }

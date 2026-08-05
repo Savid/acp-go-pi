@@ -5,6 +5,7 @@ package pi
 import (
 	"errors"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"testing"
 
@@ -19,7 +20,10 @@ func TestProcessIsolationUnixVerificationBranches(t *testing.T) {
 	processIsolationGeteuid = func() int { return 11 }
 	processIsolationGetegid = func() int { return 22 }
 	processIsolationGetgroups = func() ([]int, error) { return nil, nil }
-	policy := &ProcessIsolation{UID: 11, GID: 22, BaseEnvironment: map[string]string{}}
+	policy := &ProcessIsolation{
+		UID: 11, GID: 22, BaseEnvironment: map[string]string{},
+		StandaloneOwnerID: "unix-verification-test", StandaloneStateRoot: "/var/lib/acp-go-pi-test",
+	}
 	require.NoError(t, verifyProcessIsolation(policy))
 	require.NoError(t, applyProcessIsolation(exec.Command("/usr/bin/true"), policy))
 	processIsolationGetgroups = func() ([]int, error) { return nil, errors.New("groups") }
@@ -74,6 +78,7 @@ func TestProcessIsolationLaunchFailures(t *testing.T) {
 	containment := ContainmentSpec{Isolation: &ProcessIsolation{
 		UID: 11, GID: 22, BaseEnvironment: map[string]string{"PATH": "/usr/bin"},
 	}}
+	containment.GenerationRoot = t.TempDir()
 
 	t.Run("process", func(t *testing.T) {
 		restoreProcessSeams(t)
@@ -89,7 +94,9 @@ func TestProcessIsolationLaunchFailures(t *testing.T) {
 		versionPrepareTreeCommand = func(cmd *exec.Cmd, _ ContainmentSpec) (*processTreeCommand, error) {
 			return &processTreeCommand{cmd: cmd}, nil
 		}
-		_, err := ProbeVersion(t.Context(), "/usr/bin/true", containment)
+		agentDir := filepath.Join(containment.GenerationRoot, "probe-agent")
+		require.NoError(t, (AgentDir{Root: agentDir}).Write())
+		_, err := ProbeVersion(t.Context(), "/usr/bin/true", agentDir, containment)
 		require.ErrorContains(t, err, "apply pi version process isolation")
 	})
 }

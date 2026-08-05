@@ -90,9 +90,7 @@ func main() {
 
 See the [Go API reference](https://pkg.go.dev/github.com/savid/acp-go-pi) for
 options such as the pi executable path, scratch directory, default model,
-session storage, permissions, raw events, and OpenTelemetry providers. pi has
-no native config or auth root, so a configured home is rejected at session
-start; use the scratch directory to place per-session on-disk state.
+session storage, permissions, raw events, and OpenTelemetry providers.
 
 ## What It Provides
 
@@ -100,6 +98,9 @@ start; use the scratch directory to place per-session on-disk state.
   and extension-based fork.
 - pi RPC-mode subprocess management with isolated per-session agent
   directories and a scrubbed child environment.
+- A target-owned version-probe agent directory below `WithScratchDir`, passed
+  as an exact non-empty `PI_CODING_AGENT_DIR` so policy `HOME` is never used as
+  pi's fallback settings root.
 - Prompt streaming for messages, thoughts, tool calls, tool results, usage,
   and session metadata.
 - Permission prompts through a wrapper-owned pi bridge extension with
@@ -108,9 +109,8 @@ start; use the scratch directory to place per-session on-disk state.
   explicitly seeded extension dialogs.
 - MCP stdio and HTTP server declarations through a wrapper-owned,
   dependency-free pi MCP client extension.
-- Provider logins brokered for a worker through seven `_pi/auth/*` extension
-  methods, advertised only when both a durable agent directory and a durable
-  provider-auth ledger root are configured.
+- Deliberate provider credential injection through the isolated child
+  environment or seeded `auth.json`.
 - Optional durable mirroring through a host-provided `SessionStore`.
 - Optional raw pi event extension notifications.
 - OpenTelemetry spans, metrics, trace propagation, and structured logs

@@ -62,17 +62,12 @@ type LaunchSpec struct {
 	// PromptTemplatePaths are explicitly seeded prompt templates loaded despite disabled discovery.
 	PromptTemplatePaths []string
 	// Env is added to the scrubbed base environment. Wrapper-managed keys
-	// (PI_CODING_AGENT_DIR, PI_OFFLINE, and the browser shim's PATH and
-	// BROWSER) always win.
+	// (PI_CODING_AGENT_DIR and PI_OFFLINE) always win.
 	Env map[string]string
 	// ExtraPathDirs are absolute directories prepended, in order, to the PATH
 	// the child inherits, so a host-owned executable resolves ahead of every
 	// inherited entry.
 	ExtraPathDirs []string
-	// BrowserShim neutralises the browser a native login leg run inside this
-	// process would otherwise open on the operator's desktop. A nil shim leaves
-	// the child's PATH and BROWSER alone.
-	BrowserShim *BrowserShim
 	// Cwd is the child working directory.
 	Cwd string
 	// ShutdownStepTimeout bounds each rung of the shutdown ladder; zero uses
@@ -120,9 +115,7 @@ func (spec LaunchSpec) Args() []string {
 
 // Environ returns the child environment: the isolation policy's complete base,
 // then spec.Env, then spec.ExtraPathDirs ahead of the policy PATH,
-// then the wrapper-managed keys, which always win. The browser shim is applied
-// last so its PATH prefix and BROWSER value survive whatever a caller asked
-// for.
+// then the wrapper-managed keys, which always win.
 func (spec LaunchSpec) Environ() []string {
 	env := make(map[string]string, len(spec.Env)+2)
 	if spec.Containment.Isolation != nil {
@@ -161,7 +154,7 @@ func (spec LaunchSpec) Environ() []string {
 		environ = append(environ, key+"="+env[key])
 	}
 
-	return spec.BrowserShim.Environ(environ)
+	return environ
 }
 
 // prependPathDirs returns search with dirs ahead of every entry it already

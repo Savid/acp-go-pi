@@ -47,10 +47,7 @@ Darwin.
 | --- | --- |
 | `WithExecutablePath` | Set the pi CLI path (default: search `PATH`). |
 | `WithProcessIsolation` | Mandatory non-root UID/GID and complete replacement environment for native pi processes. On Linux the embedded supervisor stays trusted root; only `pi --mode rpc` receives the configured identity, with supplementary groups cleared. |
-| `WithScratchDir` | Parent directory for all ephemeral on-disk state (isolated per-session agent and session directories, hydration temp files, probe dirs). Empty means the system temp directory; created `0700` when missing. |
-| `WithHome` | Durable per-instance pi agent directory (`PI_CODING_AGENT_DIR`) every session runs against. Omitted, each session gets an isolated agent directory under the scratch parent, which disables pi's cross-process credential refresh lock and leaves the provider-auth surface unadvertised. |
-| `WithProviderAuthRoot` | Absolute, host-owned, durable directory holding the values-free provider-auth ledger; created mode `0700`. Omitted, or naming a root that cannot be prepared, leaves every `_pi/auth/*` leg unadvertised; a relative path is rejected at construction. See [Authentication](/docs/features/authentication). |
-| `WithProviderAuthDirectHome` | Declared and rejected: pi has no account-level provider-auth leg to gate. A non-empty value is rejected at session start with the unsupported-option error for field `providerAuthDirectHome`. |
+| `WithScratchDir` | Parent directory for all ephemeral on-disk state (isolated per-session agent and session directories, hydration temp files, and the version probe's isolated `PI_CODING_AGENT_DIR`/settings residence). Empty means the system temp directory; created `0700` when missing. |
 | `WithDefaultModel` | Default model for new sessions, as `"provider/id"`. |
 | `WithEnv` | Overlay environment variables on `ProcessIsolation.BaseEnvironment` for every pi child. Invalid names plus `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `LD_*`, and `DYLD_*` are rejected; ambient variables are never inherited. |
 | `WithExtraPathDirs` | Prepend absolute directories, in order, to the `PATH` of every pi child. The sanctioned counterpart to the rejected raw `PATH` key; a relative entry or an embedded list separator fails session start. |
@@ -63,6 +60,17 @@ Darwin.
 | `WithTurnTimeout` | Bound one prompt turn; expiry fails the turn with cause `timeout` (default: no deadline). |
 | `WithRuntimeResourceHooks` | Host admission hooks for native-process roots and adapter scratch roots. |
 | `WithDarwinBestEffortContainment` | Explicitly accept Darwin process-group containment and its escaped-descendant risk. Invalid on other platforms. |
+
+`ProcessIsolation.IdentityLock` and `ProcessIsolation.AuthorityDomain`
+optionally accept opaque host capabilities with `Duplicate() (*os.File, error)`
+for the already-held canonical UID lock and shared `domain.lock` lease. Each
+capability keeps ownership of its original descriptor; caller-owned duplicates
+reach only the trusted supervisor, which validates the named inodes, held locks,
+and strict matching domain record and protects them with checked `FD_CLOEXEC`.
+Set both fields together for
+host-borrowed authority or leave both nil for standalone domain, disposition,
+and UID-lock acquisition. A mixed nil/non-nil pair fails closed. Native
+processes receive neither capability nor descriptor.
 
 ## Pi-specific options
 
@@ -113,11 +121,15 @@ agent rejects the resulting prompt or active-turn cancellation.
 `ObserveProcess`, `ObserveProcessSnapshot`, `ObserveStartupStage`, and
 `ObserveContainment`.
 Admission callbacks receive `runtime`, `session`, `prompt`, or `discovery`; nil
-means unbounded standalone operation. Pi acquires discovery and per-session
-native permits immediately before their launches, reserves scratch before
-making the isolated agent directory, and releases only after the selected
-boundary completes and directory deletion succeeds. Pi is lockless and emits
-no home-lock-supervisor count. Provider descendant snapshots are emitted only
+means unbounded standalone operation. Before `pi --version`, Pi reserves a
+runtime generation below `WithScratchDir`, materializes a target-owned
+`probe-agent` directory with isolated `settings.json`, and passes that exact
+path as `PI_CODING_AGENT_DIR`. Pi acquires discovery and per-session native
+permits immediately before their launches, reserves scratch before making each
+isolated agent directory, and releases only after the selected boundary
+completes and directory deletion succeeds; incomplete containment quarantines
+the generation and holds both reservations. Pi is lockless and emits no
+home-lock-supervisor count. Provider descendant snapshots are emitted only
 when inventory is authoritative; Darwin best-effort emits no provider
 snapshot, including zero. `ObserveContainment` is called once with the
 effective mode. Startup observations distinguish spawn, readiness,

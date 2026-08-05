@@ -12,12 +12,20 @@ import (
 
 // ProcessIsolation is the internal launch policy copied from the public
 // adapter option. A nil policy is never a request to inherit ambient state.
+type ProcessIdentityLockCapability interface {
+	Duplicate() (*os.File, error)
+}
+
 type ProcessIsolation struct {
 	UID                      uint32
 	GID                      uint32
 	BaseEnvironment          map[string]string
 	TestOnlyNoCredential     bool
 	TestOnlyIdentityLockRoot string
+	IdentityLock             ProcessIdentityLockCapability `json:"-"`
+	AuthorityDomain          ProcessIdentityLockCapability `json:"-"`
+	StandaloneOwnerID        string                        `json:"standaloneOwnerId"`
+	StandaloneStateRoot      string                        `json:"standaloneStateRoot"`
 }
 
 var errProcessIsolationRequired = errors.New("process isolation policy is required")
@@ -37,6 +45,7 @@ func validateProcessIsolation(isolation *ProcessIsolation) error {
 	if isolation.UID == 0 || isolation.GID == 0 {
 		return errors.New("process isolation UID and GID must be nonzero")
 	}
+
 	if isolation.BaseEnvironment == nil {
 		return errors.New("process isolation base environment is required")
 	}
@@ -51,7 +60,7 @@ func validateProcessIsolation(isolation *ProcessIsolation) error {
 		}
 	}
 
-	return validateProcessIsolationPlatform()
+	return validateProcessIsolationPlatform(isolation)
 }
 
 func validEnvironmentName(key string) bool {

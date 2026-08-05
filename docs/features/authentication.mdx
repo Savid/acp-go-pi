@@ -1,44 +1,40 @@
 ---
 title: "Authentication"
-description: "Why the adapter advertises no auth methods, how to inject pi provider credentials, and how to broker one provider login for a worker"
+description: "How provider credentials enter isolated pi sessions"
 ---
 
-ACP **agent-level** auth and **per-provider** logins are separate surfaces.
-This page covers the first: pi owns authentication natively — through provider
-environment variables and an `auth.json` in its agent directory — so there is
-nothing for a host to log into through ACP itself. Brokering a provider login
-for a worker is the second surface, and it lives on the `_pi/auth/*` extension
-methods described under [Brokering a provider login](#brokering-a-provider-login)
-below.
+ACP agent authentication and pi provider credentials are separate surfaces.
+This adapter advertises no ACP auth methods. A pi session receives provider
+credentials only through an explicit environment or seeded file chosen by the
+host.
 
 ## Standalone credential input
 
-The standalone root supervisor never forwards its ambient environment.
-To pass provider API-key variables, name each variable explicitly in the
-`inheritEnvironment` array of the root-owned
-`-process-isolation-config` policy. The value must be set in the supervisor
-environment or startup fails; identity, path, loader, XDG/native-home, and
-adapter-private variables cannot be inherited. File-backed or provider-broker
-credentials must live only in the explicit target-owned native home described
-by the adapter. No standalone path reads root `HOME`, root native config, or
-an unlisted root credential.
+The standalone root supervisor never forwards its ambient environment. To pass
+a provider API-key variable, name it explicitly in `inheritEnvironment` in the
+root-owned `-process-isolation-config` policy. The variable must be present in
+the supervisor environment or startup fails. Identity, path, loader,
+XDG/native-home, and adapter-private variables cannot be inherited.
+
+File-backed credentials enter through `-seed-file
+auth.json=<hostpath>`. The adapter reads that explicitly named file before
+launch and writes it into each isolated session agent directory. No standalone
+path reads root `HOME`, root pi config, or an unlisted root credential.
 
 ## No ACP auth methods
 
-ACP initialize reports an empty `authMethods` list. A host never calls
-`authenticate` against this adapter, and ACP `logout` is a successful no-op —
-it never touches provider credentials. An
-authentication problem inside pi (a missing or refused provider key) surfaces
-as an ordinary turn failure with cause `provider`, not as an ACP auth
-challenge; see [ACP methods](/docs/reference/acp-methods).
+`initialize` reports `authMethods: []`. A host never calls `authenticate`
+against this adapter, and ACP `logout` is a successful no-op that does not
+touch provider credentials. A missing or refused provider key inside pi is an
+ordinary turn failure with cause `provider`, not an ACP auth challenge.
 
 ## Scrubbed environment
 
-Every pi session runs in an isolated per-session agent directory with a
-scrubbed environment. Ambient shell variables — including provider API keys
-exported in the operator's shell — are **not** inherited by the pi child, so a
-stray `OPENAI_API_KEY` can never silently become a session's identity.
-Credentials reach a session only when the host injects them explicitly.
+Every pi session runs in an isolated per-session agent directory with the
+complete replacement environment supplied by `ProcessIsolation`. Ambient shell
+variables, including provider API keys exported in the operator's shell, are
+not inherited by the pi child.
+
 Explicit environment maps accept ordinary provider variables but reject
 invalid names and process-hijack keys: `PATH`, `NODE_OPTIONS`, `BASH_ENV`,
 `ENV`, every `LD_*`, and every `DYLD_*`. The child-launch boundary scrubs the
@@ -46,20 +42,9 @@ same keys again as defense in depth.
 
 ## Injecting credentials
 
-Pass provider environment variables with `WithEnv` (all sessions) or
-`WithPiEnv` (one session) — pi reads standard provider variables such as
-`ANTHROPIC_API_KEY` and `OPENAI_API_KEY`:
-
-```go
-err := piacp.Serve(ctx, input, output,
-	piacp.WithEnv(map[string]string{
-		"ANTHROPIC_API_KEY": "sk-ant-...",
-	}),
-)
-```
-
-Alternatively, seed a pi `auth.json` into each session's isolated agent
-directory with `WithSeedFiles` (CLI: `-seed-file auth.json=<hostpath>`):
+For embedded use, pass provider variables with `WithEnv` for all sessions or
+`WithPiEnv` for one session. For file-backed credentials, seed pi's
+`auth.json` into each isolated agent directory:
 
 ```go
 err := piacp.Serve(ctx, input, output,
@@ -69,195 +54,13 @@ err := piacp.Serve(ctx, input, output,
 )
 ```
 
-The bundled clients expose the same deliberate path as
-`-auth-file <hostpath>` and forward it as an `auth.json` seed.
+The bundled clients expose the same deliberate file path as `-auth-file
+<hostpath>` and forward it as an `auth.json` seed.
 
-Injected credentials are never written to the session store: `auth.json` and
-the other config files in the agent directory are excluded from mirroring, so
-durable session state carries conversation rows only — see
-[Session store](/docs/features/session-store). Keep secrets in environment
-options wherever possible and prefer seeding `auth.json` only when a provider
-requires pi's own credential file format.
+## Store exclusion
 
-## Brokering a provider login
-
-A worker with no credential path of its own cannot type into pi's interactive
-`/login` dialog. The `_pi/auth/*` extension methods let a host drive that login
-on the worker's behalf: enumerate the provider catalog, start one flow, hand
-back the code the provider issued, report what is resident, and remove it.
-
-The adapter is a broker and never an OAuth client. pi mints, polls, exchanges,
-refreshes, and stores; the adapter relays the presentation, carries one value
-back, and keeps a durable record of which native slot each connection owns.
-
-### Enabling the surface
-
-Two options are required together, and the legs are absent without both:
-
-```go
-err := piacp.Serve(ctx, input, output,
-	piacp.WithHome("/srv/pi/agent"),
-	piacp.WithProviderAuthRoot("/srv/pi/auth"),
-)
-```
-
-`WithHome` is the durable per-instance agent directory a completed login
-installs into. pi's credential refresh takes a cross-process lock keyed on that
-directory, so a per-session agent directory would leave the lock guarding
-nothing and the credential nowhere.
-
-`WithProviderAuthRoot` is the durable directory holding the adapter's
-values-free ledger. It takes an absolute path, and the adapter creates it mode
-`0700`, narrowing a directory that already exists. A root that was asked for
-and could not be created, is not a directory, or is not writable leaves the
-surface unadvertised exactly as an unset one does: a leg that cannot record
-what it did is not offered. A *relative* root is a configuration failure the
-agent reports at construction, alongside a relative `WithInputHandoffRoot` and
-a negative `ImageLimits` field.
-
-`WithProviderAuthDirectHome` is declared and rejected. It gates an
-account-level removal, and pi's removal is a per-provider store call, so there
-is nothing here for it to authorize; a non-empty value fails session start.
-
-### Discovering the legs
-
-When both options are configured, ACP initialize advertises the enabled leg
-names:
-
-```json
-{
-  "agentCapabilities": {
-    "_meta": {
-      "pi": {
-        "providerAuth": {
-          "methods": [
-            "_pi/auth/methods",
-            "_pi/auth/authorize",
-            "_pi/auth/callback",
-            "_pi/auth/status",
-            "_pi/auth/cancel",
-            "_pi/auth/inventory",
-            "_pi/auth/disconnect"
-          ]
-        }
-      }
-    }
-  }
-}
-```
-
-That array is the only discovery surface. There is no `credential` leg and no
-injection key: a completed login installs into the durable agent directory and
-rotates there under pi's own lock, so nothing is brokered back out and no
-credential is accepted in.
-
-### Driving one login
-
-1. **`methods`** returns the catalog and an opaque `generation` naming that
-   exact result. Each provider carries at most one `oauth` entry and at most
-   one `api` entry, and a provider whose api-key auth is ambient-only carries
-   neither. The catalog declares no prompts: pi's provider enumeration exposes
-   none, so `authorize` carries no `inputs` and the adapter answers a native
-   question with a fixed value of its own or not at all.
-2. **`authorize`** takes that `generation` as `methodsGeneration` plus a
-   caller-minted `authorizeRequestId`. An `oauth` method starts the native
-   login and returns its presentation — `interaction: "callback"` with a URL
-   and a `callbackInput`, or `interaction: "wait"` with a device code and a
-   poll hint. An `api` method mints nothing and returns
-   `interaction: "secret"`.
-3. **`callback`** submits the one value the flow expects: the authorization
-   code for a paste-back login, the operator's key for a secret one. It returns
-   after pi reports a terminal outcome. A `wait` flow expects no value and takes
-   no `callback`: it settles from the native login itself, and `status` is where
-   a host reads that.
-4. **`status`** reports the flow, not the connection. Its `expiresAt` is
-   credential expiry and never flow expiry.
-5. **`cancel`** disarms the adapter's deadline, dismisses the native prompt, and
-   aborts the native login. It claims nothing about the provider: an issued
-   device code stays valid there until it expires. A flow has exactly one
-   terminal transition, so a native answer that arrives after the owner
-   cancelled reports `flow_cancelled` and confirms nothing.
-6. **`inventory`** answers residence from the ledger *and* a probe of the named
-   native slot, reporting `confirmed_present`, `confirmed_absent`, or
-   `not_confirmed`. It never reports an ambient or externally established
-   credential.
-7. **`disconnect`** bumps the binding generation, removes only the exactly
-   fenced slot, and verifies absence afterwards.
-
-Repeating an `authorizeRequestId` replays the recorded presentation and
-`flowId` verbatim with no native call, for as long as the session lives — a
-repeat arriving while the first mint is still running waits for it, and one
-arriving after the flow has completed, failed, or been cancelled still answers.
-A *different* one supersedes the flow, after which the old `flowId` addresses
-nothing.
-
-### What crosses the boundary
-
-Only four native presentation strings reach a host — `url`, `message`,
-`userCode`, and a catalog `label` — each bounded and NFC-normalised before it is
-relayed. Native error text never crosses at all: every failure becomes
-`pi_auth_failed` with a closed `cause`. A caller addressing failure (an unknown
-`flowId`, a superseded `methodsGeneration`, a `method` that is not the flow's)
-is invalid params with the field path instead.
-
-`connectionId` crosses the other way. It is caller-minted and bounded to at most
-128 bytes of `A-Z`, `a-z`, `0-9`, `-`, and `_`; `authorize` and `disconnect`
-each check it before the value is compared or recorded, and anything outside
-that shape is invalid params naming `connectionId`. It is never normalised,
-because `disconnect` compares it byte for byte with what `authorize` recorded.
-
-A submitted credential beginning with `!` is refused. pi executes such a value
-as a shell command and caches its stdout as the key, so a brokered value
-reaching that field would be a remote command channel into the worker.
-
-### What the ledger holds
-
-The ledger under `WithProviderAuthRoot` records provider slot identity,
-connection ID, revision, binding generation, flow ID, `authorizeRequestId`,
-state, and timestamps — nothing else. It never holds credential material,
-authorization URLs, user codes, or prompt answers, and neither does the
-[session store](/docs/features/session-store). Writes are atomic and fsynced,
-and the files are `0700`/`0600` whatever mode pi gives its own agent directory.
-
-The ledger is a crash-consistency record, not a security control: it lives
-under the worker's own UID, beside the harness that runs model-authored code as
-that same user.
-
-### Limits worth knowing
-
-- A login whose completion lands on a loopback listener is refused at mint time
-  with `cause: "unsupported_variant"` — the owner's browser cannot reach the
-  worker's socket.
-- An oauth login never opens a browser on the machine running the worker. The
-  session's child runs behind a directory of no-op browser launchers, and on a
-  platform where that cannot be arranged the mint is refused with
-  `cause: "policy"` — see [Security](/docs/operations/security).
-- pi's enumeration exposes login methods and display names but not the
-  environment-variable names behind an api-key method, and it exposes no prompt
-  schema at all. Because the catalog cannot advertise a question, no host answer
-  can reach one, and what the adapter answers with is fixed per question type
-  and carries no value of its own: a login-variant choice is answered with its
-  device-code branch, the only branch whose completion does not land on a socket
-  the owner's browser cannot reach; a free-text question is answered empty,
-  which declines the optional value and leaves the login on the vendor default
-  it already has; a credential question is answered only by the value the flow
-  was given; and everything else fails the flow closed with
-  `cause: "native_veto"`.
-- A terminal flow aborts its native login. pi's device logins park no prompt, so
-  a cancelled or expired flow that only dismissed prompts would leave an issued
-  user code approvable, and an approval landing afterwards would write a
-  credential into the durable agent directory under a ledger entry no leg will
-  ever confirm.
-- Two legs addressing the same flow, the same `(sessionId, providerId)`, or the
-  same provider's credential slot are admitted one at a time. A repeated
-  `authorizeRequestId` arriving while the first is still minting waits and
-  replays it instead of starting a second login; a second `callback` for one
-  flow is refused with `cause: "flow_state"`; and a `disconnect` never
-  interleaves with a login completion, so a `removed` ledger entry never names a
-  credential that is still resident. A caller that gives up while its leg is
-  queued gets `cause: "timeout"`.
-- Closing the session ends the flows it owns. An `authorize` still in flight when
-  `session/close` runs is refused with the uniform unknown-session error rather
-  than leaving a login running against a process already being torn down.
-- `pi login` is not a command. The only native login path is the interactive
-  slash command, which is what these legs drive.
+Injected credentials are never written to the session store. `auth.json` and
+other agent-directory config files are excluded from mirroring, so durable
+session state carries conversation rows only. Prefer environment injection
+where possible and seed `auth.json` only when a provider requires pi's file
+format.

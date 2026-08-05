@@ -209,22 +209,6 @@ func TestStartSessionEarlyFailureBranches(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestStartSessionRejectsProviderAuthDirectHome pins the consent gate: pi
-// removes a credential through a per-provider store call and has no
-// account-level leg to gate, so a configured direct home fails at session start
-// with the unsupported-option error on every establishing path.
-func TestStartSessionRejectsProviderAuthDirectHome(t *testing.T) {
-	agent := NewAgent(
-		WithExecutablePath("/fake/pi"),
-		WithProviderAuthDirectHome(t.TempDir()),
-		WithLogger(slog.New(slog.DiscardHandler)),
-	)
-	agent.versionChecked = true
-
-	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-	requireInvalidParams(t, err)
-}
-
 func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
 	for _, key := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BAD-NAME"} {
 		t.Run(key, func(t *testing.T) {
@@ -593,15 +577,33 @@ func TestCurrentUsageAndListPaginationHelpers(t *testing.T) {
 func TestStartSessionFailureBranches(t *testing.T) {
 	baseAgent := func() *Agent {
 		agent := NewAgent(testContainmentOption(), WithExecutablePath("/fake/pi"), WithScratchDir(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
-		agent.probeVersion = func(context.Context, string, pi.ContainmentSpec) (string, error) {
+		agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
 			return pi.DefaultMinimumVersion, nil
 		}
 
 		return agent
 	}
 
+	originalMkdirTemp := materializeMkdirTemp
+	originalHandoff := agentSessionHandoffNativeTree
+	t.Cleanup(func() {
+		materializeMkdirTemp = originalMkdirTemp
+		agentSessionHandoffNativeTree = originalHandoff
+	})
 	agent := baseAgent()
-	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd", ResumeID: "id"})
+	materializeMkdirTemp = func(string, string) (string, error) { return "", errors.New("session root") }
+	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	require.Error(t, err)
+	materializeMkdirTemp = originalMkdirTemp
+
+	agent = baseAgent()
+	agentSessionHandoffNativeTree = func(string, *ProcessIsolation) error { return errors.New("handoff") }
+	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	require.ErrorContains(t, err, "handoff")
+	agentSessionHandoffNativeTree = originalHandoff
+
+	agent = baseAgent()
+	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd", ResumeID: "id"})
 	require.ErrorIs(t, err, errUnknownStoredSession)
 
 	agent = baseAgent()
@@ -625,6 +627,12 @@ func TestStartSessionFailureBranches(t *testing.T) {
 	agent.options.SeedFiles = map[string]string{"../bad": "value"}
 	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	requireInvalidParams(t, err)
+
+	agent = baseAgent()
+	agent.options.ProcessIsolation.UID = uint32(os.Geteuid()) + 1
+	agent.options.ProcessIsolation.GID = uint32(os.Getegid()) + 1
+	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	require.Error(t, err)
 
 	agent = baseAgent()
 	client = newStubPiClient()

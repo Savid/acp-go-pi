@@ -28,6 +28,7 @@ func restoreMaterializeSeams(t *testing.T) {
 	t.Helper()
 	mkdirAll := materializeMkdirAll
 	mkdirTemp := materializeMkdirTemp
+	chmod := materializeChmod
 	removeAll := materializeRemoveAll
 	writeFile := materializeWriteFile
 	stat := materializeStat
@@ -37,6 +38,7 @@ func restoreMaterializeSeams(t *testing.T) {
 	t.Cleanup(func() {
 		materializeMkdirAll = mkdirAll
 		materializeMkdirTemp = mkdirTemp
+		materializeChmod = chmod
 		materializeRemoveAll = removeAll
 		materializeWriteFile = writeFile
 		materializeStat = stat
@@ -75,11 +77,13 @@ func TestSessionFilesystemHelpers(t *testing.T) {
 func TestMaterializeFaultBranches(t *testing.T) {
 	originalMkdirAll := materializeMkdirAll
 	originalMkdirTemp := materializeMkdirTemp
+	originalChmod := materializeChmod
 	originalRemoveAll := materializeRemoveAll
 	originalWriteFile := materializeWriteFile
 	t.Cleanup(func() {
 		materializeMkdirAll = originalMkdirAll
 		materializeMkdirTemp = originalMkdirTemp
+		materializeChmod = originalChmod
 		materializeRemoveAll = originalRemoveAll
 		materializeWriteFile = originalWriteFile
 	})
@@ -93,6 +97,10 @@ func TestMaterializeFaultBranches(t *testing.T) {
 	_, err = agent.createSessionDirs()
 	require.Error(t, err)
 	materializeMkdirTemp = originalMkdirTemp
+	materializeChmod = func(string, os.FileMode) error { return errors.New("chmod") }
+	_, err = agent.createSessionDirs()
+	require.Error(t, err)
+	materializeChmod = originalChmod
 
 	calls := 0
 	materializeMkdirAll = func(path string, mode os.FileMode) error {

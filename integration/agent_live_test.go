@@ -23,7 +23,7 @@ func livePiOptions(t *testing.T) []piacp.Option {
 
 	options := []piacp.Option{
 		piacp.WithExecutablePath(livePiPath(t)),
-		piacp.WithScratchDir(t.TempDir()),
+		piacp.WithScratchDir(integrationScratchDir(t)),
 		livePiAuthSeed(t),
 	}
 
@@ -44,7 +44,7 @@ func TestPiACPLivePromptTurn(t *testing.T) {
 	client := &recordingClient{}
 	conn := connectAgentForTest(t, ctx, client, livePiOptions(t)...)
 
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir()))
+	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t)))
 	require.NoError(t, err)
 
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
@@ -68,7 +68,7 @@ func TestPiACPLiveCancel(t *testing.T) {
 	client := &recordingClient{}
 	conn := connectAgentForTest(t, ctx, client, livePiOptions(t)...)
 
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir()))
+	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t)))
 	require.NoError(t, err)
 
 	promptDone := make(chan acp.PromptResponse, 1)
@@ -117,7 +117,7 @@ func TestPiACPLivePermissionGate(t *testing.T) {
 	client := &recordingClient{permissionChoice: permissionChoiceAllow}
 	conn := connectAgentForTest(t, ctx, client, livePiOptions(t)...)
 
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir()))
+	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t)))
 	require.NoError(t, err)
 
 	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
@@ -140,7 +140,7 @@ func TestPiACPLivePermissionDeny(t *testing.T) {
 	client := &recordingClient{permissionChoice: permissionChoiceDeny}
 	conn := connectAgentForTest(t, ctx, client, livePiOptions(t)...)
 
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir()))
+	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t)))
 	require.NoError(t, err)
 
 	// A denied tool call fails closed natively; the turn itself still
@@ -164,7 +164,7 @@ func TestPiACPLiveRawEventsOptIn(t *testing.T) {
 	client := &recordingClient{}
 	conn := connectAgentForTest(t, ctx, client, livePiOptions(t)...)
 
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(t.TempDir(),
+	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t),
 		piacp.WithSessionRawEvents(true)))
 	require.NoError(t, err)
 
@@ -186,7 +186,7 @@ func TestPiACPLiveForkSession(t *testing.T) {
 	client := &recordingClient{}
 	conn := connectAgentForTest(t, ctx, client, livePiOptions(t)...)
 
-	cwd := t.TempDir()
+	cwd := integrationWorkspaceDir(t)
 	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(cwd))
 	require.NoError(t, err)
 

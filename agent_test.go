@@ -35,7 +35,7 @@ func TestAgentDirectSurfaceAndVersionChecks(t *testing.T) {
 	require.Equal(t, -32601, requestError.Code)
 
 	agent.lookPath = func(string) (string, error) { return "/fake/pi", nil }
-	agent.probeVersion = func(context.Context, string, pi.ContainmentSpec) (string, error) {
+	agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
 		return pi.DefaultMinimumVersion, nil
 	}
 	require.NoError(t, agent.ensureVersion(t.Context()))
@@ -45,10 +45,12 @@ func TestAgentDirectSurfaceAndVersionChecks(t *testing.T) {
 	missing.lookPath = func(string) (string, error) { return "", errors.New("missing") }
 	require.Error(t, missing.ensureVersion(t.Context()))
 	probe := NewAgent(testContainmentOption(), WithExecutablePath("/fake/pi"), WithLogger(slog.New(slog.DiscardHandler)))
-	probe.probeVersion = func(context.Context, string, pi.ContainmentSpec) (string, error) { return "", errors.New("probe") }
+	probe.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
+		return "", errors.New("probe")
+	}
 	require.Error(t, probe.ensureVersion(t.Context()))
 	old := NewAgent(testContainmentOption(), WithExecutablePath("/fake/pi"), WithLogger(slog.New(slog.DiscardHandler)))
-	old.probeVersion = func(context.Context, string, pi.ContainmentSpec) (string, error) { return "0.1.0", nil }
+	old.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) { return "0.1.0", nil }
 	require.Error(t, old.ensureVersion(t.Context()))
 	withoutIsolation := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	require.Error(t, withoutIsolation.ensureVersion(t.Context()))
@@ -215,7 +217,7 @@ func TestServeReturnsIncompleteFailedSpawnWithoutInstalledSession(t *testing.T) 
 			WithScratchDir(t.TempDir()),
 			WithLogger(slog.New(slog.DiscardHandler)),
 		)...)
-		agent.probeVersion = func(context.Context, string, pi.ContainmentSpec) (string, error) {
+		agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
 			return pi.DefaultMinimumVersion, nil
 		}
 		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
@@ -242,7 +244,7 @@ func TestCloseAndServeJoinAdmittedIncompleteSessionConstruction(t *testing.T) {
 		WithScratchDir(t.TempDir()),
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
-	agent.probeVersion = func(context.Context, string, pi.ContainmentSpec) (string, error) {
+	agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
 		return pi.DefaultMinimumVersion, nil
 	}
 	spawnStarted := make(chan struct{})

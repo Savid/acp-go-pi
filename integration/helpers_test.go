@@ -12,8 +12,10 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -36,12 +38,103 @@ const (
 
 var integrationLogger = slog.New(slog.DiscardHandler)
 
+type integrationTargetIdentity struct {
+	uid      uint32
+	gid      uint32
+	username string
+	home     string
+}
+
+func integrationLinuxTargetIdentity(t *testing.T) integrationTargetIdentity {
+	t.Helper()
+
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("production process-isolation integration requires a Linux root supervisor")
+	}
+	account, err := user.LookupId(strconv.FormatUint(uint64(nativeBrowserCanaryUID), 10))
+	if err != nil {
+		t.Skip("production process-isolation integration requires the provisioned native-canary account")
+	}
+	accountGID, err := strconv.ParseUint(account.Gid, 10, 32)
+	require.NoError(t, err)
+	require.Equal(t, nativeBrowserCanaryGID, uint32(accountGID))
+	require.Equal(t, "native-canary", account.Username)
+	require.Equal(t, "/home/native-canary", filepath.Clean(account.HomeDir))
+
+	return integrationTargetIdentity{
+		uid: nativeBrowserCanaryUID, gid: nativeBrowserCanaryGID,
+		username: account.Username, home: filepath.Clean(account.HomeDir),
+	}
+}
+
+func integrationProductionEnvironment(target integrationTargetIdentity) map[string]string {
+	return map[string]string{
+		"HOME":    target.home,
+		"LANG":    "C.UTF-8",
+		"LOGNAME": target.username,
+		"PATH":    "/usr/local/bin:/usr/local/go/bin:/usr/bin:/bin",
+		"USER":    target.username,
+	}
+}
+
+func integrationScratchDir(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("/tmp", "acp-go-pi-integration-scratch-")
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(dir, 0o755))
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	return dir
+}
+
+func integrationWorkspaceDir(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("/tmp", "acp-go-pi-integration-workspace-")
+	require.NoError(t, err)
+	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
+		target := integrationLinuxTargetIdentity(t)
+		require.NoError(t, os.Chown(dir, int(target.uid), int(target.gid)))
+	}
+	require.NoError(t, os.Chmod(dir, 0o700))
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	return dir
+}
+
+func integrationBaseEnvironment(t *testing.T) map[string]string {
+	t.Helper()
+
+	account, err := user.LookupId(strconv.Itoa(os.Geteuid()))
+	require.NoError(t, err)
+	home := t.TempDir()
+
+	return map[string]string{
+		"HOME":    home,
+		"LANG":    "C.UTF-8",
+		"LOGNAME": account.Username,
+		"PATH":    os.Getenv("PATH"),
+		"USER":    account.Username,
+	}
+}
+
+func integrationProcessIsolationOption(t *testing.T) piacp.Option {
+	t.Helper()
+
+	target := integrationLinuxTargetIdentity(t)
+
+	return piacp.WithProcessIsolation(piacp.ProcessIsolation{
+		UID:                 target.uid,
+		GID:                 target.gid,
+		BaseEnvironment:     integrationProductionEnvironment(target),
+		StandaloneOwnerID:   "acp-go-pi-integration",
+		StandaloneStateRoot: target.home,
+	})
+}
+
 func integrationContainmentSpec(t *testing.T) internalpi.ContainmentSpec {
 	t.Helper()
-	if runtime.GOOS != "darwin" {
-		return internalpi.ContainmentSpec{}
-	}
-
 	parent := t.TempDir()
 	root, err := os.MkdirTemp(parent, "acp-go-pi-runtime-*")
 	require.NoError(t, err)
@@ -49,13 +142,45 @@ func integrationContainmentSpec(t *testing.T) internalpi.ContainmentSpec {
 	_, err = rand.Read(identity)
 	require.NoError(t, err)
 
+	uid, gid := os.Geteuid(), os.Getegid()
+	if uid == 0 || gid == 0 {
+		uid, gid = 65534, 65534
+	}
+
 	return internalpi.ContainmentSpec{
-		DarwinBestEffort: true,
+		DarwinBestEffort: runtime.GOOS == "darwin",
 		ScratchParent:    parent,
 		GenerationRoot:   root,
 		RuntimeID:        hex.EncodeToString(identity),
 		LifecycleKind:    "discovery",
+		Isolation: &internalpi.ProcessIsolation{
+			UID: uint32(uid), GID: uint32(gid),
+			BaseEnvironment:      integrationBaseEnvironment(t),
+			TestOnlyNoCredential: true,
+		},
 	}
+}
+
+func integrationVersionProbeSpec(t *testing.T) (string, internalpi.ContainmentSpec) {
+	t.Helper()
+	containment := integrationContainmentSpec(t)
+	agentDir := filepath.Join(containment.GenerationRoot, "probe-agent")
+	require.NoError(t, (internalpi.AgentDir{Root: agentDir}).Write())
+
+	return agentDir, containment
+}
+
+func expectedBuiltinCommandNames(t *testing.T, executable string) []string {
+	t.Helper()
+
+	agentDir, containment := integrationVersionProbeSpec(t)
+	version, err := internalpi.ProbeVersion(t.Context(), executable, agentDir, containment)
+	require.NoError(t, err)
+	if internalpi.CheckMinimumVersion(version, "0.81.0") == nil {
+		return []string{"llama"}
+	}
+
+	return []string{}
 }
 
 // integrationContainmentOption opts the in-process agent into Darwin
@@ -77,6 +202,9 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	slog.SetDefault(previousLogger)
+	if fakePiTargetBinaryRoot != "" {
+		_ = os.RemoveAll(fakePiTargetBinaryRoot)
+	}
 	os.Exit(code)
 }
 
@@ -188,12 +316,13 @@ func serveAgentRawForTest(t *testing.T, ctx context.Context, opts ...piacp.Optio
 	c2aR, c2aW := io.Pipe()
 	a2cR, a2cW := io.Pipe()
 	serveCtx, stopServe := context.WithCancel(ctx)
+	baseOptions := []piacp.Option{
+		piacp.WithLogger(integrationLogger), integrationContainmentOption(), integrationProcessIsolationOption(t),
+	}
 
 	serveErr := make(chan error, 1)
 	go func() {
-		options := append([]piacp.Option{
-			piacp.WithLogger(integrationLogger), integrationContainmentOption(),
-		}, opts...)
+		options := append(baseOptions, opts...)
 		serveErr <- piacp.Serve(serveCtx, c2aR, a2cW, options...)
 	}()
 
@@ -271,7 +400,7 @@ func connectFakeAgentForTest(
 
 	options := append([]piacp.Option{
 		piacp.WithExecutablePath(fakePiExecutable(t, scenario)),
-		piacp.WithScratchDir(t.TempDir()),
+		piacp.WithScratchDir(integrationScratchDir(t)),
 	}, opts...)
 
 	return connectAgentForTest(t, ctx, client, options...)
@@ -334,11 +463,35 @@ func agentBinaryPath(t *testing.T) string {
 func agentCommand(t *testing.T, ctx context.Context, args ...string) *exec.Cmd {
 	t.Helper()
 
-	if runtime.GOOS == "darwin" {
-		args = append([]string{"-darwin-best-effort-containment"}, args...)
-	}
-
 	return exec.CommandContext(ctx, agentBinaryPath(t), args...) // #nosec G204,G702 -- test-built wrapper binary.
+}
+
+func standaloneAgentCommand(t *testing.T, ctx context.Context, args ...string) *exec.Cmd {
+	t.Helper()
+
+	target := integrationLinuxTargetIdentity(t)
+	policyRoot, err := os.MkdirTemp("/root", "acp-go-pi-integration-policy-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(policyRoot)) })
+	policyPath := filepath.Join(policyRoot, "policy.json")
+	policy, err := json.Marshal(struct {
+		UID                 uint32            `json:"uid"`
+		GID                 uint32            `json:"gid"`
+		BaseEnvironment     map[string]string `json:"baseEnvironment"`
+		InheritEnvironment  []string          `json:"inheritEnvironment"`
+		StandaloneOwnerID   string            `json:"standaloneOwnerId"`
+		StandaloneStateRoot string            `json:"standaloneStateRoot"`
+	}{
+		UID: target.uid, GID: target.gid,
+		BaseEnvironment: integrationProductionEnvironment(target), InheritEnvironment: []string{},
+		StandaloneOwnerID: "acp-go-pi-integration", StandaloneStateRoot: target.home,
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(policyPath, policy, 0o600))
+
+	args = append(args, "-process-isolation-config", policyPath)
+
+	return agentCommand(t, ctx, args...)
 }
 
 type liveAgent struct {
@@ -352,7 +505,21 @@ type liveAgent struct {
 func startAgentBinary(t *testing.T, ctx context.Context, args ...string) *liveAgent {
 	t.Helper()
 
-	cmd := agentCommand(t, ctx, args...)
+	hasPolicy := false
+	for index, arg := range args {
+		if arg == "-process-isolation-config" && index+1 < len(args) {
+			hasPolicy = true
+
+			break
+		}
+	}
+
+	var cmd *exec.Cmd
+	if hasPolicy {
+		cmd = agentCommand(t, ctx, args...)
+	} else {
+		cmd = standaloneAgentCommand(t, ctx, args...)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)

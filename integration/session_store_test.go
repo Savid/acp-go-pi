@@ -26,8 +26,8 @@ func TestPiACPFakeStoreResumeAfterNativeDeletion(t *testing.T) {
 
 	store := piacp.NewInMemorySessionStore()
 	fakePath := fakePiExecutable(t, fakeTurnScenario())
-	scratchDir := t.TempDir()
-	cwd := t.TempDir()
+	scratchDir := integrationScratchDir(t)
+	cwd := integrationWorkspaceDir(t)
 
 	client := &recordingClient{}
 	conn := connectAgentForTest(t, ctx, client,
@@ -56,7 +56,7 @@ func TestPiACPFakeStoreResumeAfterNativeDeletion(t *testing.T) {
 	resumeClient := &recordingClient{}
 	resumeConn := connectAgentForTest(t, ctx, resumeClient,
 		piacp.WithExecutablePath(fakePath),
-		piacp.WithScratchDir(t.TempDir()),
+		piacp.WithScratchDir(integrationScratchDir(t)),
 		piacp.WithSessionStore(store),
 	)
 
@@ -80,12 +80,12 @@ func TestPiACPFakeStoreLoadReplaysHistory(t *testing.T) {
 
 	store := piacp.NewInMemorySessionStore()
 	fakePath := fakePiExecutable(t, fakeTurnScenario())
-	cwd := t.TempDir()
+	cwd := integrationWorkspaceDir(t)
 
 	client := &recordingClient{}
 	conn := connectAgentForTest(t, ctx, client,
 		piacp.WithExecutablePath(fakePath),
-		piacp.WithScratchDir(t.TempDir()),
+		piacp.WithScratchDir(integrationScratchDir(t)),
 		piacp.WithSessionStore(store),
 	)
 
@@ -101,7 +101,7 @@ func TestPiACPFakeStoreLoadReplaysHistory(t *testing.T) {
 	loadClient := &recordingClient{}
 	loadConn := connectAgentForTest(t, ctx, loadClient,
 		piacp.WithExecutablePath(fakePath),
-		piacp.WithScratchDir(t.TempDir()),
+		piacp.WithScratchDir(integrationScratchDir(t)),
 		piacp.WithSessionStore(store),
 	)
 
@@ -133,8 +133,8 @@ func TestPiACPLiveStoreResume(t *testing.T) {
 	defer cancel()
 
 	store := piacp.NewInMemorySessionStore()
-	scratchDir := t.TempDir()
-	cwd := t.TempDir()
+	scratchDir := integrationScratchDir(t)
+	cwd := integrationWorkspaceDir(t)
 
 	options := append(livePiOptions(t), piacp.WithSessionStore(store))
 	options = append(options, piacp.WithScratchDir(scratchDir))

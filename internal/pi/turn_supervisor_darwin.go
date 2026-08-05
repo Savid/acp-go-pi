@@ -35,7 +35,8 @@ var (
 	darwinLaunchExec         = syscall.Exec
 	darwinLaunchInput        = inheritedDarwinLaunchInput
 	darwinLaunchOpenFile     = os.NewFile
-	darwinLaunchCloseOnExec  = unix.CloseOnExec
+	darwinLaunchFcntl        = unix.FcntlInt
+	darwinLaunchCloseOnExec  = setDarwinLaunchCloseOnExec
 	darwinLaunchCreateTemp   = os.CreateTemp
 	darwinLaunchFileChmod    = func(file *os.File, mode os.FileMode) error { return file.Chmod(mode) }
 	darwinLaunchEncodeConfig = func(file *os.File, config darwinLaunchConfig) error { return json.NewEncoder(file).Encode(config) }
@@ -105,9 +106,24 @@ func inheritedDarwinLaunchInput() (io.ReadCloser, io.ReadCloser, io.WriteCloser,
 		return configFile, gate, status, errors.New("darwin native launch descriptors are unavailable")
 	}
 
-	darwinLaunchCloseOnExec(int(status.Fd()))
+	if err := darwinLaunchCloseOnExec(int(status.Fd())); err != nil {
+		return configFile, gate, status, err
+	}
 
 	return configFile, gate, status, nil
+}
+
+func setDarwinLaunchCloseOnExec(fd int) error {
+	flags, err := darwinLaunchFcntl(uintptr(fd), unix.F_GETFD, 0)
+	if err != nil {
+		return fmt.Errorf("read inherited Pi Darwin launch descriptor flags: %w", err)
+	}
+
+	if _, err = darwinLaunchFcntl(uintptr(fd), unix.F_SETFD, flags|unix.FD_CLOEXEC); err != nil {
+		return fmt.Errorf("protect inherited Pi Darwin launch descriptor from exec: %w", err)
+	}
+
+	return nil
 }
 
 func runDarwinLaunchBootstrap(configInput io.ReadCloser, gate io.ReadCloser) error {
