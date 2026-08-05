@@ -156,6 +156,33 @@ func TestEnsureVersionProbeResidenceLifetime(t *testing.T) {
 	}
 }
 
+func TestEnsureVersionFinalizesFailedProbeResidence(t *testing.T) {
+	restoreRuntimeGenerationSeams(t)
+	wantErr := errors.New("materialize probe")
+	runtimeGenerationWriteProbeAgentDir = func(string) error { return wantErr }
+	released := 0
+	agent := NewAgent(
+		testContainmentOption(),
+		WithExecutablePath("/fake/pi"),
+		WithScratchDir(t.TempDir()),
+		WithRuntimeResourceHooks(RuntimeResourceHooks{
+			ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+				return func() { released++ }, nil
+			},
+		}),
+	)
+
+	require.ErrorIs(t, agent.ensureVersion(t.Context()), wantErr)
+	require.Equal(t, 1, released)
+}
+
+func TestNativeOwnershipIsolation(t *testing.T) {
+	require.Nil(t, (*Agent)(nil).nativeOwnershipIsolation())
+	require.Nil(t, (&Agent{options: Options{testOnlyNoCredential: true}}).nativeOwnershipIsolation())
+	isolation := &ProcessIsolation{UID: 11, GID: 22}
+	require.Same(t, isolation, (&Agent{options: Options{ProcessIsolation: isolation}}).nativeOwnershipIsolation())
+}
+
 func environmentValue(environment []string, key string) string {
 	prefix := key + "="
 	for _, entry := range environment {

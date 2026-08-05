@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -140,10 +141,15 @@ func spawnFailureError(err error, proc piProcess) error {
 		}
 	}
 
-	return acp.NewInternalError(map[string]any{
+	requestErr := acp.NewInternalError(map[string]any{
 		jsonFieldError:   "pi_session_start_failed",
 		jsonFieldMessage: message,
 	})
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return errors.Join(requestErr, err)
+	}
+
+	return requestErr
 }
 
 // emptyCloneError reports whether a native command failure names a missing

@@ -49,6 +49,23 @@ func TestNewSessionBackpressure(t *testing.T) {
 	requireInvalidRequest(t, err)
 }
 
+func TestNewSessionPreservesStartupCancellation(t *testing.T) {
+	for _, sentinel := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			client := newStubPiClient()
+			client.autoRetryErr = fmt.Errorf("configure native retry: %w", sentinel)
+			agent := newStubClientAgent(t, client)
+			t.Cleanup(func() { require.NoError(t, agent.Close()) })
+
+			_, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+			require.ErrorIs(t, err, sentinel)
+			require.ErrorContains(t, err, "configure native retry")
+			var requestErr *acp.RequestError
+			require.ErrorAs(t, err, &requestErr)
+		})
+	}
+}
+
 func TestRestoreSessionAdditionalBranches(t *testing.T) {
 	entries := []SessionStoreEntry{
 		json.RawMessage(`{"type":"session","id":"resume-id","cwd":"/cwd"}`),
