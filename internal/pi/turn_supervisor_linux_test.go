@@ -195,11 +195,13 @@ func TestSupervisorIdentityDispositionRequiresExplicitAuthorityOriginAndExactSta
 		"unknown_origin": func() turnSupervisorConfig {
 			value := base
 			value.AuthorityOrigin = "unknown"
+
 			return value
 		}(),
 		"borrowed_with_owner": func() turnSupervisorConfig {
 			value := validBorrowed
 			value.StandaloneOwner = &owner
+
 			return value
 		}(),
 		"standalone_no_owner": func() turnSupervisorConfig {
@@ -377,6 +379,7 @@ func TestInheritedTurnSupervisorInputAndEnable(t *testing.T) {
 	closeOnExec := 0
 	turnSupervisorFcntl = func(uintptr, int, int) (int, error) {
 		closeOnExec++
+
 		return 0, nil
 	}
 	config, control, ready, err := inheritedTurnSupervisorInput()
@@ -987,17 +990,17 @@ func TestProcessIsolationActualPiFastExitCompletionCanPrecedeGuardianReadiness(t
 		Env:       []string{"PATH=/usr/bin:/bin"},
 		Isolation: *supervisorTestIsolation(),
 	})
-	if err := runTurnSupervisorGuardian(config, controlRead, readyWrite); err != nil {
-		t.Fatalf("fast native guardian path: %v", err)
+	if runErr := runTurnSupervisorGuardian(config, controlRead, readyWrite); runErr != nil {
+		t.Fatalf("fast native guardian path: %v", runErr)
 	}
 	if hookErr != nil {
 		t.Fatal(hookErr)
 	}
-	if err := readyWrite.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := readyWrite.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
-	if err := completionWrite.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := completionWrite.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	launch := &processTreeCommand{ready: readyRead}
 	if err = awaitProcessTreeReady(launch); err != nil {

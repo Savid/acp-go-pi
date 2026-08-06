@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -959,4 +960,11 @@ func TestDarwinFastExitRaceStress(t *testing.T) {
 	for err := range errs {
 		require.NoError(t, err)
 	}
+}
+
+func setTestIsolationBootstrapEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv(envIsolationUID, strconv.Itoa(os.Geteuid()))
+	t.Setenv(envIsolationGID, strconv.Itoa(os.Getegid()))
+	t.Setenv(envIsolationTest, "true")
 }

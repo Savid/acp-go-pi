@@ -31,8 +31,9 @@ const (
 )
 
 const (
-	handoffMetaKey = "acp-go.dev/handoff"
-	handoffVersion = 1
+	handoffMetaKey   = "acp-go.dev/handoff"
+	handoffParentDir = ".."
+	handoffVersion   = 1
 
 	handoffFieldVersion   = "version"
 	handoffFieldDigest    = "digest"
@@ -292,7 +293,7 @@ func handoffFilePath(uri *string) (string, *handoffError) {
 // resolved path inside it.
 func handoffRelativePath(root string, path string) (string, *handoffError) {
 	rel, err := filepath.Rel(filepath.Clean(root), path)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if err != nil || rel == handoffParentDir || strings.HasPrefix(rel, handoffParentDir+string(filepath.Separator)) {
 		return "", &handoffError{value: imageErrorPathNotAllowed, message: handoffOutsideRootMessage}
 	}
 

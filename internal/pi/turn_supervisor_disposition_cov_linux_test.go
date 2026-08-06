@@ -269,7 +269,7 @@ func TestTurnSupervisorCovDispositionDispatchesOnTheDeclaredAuthorityOrigin(t *t
 	unknown := base
 	unknown.AuthorityOrigin = "hijack"
 	err = validateTurnSupervisorConfigDisposition(unknown, true)
-	if err == nil || !strings.Contains(err.Error(), `Pi authority origin "hijack" is invalid`) {
+	if err == nil || !strings.Contains(err.Error(), `pi authority origin "hijack" is invalid`) {
 		t.Fatalf("unknown authority origin = %v", err)
 	}
 }

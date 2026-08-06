@@ -128,7 +128,7 @@ func rebaseGenerationPath(path string, oldRoot string, newRoot string) (string, 
 	}
 
 	relative, err := materializeRel(oldRoot, path)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+	if err != nil || relative == handoffParentDir || strings.HasPrefix(relative, handoffParentDir+string(filepath.Separator)) {
 		return "", fmt.Errorf("runtime generation path %q is outside %q", path, oldRoot)
 	}
 

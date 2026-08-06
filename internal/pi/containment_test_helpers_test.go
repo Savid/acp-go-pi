@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"testing"
 )
 
@@ -54,11 +53,4 @@ func testVersionProbeSpec(t *testing.T) (string, ContainmentSpec) {
 	}
 
 	return agentDir, containment
-}
-
-func setTestIsolationBootstrapEnv(t *testing.T) {
-	t.Helper()
-	t.Setenv(envIsolationUID, strconv.Itoa(os.Geteuid()))
-	t.Setenv(envIsolationGID, strconv.Itoa(os.Getegid()))
-	t.Setenv(envIsolationTest, "true")
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,8 +30,8 @@ var (
 )
 
 func handoffGeneratedNativeTreePlatform(root string, uid uint32, gid uint32) error {
-	trustedUID := uint32(os.Geteuid())
-	trustedGID := uint32(os.Getegid())
+	trustedUID := effectiveUID()
+	trustedGID := effectiveGID()
 
 	directory, err := openNativeOwnershipDirectory(root, func(stat unix.Stat_t, final bool) error {
 		return validateGeneratedNativeAncestor(stat, final, trustedUID, trustedGID, uid, gid)
@@ -171,7 +172,7 @@ func handoffNativeOwnershipDirectory(
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == "." || name == ".." || strings.ContainsRune(name, '/') {
+		if name == "." || name == handoffParentDir || strings.ContainsRune(name, '/') {
 			return fmt.Errorf("invalid generated native entry %q", name)
 		}
 
@@ -280,4 +281,37 @@ func chownAndVerifyNativeInode(fd int, kind uint32, uid uint32, gid uint32, sing
 	}
 
 	return nil
+}
+
+// Seams for the fail-closed guards below. Linux cannot produce a uid or gid
+// outside the 32 bits it stores them in, so the guards are unreachable through
+// the real syscalls; tests swap these to reach them.
+var (
+	effectiveUIDSource = os.Geteuid
+	effectiveGIDSource = os.Getegid
+)
+
+// effectiveUID reports the caller's effective UID. Linux stores UIDs in 32
+// bits, so the int os.Geteuid returns always fits and the guard never fires; it
+// is here because every caller compares this value against an inode owner,
+// where a silently truncated match would grant trust instead of withholding it.
+// The unrepresentable case therefore fails closed on an ID no inode can carry.
+func effectiveUID() uint32 {
+	uid := effectiveUIDSource()
+	if uid < 0 || uid > math.MaxUint32 {
+		return math.MaxUint32
+	}
+
+	return uint32(uid)
+}
+
+// effectiveGID reports the caller's effective GID under the same contract as
+// effectiveUID.
+func effectiveGID() uint32 {
+	gid := effectiveGIDSource()
+	if gid < 0 || gid > math.MaxUint32 {
+		return math.MaxUint32
+	}
+
+	return uint32(gid)
 }

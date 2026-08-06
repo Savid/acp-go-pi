@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -27,6 +28,8 @@ const (
 	turnSupervisorLivenessMode     = "liveness"
 	turnSupervisorFDName           = "acp-go-pi-turn-supervisor"
 	turnSupervisorReady            = "ready\n"
+	turnSupervisorCompleteLine     = "complete\n"
+	turnSupervisorDoneLine         = "done\n"
 	turnSupervisorOriginBorrowed   = "borrowed"
 	turnSupervisorOriginStandalone = "standalone"
 
@@ -453,7 +456,7 @@ func startTurnSupervisorNative(
 func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, readyOutput io.Writer) (runErr error) {
 	completion := turnSupervisorOpenFile(6, "pi-turn-supervisor-completion")
 	if completion == nil {
-		return errors.New("Pi guardian completion descriptor is unavailable")
+		return errors.New("pi guardian completion descriptor is unavailable")
 	}
 	defer completion.Close()
 
@@ -463,20 +466,20 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 
 	controlFile, ok := controlInput.(*os.File)
 	if !ok {
-		_, _ = completion.WriteString("complete\n")
+		_, _ = completion.WriteString(turnSupervisorCompleteLine)
 
-		return errors.New("Pi guardian control input is not an inheritable file")
+		return errors.New("pi guardian control input is not an inheritable file")
 	}
 
 	var config turnSupervisorConfig
 	if err := json.NewDecoder(configInput).Decode(&config); err != nil {
-		_, _ = completion.WriteString("complete\n")
+		_, _ = completion.WriteString(turnSupervisorCompleteLine)
 
 		return fmt.Errorf("decode Pi guardian config: %w", err)
 	}
 
 	if err := validateTurnSupervisorConfig(config); err != nil {
-		_, _ = completion.WriteString("complete\n")
+		_, _ = completion.WriteString(turnSupervisorCompleteLine)
 
 		return err
 	}
@@ -496,14 +499,14 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 
 	authority, err := acquireTurnSupervisorAuthority(config, 7, 8, controlDone, signals)
 	if err != nil {
-		_, _ = completion.WriteString("complete\n")
+		_, _ = completion.WriteString(turnSupervisorCompleteLine)
 
 		return err
 	}
 	defer func() { runErr = errors.Join(runErr, authority.Close()) }()
 
 	if err = turnSupervisorEnable(); err != nil {
-		_, _ = completion.WriteString("complete\n")
+		_, _ = completion.WriteString(turnSupervisorCompleteLine)
 
 		return fmt.Errorf("enable Pi guardian privileges: %w", err)
 	}
@@ -511,7 +514,7 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 	if err = validateTurnSupervisorAuthorityDisposition(config, authority); err != nil {
 		containErr := turnSupervisorContain(turnSupervisorProcessID(), 0)
 		if containErr == nil {
-			_, _ = completion.WriteString("complete\n")
+			_, _ = completion.WriteString(turnSupervisorCompleteLine)
 		}
 
 		return errors.Join(fmt.Errorf("validate Pi guardian identity disposition: %w", err), containErr)
@@ -523,7 +526,7 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 	if err != nil {
 		containErr := turnSupervisorContain(turnSupervisorProcessID(), 0)
 		if containErr == nil {
-			_, _ = completion.WriteString("complete\n")
+			_, _ = completion.WriteString(turnSupervisorCompleteLine)
 		}
 
 		return errors.Join(err, containErr)
@@ -544,7 +547,7 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 
 		containErr := turnSupervisorContain(turnSupervisorProcessID(), 0)
 		if containErr == nil {
-			_, _ = completion.WriteString("complete\n")
+			_, _ = completion.WriteString(turnSupervisorCompleteLine)
 		}
 
 		return errors.Join(err, waitErr, containErr)
@@ -557,7 +560,7 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 
 		containErr := turnSupervisorContain(turnSupervisorProcessID(), 0)
 		if containErr == nil {
-			_, _ = completion.WriteString("complete\n")
+			_, _ = completion.WriteString(turnSupervisorCompleteLine)
 		}
 
 		return errors.Join(fmt.Errorf("await Pi liveness readiness: %w", readyErr), waitErr, containErr)
@@ -576,7 +579,7 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 
 		containErr := turnSupervisorContain(turnSupervisorProcessID(), 0)
 		if containErr == nil {
-			_, _ = completion.WriteString("complete\n")
+			_, _ = completion.WriteString(turnSupervisorCompleteLine)
 		}
 
 		return errors.Join(err, waitErr, containErr)
@@ -588,7 +591,7 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 
 		containErr := turnSupervisorContain(turnSupervisorProcessID(), nativePID)
 		if containErr == nil {
-			_, _ = completion.WriteString("complete\n")
+			_, _ = completion.WriteString(turnSupervisorCompleteLine)
 		}
 
 		return errors.Join(err, waitErr, containErr)
@@ -616,16 +619,16 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 livenessExited:
 	doneLine, doneErr := reader.ReadString('\n')
 
-	if doneErr == nil && doneLine == "done\n" {
+	if doneErr == nil && doneLine == turnSupervisorDoneLine {
 		return waitErr
 	}
 
 	containErr := turnSupervisorContain(turnSupervisorProcessID(), nativePID)
 	if containErr == nil {
-		_, _ = completion.WriteString("complete\n")
+		_, _ = completion.WriteString(turnSupervisorCompleteLine)
 	}
 
-	return errors.Join(waitErr, fmt.Errorf("Pi liveness exited without completion report: %v", doneErr), containErr)
+	return errors.Join(waitErr, fmt.Errorf("pi liveness exited without completion report: %v", doneErr), containErr)
 }
 
 type turnSupervisorAuthority struct {
@@ -658,14 +661,14 @@ func validateTurnSupervisorConfigDisposition(config turnSupervisorConfig, testOn
 		)
 	case turnSupervisorOriginStandalone:
 		if config.StandaloneOwner == nil {
-			return errors.New("Pi standalone authority owner tuple is unavailable")
+			return errors.New("pi standalone authority owner tuple is unavailable")
 		}
 
 		return validateStandaloneAgentIdentityDisposition(
 			*config.StandaloneOwner, testOnly, config.Isolation.TestOnlyIdentityLockRoot,
 		)
 	default:
-		return fmt.Errorf("Pi authority origin %q is invalid", config.AuthorityOrigin)
+		return fmt.Errorf("pi authority origin %q is invalid", config.AuthorityOrigin)
 	}
 }
 
@@ -888,7 +891,7 @@ func startTurnSupervisorLiveness(
 func parseTurnSupervisorLivenessReady(line string) (int, error) {
 	text, ok := strings.CutSuffix(line, "\n")
 	if !ok {
-		return 0, errors.New("Pi liveness readiness is not newline terminated")
+		return 0, errors.New("pi liveness readiness is not newline terminated")
 	}
 
 	pidText, ok := strings.CutPrefix(text, "ready:")
@@ -910,17 +913,17 @@ func validateTurnSupervisorConfig(config turnSupervisorConfig) error {
 	}
 
 	if config.IdentityLock != config.AuthorityDomain {
-		return errors.New("Pi native supervisor identity lock and authority domain must be provided together")
+		return errors.New("pi native supervisor identity lock and authority domain must be provided together")
 	}
 
 	switch config.AuthorityOrigin {
 	case "":
 		if config.IdentityLock || config.StandaloneOwner != nil {
-			return errors.New("Pi native supervisor inherited authority origin is required")
+			return errors.New("pi native supervisor inherited authority origin is required")
 		}
 	case turnSupervisorOriginBorrowed:
 		if !config.IdentityLock || config.StandaloneOwner != nil {
-			return errors.New("Pi native supervisor borrowed authority origin is inconsistent")
+			return errors.New("pi native supervisor borrowed authority origin is inconsistent")
 		}
 	case turnSupervisorOriginStandalone:
 		owner := config.StandaloneOwner
@@ -929,10 +932,10 @@ func validateTurnSupervisorConfig(config turnSupervisorConfig) error {
 			!knownAgentStandaloneProvider(owner.Provider) || owner.OwnerID == "" ||
 			!filepath.IsAbs(owner.StateRoot.Path) || filepath.Clean(owner.StateRoot.Path) != owner.StateRoot.Path ||
 			owner.StateRoot.Dev == 0 || owner.StateRoot.Ino == 0 {
-			return errors.New("Pi native supervisor standalone authority origin is inconsistent")
+			return errors.New("pi native supervisor standalone authority origin is inconsistent")
 		}
 	default:
-		return fmt.Errorf("Pi native supervisor authority origin %q is invalid", config.AuthorityOrigin)
+		return fmt.Errorf("pi native supervisor authority origin %q is invalid", config.AuthorityOrigin)
 	}
 
 	validation := config.Isolation
@@ -966,7 +969,7 @@ func runTurnSupervisorLiveness(configInput io.Reader, controlInput io.Reader, re
 			_ = peer.Close()
 		}
 
-		return errors.New("Pi liveness inherited descriptors are unavailable")
+		return errors.New("pi liveness inherited descriptors are unavailable")
 	}
 	defer completion.Close()
 	defer peer.Close()
@@ -1038,7 +1041,9 @@ func runTurnSupervisorNative(
 		standalone      *agentStandaloneIdentity
 		err             error
 	)
-	if config.IdentityLock {
+
+	switch {
+	case config.IdentityLock:
 		identityLock, err = adoptAgentIdentityLock(
 			turnSupervisorOpenFile(identityFD, "pi-agent-identity-lock"),
 			config.Isolation.UID,
@@ -1057,11 +1062,11 @@ func runTurnSupervisorNative(
 		if err != nil {
 			return errors.Join(fmt.Errorf("adopt Pi agent authority domain: %w", err), identityLock.Close())
 		}
-	} else if config.Isolation.TestOnlyNoCredential &&
-		config.Isolation.StandaloneOwnerID == "" && config.Isolation.StandaloneStateRoot == "" {
+	case config.Isolation.TestOnlyNoCredential &&
+		config.Isolation.StandaloneOwnerID == "" && config.Isolation.StandaloneStateRoot == "":
 		identityLock = &agentIdentityLock{}
 		authorityDomain = &agentIdentityLock{}
-	} else {
+	default:
 		standalone, err = turnSupervisorAcquireStandalone(
 			config.Isolation.UID,
 			config.Isolation.GID,
@@ -1079,6 +1084,7 @@ func runTurnSupervisorNative(
 		identityLock = standalone.identity
 		authorityDomain = standalone.authority
 	}
+
 	defer func() {
 		if standalone != nil {
 			runErr = errors.Join(runErr, standalone.Close())
@@ -1090,7 +1096,7 @@ func runTurnSupervisorNative(
 	}()
 
 	if identityLock == nil || authorityDomain == nil {
-		return errors.New("Pi agent identity authority is incomplete")
+		return errors.New("pi agent identity authority is incomplete")
 	}
 
 	contained := false
@@ -1106,7 +1112,7 @@ func runTurnSupervisorNative(
 			}
 
 			if livenessProtocol {
-				_, _ = io.WriteString(readyOutput, "done\n")
+				_, _ = io.WriteString(readyOutput, turnSupervisorDoneLine)
 			}
 		}()
 	}
@@ -1218,12 +1224,12 @@ func validateTurnSupervisorGuardianPeer(peer *os.File, done <-chan struct{}) err
 
 	select {
 	case <-done:
-		return errors.New("Pi guardian exited before native launch")
+		return errors.New("pi guardian exited before native launch")
 	default:
 	}
 
 	poll := []unix.PollFd{{
-		Fd:     int32(peer.Fd()),
+		Fd:     pollFD(peer),
 		Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR,
 	}}
 
@@ -1233,7 +1239,7 @@ func validateTurnSupervisorGuardianPeer(peer *os.File, done <-chan struct{}) err
 	}
 
 	if ready != 0 || poll[0].Revents != 0 {
-		return errors.New("Pi guardian exited before native launch")
+		return errors.New("pi guardian exited before native launch")
 	}
 
 	return nil
@@ -1394,4 +1400,21 @@ func signalLinuxIdentity(identity linuxProcessIdentity, processSignal syscall.Si
 	}
 
 	return nil
+}
+
+// Seam for the fail-closed guard in pollFD. Linux hands out small descriptors,
+// so the guard is unreachable through a real *os.File; tests swap this to reach it.
+var pollFDSource = (*os.File).Fd
+
+// pollFD narrows a descriptor to the int32 unix.PollFd carries. Linux hands out
+// small non-negative descriptors, so the guard never fires; when the value
+// cannot be represented it yields -1, which poll reports as EBADF rather than
+// aliasing onto a live descriptor.
+func pollFD(file *os.File) int32 {
+	fd := pollFDSource(file)
+	if fd > math.MaxInt32 {
+		return -1
+	}
+
+	return int32(fd)
 }
