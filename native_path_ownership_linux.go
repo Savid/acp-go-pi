@@ -31,6 +31,7 @@ var (
 func handoffGeneratedNativeTreePlatform(root string, uid uint32, gid uint32) error {
 	trustedUID := uint32(os.Geteuid())
 	trustedGID := uint32(os.Getegid())
+
 	directory, err := openNativeOwnershipDirectory(root, func(stat unix.Stat_t, final bool) error {
 		return validateGeneratedNativeAncestor(stat, final, trustedUID, trustedGID, uid, gid)
 	})
@@ -52,18 +53,21 @@ func openNativeOwnershipDirectory(name string, validate func(unix.Stat_t, bool) 
 	}
 
 	clean := filepath.Clean(name)
+
 	fd, err := nativeOwnershipOpenFilesystemRoot()
 	if err != nil {
 		return nil, err
 	}
 
 	components := strings.Split(strings.TrimPrefix(clean, "/"), "/")
+
 	var rootStat unix.Stat_t
 	if statErr := nativeOwnershipFstat(fd, &rootStat); statErr != nil {
 		_ = unix.Close(fd)
 
 		return nil, statErr
 	}
+
 	if validateErr := validate(rootStat, len(components) == 1 && components[0] == ""); validateErr != nil {
 		_ = unix.Close(fd)
 
@@ -81,6 +85,7 @@ func openNativeOwnershipDirectory(name string, validate func(unix.Stat_t, bool) 
 
 			return nil, openErr
 		}
+
 		var stat unix.Stat_t
 		if statErr := nativeOwnershipFstat(next, &stat); statErr != nil {
 			_ = unix.Close(next)
@@ -88,12 +93,14 @@ func openNativeOwnershipDirectory(name string, validate func(unix.Stat_t, bool) 
 
 			return nil, statErr
 		}
+
 		if validateErr := validate(stat, index == len(components)-1); validateErr != nil {
 			_ = unix.Close(next)
 			_ = unix.Close(fd)
 
 			return nil, validateErr
 		}
+
 		closeErr := nativeOwnershipClose(fd)
 		if closeErr != nil {
 			_ = unix.Close(next)
@@ -118,13 +125,16 @@ func validateGeneratedNativeAncestor(
 	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != trustedUID || stat.Gid != trustedGID {
 		return errors.New("generated native path ancestry is not a trusted directory")
 	}
+
 	mode := stat.Mode & 0o7777
 	if final && mode != 0o700 {
 		return fmt.Errorf("generated native root mode %#o is unsafe", mode)
 	}
+
 	if !final && mode&0o022 != 0 && mode&unix.S_ISVTX == 0 {
 		return fmt.Errorf("generated native ancestor mode %#o is writable without sticky protection", mode)
 	}
+
 	if !final && !nativeIdentityCanTraverse(stat, targetUID, targetGID) {
 		return errors.New("generated native path ancestry is not traversable by the target identity")
 	}
@@ -177,6 +187,7 @@ func handoffNativeOwnershipDirectory(
 
 		entryFile := os.NewFile(uintptr(fd), name)
 		entryErr := handoffNativeOwnershipEntry(entryFile, trustedUID, trustedGID, targetUID, targetGID)
+
 		closeErr := entryFile.Close()
 		if entryErr != nil || closeErr != nil {
 			return errors.Join(fmt.Errorf("handoff generated native entry %q: %w", name, entryErr), closeErr)
@@ -225,19 +236,24 @@ func validateHandoffNativeInode(
 	if err := nativeOwnershipFstat(fd, &stat); err != nil {
 		return err
 	}
+
 	if stat.Mode&unix.S_IFMT != kind {
 		return fmt.Errorf("generated native inode type %#o changed", stat.Mode&unix.S_IFMT)
 	}
+
 	if stat.Uid != trustedUID || stat.Gid != trustedGID {
 		return fmt.Errorf("generated native inode owner changed to uid=%d gid=%d", stat.Uid, stat.Gid)
 	}
+
 	if singleLink && stat.Nlink != 1 {
 		return fmt.Errorf("generated native file has %d links", stat.Nlink)
 	}
+
 	mode := stat.Mode & 0o7777
 	if kind == unix.S_IFDIR && mode != 0o700 {
 		return fmt.Errorf("generated native directory mode %#o is unsafe", mode)
 	}
+
 	if kind == unix.S_IFREG && mode != 0o600 && mode != 0o700 {
 		return fmt.Errorf("generated native inode mode %#o is unsafe", stat.Mode&0o7777)
 	}
@@ -254,9 +270,11 @@ func chownAndVerifyNativeInode(fd int, kind uint32, uid uint32, gid uint32, sing
 	if err := nativeOwnershipFstat(fd, &stat); err != nil {
 		return err
 	}
+
 	if stat.Mode&unix.S_IFMT != kind || stat.Uid != uid || stat.Gid != gid {
 		return errors.New("generated native inode ownership handoff could not be proven")
 	}
+
 	if singleLink && stat.Nlink != 1 {
 		return fmt.Errorf("generated native file has %d links after handoff", stat.Nlink)
 	}
