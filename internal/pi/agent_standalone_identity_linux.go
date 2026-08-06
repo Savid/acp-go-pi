@@ -708,13 +708,17 @@ func acquireAgentStandaloneDomain(
 			}
 			continue
 		}
-		// This audit requires an empty registry, so it refuses at the uid lock a
-		// live marker temporary would need before it could ever report that
-		// temporary busy. There is nothing here to wait for.
 		if err = auditAgentStandaloneAuthorityRoot(
 			directory, ownerUID, ownerGID, true, true, false, deadline, canceled, signals,
 		); err != nil {
 			_ = exclusive.Close()
+			if errors.Is(err, errAgentStandaloneMarkerTempBusy) {
+				if waitErr := waitAgentStandaloneRetry(deadline, canceled, signals); waitErr != nil {
+					return nil, waitErr
+				}
+
+				continue
+			}
 
 			return nil, err
 		}
