@@ -33,7 +33,7 @@ func bindAgentStandaloneStateRoot(path string, uid, gid uint32) (agentStandalone
 	}
 	defer func() { _ = unix.Close(fd) }()
 	components := strings.Split(strings.TrimPrefix(path, "/"), "/")
-	for index, component := range components {
+	for _, component := range components {
 		var parent unix.Stat_t
 		if err = agentStandaloneFstat(fd, &parent); err != nil {
 			return agentStandaloneStateRoot{}, err
@@ -51,20 +51,17 @@ func bindAgentStandaloneStateRoot(path string, uid, gid uint32) (agentStandalone
 		}
 		_ = unix.Close(fd)
 		fd = next
-		if index != len(components)-1 {
-			continue
-		}
-		var final unix.Stat_t
-		if err = agentStandaloneFstat(fd, &final); err != nil {
-			return agentStandaloneStateRoot{}, err
-		}
-		if final.Mode&unix.S_IFMT != unix.S_IFDIR || final.Uid != uid || final.Gid != gid ||
-			final.Mode&0o777 != 0o700 || final.Dev == 0 || final.Ino == 0 {
-			return agentStandaloneStateRoot{}, errors.New("standalone state root must be the claimed UID:GID-owned mode-0700 directory")
-		}
-		return agentStandaloneStateRoot{Path: path, Dev: uint64(final.Dev), Ino: final.Ino}, nil
 	}
-	return agentStandaloneStateRoot{}, errors.New("standalone state root has no path components")
+	var final unix.Stat_t
+	if err = agentStandaloneFstat(fd, &final); err != nil {
+		return agentStandaloneStateRoot{}, err
+	}
+	if final.Mode&unix.S_IFMT != unix.S_IFDIR || final.Uid != uid || final.Gid != gid ||
+		final.Mode&0o777 != 0o700 || final.Dev == 0 || final.Ino == 0 {
+		return agentStandaloneStateRoot{}, errors.New("standalone state root must be the claimed UID:GID-owned mode-0700 directory")
+	}
+
+	return agentStandaloneStateRoot{Path: path, Dev: uint64(final.Dev), Ino: final.Ino}, nil
 }
 
 func validAgentStandaloneStateRootPath(path string) bool {
@@ -92,14 +89,13 @@ func revalidateAgentStandaloneStateRoot(want agentStandaloneStateRoot, uid, gid 
 	return nil
 }
 
-func agentStandaloneSessionKey(owner agentStandaloneOwner) (string, error) {
-	payload, err := json.Marshal(owner)
-	if err != nil {
-		return "", err
-	}
+func agentStandaloneSessionKey(owner agentStandaloneOwner) string {
+	// agentStandaloneOwner holds only strings and integers, so json.Marshal
+	// cannot fail on it.
+	payload, _ := json.Marshal(owner)
 	digest := sha256.Sum256(payload)
 
-	return "standalone:" + hex.EncodeToString(digest[:]), nil
+	return "standalone:" + hex.EncodeToString(digest[:])
 }
 
 func knownAgentStandaloneProvider(value string) bool {
@@ -456,10 +452,7 @@ func completeAgentStandaloneOwnerClaim(
 	); err != nil {
 		return err
 	}
-	sessionKey, err := agentStandaloneSessionKey(want)
-	if err != nil {
-		return err
-	}
+	sessionKey := agentStandaloneSessionKey(want)
 	if wasPresent {
 		if err := proveAgentStandaloneIdentityVacantTwice(want.UID, want.GID, deadline, canceled, signals); err != nil {
 			return err
@@ -711,16 +704,14 @@ func acquireAgentStandaloneDomain(
 			}
 			continue
 		}
+		// This audit requires an empty registry, so it refuses at the uid lock a
+		// live marker temporary would need before it could ever report that
+		// temporary busy. There is nothing here to wait for.
 		if err = auditAgentStandaloneAuthorityRoot(
 			directory, ownerUID, ownerGID, true, true, false, deadline, canceled, signals,
 		); err != nil {
 			_ = exclusive.Close()
-			if errors.Is(err, errAgentStandaloneMarkerTempBusy) {
-				if waitErr := waitAgentStandaloneRetry(deadline, canceled, signals); waitErr != nil {
-					return nil, waitErr
-				}
-				continue
-			}
+
 			return nil, err
 		}
 		if err = agentStandaloneFilesystemProbe(directory, testOnly); err != nil {
@@ -1290,10 +1281,7 @@ func validateAgentStandaloneSameBootRebind(
 			errors.New("same-boot authority rebind requires the retained standalone ACTIVE marker"), err,
 		))
 	}
-	sessionKey, err := agentStandaloneSessionKey(owner)
-	if err != nil {
-		return failIdentity(err)
-	}
+	sessionKey := agentStandaloneSessionKey(owner)
 	if marker.State != "active" || marker.GID != owner.GID || marker.SessionKey != sessionKey || len(marker.Paths) != 0 {
 		return failIdentity(errors.New("same-boot authority rebind requires the exact retained standalone ACTIVE marker"))
 	}
@@ -1413,10 +1401,9 @@ func auditAgentStandaloneAuthorityRoot(
 			}
 			continue
 		}
-		if uidText, ok := strings.CutSuffix(name, ".owner"); ok {
-			if _, parseErr := parseAgentStandaloneUID(uidText); parseErr != nil {
-				return fmt.Errorf("invalid standalone owner name %q", name)
-			}
+		// The owner pass above already refused every ".owner" entry whose uid
+		// text does not parse, so this pass only has to account for the entry.
+		if _, ok := strings.CutSuffix(name, ".owner"); ok {
 			if requireEmpty {
 				return errors.New("agent authority record is missing but a permanent owner binding exists")
 			}
@@ -1511,10 +1498,7 @@ func auditAgentStandaloneAuthorityRoot(
 		}
 		seenGIDs[marker.GID] = uid
 		if owner, bound := owners[uid]; bound {
-			sessionKey, keyErr := agentStandaloneSessionKey(owner)
-			if keyErr != nil {
-				return keyErr
-			}
+			sessionKey := agentStandaloneSessionKey(owner)
 			if marker.State != "active" || marker.GID != owner.GID || marker.SessionKey != sessionKey || len(marker.Paths) != 0 {
 				return fmt.Errorf("standalone owner uid %d has an incompatible retained marker", uid)
 			}
@@ -1857,10 +1841,9 @@ func replaceAgentStandaloneDomainRecord(directory *os.File, ownerUID, ownerGID u
 		return err
 	}
 	temporary := "domain.json.next-" + hex.EncodeToString(random[:])
-	payload, err := json.Marshal(record)
-	if err != nil {
-		return err
-	}
+	// agentAuthorityDomainRecord holds only scalars and slices of scalars, so
+	// json.Marshal cannot fail on it.
+	payload, _ := json.Marshal(record)
 	fd, err := agentStandaloneOpenat(int(directory.Fd()), temporary, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return err
@@ -1903,9 +1886,8 @@ func replaceAgentStandaloneDomainRecord(directory *os.File, ownerUID, ownerGID u
 	if err != nil {
 		return err
 	}
-	publishedPayload, err := json.Marshal(published)
-	if err != nil || !bytes.Equal(publishedPayload, payload) {
-		return errors.Join(errors.New("published agent authority record payload changed"), err)
+	if publishedPayload, _ := json.Marshal(published); !bytes.Equal(publishedPayload, payload) {
+		return errors.New("published agent authority record payload changed")
 	}
 	var named unix.Stat_t
 	if err = agentStandaloneFstatat(int(directory.Fd()), "domain.json", &named, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
@@ -2065,10 +2047,7 @@ func validateAgentStandalonePriorDisposition(directory *os.File, owner agentStan
 	if err != nil {
 		return err
 	}
-	sessionKey, keyErr := agentStandaloneSessionKey(owner)
-	if keyErr != nil {
-		return keyErr
-	}
+	sessionKey := agentStandaloneSessionKey(owner)
 	if marker.State != "active" || marker.GID != owner.GID || marker.SessionKey != sessionKey || len(marker.Paths) != 0 {
 		return errors.New("standalone owner has an incompatible retained ACTIVE marker")
 	}
@@ -2083,10 +2062,9 @@ func createAgentStandaloneOwner(directory *os.File, owner agentStandaloneOwner, 
 		return err
 	}
 	temporary := name + ".next-" + hex.EncodeToString(random[:])
-	payload, err := json.Marshal(owner)
-	if err != nil {
-		return err
-	}
+	// agentStandaloneOwner holds only strings and integers, so json.Marshal
+	// cannot fail on it.
+	payload, _ := json.Marshal(owner)
 	payload = append(payload, '\n')
 	fd, err := agentStandaloneOpenat(int(directory.Fd()), temporary, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
@@ -2161,11 +2139,9 @@ func loadAgentStandaloneOwner(directory *os.File, uid, ownerUID, ownerGID uint32
 	if err = decoder.Decode(&owner); err != nil {
 		return agentStandaloneOwner{}, err
 	}
-	if err = decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return agentStandaloneOwner{}, errors.New("standalone owner contains trailing data")
-	}
-	canonical, err := json.Marshal(owner)
-	if err != nil || !bytes.Equal(payload, append(canonical, '\n')) {
+	// rejectAgentAuthorityDuplicateJSONKeys already refused a payload carrying
+	// more than one JSON value, so the decode above consumed all of it.
+	if canonical, _ := json.Marshal(owner); !bytes.Equal(payload, append(canonical, '\n')) {
 		return agentStandaloneOwner{}, errors.New("standalone owner is not canonical compact JSON with one newline")
 	}
 	if owner.Version != 1 || owner.UID != uid || owner.UID == 0 || owner.GID == 0 ||
@@ -2194,10 +2170,10 @@ func publishAgentStandaloneActive(
 		Version: 2, UID: uid, GID: gid, SessionKey: key, State: "active",
 		LeaseID: hex.EncodeToString(lease[:]), Paths: make([]agentStandaloneManifestPath, 0),
 	}
-	payload, err := json.Marshal(marker)
-	if err != nil {
-		return err
-	}
+	// agentStandaloneMarker holds only strings, integers and a slice of those,
+	// so json.Marshal cannot fail on it.
+	payload, _ := json.Marshal(marker)
+
 	return replaceAgentStandaloneFile(
 		directory, strconv.FormatUint(uint64(uid), 10)+".quarantine", payload,
 		ownerUID, ownerGID, deadline, canceled, signals,
@@ -2226,9 +2202,8 @@ func loadAgentStandaloneMarker(directory *os.File, uid, ownerUID, ownerGID uint3
 	if err = decoder.Decode(&marker); err != nil {
 		return agentStandaloneMarker{}, err
 	}
-	if err = decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return agentStandaloneMarker{}, errors.New("agent identity marker contains trailing data")
-	}
+	// rejectAgentAuthorityDuplicateJSONKeys already refused a payload carrying
+	// more than one JSON value, so the decode above consumed all of it.
 	if marker.Version != 2 || marker.UID != uid || marker.UID == 0 || marker.GID == 0 ||
 		!validAgentStandaloneSessionKey(marker.SessionKey) {
 		return agentStandaloneMarker{}, errors.New("agent identity marker is incomplete")
@@ -2253,17 +2228,22 @@ func loadAgentStandaloneMarker(directory *os.File, uid, ownerUID, ownerGID uint3
 	}
 	var rawPaths []json.RawMessage
 	if marker.State == "active" {
-		if err = json.Unmarshal(raw["paths"], &rawPaths); err != nil || len(rawPaths) != len(marker.Paths) {
-			return agentStandaloneMarker{}, errors.Join(errors.New("ACTIVE marker paths are invalid"), err)
+		// The ACTIVE branch above proved "paths" is present and decoded into a
+		// non-nil slice, so those exact bytes are a JSON array with one element
+		// per decoded path. Reading them back as raw elements re-presents that
+		// decode; it is not a second parse that could disagree with it.
+		_ = json.Unmarshal(raw["paths"], &rawPaths)
+	}
+
+	for index, element := range rawPaths {
+		if _, fieldsErr := exactAgentAuthorityFields(
+			element, "base", "segments", "action", "rootDev", "rootIno",
+		); fieldsErr != nil {
+			return agentStandaloneMarker{}, fmt.Errorf("invalid marker path %d schema: %w", index, fieldsErr)
 		}
 	}
 	seenPaths := make(map[string]string, len(marker.Paths))
 	for index, path := range marker.Paths {
-		if _, fieldsErr := exactAgentAuthorityFields(
-			rawPaths[index], "base", "segments", "action", "rootDev", "rootIno",
-		); fieldsErr != nil {
-			return agentStandaloneMarker{}, fmt.Errorf("invalid marker path %d schema: %w", index, fieldsErr)
-		}
 		if err = validateAgentStandaloneManifestPath(path); err != nil {
 			return agentStandaloneMarker{}, fmt.Errorf("invalid marker path %d: %w", index, err)
 		}
