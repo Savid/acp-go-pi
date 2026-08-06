@@ -27,7 +27,7 @@ func bindAgentStandaloneStateRoot(path string, uid, gid uint32) (agentStandalone
 	if !validAgentStandaloneStateRootPath(path) {
 		return agentStandaloneStateRoot{}, errors.New("standalone state root must be a clean absolute path")
 	}
-	fd, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := agentStandaloneStateRootOpen("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return agentStandaloneStateRoot{}, fmt.Errorf("open filesystem root for standalone state root: %w", err)
 	}
@@ -129,6 +129,9 @@ var agentStandaloneCloseTemporary = func(file *os.File) error { return file.Clos
 var agentStandaloneVacancyScan = proveAgentStandaloneIdentityVacant
 var agentStandaloneReadDir = os.ReadDir
 var agentStandaloneReadFile = os.ReadFile
+var agentStandaloneReadlink = os.Readlink
+var agentStandaloneStateRootOpen = unix.Open
+var agentStandaloneCurrentDomain = currentAgentAuthorityDomain
 var agentStandaloneReplaceDomain = replaceAgentStandaloneDomainRecord
 var agentStandaloneLockOpenat = unix.Openat
 var agentStandaloneLockFchown = unix.Fchown
@@ -142,6 +145,7 @@ var agentStandaloneProbeFstatfs = unix.Fstatfs
 var agentStandaloneProbeFcntl = unix.FcntlInt
 var agentStandaloneProbeUnlinkat = unix.Unlinkat
 var agentStandaloneProbeDirectorySync = unix.Fsync
+var agentStandaloneProbeCloseFD = unix.Close
 var agentStandaloneRandRead = rand.Read
 var agentStandaloneOpenat = unix.Openat
 var agentStandaloneFstat = unix.Fstat
@@ -516,7 +520,7 @@ func acquireAgentStandaloneDomain(
 		}
 		record, loadErr := loadAgentAuthorityDomainRecord(directory, ownerUID, ownerGID)
 		if loadErr == nil {
-			current, currentErr := currentAgentAuthorityDomain(directory)
+			current, currentErr := agentStandaloneCurrentDomain(directory)
 			if currentErr != nil {
 				_ = shared.Close()
 				return nil, currentErr
@@ -551,7 +555,7 @@ func acquireAgentStandaloneDomain(
 					return nil, exclusiveErr
 				}
 				record, loadErr = loadAgentAuthorityDomainRecord(directory, ownerUID, ownerGID)
-				current, currentErr = currentAgentAuthorityDomain(directory)
+				current, currentErr = agentStandaloneCurrentDomain(directory)
 				if loadErr != nil || currentErr != nil || !record.sameDomain(current) {
 					_ = exclusive.Close()
 					if loadErr != nil && !errors.Is(loadErr, unix.ENOENT) {
@@ -595,7 +599,7 @@ func acquireAgentStandaloneDomain(
 		}
 		record, loadErr = loadAgentAuthorityDomainRecord(directory, ownerUID, ownerGID)
 		if loadErr == nil {
-			current, currentErr := currentAgentAuthorityDomain(directory)
+			current, currentErr := agentStandaloneCurrentDomain(directory)
 			if currentErr != nil {
 				_ = exclusive.Close()
 				return nil, currentErr
@@ -718,7 +722,7 @@ func acquireAgentStandaloneDomain(
 			_ = exclusive.Close()
 			return nil, err
 		}
-		current, err := currentAgentAuthorityDomain(directory)
+		current, err := agentStandaloneCurrentDomain(directory)
 		if err != nil {
 			_ = exclusive.Close()
 			return nil, err
@@ -1083,7 +1087,7 @@ func validateAgentStandaloneBinder() error {
 		return err
 	}
 	selfPID := strconv.Itoa(os.Getpid())
-	procSelf, err := os.Readlink("/proc/self")
+	procSelf, err := agentStandaloneReadlink("/proc/self")
 	if err != nil {
 		return fmt.Errorf("resolve procfs self PID anchor: %w", err)
 	}
@@ -1097,7 +1101,7 @@ func validateAgentStandaloneBinder() error {
 	if self != procNamespace {
 		return errors.New("standalone agent authority binder requires self and procfs PID namespaces to match")
 	}
-	if _, err = os.ReadFile("/proc/1/status"); err != nil {
+	if _, err = agentStandaloneReadFile("/proc/1/status"); err != nil {
 		return fmt.Errorf("prove unrestricted root procfs visibility: %w", err)
 	}
 	const initialPIDNamespaceInode = 0xeffffffc
@@ -1162,7 +1166,7 @@ func probeAgentStandaloneFilesystem(directory *os.File, testOnly bool) (probeErr
 		return err
 	}
 	contenderErr := agentStandaloneFlock(contender, unix.LOCK_EX|unix.LOCK_NB)
-	closeErr := unix.Close(contender)
+	closeErr := agentStandaloneProbeCloseFD(contender)
 	if contenderErr == nil || (!errors.Is(contenderErr, unix.EWOULDBLOCK) && !errors.Is(contenderErr, unix.EAGAIN)) {
 		return errors.Join(errors.New("agent authority filesystem lacks separate-open flock exclusion"), closeErr)
 	}
@@ -1540,7 +1544,7 @@ func parseAgentStandaloneTemporarySuffix(name, prefix string, allowRenamed bool)
 }
 
 func agentStandaloneAuthorityPath(directory *os.File) (string, error) {
-	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", directory.Fd()))
+	path, err := agentStandaloneReadlink(fmt.Sprintf("/proc/self/fd/%d", directory.Fd()))
 	if err != nil {
 		return "", fmt.Errorf("resolve agent authority root path: %w", err)
 	}
