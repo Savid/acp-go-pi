@@ -393,7 +393,7 @@ func TestSelectedModelImageSupport(t *testing.T) {
 		{name: "unsupported", model: "p/text-only", want: imageInputUnsupported},
 		{name: "no input list", model: "p/mystery", want: imageInputUnknown},
 		{name: "absent from catalog", model: "p/absent", want: imageInputUnknown},
-		{name: "unparseable selection", model: "", want: imageInputUnknown},
+		{name: "unparsable selection", model: "", want: imageInputUnknown},
 	}
 
 	for _, test := range tests {

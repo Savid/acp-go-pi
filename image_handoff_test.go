@@ -132,7 +132,7 @@ func TestHandoffFormSelection(t *testing.T) {
 		requireImageParamError(t, err, imageErrorMissingData, 0)
 	})
 
-	t.Run("unparseable uri without data is not handoff intent", func(t *testing.T) {
+	t.Run("unparsable uri without data is not handoff intent", func(t *testing.T) {
 		block := acp.ImageBlock("", "image/png")
 		broken := "file://ho\x7fst/a.png"
 		block.Image.Uri = &broken
@@ -287,7 +287,7 @@ func TestHandoffURIDefects(t *testing.T) {
 		message string
 	}{
 		{name: "empty", uri: "", message: "requires a file uri"},
-		{name: "unparseable", uri: "file://ho\x7fst/a.png", message: "not a valid uri"},
+		{name: "unparsable", uri: "file://ho\x7fst/a.png", message: "not a valid uri"},
 		{name: "wrong scheme", uri: "https://example.test/a.png", message: "scheme must be file"},
 		{name: "remote host", uri: "file://elsewhere/a.png", message: "host is not local"},
 		{name: "opaque path", uri: "file:relative.png", message: "path must be absolute"},

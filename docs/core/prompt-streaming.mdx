@@ -85,7 +85,7 @@ failure winning:
 
 | `error` | Cause |
 | --- | --- |
-| `invalid_handoff` | The block is malformed as a block: no handoff root is configured, or the envelope or `file://` uri is absent, unparseable, non-local, non-absolute, wrongly versioned, missing a field, or carrying an unknown one. |
+| `invalid_handoff` | The block is malformed as a block: no handoff root is configured, or the envelope or `file://` uri is absent, unparsable, non-local, non-absolute, wrongly versioned, missing a field, or carrying an unknown one. |
 | `path_not_allowed` | The path lies outside the handoff root, is reached through a symlink the root refuses (any absolute symlink, or one leading out of the root), or does not name a regular file. |
 | `missing_file` | A path inside the root that does not exist or cannot be opened or read. |
 | `handoff_digest_mismatch` | The file's byte count or sha256 does not match the envelope. Fail-closed: there is no fallback to the embedded form. |

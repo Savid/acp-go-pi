@@ -56,7 +56,7 @@ var imageBlockTypeMarker = []byte(`"image"`)
 
 // redactedImageMarker replaces a raw event line that carries image content
 // but cannot be parsed for structured redaction.
-const redactedImageMarker = `{"redacted":"unparseable native event carrying image content"}`
+const redactedImageMarker = `{"redacted":"unparsable native event carrying image content"}`
 
 // marshalRedactedEvent re-encodes a redacted event; a package variable so a
 // test can force the re-encode to fail.

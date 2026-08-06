@@ -11,7 +11,7 @@ import (
 // TestInheritedProcessIsolationDecodesOnlyAVerifiedPolicy proves the Darwin
 // supervisor bootstrap accepts an inherited identity only when it parses and
 // the running process actually holds it. The environment is attacker-adjacent
-// input to a process that is about to drop privilege, so an unparseable pair is
+// input to a process that is about to drop privilege, so an unparsable pair is
 // refused, and a parseable pair that the process cannot verify it holds is
 // refused too. Only the explicit credential-free test policy bypasses the
 // verification, and that is the one shape that grants nothing.

@@ -260,7 +260,7 @@ func handoffSizeBytes(value any) (int64, bool) {
 }
 
 // handoffFilePath maps a handoff block uri to a cleaned local path. A missing,
-// unparseable, non-file, non-local, or non-absolute uri is a block malformed
+// unparsable, non-file, non-local, or non-absolute uri is a block malformed
 // as a block.
 func handoffFilePath(uri *string) (string, *handoffError) {
 	if uri == nil || *uri == "" {
