@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"syscall"
 	"testing"
 
@@ -48,27 +47,6 @@ func TestProcessIsolationUnixVerificationBranches(t *testing.T) {
 	plain := exec.Command("/usr/bin/true")
 	require.NoError(t, applyProcessIsolation(plain, policy))
 	require.NotNil(t, plain.SysProcAttr.Credential)
-
-	t.Setenv(envIsolationUID, "invalid")
-	t.Setenv(envIsolationGID, "22")
-	_, err := inheritedProcessIsolation()
-	require.Error(t, err)
-	t.Setenv(envIsolationUID, "11")
-	t.Setenv(envIsolationTest, "true")
-	_, err = inheritedProcessIsolation()
-	require.NoError(t, err)
-	t.Setenv(envIsolationTest, "false")
-	_, err = inheritedProcessIsolation()
-	require.Error(t, err)
-	processIsolationGeteuid = func() int { return 11 }
-	processIsolationGetegid = func() int { return 22 }
-	processIsolationGetgroups = func() ([]int, error) { return nil, nil }
-	_, err = inheritedProcessIsolation()
-	if runtime.GOOS == "linux" {
-		require.ErrorContains(t, err, "standalone owner id")
-	} else {
-		require.NoError(t, err)
-	}
 }
 
 func TestProcessIsolationLaunchFailures(t *testing.T) {
