@@ -462,3 +462,96 @@ func TestAgentStandaloneResBinderRefusesEveryProcfsDisagreement(t *testing.T) {
 		)
 	})
 }
+
+// agentStandaloneResStageMarkerTemporaryRace stages the one registry state that
+// makes the pristine-registry audit report a live UID holder: a marker
+// temporary with no permanent UID lock beside it, plus a peer that creates and
+// holds that UID lock in the window between the audit listing the registry and
+// the audit reaching the temporary. That window is real — the listing is a
+// snapshot taken through (*os.File).ReadDir, and a concurrent
+// acquireAgentStandaloneOwnerIdentity creates its UID lock exactly there — and
+// the lock-open seam is the only way to place a peer inside it.
+func agentStandaloneResStageMarkerTemporaryRace(
+	t *testing.T,
+	directory *os.File,
+	ownerUID uint32,
+	ownerGID uint32,
+	arrive func(),
+) {
+	t.Helper()
+	temporary := agentStandaloneCovWriteRegistryFile(
+		t, directory, "62997.quarantine.next-"+agentStandaloneCovSuffix, "{}\n",
+	)
+	restoreAgentStandalonePermanentLockSeams(t)
+	original := agentStandaloneLockOpenat
+	raced := false
+	agentStandaloneLockOpenat = func(dirfd int, path string, flags int, mode uint32) (int, error) {
+		if path == "62997.lock" && !raced {
+			raced = true
+			held, err := openAgentStandaloneNamedLock(directory, "62997.lock", true, ownerUID, ownerGID)
+			require.NoError(t, err)
+			require.NoError(t, unix.Flock(int(held.Fd()), unix.LOCK_EX|unix.LOCK_NB))
+			t.Cleanup(func() { _ = held.Close() })
+			require.NoError(t, os.Remove(temporary))
+			arrive()
+		}
+
+		return original(dirfd, path, flags, mode)
+	}
+	t.Cleanup(func() { require.True(t, raced, "the peer never took the UID lock") })
+}
+
+// agentStandaloneResDomainLockIsFree asserts the claim released the domain lock
+// it took, so a refusal never leaves the registry wedged for the next claim.
+func agentStandaloneResDomainLockIsFree(t *testing.T, directory *os.File, ownerUID, ownerGID uint32) {
+	t.Helper()
+	contender, acquired, err := tryAgentStandaloneNamedLock(directory, "domain.lock", false, ownerUID, ownerGID)
+	require.NoError(t, err)
+	require.True(t, acquired, "the refused claim must release the domain lock")
+	require.NoError(t, contender.Close())
+}
+
+// TestAgentStandaloneResDomainClaimRetriesAroundALiveUIDHolder proves the
+// first-ever domain claim treats "a peer holds that identity's UID lock" as a
+// reason to wait and look again, not as a reason to refuse the registry, and
+// that once the peer's lock is the only prior state left the claim refuses by
+// naming it. The audit reads the registry before it adjudicates it, so a UID
+// lock created inside that window must not be mistaken for an unaccountable
+// registry — and a claim that gave up there would refuse a registry that is
+// merely busy.
+func TestAgentStandaloneResDomainClaimRetriesAroundALiveUIDHolder(t *testing.T) {
+	want := agentStandaloneCovOwner(62997, 62998, "res-busy", "/srv/pi/res-busy", 41, 42)
+
+	t.Run("waits and looks again", func(t *testing.T) {
+		directory := openAgentStandaloneTestDirectory(t)
+		ownerUID, ownerGID := agentStandaloneTestAuthorityIDs()
+		agentStandaloneCovPermanentLock(t, directory, "domain.lock")
+		agentStandaloneResStageMarkerTemporaryRace(t, directory, ownerUID, ownerGID, func() {})
+
+		authority, err := acquireAgentStandaloneDomain(
+			directory, want, ownerUID, ownerGID, true, time.Now().Add(2*time.Second), nil, nil,
+		)
+		require.Nil(t, authority)
+		require.ErrorContains(t, err, `root contains prior lock "62997.lock"`)
+		require.NoFileExists(t, filepath.Join(directory.Name(), "domain.json"))
+		agentStandaloneResDomainLockIsFree(t, directory, ownerUID, ownerGID)
+	})
+
+	t.Run("gives up when cancellation arrives first", func(t *testing.T) {
+		directory := openAgentStandaloneTestDirectory(t)
+		ownerUID, ownerGID := agentStandaloneTestAuthorityIDs()
+		agentStandaloneCovPermanentLock(t, directory, "domain.lock")
+		canceled := make(chan struct{})
+		agentStandaloneResStageMarkerTemporaryRace(t, directory, ownerUID, ownerGID, func() {
+			close(canceled)
+		})
+
+		authority, err := acquireAgentStandaloneDomain(
+			directory, want, ownerUID, ownerGID, true, time.Now().Add(2*time.Second), canceled, nil,
+		)
+		require.Nil(t, authority)
+		require.ErrorIs(t, err, errAgentStandaloneCanceled)
+		require.NoFileExists(t, filepath.Join(directory.Name(), "domain.json"))
+		agentStandaloneResDomainLockIsFree(t, directory, ownerUID, ownerGID)
+	})
+}
