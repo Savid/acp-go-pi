@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -55,13 +56,89 @@ func agentStandaloneCovHoldDomainShared(t *testing.T, directory *os.File) *os.Fi
 	return held
 }
 
-// agentStandaloneCovFailingProbe makes the durability probe refuse, so a case
-// can pin where in the domain transition the probe is consulted.
-func agentStandaloneCovFailingProbe(t *testing.T, verdict error) {
+// agentStandaloneCovRebindableOwner stages the complete same-boot rebind state
+// for one owner: the permanent owners.lock and UID lock, the owner binding on a
+// real protected state root, and the retained ACTIVE marker that matches it.
+// Without all of it a same-boot rebind stops at the registry state it demands,
+// so a case about a later step would never reach that step.
+func agentStandaloneCovRebindableOwner(
+	t *testing.T,
+	directory *os.File,
+	uid uint32,
+	gid uint32,
+	ownerID string,
+) agentStandaloneOwner {
+	t.Helper()
+	stateRoot, err := bindAgentStandaloneStateRoot(
+		createAgentStandaloneProtectedStateRoot(t, uid, gid), uid, gid,
+	)
+	require.NoError(t, err)
+	owner := agentStandaloneCovOwner(uid, gid, ownerID, stateRoot.Path, stateRoot.Dev, stateRoot.Ino)
+	agentStandaloneCovPermanentLock(t, directory, "owners.lock")
+	agentStandaloneCovPermanentLock(t, directory, strconv.FormatUint(uint64(uid), 10)+".lock")
+	agentStandaloneCovWriteOwner(t, directory, owner)
+	agentStandaloneCovWriteActiveMarker(t, directory, owner)
+
+	return owner
+}
+
+// agentStandaloneCovFailingProbe makes the durability probe refuse and reports
+// how many times the claim consulted it, so a case can pin where in the domain
+// transition the probe is reached and prove that an earlier refusal never
+// reached it at all.
+func agentStandaloneCovFailingProbe(t *testing.T, verdict error) *int {
 	t.Helper()
 	previous := agentStandaloneFilesystemProbe
-	agentStandaloneFilesystemProbe = func(*os.File, bool) error { return verdict }
+	probes := 0
+	agentStandaloneFilesystemProbe = func(*os.File, bool) error {
+		probes++
+
+		return verdict
+	}
 	t.Cleanup(func() { agentStandaloneFilesystemProbe = previous })
+
+	return &probes
+}
+
+// agentStandaloneCovBinderVerdicts are the two answers the process binder can
+// give a claim, each forced through an existing seam rather than inherited from
+// whichever PID namespace the container happens to give the test. CI runs this
+// package in the initial namespace, where the binder always agrees, and the
+// fast iteration container runs it in a nested one, where the binder always
+// refuses; without substituting the verdict each environment would leave the
+// other's branch unproven.
+func agentStandaloneCovBinderVerdicts(refusal error) []struct {
+	name    string
+	arrange func(t *testing.T)
+	wantErr func(probeErr error) error
+	probes  int
+} {
+	const initialPIDNamespaceInode = 0xeffffffc
+
+	return []struct {
+		name    string
+		arrange func(t *testing.T)
+		wantErr func(probeErr error) error
+		probes  int
+	}{
+		{
+			name: "binder refuses",
+			arrange: func(t *testing.T) {
+				t.Helper()
+				agentStandaloneResFaultReadlink(t, "/proc/self", refusal)
+			},
+			wantErr: func(error) error { return refusal },
+		},
+		{
+			name: "binder agrees",
+			arrange: func(t *testing.T) {
+				t.Helper()
+				agentStandaloneResNamespaceInode(t, initialPIDNamespaceInode)
+			},
+			wantErr: func(probeErr error) error { return probeErr },
+			probes:  1,
+		},
+	}
 }
 
 // TestAgentStandaloneCovDomainAcquisitionRefusesAnUnusableRegistry proves the
@@ -591,50 +668,58 @@ func TestAgentStandaloneCovAuthorityBinderMatchesTheProcessPIDNamespace(t *testi
 // TestAgentStandaloneCovDomainClaimConsultsTheBinderBeforeMutating proves that
 // a claim which is about to rebind a foreign authority record, and a claim
 // which is about to mint the first one, both consult the process binder before
-// they touch the registry — and that when the binder refuses, no record is
-// written. The binder is what stops a container in its own PID namespace from
-// minting authority the host would honour.
+// they touch the registry: a refusing binder ends the claim with its own
+// refusal, the durability probe that follows it is never consulted, and the
+// published record is left exactly as it was found. Each registry is otherwise
+// staged so the claim would run all the way to the probe, which is what pins
+// the refusal to the binder rather than to an earlier guard that happens to
+// fire first.
+//
+// The binder is what stops a container in its own PID namespace from minting
+// authority the host would honour, so both of its verdicts are substituted
+// here instead of inherited from the container the test runs in.
 func TestAgentStandaloneCovDomainClaimConsultsTheBinderBeforeMutating(t *testing.T) {
-	const initialPIDNamespaceInode = 0xeffffffc
-	var namespace unix.Stat_t
-	require.NoError(t, unix.Stat("/proc/self/ns/pid", &namespace))
-	binderRefuses := namespace.Ino != initialPIDNamespaceInode && os.Getpid() != 1
-	want := agentStandaloneCovStaticOwner(62951, 62952, "binder")
+	binderErr := errors.New("injected binder self-anchor failure")
 	probeErr := errors.New("injected post-binder probe failure")
 
-	t.Run("rebind", func(t *testing.T) {
-		directory, ownerUID, ownerGID := agentStandaloneCovDivergentDomainFixture(t)
-		before, err := os.ReadFile(filepath.Join(directory.Name(), "domain.json"))
-		require.NoError(t, err)
-		agentStandaloneCovFailingProbe(t, probeErr)
+	for _, verdict := range agentStandaloneCovBinderVerdicts(binderErr) {
+		t.Run("rebind/"+verdict.name, func(t *testing.T) {
+			verdict.arrange(t)
+			directory, ownerUID, ownerGID := agentStandaloneCovDivergentDomainFixture(t)
+			before, err := os.ReadFile(filepath.Join(directory.Name(), "domain.json"))
+			require.NoError(t, err)
+			rebinding := agentStandaloneCovRebindableOwner(t, directory, 62951, 62952, "binder")
+			agentStandaloneCovNoVacancy(t, nil)
+			probes := agentStandaloneCovFailingProbe(t, probeErr)
 
-		lease, err := acquireAgentStandaloneDomain(
-			directory, want, ownerUID, ownerGID, false, time.Now().Add(time.Second), nil, nil,
-		)
-		require.Nil(t, lease)
-		if binderRefuses {
-			require.ErrorContains(t, err, "non-initial PID namespace")
-		} else {
-			require.ErrorIs(t, err, probeErr)
-		}
-		after, err := os.ReadFile(filepath.Join(directory.Name(), "domain.json"))
-		require.NoError(t, err)
-		require.Equal(t, before, after)
-	})
+			lease, err := acquireAgentStandaloneDomain(
+				directory, rebinding, ownerUID, ownerGID, false, time.Now().Add(5*time.Second), nil, nil,
+			)
+			require.Nil(t, lease)
+			require.ErrorIs(t, err, verdict.wantErr(probeErr))
+			require.Equal(t, verdict.probes, *probes, "the probe follows the binder, never precedes it")
+			after, err := os.ReadFile(filepath.Join(directory.Name(), "domain.json"))
+			require.NoError(t, err)
+			require.Equal(t, before, after, "a refused rebind must leave the foreign record intact")
+			contender, taken, lockErr := tryAgentStandaloneNamedLock(directory, "62951.lock", false, ownerUID, ownerGID)
+			require.NoError(t, lockErr)
+			require.True(t, taken, "a refused rebind must hold no UID lock")
+			require.NoError(t, contender.Close())
+		})
 
-	t.Run("pristine", func(t *testing.T) {
-		directory, ownerUID, ownerGID := agentStandaloneCovPristineDomainFixture(t)
-		agentStandaloneCovFailingProbe(t, probeErr)
+		t.Run("pristine/"+verdict.name, func(t *testing.T) {
+			verdict.arrange(t)
+			directory, ownerUID, ownerGID := agentStandaloneCovPristineDomainFixture(t)
+			want := agentStandaloneCovStaticOwner(62953, 62954, "binder-pristine")
+			probes := agentStandaloneCovFailingProbe(t, probeErr)
 
-		lease, err := acquireAgentStandaloneDomain(
-			directory, want, ownerUID, ownerGID, false, time.Now().Add(time.Second), nil, nil,
-		)
-		require.Nil(t, lease)
-		if binderRefuses {
-			require.ErrorContains(t, err, "non-initial PID namespace")
-		} else {
-			require.ErrorIs(t, err, probeErr)
-		}
-		require.NoFileExists(t, filepath.Join(directory.Name(), "domain.json"))
-	})
+			lease, err := acquireAgentStandaloneDomain(
+				directory, want, ownerUID, ownerGID, false, time.Now().Add(time.Second), nil, nil,
+			)
+			require.Nil(t, lease)
+			require.ErrorIs(t, err, verdict.wantErr(probeErr))
+			require.Equal(t, verdict.probes, *probes, "the probe follows the binder, never precedes it")
+			require.NoFileExists(t, filepath.Join(directory.Name(), "domain.json"))
+		})
+	}
 }
