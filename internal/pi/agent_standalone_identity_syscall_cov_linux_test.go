@@ -623,7 +623,7 @@ func TestAgentStandaloneCovAuthorityRandomnessFailuresAbortTheClaim(t *testing.T
 	ownerUID, ownerGID := agentStandaloneTestAuthorityIDs()
 
 	t.Run("authority id", func(t *testing.T) {
-		directory, ownerUID, ownerGID := agentStandaloneCovPristineDomainFixture(t)
+		directory, registryUID, registryGID := agentStandaloneCovPristineDomainFixture(t)
 		wantErr := errors.New("injected authority id randomness failure")
 		agentStandaloneCovRestoreSyscallSeams(t)
 		previous := agentStandaloneRandRead
@@ -637,7 +637,7 @@ func TestAgentStandaloneCovAuthorityRandomnessFailuresAbortTheClaim(t *testing.T
 
 		lease, err := acquireAgentStandaloneDomain(
 			directory, agentStandaloneCovStaticOwner(63031, 63032, "randomness"),
-			ownerUID, ownerGID, true, time.Now().Add(time.Second), nil, nil,
+			registryUID, registryGID, true, time.Now().Add(time.Second), nil, nil,
 		)
 		require.Nil(t, lease)
 		require.ErrorIs(t, err, wantErr)

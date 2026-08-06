@@ -35,7 +35,7 @@ func bindAgentStandaloneStateRoot(path string, uid, gid uint32) (agentStandalone
 	components := strings.Split(strings.TrimPrefix(path, "/"), "/")
 	for index, component := range components {
 		var parent unix.Stat_t
-		if err = unix.Fstat(fd, &parent); err != nil {
+		if err = agentStandaloneFstat(fd, &parent); err != nil {
 			return agentStandaloneStateRoot{}, err
 		}
 		if parent.Mode&unix.S_IFMT != unix.S_IFDIR || parent.Uid != 0 || parent.Mode&0o022 != 0 {
@@ -55,7 +55,7 @@ func bindAgentStandaloneStateRoot(path string, uid, gid uint32) (agentStandalone
 			continue
 		}
 		var final unix.Stat_t
-		if err = unix.Fstat(fd, &final); err != nil {
+		if err = agentStandaloneFstat(fd, &final); err != nil {
 			return agentStandaloneStateRoot{}, err
 		}
 		if final.Mode&unix.S_IFMT != unix.S_IFDIR || final.Uid != uid || final.Gid != gid ||
