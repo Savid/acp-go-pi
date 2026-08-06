@@ -80,6 +80,7 @@ var (
 	turnSupervisorSealConfig              = unix.FcntlInt
 	turnSupervisorEffectiveUID            = os.Geteuid
 	turnSupervisorPoll                    = unix.Poll
+	turnSupervisorReadDeadline            = (*os.File).SetReadDeadline
 	turnSupervisorBeforeGuardianReadiness = func() {}
 )
 
@@ -481,7 +482,7 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 	go func() { waiter <- liveness.Wait() }()
 	reader := bufio.NewReader(data)
 	turnSupervisorBeforeGuardianReadiness()
-	if err = data.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err = turnSupervisorReadDeadline(data, time.Now().Add(5*time.Second)); err != nil {
 		_ = peer.Close()
 		waitErr := <-waiter
 		containErr := turnSupervisorContain(turnSupervisorProcessID(), 0)
@@ -502,7 +503,7 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 
 		return errors.Join(fmt.Errorf("await Pi liveness readiness: %w", readyErr), waitErr, containErr)
 	}
-	if err = data.SetReadDeadline(time.Time{}); err != nil {
+	if err = turnSupervisorReadDeadline(data, time.Time{}); err != nil {
 		_ = peer.Close()
 
 		return err

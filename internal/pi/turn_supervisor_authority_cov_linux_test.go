@@ -390,11 +390,11 @@ func TestTurnSupervisorCovLivenessLaunchFailsClosedOnEveryResource(t *testing.T)
 	}
 
 	for name, test := range map[string]struct {
-		arrange func(t *testing.T) *turnSupervisorAuthority
+		arrange func() *turnSupervisorAuthority
 		want    error
 	}{
 		"memfd": {
-			arrange: func(*testing.T) *turnSupervisorAuthority {
+			arrange: func() *turnSupervisorAuthority {
 				turnSupervisorMemfd = func(string, int) (int, error) { return 0, memfdErr }
 
 				return &turnSupervisorAuthority{}
@@ -402,7 +402,7 @@ func TestTurnSupervisorCovLivenessLaunchFailsClosedOnEveryResource(t *testing.T)
 			want: memfdErr,
 		},
 		"seal": {
-			arrange: func(*testing.T) *turnSupervisorAuthority {
+			arrange: func() *turnSupervisorAuthority {
 				turnSupervisorSealConfig = func(uintptr, int, int) (int, error) { return 0, sealErr }
 
 				return &turnSupervisorAuthority{}
@@ -410,7 +410,7 @@ func TestTurnSupervisorCovLivenessLaunchFailsClosedOnEveryResource(t *testing.T)
 			want: sealErr,
 		},
 		"data_pipe": {
-			arrange: func(*testing.T) *turnSupervisorAuthority {
+			arrange: func() *turnSupervisorAuthority {
 				turnSupervisorPipe = func() (*os.File, *os.File, error) { return nil, nil, dataPipeErr }
 
 				return &turnSupervisorAuthority{}
@@ -418,7 +418,7 @@ func TestTurnSupervisorCovLivenessLaunchFailsClosedOnEveryResource(t *testing.T)
 			want: dataPipeErr,
 		},
 		"peer_pipe": {
-			arrange: func(*testing.T) *turnSupervisorAuthority {
+			arrange: func() *turnSupervisorAuthority {
 				calls := 0
 				turnSupervisorPipe = func() (*os.File, *os.File, error) {
 					calls++
@@ -434,15 +434,15 @@ func TestTurnSupervisorCovLivenessLaunchFailsClosedOnEveryResource(t *testing.T)
 			want: peerPipeErr,
 		},
 		"identity_duplicate": {
-			arrange: func(t *testing.T) *turnSupervisorAuthority { return borrowed(t, false, true) },
+			arrange: func() *turnSupervisorAuthority { return borrowed(t, false, true) },
 			want:    unix.EBADF,
 		},
 		"domain_duplicate": {
-			arrange: func(t *testing.T) *turnSupervisorAuthority { return borrowed(t, true, false) },
+			arrange: func() *turnSupervisorAuthority { return borrowed(t, true, false) },
 			want:    unix.EBADF,
 		},
 		"executable": {
-			arrange: func(t *testing.T) *turnSupervisorAuthority {
+			arrange: func() *turnSupervisorAuthority {
 				turnSupervisorExecutable = func() (string, error) { return "", executableErr }
 
 				return borrowed(t, true, true)
@@ -450,7 +450,7 @@ func TestTurnSupervisorCovLivenessLaunchFailsClosedOnEveryResource(t *testing.T)
 			want: executableErr,
 		},
 		"start": {
-			arrange: func(t *testing.T) *turnSupervisorAuthority {
+			arrange: func() *turnSupervisorAuthority {
 				turnSupervisorExecutable = func() (string, error) { return "/nonexistent/pi-supervisor", nil }
 
 				return borrowed(t, true, true)
@@ -460,7 +460,7 @@ func TestTurnSupervisorCovLivenessLaunchFailsClosedOnEveryResource(t *testing.T)
 	} {
 		t.Run(name, func(t *testing.T) {
 			restoreTurnSupervisorSeams(t)
-			authority := test.arrange(t)
+			authority := test.arrange()
 			before := turnSupervisorCovDescriptors(t)
 			liveness, data, peer, launchErr := startTurnSupervisorLiveness(
 				turnSupervisorConfig{}, controlRead, completionWrite, authority,
