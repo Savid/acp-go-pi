@@ -302,8 +302,29 @@ func connectConformanceAgent(
 	})
 
 	conn := acp.NewClientSideConnection(client, c2aW, a2cR)
-	_, err := conn.Initialize(ctx, init)
-	require.NoError(t, err)
+
+	// The handshake writes to an io.Pipe, and io.Pipe.Write blocks until a
+	// reader appears: it observes neither ctx nor the subtest deadline. So when
+	// Serve returns early nothing ever reads, the write blocks forever, and the
+	// package dies on the global test timeout with the agent's real startup
+	// error still sitting unread in done. Race the handshake against Serve's
+	// exit so that error is what fails the case.
+	initialized := make(chan error, 1)
+	go func() {
+		_, initErr := conn.Initialize(ctx, init)
+		initialized <- initErr
+	}()
+
+	select {
+	case err := <-initialized:
+		require.NoError(t, err)
+	case err := <-done:
+		done <- err
+
+		require.FailNowf(t, "agent stopped before the handshake completed", "Serve: %v", err)
+	case <-ctx.Done():
+		require.FailNowf(t, "handshake did not complete", "%v", ctx.Err())
+	}
 
 	return conn
 }
