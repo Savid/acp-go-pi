@@ -5,6 +5,7 @@ package pi
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -904,4 +905,50 @@ func restoreAgentIdentityLockTestSeams(t *testing.T) {
 		agentIdentityDirectoryClose = closeDirectory
 		agentIdentityLockReadFile = readFile
 	})
+}
+
+// TestEffectiveIdentityFailsClosedOnAnUnrepresentableKernelAnswer proves the
+// effective-id helpers refuse rather than narrow. Every caller compares their
+// result against an inode's 32-bit owner, so an answer outside that width must
+// not be truncated into an id a real inode could carry — the truncation of an
+// answer one past the 32-bit range is 0, which is root. Linux stores its ids in
+// 32 bits and cannot produce such an answer, so it is staged through the seams
+// the helpers read.
+func TestEffectiveIdentityFailsClosedOnAnUnrepresentableKernelAnswer(t *testing.T) {
+	realUID, realGID := effectiveUIDSource, effectiveGIDSource
+	t.Cleanup(func() { effectiveUIDSource, effectiveGIDSource = realUID, realGID })
+
+	effectiveUIDSource = func() int { return -1 }
+	effectiveGIDSource = func() int { return -1 }
+
+	if uid := effectiveUID(); uid != math.MaxUint32 {
+		t.Fatalf("negative uid answer narrowed to %d", uid)
+	}
+
+	if gid := effectiveGID(); gid != math.MaxUint32 {
+		t.Fatalf("negative gid answer narrowed to %d", gid)
+	}
+
+	effectiveUIDSource = func() int { return math.MaxUint32 + 1 }
+	effectiveGIDSource = func() int { return math.MaxUint32 + 1 }
+
+	uid, gid := effectiveUID(), effectiveGID()
+	if uid != math.MaxUint32 || uid == 0 {
+		t.Fatalf("unrepresentable uid answer narrowed to %d; zero would have claimed root", uid)
+	}
+
+	if gid != math.MaxUint32 || gid == 0 {
+		t.Fatalf("unrepresentable gid answer narrowed to %d; zero would have claimed the root group", gid)
+	}
+
+	effectiveUIDSource = func() int { return 65534 }
+	effectiveGIDSource = func() int { return 65533 }
+
+	if uid := effectiveUID(); uid != 65534 {
+		t.Fatalf("representable uid answer = %d, want 65534", uid)
+	}
+
+	if gid := effectiveGID(); gid != 65533 {
+		t.Fatalf("representable gid answer = %d, want 65533", gid)
+	}
 }
