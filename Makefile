@@ -5,7 +5,7 @@
 GOLANGCI_LINT_VERSION ?= v2.12.2
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
-.PHONY: build lint fmt-check fmt test coverage-check test-cross-compile test-integration-smoke test-integration-live test-integration-cover test-integration-native-browser docs-audit clean tidy vuln modernize-check audit test/cover help
+.PHONY: build lint fmt-check fmt test coverage-check test-cross-compile test-integration-smoke test-integration-live test-integration-cover test-integration-native-browser docs-audit clean tidy vuln vuln-sarif modernize-check audit test/cover help
 
 ## build: compile all packages
 build:
@@ -128,6 +128,13 @@ tidy:
 # keep the tool directive pinned at v1.5.0 or newer.
 vuln:
 	go tool govulncheck ./...
+
+## vuln-sarif: run the same pinned govulncheck, emitting SARIF for code scanning
+# The CI job uploads this file. It runs the go.mod tool directive rather than a
+# third-party action that go-installs an unpinned govulncheck: the family pins
+# every tool, and x/vuln before v1.5.0 panics in x/tools SSA on Go 1.26 generics.
+vuln-sarif:
+	go tool govulncheck -format sarif ./... > govulncheck.sarif
 
 ## modernize-check: preview Go modernizations without changing files
 modernize-check:
