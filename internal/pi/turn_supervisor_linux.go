@@ -29,6 +29,13 @@ const (
 	turnSupervisorReady            = "ready\n"
 	turnSupervisorOriginBorrowed   = "borrowed"
 	turnSupervisorOriginStandalone = "standalone"
+
+	// turnSupervisorLivenessReadyWait bounds the guardian's wait for its
+	// liveness child's readiness report. The guardian arms it only after
+	// acquireTurnSupervisorAuthority has returned, so unlike the parent's
+	// readiness wait it does not span the standalone identity claim and is
+	// deliberately not tied to agentStandaloneClaimMax.
+	turnSupervisorLivenessReadyWait = 5 * time.Second
 )
 
 type turnSupervisorConfig struct {
@@ -320,7 +327,12 @@ func awaitProcessTreeReady(launch *processTreeCommand) error {
 		launch.ready = nil
 	}()
 
-	if err := launch.ready.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	// The guardian reports readiness only after it has acquired its standalone
+	// agent identity, so this wait spans the claim and must never be shorter
+	// than the claim's own maximum. Naming the claim budget here keeps the two
+	// tied: a shorter wait would cancel a claim that was still progressing and
+	// report a containment failure that never happened.
+	if err := launch.ready.SetReadDeadline(time.Now().Add(agentStandaloneClaimMax)); err != nil {
 		return fmt.Errorf("arm Pi native supervisor readiness: %w", err)
 	}
 
@@ -482,7 +494,7 @@ func runTurnSupervisorGuardian(configInput io.Reader, controlInput io.Reader, re
 	go func() { waiter <- liveness.Wait() }()
 	reader := bufio.NewReader(data)
 	turnSupervisorBeforeGuardianReadiness()
-	if err = turnSupervisorReadDeadline(data, time.Now().Add(5*time.Second)); err != nil {
+	if err = turnSupervisorReadDeadline(data, time.Now().Add(turnSupervisorLivenessReadyWait)); err != nil {
 		_ = peer.Close()
 		waitErr := <-waiter
 		containErr := turnSupervisorContain(turnSupervisorProcessID(), 0)

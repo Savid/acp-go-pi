@@ -861,6 +861,59 @@ func TestTurnSupervisorConfigAndReadinessBranches(t *testing.T) {
 	}
 }
 
+// TestProcessTreeReadinessSpansTheStandaloneClaimBudget proves that the managed
+// root's wait for the guardian's readiness report is at least as long as the
+// standalone identity claim the report waits behind, and that the guardian's
+// own post-claim wait is deliberately held apart from it.
+//
+// The guardian writes turnSupervisorReady only after
+// acquireTurnSupervisorAuthority has returned, and that claim is allowed
+// agentStandaloneClaimMax to finish. A readiness wait shorter than the claim
+// budget therefore cancels a claim that was still making progress and reports a
+// native supervisor readiness failure that never happened. The first case
+// reports readiness one second past the retired five-second budget and requires
+// the wait to accept it. The second case pins the distinction: the guardian
+// arms turnSupervisorLivenessReadyWait only after its own claim has already
+// completed, so that budget does not span a claim and must not be raised to the
+// claim maximum along with the readiness wait.
+func TestProcessTreeReadinessSpansTheStandaloneClaimBudget(t *testing.T) {
+	if turnSupervisorLivenessReadyWait >= agentStandaloneClaimMax {
+		t.Fatalf(
+			"post-claim liveness wait %v is no longer held apart from the claim budget %v",
+			turnSupervisorLivenessReadyWait, agentStandaloneClaimMax,
+		)
+	}
+
+	report := turnSupervisorLivenessReadyWait + time.Second
+	if report >= agentStandaloneClaimMax {
+		t.Fatalf("readiness at %v does not fit inside the claim budget %v", report, agentStandaloneClaimMax)
+	}
+
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reported := make(chan struct{})
+	t.Cleanup(func() {
+		<-reported
+		_ = write.Close()
+	})
+	go func() {
+		defer close(reported)
+		time.Sleep(report)
+		_, _ = io.WriteString(write, turnSupervisorReady)
+	}()
+
+	started := time.Now()
+	if err = awaitProcessTreeReady(&processTreeCommand{ready: read}); err != nil {
+		t.Fatalf("readiness reported %v into the claim: %v", report, err)
+	}
+	if waited := time.Since(started); waited < report {
+		t.Fatalf("readiness accepted after %v, want the wait to have outlasted %v", waited, report)
+	}
+}
+
 func TestProcessIsolationActualPiFastExitCompletionCanPrecedeGuardianReadiness(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("real guardian/liveness supervisor regression requires root")
