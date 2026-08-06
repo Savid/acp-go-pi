@@ -117,36 +117,6 @@ func validateGeneratedNativeAncestor(
 	return nil
 }
 
-func validateDurableNativeAncestor(
-	stat unix.Stat_t,
-	final bool,
-	trustedUID uint32,
-	trustedGID uint32,
-	targetUID uint32,
-	targetGID uint32,
-) error {
-	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
-		return errors.New("native-owned path ancestry is not a directory")
-	}
-	trusted := stat.Uid == trustedUID && stat.Gid == trustedGID
-	target := stat.Uid == targetUID && stat.Gid == targetGID
-	if !trusted && !target {
-		return fmt.Errorf("native-owned path ancestor is uid=%d gid=%d", stat.Uid, stat.Gid)
-	}
-	mode := stat.Mode & 0o7777
-	if mode&0o022 != 0 && !(trusted && mode&unix.S_ISVTX != 0) {
-		return fmt.Errorf("native-owned path ancestor mode %#o is writable", mode)
-	}
-	if final && (!target || mode&0o700 != 0o700) {
-		return errors.New("native-owned directory is not safely owned by the target identity")
-	}
-	if !nativeIdentityCanTraverse(stat, targetUID, targetGID) {
-		return errors.New("native-owned path ancestry is not traversable by the target identity")
-	}
-
-	return nil
-}
-
 func nativeIdentityCanTraverse(stat unix.Stat_t, uid uint32, gid uint32) bool {
 	switch {
 	case stat.Uid == uid:
