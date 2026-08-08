@@ -33,6 +33,16 @@ const (
 	turnSupervisorOriginBorrowed   = "borrowed"
 	turnSupervisorOriginStandalone = "standalone"
 
+	// turnSupervisorFailure prefixes the terminal readiness frame a supervisor
+	// writes in place of the readiness it never reached. A refusal reason is
+	// otherwise only ever printed to a stderr the parent discards, and every
+	// caller sees a bare "await Pi native supervisor readiness: EOF" instead of
+	// the reason. The frame changes nothing about the verdict — a refusal is
+	// still a refusal — it only lets the refusal name itself. A child that dies
+	// without writing the frame still closes the pipe wordless, and EOF remains
+	// the honest answer for that.
+	turnSupervisorFailure = "error:"
+
 	// turnSupervisorLivenessReadyWait bounds the guardian's wait for its
 	// liveness child's readiness report. The guardian arms it only after
 	// acquireTurnSupervisorAuthority has returned, so unlike the parent's
@@ -176,6 +186,10 @@ func turnSupervisorBootstrap() {
 
 	if control != nil {
 		_ = control.Close()
+	}
+
+	if err != nil && ready != nil {
+		_, _ = fmt.Fprintln(ready, turnSupervisorFailure+err.Error())
 	}
 
 	if ready != nil {
@@ -367,6 +381,10 @@ func awaitProcessTreeReady(launch *processTreeCommand) error {
 	line, err := bufio.NewReader(launch.ready).ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("await Pi native supervisor readiness: %w", err)
+	}
+
+	if failure, ok := strings.CutPrefix(strings.TrimSpace(line), turnSupervisorFailure); ok {
+		return fmt.Errorf("pi native supervisor failed before readiness: %s", failure)
 	}
 
 	if line != turnSupervisorReady {
@@ -892,6 +910,10 @@ func parseTurnSupervisorLivenessReady(line string) (int, error) {
 	text, ok := strings.CutSuffix(line, "\n")
 	if !ok {
 		return 0, errors.New("pi liveness readiness is not newline terminated")
+	}
+
+	if failure, failed := strings.CutPrefix(text, turnSupervisorFailure); failed {
+		return 0, fmt.Errorf("pi liveness failed before readiness: %s", failure)
 	}
 
 	pidText, ok := strings.CutPrefix(text, "ready:")
