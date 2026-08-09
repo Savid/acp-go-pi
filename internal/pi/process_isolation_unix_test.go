@@ -14,9 +14,15 @@ import (
 
 func TestProcessIsolationUnixVerificationBranches(t *testing.T) {
 	originalUID, originalGID, originalGroups := processIsolationGeteuid, processIsolationGetegid, processIsolationGetgroups
+	originalGOOS := processIsolationGOOS
 	t.Cleanup(func() {
 		processIsolationGeteuid, processIsolationGetegid, processIsolationGetgroups = originalUID, originalGID, originalGroups
+		processIsolationGOOS = originalGOOS
 	})
+	// The seams below name an identity the supervisor already holds, which is
+	// the shared-identity arm on Linux. This test pins the credential
+	// verification the other backends perform, so it selects that backend.
+	processIsolationGOOS = "darwin"
 	processIsolationGeteuid = func() int { return 11 }
 	processIsolationGetegid = func() int { return 22 }
 	processIsolationGetgroups = func() ([]int, error) { return nil, nil }
@@ -52,9 +58,16 @@ func TestProcessIsolationUnixVerificationBranches(t *testing.T) {
 func TestProcessIsolationLaunchFailures(t *testing.T) {
 	wantErr := errors.New("injected isolation failure")
 	originalUID, originalGID, originalGroups := processIsolationGeteuid, processIsolationGetegid, processIsolationGetgroups
+	originalGOOS := processIsolationGOOS
 	t.Cleanup(func() {
 		processIsolationGeteuid, processIsolationGetegid, processIsolationGetgroups = originalUID, originalGID, originalGroups
+		processIsolationGOOS = originalGOOS
 	})
+	// The seams below name an identity the supervisor already holds, which is
+	// the shared-identity arm on Linux. This test pins how the credential
+	// verification the other backends perform surfaces through the launch
+	// wrappers, so it selects that backend.
+	processIsolationGOOS = "darwin"
 	processIsolationGeteuid = func() int { return 11 }
 	processIsolationGetegid = func() int { return 22 }
 	processIsolationGetgroups = func() ([]int, error) { return nil, wantErr }

@@ -441,10 +441,16 @@ func TestTurnSupervisorCovNativeRefusesToStartWithoutProvableIdentity(t *testing
 	}
 
 	uidOriginal, gidOriginal, groupsOriginal := processIsolationGeteuid, processIsolationGetegid, processIsolationGetgroups
+	goosOriginal := processIsolationGOOS
 	t.Cleanup(func() {
 		processIsolationGeteuid, processIsolationGetegid, processIsolationGetgroups =
 			uidOriginal, gidOriginal, groupsOriginal
+		processIsolationGOOS = goosOriginal
 	})
+	// The seams below name an identity the supervisor already holds, which is
+	// the shared-identity arm on Linux. This test pins the credential proof the
+	// other backends perform, so it selects that backend.
+	processIsolationGOOS = "darwin"
 	processIsolationGeteuid = func() int { return 64391 }
 	processIsolationGetegid = func() int { return 64392 }
 	groupsErr := errors.New("supplementary groups refused")

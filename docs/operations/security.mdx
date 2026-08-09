@@ -157,6 +157,29 @@ Permanent coordination inodes are never reconstructed beside durable state.
   its shard. This prevents an old unlinked open file description from becoming
   split-brain authority. An exact-owner restart still validates the named
   owners-lock metadata even though it skips that flock.
+When the configured native UID is the effective UID the supervisor already
+runs as, there is no privilege boundary to cross and the launch takes the
+shared-identity arm. Root can never reach it: the native UID is required to be
+nonzero. The arm skips the trusted-root assertion, the standalone owner fields,
+the whole `/var/lib/acp-go` authority — claim, vacancy proof, state-root
+ancestry, disposition and quarantine — and the credential drop, because the
+task vacancy that record proves cannot hold while the supervisor itself
+occupies the identity, and an unprivileged process can neither re-enter its own
+identity nor shed the groups of the account it was started under. A native GID
+the supervisor is not already in is still refused. Empty capabilities with
+empty owner fields is the only accepted shape; owner fields are refused because
+they promise a record this arm never writes. The parent stamps the decision
+into the sealed configuration and the guardian and liveness children each
+re-derive it from their own identity, refusing a configuration that disagrees
+in either direction. Everything else is retained: both subreaper claims,
+no-new-privs, core-dump suppression, the guardian and liveness pair, the
+descriptor fences, the readiness handshake, descendant adoption and reaping to
+kernel `ECHILD`, and the process-group teardown. Containment reports
+`shared_identity`: whole-tree lifecycle is still proven, the credential
+boundary between supervisor and agent is not, concurrent sessions share one
+home and one credential set, and no host-global lock excludes another runner
+under the same account.
+
 With both host capabilities nil, standalone acquisition requires the explicit
 owner ID and state-root fields and strictly validates `<uid>.owner` and
 `<uid>.quarantine`. A new claim takes domain SH, permanent checked-CLOEXEC

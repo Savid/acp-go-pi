@@ -127,8 +127,16 @@ default because a process-group check cannot account for descendants that call
 that limitation can opt in with `WithDarwinBestEffortContainment`. The
 effective mode is
 available from `Agent.ContainmentMode` and is reported as `authoritative`,
-`best_effort`, or `unavailable`. FreeBSD, OpenBSD, and other unsupported
-platforms continue to fail closed.
+`shared_identity`, `best_effort`, or `unavailable`. FreeBSD, OpenBSD, and other
+unsupported platforms continue to fail closed.
+
+A Linux deployment that never held privilege can name its own identity as the
+native identity. The supervisor then launches without dropping credentials it
+does not have, keeps the guardian and liveness pair, the subreaper tree, the
+descendant reaping and the process-group teardown, and reports
+`shared_identity`. Whole-tree lifecycle is still proven; there is no credential
+boundary between the supervisor and the agent, and no host-global record of who
+holds the identity.
 
 Darwin best-effort mode reaps the direct child and applies a bounded
 TERM-to-KILL ladder to the captured original process group. It does not claim

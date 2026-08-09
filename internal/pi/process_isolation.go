@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,7 +35,19 @@ const (
 	envIsolationUID  = privateEnvPrefix + "ISOLATION_UID"
 	envIsolationGID  = privateEnvPrefix + "ISOLATION_GID"
 	envIsolationTest = privateEnvPrefix + "ISOLATION_TEST_ONLY"
+
+	processIsolationLinux = "linux"
 )
+
+var processIsolationGOOS = runtime.GOOS
+
+// sharedIdentitySupervisorRemedy states what an operator can change when the
+// supervisor was asked to launch the native process under the very identity it
+// already runs as and the shape it was handed describes something else. There
+// is no privilege boundary to cross in that deployment, so the two answers are
+// to give the supervisor one, or to describe the launch as what it is.
+const sharedIdentitySupervisorRemedy = "run the supervisor as root to isolate the agent identity, " +
+	"or launch the agent under the identity the supervisor already holds"
 
 func validateProcessIsolation(isolation *ProcessIsolation) error {
 	if isolation == nil {

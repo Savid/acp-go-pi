@@ -34,6 +34,20 @@ func validateStandaloneIdentityDisposition(isolation *ProcessIsolation) error {
 		return nil
 	}
 
+	// A native identity the supervisor already holds cannot be recorded as a
+	// standalone one: the durable record proves an identity no live task
+	// occupies, and the supervisor asking for it is such a task. No
+	// capabilities and no standalone fields is therefore the canonical shape,
+	// and fields that promise a record this arm never writes are refused.
+	if sharedProcessIdentity(isolation) {
+		if isolation.StandaloneOwnerID != "" || isolation.StandaloneStateRoot != "" {
+			return errors.New("standalone owner fields describe an identity the supervisor already holds; " +
+				sharedIdentitySupervisorRemedy)
+		}
+
+		return nil
+	}
+
 	if !validStandaloneOwnerID(isolation.StandaloneOwnerID) {
 		return errors.New("standalone owner id must be 1..256 valid UTF-8 bytes without whitespace or control characters")
 	}

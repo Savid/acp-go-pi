@@ -100,3 +100,42 @@ func TestProcessIsolationOptionIsRefusedOnWindows(t *testing.T) {
 	agentRuntimePlatform = darwinPlatform
 	require.NoError(t, validateProcessIsolationOption(isolation))
 }
+
+// TestSharedIdentityProcessIsolationOptionCarriesNoOwnerFields proves the public
+// option accepts the only shape a shared identity can have and refuses fields
+// that promise a durable record the supervisor will never write, while the
+// isolated shape keeps every rule it has today.
+func TestSharedIdentityProcessIsolationOptionCarriesNoOwnerFields(t *testing.T) {
+	restoreSharedIdentitySeams(t)
+
+	agentRuntimePlatform = linuxPlatform
+	processIsolationEffectiveUID = func() int { return 1000 }
+
+	canonical := &ProcessIsolation{UID: 1000, GID: 1000, BaseEnvironment: map[string]string{}}
+	require.NoError(t, validateProcessIsolationOption(canonical))
+
+	withOwner := *canonical
+	withOwner.StandaloneOwnerID = "shared-option-test"
+	require.ErrorContains(
+		t,
+		validateProcessIsolationOption(&withOwner),
+		"standalone owner fields describe an identity the supervisor already holds",
+	)
+
+	withStateRoot := *canonical
+	withStateRoot.StandaloneStateRoot = "/var/tmp/acp-go-pi-shared"
+	require.ErrorContains(
+		t,
+		validateProcessIsolationOption(&withStateRoot),
+		"standalone owner fields describe an identity the supervisor already holds",
+	)
+
+	require.False(t, sharedProcessIdentity(nil))
+
+	processIsolationEffectiveUID = func() int { return 0 }
+	require.EqualError(
+		t,
+		validateProcessIsolationOption(canonical),
+		"standalone owner id must be 1..256 valid UTF-8 bytes without whitespace or control characters",
+	)
+}

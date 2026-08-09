@@ -383,3 +383,46 @@ func TestCloseAndServeJoinAdmittedIncompletePromptRelaunch(t *testing.T) {
 	require.ErrorIs(t, <-serveErr, pi.ErrProcessContainmentIncomplete)
 	require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
 }
+
+func restoreSharedIdentitySeams(t *testing.T) {
+	t.Helper()
+
+	platform, effectiveUID := agentRuntimePlatform, processIsolationEffectiveUID
+	t.Cleanup(func() { agentRuntimePlatform, processIsolationEffectiveUID = platform, effectiveUID })
+}
+
+// TestContainmentModeReportsASharedAgentIdentity proves the reported boundary
+// names what the deployment actually proves: whole-tree lifecycle either way,
+// and the credential separation only when the agent runs under an identity of
+// its own.
+func TestContainmentModeReportsASharedAgentIdentity(t *testing.T) {
+	restoreSharedIdentitySeams(t)
+
+	agentRuntimePlatform = linuxPlatform
+	processIsolationEffectiveUID = func() int { return 1000 }
+
+	shared := Options{ProcessIsolation: &ProcessIsolation{UID: 1000, GID: 1000}}
+	require.Equal(t, RuntimeContainmentSharedIdentity, containmentMode(shared))
+	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{
+		ProcessIsolation: shared.ProcessIsolation, DarwinBestEffortContainment: true,
+	}))
+
+	require.Equal(t, RuntimeContainmentAuthoritative, containmentMode(Options{
+		ProcessIsolation: &ProcessIsolation{UID: 1001, GID: 1001},
+	}))
+
+	processIsolationEffectiveUID = func() int { return 0 }
+	require.Equal(t, RuntimeContainmentAuthoritative, containmentMode(shared))
+	require.Equal(t, RuntimeContainmentAuthoritative, containmentMode(Options{
+		ProcessIsolation: &ProcessIsolation{},
+	}))
+
+	processIsolationEffectiveUID = func() int { return 1000 }
+	agentRuntimePlatform = darwinPlatform
+	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(shared))
+
+	agent := NewAgent(WithProcessIsolation(*shared.ProcessIsolation))
+	t.Cleanup(func() { _ = agent.Close() })
+	agentRuntimePlatform = linuxPlatform
+	require.Equal(t, RuntimeContainmentSharedIdentity, agent.ContainmentMode())
+}

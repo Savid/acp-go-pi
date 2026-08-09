@@ -19,10 +19,17 @@ recording prompt text, tool inputs, tool outputs, and raw pi event bodies.
 ## Containment signal
 
 `acp_go_pi.runtime.containment` is recorded as `1` with the exact
-`containment` attribute `authoritative`, `best_effort`, or `unavailable`.
+`containment` attribute `authoritative`, `shared_identity`, `best_effort`, or
+`unavailable`.
 Embedded hosts receive the same value once through
 `RuntimeResourceHooks.ObserveContainment`; `Agent.ContainmentMode` exposes it
 directly.
+
+A Linux agent whose configured native identity is the identity the process
+already runs as reports `containment=shared_identity`. The subreaper tree, the
+descendant reaping and the process-group teardown are unchanged, so the
+whole-tree lifecycle proof and every process snapshot are the authoritative
+ones; the attribute records that the agent holds no credentials of its own.
 
 Darwin opt-in logs a structured warning with `containment=best_effort`, and the
 standalone binary prints a plain warning even without `-debug`. Best-effort

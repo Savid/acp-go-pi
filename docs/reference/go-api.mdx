@@ -33,6 +33,8 @@ it must retain or quarantine any resources the native runtime may still
 reach. It does not mean that every descendant can be inventoried on Darwin.
 
 `Agent.ContainmentMode()` returns `RuntimeContainmentAuthoritative` on Linux,
+`RuntimeContainmentSharedIdentity` on a Linux agent whose configured native
+identity is the identity the process already runs as,
 `RuntimeContainmentBestEffort` on an opted-in Darwin agent, and
 `RuntimeContainmentUnavailable` otherwise. Windows native launch is unavailable
 because the mandatory Unix UID/GID identity boundary with empty supplementary

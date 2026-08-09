@@ -175,6 +175,10 @@ func containmentMode(options Options) RuntimeContainmentMode {
 			return RuntimeContainmentUnavailable
 		}
 
+		if sharedProcessIdentity(options.ProcessIsolation) {
+			return RuntimeContainmentSharedIdentity
+		}
+
 		return RuntimeContainmentAuthoritative
 	case darwinPlatform:
 		if options.DarwinBestEffortContainment {

@@ -61,11 +61,16 @@ func testContainmentOption() Option {
 	}
 }
 
+// testProcessIsolationOption installs the isolated shape: a native identity
+// that is never the identity running the test, so the fixture keeps describing
+// a launch with a privilege boundary to cross whoever runs it.
 func testProcessIsolationOption() Option {
 	return func(options *Options) {
 		uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
 		if uid == 0 {
 			uid, gid = 11, 22
+		} else {
+			uid, gid = uid+1, gid+1
 		}
 		WithProcessIsolation(ProcessIsolation{
 			UID: uid, GID: gid,
