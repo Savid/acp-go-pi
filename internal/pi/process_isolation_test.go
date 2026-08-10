@@ -115,6 +115,8 @@ func TestOrdinaryExecutableLookupAcceptsOrdinaryPaths(t *testing.T) {
 
 	_, err = ResolveExecutable("pi", &ProcessIsolation{
 		UID: 1, GID: 1, BaseEnvironment: map[string]string{"PATH": relativeDir},
+		StandaloneOwnerID:   "relative-policy-path-test",
+		StandaloneStateRoot: "/var/tmp/acp-go-pi-relative-policy-path-test",
 	}, nil)
 	require.ErrorContains(t, err, "not absolute")
 

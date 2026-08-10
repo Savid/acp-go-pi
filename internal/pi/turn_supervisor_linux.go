@@ -1298,10 +1298,6 @@ func validateTurnSupervisorGuardianPeer(peer *os.File, done <-chan struct{}) err
 }
 
 func validateTurnSupervisorIdentity(isolation *ProcessIsolation) error {
-	if isolation == nil {
-		return errors.New("process isolation is required")
-	}
-
 	effectiveUID := turnSupervisorEffectiveUID()
 	if effectiveUID != 0 {
 		return fmt.Errorf("trusted root identity is required, effective uid is %d", effectiveUID)

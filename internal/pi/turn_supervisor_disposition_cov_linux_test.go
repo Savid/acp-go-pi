@@ -57,24 +57,41 @@ func turnSupervisorCovAssertNoLeak(t *testing.T, before map[string]struct{}) {
 	}
 }
 
-// TestTurnSupervisorCovPrepareRefusesIncompleteIsolationAndAuthorityPairs
+// TestTurnSupervisorCovPrepareAcceptsOrdinaryExecutionWithoutIsolation proves
+// that an absent isolation policy selects the ordinary process-tree path. The
+// native command still receives the platform process-group contract, but no
+// supervisor or identity authority is invented for it.
+func TestTurnSupervisorCovPrepareAcceptsOrdinaryExecutionWithoutIsolation(t *testing.T) {
+	native := exec.Command("/bin/true")
+	launch, err := prepareProcessTreeCommand(native, ContainmentSpec{})
+	if err != nil {
+		t.Fatalf("ordinary preparation = %v", err)
+	}
+	if launch == nil || launch.cmd != native || !launch.ordinary {
+		t.Fatalf("ordinary launch = %#v", launch)
+	}
+}
+
+// TestTurnSupervisorCovPrepareRefusesIncompleteExplicitIsolationAndAuthorityPairs
 // proves that the parent side refuses to build a supervised launch whenever
-// the isolation policy is absent or incomplete, or when only one half of the
+// an explicit isolation policy is incomplete, or when only one half of the
 // borrowed authority pair is supplied. A supervisor started with half an
 // authority pair would run the native command with an identity nobody can
 // revalidate downstream, so the refusal must happen before any descriptor is
 // created.
-func TestTurnSupervisorCovPrepareRefusesIncompleteIsolationAndAuthorityPairs(t *testing.T) {
+func TestTurnSupervisorCovPrepareRefusesIncompleteExplicitIsolationAndAuthorityPairs(t *testing.T) {
 	restoreTurnSupervisorSeams(t)
 
-	if err := validateTurnSupervisorIdentity(nil); err == nil ||
-		!strings.Contains(err.Error(), "process isolation is required") {
-		t.Fatalf("absent isolation identity = %v", err)
+	before := turnSupervisorCovDescriptors(t)
+	_, err := prepareProcessTreeCommand(exec.Command("/bin/true"), ContainmentSpec{
+		DarwinBestEffort: true,
+		Isolation:        supervisorTestIsolation(),
+	})
+	if err == nil || !errors.Is(err, ErrProcessContainmentIncomplete) {
+		t.Fatalf("Darwin containment with explicit Linux isolation = %v", err)
 	}
 
-	before := turnSupervisorCovDescriptors(t)
 	for name, isolation := range map[string]*ProcessIsolation{
-		"absent":     nil,
 		"zero_ident": {BaseEnvironment: map[string]string{}},
 		"no_environ": {UID: 11, GID: 22},
 	} {
@@ -358,6 +375,13 @@ func TestTurnSupervisorCovGuardianPeerPollFailureRefusesTheNativeLaunch(t *testi
 
 	if err = validateTurnSupervisorGuardianPeer(nil, nil); err != nil {
 		t.Fatalf("absent guardian peer = %v", err)
+	}
+
+	done := make(chan struct{})
+	close(done)
+	if err = validateTurnSupervisorGuardianPeer(peerRead, done); err == nil ||
+		!strings.Contains(err.Error(), "guardian exited before native launch") {
+		t.Fatalf("completed guardian peer = %v", err)
 	}
 
 	pollErr := errors.New("poll refused")
