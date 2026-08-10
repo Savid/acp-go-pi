@@ -95,14 +95,4 @@ jobs:
 
       - name: Execute supplied-environment PATH resolution
         shell: bash
-        run: |
-          set -euo pipefail
-          selector='^(TestOrdinaryWindowsExecutableResolutionExecutesSuppliedPATHEXTChild|TestWindowsEnvironmentCompositionIsCaseInsensitiveLastWins)$'
-          log=$(mktemp)
-          expected=$(go test -list "$selector" ./internal/pi | grep -Ec '^Test' || true)
-          [ "$expected" -eq 2 ] || { echo "windows executable test count $expected, want 2"; exit 1; }
-          go test -count=1 -v -run "$selector" ./internal/pi 2>&1 | tee "$log"
-          passed=$(grep -Ec '^--- PASS: Test[^/]+ ' "$log" || true)
-          skipped=$(grep -Ec '^[[:space:]]*--- SKIP: Test' "$log" || true)
-          [ "$passed" -eq "$expected" ] || { echo "windows executable pass count $passed, want $expected"; exit 1; }
-          [ "$skipped" -eq 0 ] || { echo "windows executable lane skipped $skipped tests"; exit 1; }
+        run: .github/scripts/run-windows-behavior-proof.sh
