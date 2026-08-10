@@ -109,8 +109,10 @@ session storage, permissions, raw events, and OpenTelemetry providers.
   explicitly seeded extension dialogs.
 - MCP stdio and HTTP server declarations through a wrapper-owned,
   dependency-free pi MCP client extension.
-- Deliberate provider credential injection through the isolated child
-  environment or seeded `auth.json`.
+- Deliberate provider credential injection through the child environment or a
+  seeded `auth.json`.
+- Optional seven-leg provider-auth brokerage backed by Pi's durable native
+  credential home and a separate values-free ownership ledger.
 - Optional durable mirroring through a host-provided `SessionStore`.
 - Optional raw pi event extension notifications.
 - OpenTelemetry spans, metrics, trace propagation, and structured logs
@@ -118,29 +120,24 @@ session storage, permissions, raw events, and OpenTelemetry providers.
 
 ## Process containment
 
-Linux provides the authoritative native process boundary. Windows native launch
-fails closed because its process API cannot apply the mandatory Unix UID/GID
-identity boundary with empty supplementary groups; cross-compilation proves
-only that this refusal path builds, not runtime support. Darwin fails closed by
-default because a process-group check cannot account for descendants that call
-`setsid`. The standalone command is Linux-only. Embedded hosts who accept
-that limitation can opt in with `WithDarwinBestEffortContainment`. The
-effective mode is
-available from `Agent.ContainmentMode` and is reported as `authoritative`,
-`shared_identity`, `best_effort`, or `unavailable`. FreeBSD, OpenBSD, and other
-unsupported platforms continue to fail closed.
+The default is ordinary execution. Omitting `WithProcessIsolation` (or the CLI
+`-process-isolation-config`) launches Pi as the adapter's current root or
+non-root identity on Linux, Darwin, FreeBSD, OpenBSD, and Windows. It reports
+`shared_identity`, uses portable direct-process liveness and locking, and makes
+no descendant-inventory, whole-tree-quiescence, credential-separation, or
+host-authority claim. It creates no identity lease or privileged supervisor.
 
-A Linux deployment that never held privilege can name its own identity as the
-native identity. The supervisor then launches without dropping credentials it
-does not have, keeps the guardian and liveness pair, the subreaper tree, the
-descendant reaping and the process-group teardown, and reports
-`shared_identity`. Whole-tree lifecycle is still proven; there is no credential
-boundary between the supervisor and the agent, and no host-global record of who
-holds the identity.
+Supplying `WithProcessIsolation` is a distinct hardened posture: a trusted root
+Linux supervisor launches Pi as the configured non-root UID/GID with an empty
+supplementary-group set and a closed policy environment. Any invalid policy,
+missing authority, same-identity request, or unsupported platform fails closed;
+it never retries as ordinary execution or as Darwin best effort. The effective
+mode is available from `Agent.ContainmentMode`.
 
 Darwin best-effort mode reaps the direct child and applies a bounded
 TERM-to-KILL ladder to the captured original process group. It does not claim
-that escaped descendants are absent. The adapter prints a warning on startup
+that escaped descendants are absent. It is a separate embedded-only opt-in,
+never an explicit-isolation fallback. The adapter prints a warning on startup
 and retains runtime records that operators can inspect with `acp-go-pi
 containment diagnose`; see the [CLI reference](docs/reference/cli.mdx) and
 [security limits](docs/operations/security.mdx).
@@ -176,6 +173,8 @@ Full Go API reference:
 make audit
 make test-integration-smoke
 make test-integration-live
+make test-integration-attended
+make test-integration-keystore
 make test-integration-cover
 ```
 
@@ -186,11 +185,13 @@ require a local `pi` CLI (v0.80.6 or newer) and are double-gated: the
 `make test-integration-smoke` runs the integration tier without spending
 model tokens; tests that spend tokens additionally require
 `ACP_GO_PI_RUN_LIVE_TOKENS=1`, which only `make test-integration-live` sets.
+The attended target drives a real browser-approved provider login; the
+keystore target validates durable credential residence and browser suppression
+inside its Linux container fixture.
 `make test-integration-cover` runs the integration tier against a
 coverage-instrumented binary. Integration tests always launch pi with an
-isolated temp `PI_CODING_AGENT_DIR` and a scrubbed environment; the live tier
-injects provider credentials into that isolated directory and never reads a
-shared mutable pi home.
+explicit test-owned `PI_CODING_AGENT_DIR` and a scrubbed environment. Provider
+auth tests use only test-owned durable homes and ledgers.
 
 ## License
 

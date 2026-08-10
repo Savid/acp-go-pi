@@ -2,7 +2,6 @@ package piacp
 
 import (
 	"errors"
-	"os"
 	"path/filepath"
 	"strings"
 	"unicode"
@@ -75,6 +74,10 @@ func (a *Agent) sessionStartConfigurationError() error {
 		return optionsErr
 	}
 
+	if a.options.ProviderAuthDirectHome != "" {
+		return unsupportedField(optionFieldProviderAuthDirectHome)
+	}
+
 	if isolationErr := validateProcessIsolationOption(a.options.ProcessIsolation); isolationErr != nil {
 		return isolationErr
 	}
@@ -98,50 +101,30 @@ func (a *Agent) sessionStartConfigurationError() error {
 
 func validateProcessIsolationOption(isolation *ProcessIsolation) error {
 	if isolation == nil {
-		return errors.New("process isolation policy is required")
+		return nil
 	}
 
 	if isolation.UID == 0 || isolation.GID == 0 {
 		return errors.New("process isolation UID and GID must be nonzero")
 	}
 
+	if agentRuntimePlatform != linuxPlatform {
+		return errors.New("explicit process isolation is supported only on linux")
+	}
+
 	if agentRuntimePlatform == linuxPlatform {
 		if err := validateStandaloneIdentityOption(
 			isolation.IdentityLock != nil, isolation.AuthorityDomain != nil,
 			isolation.StandaloneOwnerID, isolation.StandaloneStateRoot,
-			sharedProcessIdentity(isolation),
 		); err != nil {
 			return err
 		}
 	}
 
-	if agentRuntimePlatform == windowsPlatform {
-		return errors.New("process isolation is unsupported on windows")
-	}
-
 	return nil
 }
 
-// processIsolationEffectiveUID is the seam the shared-identity decision is
-// derived through. The containment mode is selected from a faked platform in
-// tests, so the identity it is compared against has to be selectable there too.
-var processIsolationEffectiveUID = os.Geteuid
-
-// sharedProcessIdentity reports whether the configured native identity is the
-// identity this process already runs as. Root never qualifies: a zero effective
-// uid is the trusted supervisor identity, and the native uid is required to be
-// nonzero, so the two can never name the same identity.
-func sharedProcessIdentity(isolation *ProcessIsolation) bool {
-	if isolation == nil {
-		return false
-	}
-
-	effectiveUID := processIsolationEffectiveUID()
-
-	return effectiveUID > 0 && uint64(isolation.UID) == uint64(effectiveUID)
-}
-
-func validateStandaloneIdentityOption(identityLock, authorityDomain bool, ownerID, stateRoot string, shared bool) error {
+func validateStandaloneIdentityOption(identityLock, authorityDomain bool, ownerID, stateRoot string) error {
 	if identityLock != authorityDomain {
 		return errors.New("process identity lock and authority domain must be provided together")
 	}
@@ -149,19 +132,6 @@ func validateStandaloneIdentityOption(identityLock, authorityDomain bool, ownerI
 	if identityLock {
 		if ownerID != "" || stateRoot != "" {
 			return errors.New("borrowed process identity forbids standalone owner fields")
-		}
-
-		return nil
-	}
-
-	// A native identity the supervisor already holds is never recorded as a
-	// standalone one: the durable record proves an identity no live task
-	// occupies, and the process asking for it is such a task.
-	if shared {
-		if ownerID != "" || stateRoot != "" {
-			return errors.New("standalone owner fields describe an identity the supervisor already holds; " +
-				"run the supervisor as root to isolate the agent identity, " +
-				"or launch the agent under the identity the supervisor already holds")
 		}
 
 		return nil

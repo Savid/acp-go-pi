@@ -447,9 +447,8 @@ func TestTurnSupervisorCovNativeRefusesToStartWithoutProvableIdentity(t *testing
 			uidOriginal, gidOriginal, groupsOriginal
 		processIsolationGOOS = goosOriginal
 	})
-	// The seams below name an identity the supervisor already holds, which is
-	// the shared-identity arm on Linux. This test pins the credential proof the
-	// other backends perform, so it selects that backend.
+	// Select the Unix credential backend directly to inject the final
+	// supplementary-group proof failure.
 	processIsolationGOOS = "darwin"
 	processIsolationGeteuid = func() int { return 64391 }
 	processIsolationGetegid = func() int { return 64392 }

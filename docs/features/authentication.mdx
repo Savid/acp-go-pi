@@ -1,50 +1,76 @@
 ---
 title: "Authentication"
-description: "How provider credentials enter isolated pi sessions"
+description: "Inject provider credentials or connect them through Pi's durable seven-leg broker"
 ---
 
-ACP agent authentication and pi provider credentials are separate surfaces.
-This adapter advertises no ACP auth methods. A pi session receives provider
-credentials only through an explicit environment or seeded file chosen by the
-host.
+ACP agent authentication and Pi provider credentials are separate surfaces.
+`authenticate` is not used for Pi provider login. Hosts can inject credentials
+explicitly, or enable Pi's `_pi/auth/*` extension broker in ordinary execution.
 
-## Standalone credential input
+## Enable provider auth
 
-The standalone root supervisor never forwards its ambient environment. To pass
-a provider API-key variable, name it explicitly in `inheritEnvironment` in the
-root-owned `-process-isolation-config` policy. The variable must be present in
-the supervisor environment or startup fails. Identity, path, loader,
-XDG/native-home, and adapter-private variables cannot be inherited.
+Configure both a durable Pi-native home and a separate durable ledger root:
 
-File-backed credentials enter through `-seed-file
-auth.json=<hostpath>`. The adapter reads that explicitly named file before
-launch and writes it into each isolated session agent directory. No standalone
-path reads root `HOME`, root pi config, or an unlisted root credential.
+```go
+agent := piacp.NewAgent(
+	piacp.WithHome("/var/lib/my-host/pi-home"),
+	piacp.WithProviderAuthRoot("/var/lib/my-host/pi-auth"),
+)
+```
 
-## No ACP auth methods
+The CLI equivalents are `-home` and `-provider-auth-root`. Both paths must be
+owned by the service deployment, never the operator's real `~/.pi`. The home is
+Pi's `PI_CODING_AGENT_DIR`, including its native `auth.json`, catalog behavior,
+and cross-process credential lock. The ledger records only provider,
+connection, revision, binding generation, flow identifiers, state, and
+timestamps; it never stores credential values, login inputs, URLs, codes, or
+native messages.
 
-`initialize` reports `authMethods: []`. A host never calls `authenticate`
-against this adapter, and ACP `logout` is a successful no-op that does not
-touch provider credentials. A missing or refused provider key inside pi is an
-ordinary turn failure with cause `provider`, not an ACP auth challenge.
+When both roots are usable, `initialize` advertises `providerAuth` with all
+seven method names. No credential needs to exist first: an empty durable home
+still advertises the broker so a host can show Connect. Omitting either root
+leaves the surface unadvertised. `WithProviderAuthDirectHome` is present for
+the shared family API, but Pi has no account-wide auth mutation; a non-empty
+value is refused.
 
-## Scrubbed environment
+Provider auth is intentionally limited to ordinary nil/default execution.
+Supplying `WithProcessIsolation` selects a distinct trusted-root identity whose
+safe credential-delivery path has not been proven, so the broker is not
+advertised and a durable broker home is refused. Explicit isolation never
+downgrades to ordinary execution to make login available.
 
-Every pi session runs in an isolated per-session agent directory with the
-complete replacement environment supplied by `ProcessIsolation`. Ambient shell
-variables, including provider API keys exported in the operator's shell, are
-not inherited by the pi child.
+## The seven legs
 
-Explicit environment maps accept ordinary provider variables but reject
-invalid names and process-hijack keys: `PATH`, `NODE_OPTIONS`, `BASH_ENV`,
-`ENV`, every `LD_*`, and every `DYLD_*`. The child-launch boundary scrubs the
-same keys again as defense in depth.
+| Method | Semantics |
+| --- | --- |
+| `_pi/auth/methods` | Executes Pi's provider catalog in the target session and returns bounded OAuth/API methods plus a fresh catalog generation. |
+| `_pi/auth/authorize` | Starts or idempotently replays one session/provider/connection flow after validating the catalog generation and authorization request id. |
+| `_pi/auth/callback` | Supplies the bounded paste-back value for callback-style OAuth and completes the native login. |
+| `_pi/auth/status` | Returns the closed pending/authenticated/failed/cancelled state for a flow without exposing native secret text. |
+| `_pi/auth/cancel` | Cancels the addressed flow and its in-flight native exchange. |
+| `_pi/auth/inventory` | Probes native residence and combines it with the values-free ledger, returning only confirmed-present, confirmed-absent, or not-confirmed proof. |
+| `_pi/auth/disconnect` | Deletes exactly one provider through Pi's native `AuthStorage`, fenced by connection id and binding generation, then records confirmed absence. |
 
-## Injecting credentials
+There is deliberately no credential-return leg and no injection key. OAuth and
+API-key material travels only between the host dialog, the wrapper-owned Pi
+bridge, and Pi's native `AuthStorage`; it is never returned through ACP. Login
+URLs and labels are normalized and bounded, loopback-only flows and executable
+shell credentials are refused, and browser-launcher shims prevent the native
+child from opening the operator's desktop browser behind the host's UX.
 
-For embedded use, pass provider variables with `WithEnv` for all sessions or
-`WithPiEnv` for one session. For file-backed credentials, seed pi's
-`auth.json` into each isolated agent directory:
+Per-provider slot gates serialize credential writes and disconnects. Flow
+admission also fences duplicate callbacks, session close, cancellation, and
+authorize replays so a late completion cannot resurrect a removed binding.
+
+## Explicit credential injection
+
+Ordinary mode captures a narrow base environment once and scrubs ambient
+provider keys, `NODE_OPTIONS`, shell hooks, loader variables, and adapter-private
+state. Pass deliberate provider variables with `WithEnv` for all sessions or
+`WithPiEnv` for one session. Explicit maps still reject invalid names and
+process-hijack keys.
+
+For file-backed credentials, seed Pi's `auth.json` into an ephemeral session:
 
 ```go
 err := piacp.Serve(ctx, input, output,
@@ -54,13 +80,7 @@ err := piacp.Serve(ctx, input, output,
 )
 ```
 
-The bundled clients expose the same deliberate file path as `-auth-file
-<hostpath>` and forward it as an `auth.json` seed.
-
-## Store exclusion
-
-Injected credentials are never written to the session store. `auth.json` and
-other agent-directory config files are excluded from mirroring, so durable
-session state carries conversation rows only. Prefer environment injection
-where possible and seed `auth.json` only when a provider requires pi's file
-format.
+The bundled clients expose this route as `-auth-file <hostpath>`. Session-store
+mirroring carries conversation rows only; injected credentials and
+agent-directory configuration are excluded. Brokered credentials instead stay
+in the explicitly configured durable Pi home.

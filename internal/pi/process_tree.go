@@ -74,6 +74,9 @@ type ContainmentSpec struct {
 	RuntimeID        string
 	LifecycleKind    string
 	Isolation        *ProcessIsolation
+	// OrdinaryEnvironment is the once-captured sanitized base used only when
+	// Isolation is nil. It is never interpreted as an isolation policy.
+	OrdinaryEnvironment map[string]string
 }
 
 // ErrProcessContainmentIncomplete means the selected native boundary did not
@@ -90,10 +93,10 @@ const (
 
 const turnSupervisorComplete = "complete\n"
 
-// processTreeCommand owns the platform launch wrapper and every parent-side
-// descriptor that establishes its containment boundary. Linux launches an
-// embedded subreaper, opted-in Darwin uses its best-effort process group, and
-// unsupported platforms, including Windows, reject the launch.
+// processTreeCommand owns the selected launch command and any parent-side
+// descriptors that establish an explicit containment boundary. Ordinary mode
+// launches the direct child portably; Linux explicit mode launches an embedded
+// subreaper, and opted-in Darwin uses its best-effort process group.
 type processTreeCommand struct {
 	cmd             *exec.Cmd
 	inherited       []*os.File
@@ -103,6 +106,7 @@ type processTreeCommand struct {
 	completion      *os.File
 	containment     containmentRecord
 	nativeIsolation bool
+	ordinary        bool
 }
 
 func (c *processTreeCommand) releaseInherited() {

@@ -26,14 +26,16 @@ RPC mode. It owns:
   declared MCP servers.
 - Model configuration, slash-command projection, optional raw events, and
   optional durable session storage.
+- Optional provider-auth brokerage through Pi's native auth catalog and
+  `AuthStorage`, with a durable values-free ownership ledger.
 
 ## What the adapter does not own
 
-Provider authentication stays with pi. pi is bring-your-own-key across many
-providers, and the adapter only injects credentials into each session's
-isolated agent directory — through environment options or seeded files — and
-never logs in, brokers, or persists them. ACP initialize reports no auth
-methods; see [Authentication](/docs/features/authentication).
+Provider credential values stay with Pi. A host may inject a key or seeded file,
+or configure a durable Pi home and ledger root to expose seven `_pi/auth/*`
+extension legs. The adapter brokers dialogs, flow state, residence proof, and a
+fenced disconnect, but never returns credential material or stores it in the
+ledger. See [Authentication](/docs/features/authentication).
 
 ## Extension surface
 
@@ -44,6 +46,7 @@ metadata lives under the `_meta.pi` namespace:
 | --- | --- |
 | `_pi/session/fork` | Fork a stored or active session. |
 | `_pi/rawEvent` | Emit opt-in, bounded raw pi RPC events. |
+| `_pi/auth/methods`, `_pi/auth/authorize`, `_pi/auth/callback`, `_pi/auth/status`, `_pi/auth/cancel`, `_pi/auth/inventory`, `_pi/auth/disconnect` | Optional session-scoped provider catalog, connection flow, proof, and removal legs. |
 
 ## Where to go next
 

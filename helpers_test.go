@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -53,12 +52,7 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 }
 
 func testContainmentOption() Option {
-	return func(options *Options) {
-		testProcessIsolationOption()(options)
-		if runtime.GOOS == "darwin" {
-			WithDarwinBestEffortContainment()(options)
-		}
-	}
+	return func(*Options) {}
 }
 
 // testProcessIsolationOption installs the isolated shape: a native identity

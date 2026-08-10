@@ -25,20 +25,20 @@ func TestProcessIsolationCovResolveRefusesUnusablePolicySearchPath(t *testing.T)
 		TestOnlyNoCredential: true,
 	}
 	require.Empty(t, environmentValue([]string{"HOME=/nonexistent"}, envPath))
-	_, err := ResolveExecutable("pi", missingPath)
+	_, err := ResolveExecutable("pi", missingPath, nil)
 	require.ErrorContains(t, err, `executable "pi" cannot be resolved without policy PATH`)
 
 	relativePath := &ProcessIsolation{
 		UID: 11, GID: 22, BaseEnvironment: map[string]string{envPath: filepath.Base(dir)},
 		TestOnlyNoCredential: true,
 	}
-	_, err = ResolveExecutable("pi", relativePath)
+	_, err = ResolveExecutable("pi", relativePath, nil)
 	require.ErrorContains(t, err, "policy PATH entry")
 	require.ErrorContains(t, err, "is not absolute")
 
 	resolved, err := ResolveExecutable("pi", &ProcessIsolation{
 		UID: 11, GID: 22, BaseEnvironment: map[string]string{envPath: dir}, TestOnlyNoCredential: true,
-	})
+	}, nil)
 	require.NoError(t, err)
 	require.Equal(t, filepath.Join(dir, "pi"), resolved)
 }

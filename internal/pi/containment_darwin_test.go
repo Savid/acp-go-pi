@@ -228,8 +228,10 @@ func TestDarwinLaunchBootstrapCommandAndGateLifecycle(t *testing.T) {
 func TestDarwinLaunchPreparationFailures(t *testing.T) {
 	wantErr := errors.New("injected Darwin launch failure")
 
-	_, err := prepareProcessTreeCommand(exec.Command("/usr/bin/true"), ContainmentSpec{})
-	require.ErrorIs(t, err, ErrProcessContainmentIncomplete)
+	ordinary, err := prepareProcessTreeCommand(exec.Command("/usr/bin/true"), ContainmentSpec{})
+	require.NoError(t, err)
+	require.True(t, ordinary.ordinary)
+	ordinary.close()
 
 	invalid := testContainmentSpec(t)
 	invalid.RuntimeID = "bad"
@@ -286,9 +288,9 @@ func TestDarwinLaunchPreparationFailures(t *testing.T) {
 	}
 
 	invalidIsolation := testContainmentSpec(t)
-	invalidIsolation.Isolation = nil
+	invalidIsolation.Isolation = &ProcessIsolation{UID: 1, GID: 1, BaseEnvironment: map[string]string{}}
 	_, err = prepareProcessTreeCommand(exec.Command("/usr/bin/true"), invalidIsolation)
-	require.ErrorContains(t, err, "prepare Darwin native launch isolation")
+	require.ErrorContains(t, err, "supported only on linux")
 }
 
 func TestDarwinLaunchInputAndStatusBranches(t *testing.T) {
@@ -524,6 +526,19 @@ func TestDarwinVanishedLeaderFailureBranches(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	direct := &directChildWait{done: done, start: make(chan struct{})}
+
+	t.Run("ordinary direct child needs no group probe", func(t *testing.T) {
+		launch := &processTreeCommand{
+			cmd:      &exec.Cmd{Process: &os.Process{Pid: 8122}},
+			ordinary: true,
+		}
+		ordinaryWait := &directChildWait{done: done, start: make(chan struct{})}
+		tree, handled, err := handleVanishedProcessGroupLeader(launch, ordinaryWait)
+		require.NoError(t, err)
+		require.True(t, handled)
+		require.True(t, tree.ordinary)
+		require.Equal(t, 8122, tree.pgid)
+	})
 
 	t.Run("absent group record failure", func(t *testing.T) {
 		restoreDarwinProcessTreeSeams(t)

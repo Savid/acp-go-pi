@@ -52,8 +52,11 @@ func TestAgentDirectSurfaceAndVersionChecks(t *testing.T) {
 	old := NewAgent(testContainmentOption(), WithExecutablePath("/fake/pi"), WithLogger(slog.New(slog.DiscardHandler)))
 	old.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) { return "0.1.0", nil }
 	require.Error(t, old.ensureVersion(t.Context()))
-	withoutIsolation := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	require.Error(t, withoutIsolation.ensureVersion(t.Context()))
+	withoutIsolation := NewAgent(WithExecutablePath("/fake/pi"), WithLogger(slog.New(slog.DiscardHandler)))
+	withoutIsolation.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
+		return pi.DefaultMinimumVersion, nil
+	}
+	require.NoError(t, withoutIsolation.ensureVersion(t.Context()))
 
 	require.NoError(t, agent.Close())
 	_, err = agent.HandleExtensionMethod(t.Context(), "_pi/unknown", nil)
@@ -68,19 +71,25 @@ func TestContainmentModePlatformMatrix(t *testing.T) {
 	require.Equal(t, RuntimeContainmentUnavailable, (*Agent)(nil).ContainmentMode())
 
 	agentRuntimePlatform = "linux"
-	require.Equal(t, RuntimeContainmentAuthoritative, containmentMode(Options{}))
+	require.Equal(t, RuntimeContainmentSharedIdentity, containmentMode(Options{}))
 	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{DarwinBestEffortContainment: true}))
 	require.Error(t, validateContainmentOption(Options{DarwinBestEffortContainment: true}))
 
 	agentRuntimePlatform = windowsPlatform
-	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{}))
+	require.Equal(t, RuntimeContainmentSharedIdentity, containmentMode(Options{}))
 	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{DarwinBestEffortContainment: true}))
 	require.Error(t, validateContainmentOption(Options{DarwinBestEffortContainment: true}))
 
 	agentRuntimePlatform = darwinPlatform
-	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{}))
+	require.Equal(t, RuntimeContainmentSharedIdentity, containmentMode(Options{}))
 	require.Equal(t, RuntimeContainmentBestEffort, containmentMode(Options{DarwinBestEffortContainment: true}))
 	require.NoError(t, validateContainmentOption(Options{DarwinBestEffortContainment: true}))
+	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{
+		ProcessIsolation: policyForContainmentModeTest(), DarwinBestEffortContainment: true,
+	}))
+	require.Error(t, validateContainmentOption(Options{
+		ProcessIsolation: policyForContainmentModeTest(), DarwinBestEffortContainment: true,
+	}))
 	var logs strings.Builder
 	bestEffort := NewAgent(
 		WithDarwinBestEffortContainment(),
@@ -90,13 +99,17 @@ func TestContainmentModePlatformMatrix(t *testing.T) {
 	require.Contains(t, logs.String(), "escaped descendants may survive")
 
 	agentRuntimePlatform = "freebsd"
-	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{}))
+	require.Equal(t, RuntimeContainmentSharedIdentity, containmentMode(Options{}))
 	unavailable := NewAgent(testProcessIsolationOption(), WithLogger(slog.New(slog.DiscardHandler)))
-	require.ErrorIs(t, unavailable.ensureVersion(t.Context()), ErrProcessContainmentIncomplete)
+	require.ErrorContains(t, unavailable.ensureVersion(t.Context()), "supported only on linux")
 
 	var configured Options
 	WithDarwinBestEffortContainment()(&configured)
 	require.True(t, configured.DarwinBestEffortContainment)
+}
+
+func policyForContainmentModeTest() *ProcessIsolation {
+	return &ProcessIsolation{UID: 11, GID: 22, BaseEnvironment: map[string]string{}}
 }
 
 func TestStartRealPiProcessRejectsEmptySpec(t *testing.T) {
@@ -384,45 +397,72 @@ func TestCloseAndServeJoinAdmittedIncompletePromptRelaunch(t *testing.T) {
 	require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
 }
 
-func restoreSharedIdentitySeams(t *testing.T) {
+func restoreContainmentPlatformSeam(t *testing.T) {
 	t.Helper()
 
-	platform, effectiveUID := agentRuntimePlatform, processIsolationEffectiveUID
-	t.Cleanup(func() { agentRuntimePlatform, processIsolationEffectiveUID = platform, effectiveUID })
+	platform := agentRuntimePlatform
+	t.Cleanup(func() { agentRuntimePlatform = platform })
 }
 
-// TestContainmentModeReportsASharedAgentIdentity proves the reported boundary
-// names what the deployment actually proves: whole-tree lifecycle either way,
-// and the credential separation only when the agent runs under an identity of
-// its own.
-func TestContainmentModeReportsASharedAgentIdentity(t *testing.T) {
-	restoreSharedIdentitySeams(t)
+// TestAgentSessionDefaultsToOrdinaryExecution pins omission as the portable,
+// non-authoritative current-identity posture on every supported platform.
+func TestAgentSessionDefaultsToOrdinaryExecution(t *testing.T) {
+	restoreContainmentPlatformSeam(t)
 
-	agentRuntimePlatform = linuxPlatform
-	processIsolationEffectiveUID = func() int { return 1000 }
+	for _, platform := range []string{linuxPlatform, darwinPlatform, windowsPlatform, "freebsd"} {
+		agentRuntimePlatform = platform
+		require.Equal(t, RuntimeContainmentSharedIdentity, containmentMode(Options{}), platform)
+	}
 
-	shared := Options{ProcessIsolation: &ProcessIsolation{UID: 1000, GID: 1000}}
-	require.Equal(t, RuntimeContainmentSharedIdentity, containmentMode(shared))
-	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{
-		ProcessIsolation: shared.ProcessIsolation, DarwinBestEffortContainment: true,
-	}))
-
-	require.Equal(t, RuntimeContainmentAuthoritative, containmentMode(Options{
-		ProcessIsolation: &ProcessIsolation{UID: 1001, GID: 1001},
-	}))
-
-	processIsolationEffectiveUID = func() int { return 0 }
-	require.Equal(t, RuntimeContainmentAuthoritative, containmentMode(shared))
-	require.Equal(t, RuntimeContainmentAuthoritative, containmentMode(Options{
-		ProcessIsolation: &ProcessIsolation{},
-	}))
-
-	processIsolationEffectiveUID = func() int { return 1000 }
-	agentRuntimePlatform = darwinPlatform
-	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(shared))
-
-	agent := NewAgent(WithProcessIsolation(*shared.ProcessIsolation))
+	agent := NewAgent()
 	t.Cleanup(func() { _ = agent.Close() })
-	agentRuntimePlatform = linuxPlatform
 	require.Equal(t, RuntimeContainmentSharedIdentity, agent.ContainmentMode())
+	require.Nil(t, agent.options.ProcessIsolation)
+}
+
+func TestAgentCapturesOrdinaryEnvironmentOnce(t *testing.T) {
+	t.Setenv("PATH", "/ordinary/first")
+	t.Setenv("OPENAI_API_KEY", "must-not-cross")
+
+	agent := NewAgent()
+	t.Cleanup(func() { _ = agent.Close() })
+	t.Setenv("PATH", "/ordinary/second")
+
+	require.Equal(t, "/ordinary/first", agent.ordinaryEnvironment["PATH"])
+	require.NotContains(t, agent.ordinaryEnvironment, "OPENAI_API_KEY")
+}
+
+// TestExplicitProcessIsolationPreservesPolicy pins that a supplied policy is
+// never reinterpreted as ordinary execution or a Darwin fallback.
+func TestExplicitProcessIsolationPreservesPolicy(t *testing.T) {
+	restoreContainmentPlatformSeam(t)
+	policy := &ProcessIsolation{UID: 1001, GID: 1001, BaseEnvironment: map[string]string{}}
+
+	agentRuntimePlatform = linuxPlatform
+	require.Equal(t, RuntimeContainmentAuthoritative, containmentMode(Options{ProcessIsolation: policy}))
+
+	for _, platform := range []string{darwinPlatform, windowsPlatform, "freebsd"} {
+		agentRuntimePlatform = platform
+		require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{ProcessIsolation: policy}), platform)
+		require.Error(t, validateProcessIsolationOption(policy), platform)
+	}
+
+	agentRuntimePlatform = darwinPlatform
+	require.Equal(t, RuntimeContainmentUnavailable, containmentMode(Options{
+		ProcessIsolation: policy, DarwinBestEffortContainment: true,
+	}))
+}
+
+func TestEnsureVersionRefusesExplicitIsolationBestEffortCombination(t *testing.T) {
+	restoreContainmentPlatformSeam(t)
+	agentRuntimePlatform = linuxPlatform
+
+	agent := NewAgent(
+		WithProcessIsolation(ProcessIsolation{
+			UID: 11, GID: 22, BaseEnvironment: map[string]string{},
+			StandaloneOwnerID: "explicit-test", StandaloneStateRoot: "/var/lib/explicit-test",
+		}),
+		WithDarwinBestEffortContainment(),
+	)
+	require.ErrorIs(t, agent.ensureVersion(t.Context()), ErrProcessContainmentIncomplete)
 }

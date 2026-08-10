@@ -19,9 +19,8 @@ func TestProcessIsolationUnixVerificationBranches(t *testing.T) {
 		processIsolationGeteuid, processIsolationGetegid, processIsolationGetgroups = originalUID, originalGID, originalGroups
 		processIsolationGOOS = originalGOOS
 	})
-	// The seams below name an identity the supervisor already holds, which is
-	// the shared-identity arm on Linux. This test pins the credential
-	// verification the other backends perform, so it selects that backend.
+	// Select the Unix credential backend directly; the Linux supervisor owns
+	// its distinct-identity proof separately.
 	processIsolationGOOS = "darwin"
 	processIsolationGeteuid = func() int { return 11 }
 	processIsolationGetegid = func() int { return 22 }
@@ -63,10 +62,8 @@ func TestProcessIsolationLaunchFailures(t *testing.T) {
 		processIsolationGeteuid, processIsolationGetegid, processIsolationGetgroups = originalUID, originalGID, originalGroups
 		processIsolationGOOS = originalGOOS
 	})
-	// The seams below name an identity the supervisor already holds, which is
-	// the shared-identity arm on Linux. This test pins how the credential
-	// verification the other backends perform surfaces through the launch
-	// wrappers, so it selects that backend.
+	// Select the Unix credential backend directly to pin how its verification
+	// failures surface through the launch wrappers.
 	processIsolationGOOS = "darwin"
 	processIsolationGeteuid = func() int { return 11 }
 	processIsolationGetegid = func() int { return 22 }

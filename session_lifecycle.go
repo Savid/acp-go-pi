@@ -35,6 +35,7 @@ func finalizeSessionRuntimeResources(
 	nativeRelease func(),
 	sessionRoot string,
 	scratchRelease func(),
+	browserShim *pi.BrowserShim,
 ) error {
 	if !pi.ProcessContainmentComplete(runtimeErr) {
 		return runtimeErr
@@ -44,9 +45,9 @@ func finalizeSessionRuntimeResources(
 		nativeRelease()
 	}
 
-	var removeErr error
+	removeErr := browserShim.Remove()
 	if sessionRoot != "" {
-		removeErr = materializeRemoveAll(sessionRoot)
+		removeErr = errors.Join(removeErr, materializeRemoveAll(sessionRoot))
 	}
 
 	if removeErr == nil && scratchRelease != nil {
@@ -302,8 +303,14 @@ func (s *agentSession) nextRuntimeLaunch(previous pi.LaunchSpec, lastSessionFile
 		return pi.LaunchSpec{}, errors.Join(cause, materializeRemoveAll(dirs.Root))
 	}
 
-	if copyErr := copyGenerationAgentDir(previous.AgentDir, dirs.AgentDir); copyErr != nil {
-		return fail(fmt.Errorf("copy pi agent generation: %w", copyErr))
+	if homeErr := s.agent.applyDurableHome(&dirs); homeErr != nil {
+		return fail(homeErr)
+	}
+
+	if dirs.AgentDir != previous.AgentDir {
+		if copyErr := copyGenerationAgentDir(previous.AgentDir, dirs.AgentDir); copyErr != nil {
+			return fail(fmt.Errorf("copy pi agent generation: %w", copyErr))
+		}
 	}
 
 	spec := previous
@@ -689,6 +696,12 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 
 	s.cancelPendingInteractions()
 
+	// Terminalize provider-auth flows before interrupting the Pi child so no
+	// login is abandoned to a process already being torn down.
+	if s.agent != nil && s.agent.providerAuth != nil {
+		s.agent.providerAuth.closeSession(ctx, s)
+	}
+
 	s.mu.Lock()
 	cancel := s.cancel
 	proc := s.proc
@@ -730,7 +743,7 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 	}
 
 	err = finalizeSessionRuntimeResources(
-		err, s.nativeRootRelease, s.sessionRoot, s.scratchRootRelease,
+		err, s.nativeRootRelease, s.sessionRoot, s.scratchRootRelease, s.browserShim,
 	)
 
 	if s.agent != nil {

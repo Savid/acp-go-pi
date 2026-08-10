@@ -24,6 +24,7 @@ const stderrTailLimit = 8 << 10
 
 const (
 	envPath          = "PATH"
+	envHome          = "HOME"
 	envNodeOptions   = "NODE_OPTIONS"
 	envBashEnv       = "BASH_ENV"
 	envShellEnv      = "ENV"
@@ -68,6 +69,10 @@ type LaunchSpec struct {
 	// the child inherits, so a host-owned executable resolves ahead of every
 	// inherited entry.
 	ExtraPathDirs []string
+	// BrowserShim neutralises the browser a native login leg run inside this
+	// process would otherwise open on the operator's desktop. A nil shim leaves
+	// the child's PATH and BROWSER alone.
+	BrowserShim *BrowserShim
 	// Cwd is the child working directory.
 	Cwd string
 	// ShutdownStepTimeout bounds each rung of the shutdown ladder; zero uses
@@ -113,14 +118,21 @@ func (spec LaunchSpec) Args() []string {
 	return args
 }
 
-// Environ returns the child environment: the isolation policy's complete base,
-// then spec.Env, then spec.ExtraPathDirs ahead of the policy PATH,
+// Environ returns the child environment: the isolation policy's complete base
+// or the captured sanitized ordinary base, then spec.Env, then
+// spec.ExtraPathDirs ahead of PATH,
 // then the wrapper-managed keys, which always win.
 func (spec LaunchSpec) Environ() []string {
 	env := make(map[string]string, len(spec.Env)+2)
 	if spec.Containment.Isolation != nil {
 		for key, value := range spec.Containment.Isolation.BaseEnvironment {
 			env[key] = value
+		}
+	} else {
+		for key, value := range spec.Containment.OrdinaryEnvironment {
+			if ordinaryEnvironmentKey(key) {
+				env[key] = value
+			}
 		}
 	}
 
@@ -154,7 +166,7 @@ func (spec LaunchSpec) Environ() []string {
 		environ = append(environ, key+"="+env[key])
 	}
 
-	return environ
+	return spec.BrowserShim.Environ(environ)
 }
 
 // prependPathDirs returns search with dirs ahead of every entry it already
@@ -184,7 +196,9 @@ func prependPathDirs(search string, dirs []string) string {
 
 // safeExplicitEnvKey is defense in depth for internal LaunchSpec callers.
 // Public options reject these keys before launch; this boundary also drops
-// malformed names and loader, shell, PATH, and Node injection vectors.
+// malformed names and loader, shell, and Node injection vectors. An explicit
+// PATH is allowed; strict isolation and ordinary execution resolve it under
+// their respective policies.
 func safeExplicitEnvKey(key string) bool {
 	if key == "" {
 		return false
@@ -252,13 +266,25 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 		return nil, fmt.Errorf("pi executable path is required")
 	}
 
-	if err := validateProcessIsolation(spec.Containment.Isolation); err != nil {
-		return nil, fmt.Errorf("validate pi process isolation: %w", err)
+	if spec.Containment.Isolation != nil {
+		if err := validateProcessIsolation(spec.Containment.Isolation); err != nil {
+			return nil, fmt.Errorf("validate pi process isolation: %w", err)
+		}
 	}
 
 	environment := spec.Environ()
 
-	executable, err := lookPathInEnvironment(spec.ExecutablePath, environment)
+	var (
+		executable string
+		err        error
+	)
+
+	if spec.Containment.Isolation == nil {
+		executable, err = lookPathInOrdinaryEnvironment(spec.ExecutablePath, environment)
+	} else {
+		executable, err = lookPathInEnvironment(spec.ExecutablePath, environment)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("resolve pi executable: %w", err)
 	}
@@ -294,7 +320,7 @@ func StartProcess(ctx context.Context, spec LaunchSpec) (*Process, error) {
 		return nil, fmt.Errorf("prepare pi process: %w", err)
 	}
 
-	if !launch.nativeIsolation {
+	if !launch.nativeIsolation && spec.Containment.Isolation != nil {
 		if isolationErr := applyProcessIsolation(launch.cmd, spec.Containment.Isolation); isolationErr != nil {
 			launch.close()
 			closeQuietly(stdinRead, stdinWrite, stdoutRead, stdoutWrite)

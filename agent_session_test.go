@@ -645,9 +645,10 @@ func TestStartSessionFailureBranches(t *testing.T) {
 	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	requireInvalidParams(t, err)
 
-	agent = baseAgent()
-	agent.options.ProcessIsolation.UID = uint32(os.Geteuid()) + 1
-	agent.options.ProcessIsolation.GID = uint32(os.Getegid()) + 1
+	agent = NewAgent(
+		testProcessIsolationOption(), WithExecutablePath("/fake/pi"),
+		WithScratchDir(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)),
+	)
 	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	require.Error(t, err)
 

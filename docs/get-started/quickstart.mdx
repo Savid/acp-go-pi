@@ -9,10 +9,10 @@ This tutorial takes you from nothing to a streamed assistant reply over ACP.
 
 - A local pi CLI (`pi`) on `PATH`, **version 0.80.6 or newer**. The adapter
   probes `pi --version` at startup and fails fast on anything older.
-- Provider credentials for at least one pi provider. pi is bring-your-own-key,
-  and the adapter launches pi with a scrubbed environment, so credentials are
-  injected explicitly rather than inherited from your shell — see
-  [Authentication](/docs/features/authentication) for the injection options.
+- A way to authenticate one pi provider: explicitly inject an environment key
+  or `auth.json`, or configure the provider-auth broker and connect after ACP
+  initialization. Ambient provider keys are scrubbed — see
+  [Authentication](/docs/features/authentication).
 - A Go toolchain to build and run the example clients.
 
 ## Steps
@@ -65,6 +65,19 @@ go run ./cmd/acp-go-pi \
   -seed-file "auth.json=$HOME/.pi/agent/auth.json" \
   -debug
 ```
+
+For an ACP host that implements the `_pi/auth/*` extension legs, replace the
+seed with test- or service-owned durable paths:
+
+```sh
+go run ./cmd/acp-go-pi \
+  -path "$(command -v pi)" \
+  -home /var/lib/my-host/pi-home \
+  -provider-auth-root /var/lib/my-host/pi-auth
+```
+
+The broker is advertised even when that durable home does not yet contain a
+credential; that is how the host discovers and presents Connect.
 
 ## Next steps
 

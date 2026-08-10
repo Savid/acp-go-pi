@@ -16,6 +16,10 @@ var darwinProcessGroupSignal = syscallKill
 var darwinDirectProcessKill = func(process *os.Process) error { return process.Kill() }
 
 func awaitProcessGroupBoundary(tree *processTree, _ time.Duration) error {
+	if tree != nil && tree.ordinary {
+		return tree.direct.awaitReaped(defaultProcessTreeWait)
+	}
+
 	if tree == nil || tree.pgid <= 0 {
 		return nil
 	}
@@ -28,10 +32,22 @@ func awaitProcessGroupBoundary(tree *processTree, _ time.Duration) error {
 }
 
 func terminateProcessTree(tree *processTree) error {
+	if tree != nil && tree.ordinary {
+		_, err := signalOriginalProcessGroup(tree.pgid, syscall.SIGTERM)
+
+		return err
+	}
+
 	return awaitProcessGroupBoundary(tree, defaultProcessTreeWait)
 }
 
 func killProcessTree(tree *processTree) error {
+	if tree != nil && tree.ordinary {
+		_, err := signalOriginalProcessGroup(tree.pgid, syscall.SIGKILL)
+
+		return err
+	}
+
 	return awaitProcessGroupBoundary(tree, defaultProcessTreeWait)
 }
 

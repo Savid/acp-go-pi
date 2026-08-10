@@ -55,16 +55,7 @@ func darwinLaunchBootstrap() {
 		return
 	}
 
-	_, err := inheritedProcessIsolation()
-
-	var (
-		configFile, gate io.ReadCloser
-		status           io.WriteCloser
-	)
-	if err == nil {
-		configFile, gate, status, err = darwinLaunchInput()
-	}
-
+	configFile, gate, status, err := darwinLaunchInput()
 	if err == nil {
 		err = runDarwinLaunchBootstrap(configFile, gate)
 	}
@@ -153,11 +144,14 @@ func runDarwinLaunchBootstrap(configInput io.ReadCloser, gate io.ReadCloser) err
 }
 
 func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*processTreeCommand, error) {
-	if !containment.DarwinBestEffort {
-		return nil, fmt.Errorf(
-			"%w: Darwin containment is unavailable without explicit best-effort opt-in",
-			ErrProcessContainmentIncomplete,
-		)
+	if containment.Isolation == nil && !containment.DarwinBestEffort {
+		configureProcessCommandPlatform(native)
+
+		return &processTreeCommand{cmd: native, ordinary: true}, nil
+	}
+
+	if containment.Isolation != nil {
+		return nil, errors.New("explicit process isolation is supported only on linux")
 	}
 
 	if err := validateContainmentSpec(containment); err != nil {
@@ -236,16 +230,7 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 	helper := darwinLaunchCommand(executable) // #nosec G204 -- the current executable hosts the private launch bootstrap.
 	helper.Dir = native.Dir
 
-	helper.Env, executableErr = supervisorEnvironment(native.Env, containment.Isolation, darwinLaunchBootstrapEnv, darwinLaunchBootstrapMode)
-	if executableErr != nil {
-		_ = configFile.Close()
-		_ = gateRead.Close()
-		_ = gateWrite.Close()
-		_ = statusRead.Close()
-		_ = statusWrite.Close()
-
-		return nil, fmt.Errorf("prepare Darwin native launch isolation: %w", executableErr)
-	}
+	helper.Env = darwinLaunchBootstrapEnvironment()
 
 	helper.Stdin = native.Stdin
 	helper.Stdout = native.Stdout
@@ -281,6 +266,10 @@ func darwinLaunchBootstrapEnvironment() []string {
 }
 
 func awaitProcessTreeReady(launch *processTreeCommand) error {
+	if launch.ordinary {
+		return nil
+	}
+
 	if launch.ready == nil {
 		return errors.New("darwin native launch status is unavailable")
 	}

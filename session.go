@@ -25,8 +25,9 @@ const (
 	acpFieldSessionID = "sessionId"
 	acpFieldValue     = "value"
 
-	optionFieldEnv           = "env"
-	optionFieldExtraPathDirs = "extraPathDirs"
+	optionFieldEnv                    = "env"
+	optionFieldExtraPathDirs          = "extraPathDirs"
+	optionFieldProviderAuthDirectHome = "providerAuthDirectHome"
 
 	validationRequired    = "required"
 	validationUnsupported = "unsupported"
@@ -117,6 +118,8 @@ type agentSession struct {
 	scratchRootRelease   func()
 	nativeContainmentErr error
 	providerProcessRoot  *providerProcessRoot
+	browserShim          *pi.BrowserShim
+	authClosed           bool
 }
 
 // turnToolCall is the exact-ID lifecycle published for one native tool call.

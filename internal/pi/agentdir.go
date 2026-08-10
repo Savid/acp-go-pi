@@ -16,6 +16,10 @@ const (
 	// wrapper's deep-merge seed filename: the wrapper's managed keys win, a
 	// seeded settings.json supplies everything else.
 	SettingsFileName = "settings.json"
+	// AuthFileName is pi's provider credential file. It may be explicitly
+	// injected into an ephemeral agent directory or owned natively by a durable
+	// provider-auth home; it is never persisted to the session store.
+	AuthFileName = "auth.json"
 	// seedManifestFileName tracks the relative paths the wrapper owns inside
 	// a seed root so seed writes never clobber an operator-authored file.
 	seedManifestFileName = ".seed-manifest.json"
@@ -61,6 +65,9 @@ type AgentDir struct {
 	// launch. settings.json participates in the deep merge; all other files
 	// are written verbatim.
 	SeedFiles map[string]string
+	// AuthJSON, when non-empty, is written to auth.json at hydrate time. It
+	// is credential material: excluded from the store, never seeded.
+	AuthJSON []byte
 }
 
 // ExplicitResources are seeded native resources that must be passed to pi by
@@ -123,6 +130,12 @@ func (d AgentDir) Write() error {
 
 	if err := writeSeedFiles(d.Root, files); err != nil {
 		return err
+	}
+
+	if len(d.AuthJSON) > 0 {
+		if err := fsWriteFile(filepath.Join(d.Root, AuthFileName), d.AuthJSON, 0o600); err != nil {
+			return fmt.Errorf("write auth file: %w", err)
+		}
 	}
 
 	return nil

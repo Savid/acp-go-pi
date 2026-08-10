@@ -629,18 +629,19 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	var (
 		dirs          sessionDirs
 		nativeRelease func()
+		browserShim   *pi.BrowserShim
 	)
 
 	keepScratch := false
 	defer func() {
 		if !keepScratch {
 			err = finalizeSessionRuntimeResources(
-				err, nativeRelease, dirs.SessionRoot, scratchRelease,
+				err, nativeRelease, dirs.SessionRoot, scratchRelease, browserShim,
 			)
 		}
 	}()
 
-	dirs, err = a.createSessionDirs()
+	dirs, browserShim, err = a.createSessionRuntime()
 	if err != nil {
 		return nil, err
 	}
@@ -745,6 +746,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		Env:                 env,
 		ExtraPathDirs:       sessionExtraPathDirs(start.MetaOptions.ExtraPathDirs, a.options.ExtraPathDirs),
 		Cwd:                 start.Cwd,
+		BrowserShim:         browserShim,
 	}
 
 	spec.Containment, err = a.containmentSpecForRoot(scratchParent(a.options.ScratchDir), dirs.Root, RuntimeResourceSession)
@@ -779,6 +781,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		fingerprint:           sessionStartFingerprint(start),
 		launch:                spec,
 		sessionRoot:           dirs.SessionRoot,
+		browserShim:           browserShim,
 		permissionMode:        permission,
 		autoRetry:             start.MetaOptions.AutoRetry,
 		mcpRefreshPending:     includeMCP,

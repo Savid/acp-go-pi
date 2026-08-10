@@ -7,10 +7,11 @@
 // client. Hosts must complete ACP initialization before issuing session or
 // other agent methods.
 //
-// Hosts should use [Serve] for the JSON-RPC transport. Provider
-// authentication remains owned by the operator: credentials are injected
-// into each isolated per-session pi agent directory from options and
-// environment, never brokered through ACP auth methods.
+// Hosts should use [Serve] for the JSON-RPC transport. Credentials may be
+// injected explicitly, or ordinary-mode hosts may configure [WithHome] and
+// [WithProviderAuthRoot] to expose Pi's seven provider-auth extension legs.
+// Brokered credentials remain in Pi's durable native home; the adapter's
+// ledger contains binding metadata but no credential values.
 //
 // Hosts that need durable remote resume can provide [WithSessionStore]. A
 // session store receives pi session JSONL mirror rows, can back
@@ -24,9 +25,11 @@
 // exporter setup for command-line use. Caller-supplied providers remain
 // owned by the caller, including ForceFlush and Shutdown.
 //
-// Linux provides authoritative native process containment. Windows refuses
-// native launch because it cannot apply the mandatory Unix UID/GID isolation.
-// Darwin fails native startup closed unless [WithDarwinBestEffortContainment] is
-// supplied; that mode reaps the direct child and observes only the captured
-// original process group, so it does not establish escaped-descendant absence.
+// Omitting [WithProcessIsolation] runs Pi portably as the adapter's current
+// root or non-root identity and reports shared_identity. This ordinary mode
+// proves direct-process liveness but claims no descendant inventory or
+// whole-tree quiescence. Supplying [WithProcessIsolation] selects a distinct,
+// trusted-root Linux-only boundary and fails closed if it cannot be established.
+// [WithDarwinBestEffortContainment] is a separate embedded opt-in and is never
+// a fallback for an explicit isolation policy.
 package piacp

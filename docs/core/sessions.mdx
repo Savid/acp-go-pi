@@ -55,11 +55,11 @@ Each prompt is a *turn*. A turn ends with an ACP `StopReason`, a user cancel,
 or a native failure. Cancelling a turn resolves as a successful `cancelled`
 response, not an error. Native abort is advisory: for every active cancel the
 adapter drives the session process to its selected containment boundary before
-either the cancel path or prompt settles. Linux provides an authoritative
-boundary. Windows native launch fails closed because the mandatory Unix UID/GID
-identity boundary is unavailable. Darwin best-effort only reaps the direct
-child and observes the captured original process group absent; it never
-establishes that escaped descendants are absent. If native
+either the cancel path or prompt settles. Ordinary mode is portable and waits
+for direct-process completion without claiming descendant absence. Explicit
+Linux isolation is authoritative. The separate Darwin best-effort opt-in reaps
+the direct child and observes the captured original process group absent; it
+never establishes that escaped descendants are absent. If native
 `agent_settled` preceded the abort acknowledgement, the adapter then commits
 pi's durable aborted generation before returning `cancelled`; an escalated
 pre-settle cancellation preserves the prior commit. The next prompt lazily

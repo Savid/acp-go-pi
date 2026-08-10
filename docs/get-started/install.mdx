@@ -34,8 +34,10 @@ go build ./cmd/acp-go-pi
 
 The adapter launches `pi` from `PATH` unless a host provides `-path`
 (`WithExecutablePath`). Use `-scratch-dir` (`WithScratchDir`) to choose the
-parent directory under which the adapter creates one isolated pi agent
-directory per session — it never shares a mutable native home such as `~/.pi`.
+parent directory under which the adapter creates ephemeral session state. By
+default each session receives a private Pi agent directory. Configure `-home`
+only when the instance needs a durable Pi-native credential residence, such as
+for the provider-auth broker; never point it at the operator's real `~/.pi`.
 The launched CLI must be pi **0.80.6 or newer**; the adapter probes
 `pi --version` at startup and fails fast on older builds. Install pi itself
 from npm:
@@ -44,9 +46,12 @@ from npm:
 npm install -g @earendil-works/pi-coding-agent
 ```
 
-## Provision Linux identity authority
+## Optional Linux hardening
 
-Linux installations must persist the shared identity-lock root:
+No privileged setup is needed for ordinary execution: omission runs as the
+current root or non-root identity. A deployment that explicitly selects the
+trusted-root Linux `ProcessIsolation` posture must persist the identity-lock
+root:
 
 ```sh
 sudo install -d -o root -g root -m 0700 \

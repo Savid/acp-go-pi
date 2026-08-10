@@ -208,6 +208,10 @@ func availableCommandsFromNative(commands []pi.SlashCommand) []acp.AvailableComm
 			continue
 		}
 
+		if command.Name == pi.AuthCommandName {
+			continue
+		}
+
 		available = append(available, acp.AvailableCommand{
 			Name:        command.Name,
 			Description: command.Description,

@@ -10,6 +10,10 @@ import (
 )
 
 func awaitProcessGroupBoundary(tree *processTree, timeout time.Duration) error {
+	if tree != nil && tree.ordinary {
+		return tree.direct.awaitReaped(timeout)
+	}
+
 	if tree == nil || tree.pgid <= 0 {
 		return nil
 	}

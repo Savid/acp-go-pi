@@ -11,15 +11,273 @@
  *
  * Mode comes from ACP_GO_PI_PERMISSION: "allow" auto-allows every tool call
  * (no dialog); any other value (including unset) asks per call.
+ *
+ * Provider auth: the /acp-auth command enumerates providers, probes the
+ * credential store, drives one native login, and removes one entry. It reports
+ * results and asks for values over the same marker-prefixed dialogs.
  */
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { getPackageDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { Type } from "typebox";
 
 const PERMISSION_MARKER = "acp-go-pi:permission:";
+const AUTH_MARKER = "acp-go-pi:auth:";
+const AUTH_COMMAND = "acp-auth";
+const AUTH_ACK = "ok";
 const QUESTION_TOOL = "question";
 
+/** Request the Go wrapper sends as the argument of /acp-auth. */
+type AuthRequest = {
+	id: string;
+	op: "catalog" | "probe" | "login" | "remove";
+	providerId?: string;
+	method?: "oauth" | "api";
+	providerIds?: string[];
+};
+
+type AuthEvent = Record<string, unknown> & { type: string };
+
+type AuthPrompt = {
+	type: "text" | "secret" | "select" | "manual_code";
+	message: string;
+	placeholder?: string;
+	options?: readonly { id: string; label: string; description?: string }[];
+};
+
+/** Raise one marker dialog the wrapper acknowledges and continue. */
+async function announce(ctx: ExtensionCommandContext, payload: unknown): Promise<void> {
+	await ctx.ui.select(AUTH_MARKER + JSON.stringify(payload), [AUTH_ACK]);
+}
+
+// watchAbort raises the one dialog the wrapper leaves unanswered for the life
+// of a login. Answering it aborts the login, which is what stops a device-code
+// poll: those flows return no control to this extension between the
+// presentation and the provider's approval, so without an abort a flow the
+// wrapper has already terminalized keeps a live user code approvable at the
+// provider for the whole native timeout. The controller's own abort resolves
+// the dialog too, which releases it when the login ends on its own.
+function watchAbort(ctx: ExtensionCommandContext, id: string): AbortController {
+	const controller = new AbortController();
+
+	void ctx.ui
+		.select(AUTH_MARKER + JSON.stringify({ id, kind: "cancel" }), [AUTH_ACK], { signal: controller.signal })
+		.then((answer) => {
+			if (answer !== undefined) controller.abort();
+		})
+		.catch(() => controller.abort());
+
+	return controller;
+}
+
+/** Ask the wrapper for one value. An unanswered dialog aborts the flow. */
+async function ask(ctx: ExtensionCommandContext, payload: unknown): Promise<string> {
+	const answer = await ctx.ui.input(AUTH_MARKER + JSON.stringify(payload));
+	if (answer === undefined) throw new Error("declined");
+
+	return answer;
+}
+
+// AuthStorage is the only write path into pi's own auth.json, and it holds the
+// cross-process lock every refresh takes. The package root re-exports the
+// read helper but not the class, and the package export map blocks the
+// subpath, so the module is loaded by absolute path under the resolved
+// install root.
+async function authStorage(): Promise<{
+	modify(id: string, fn: (current: unknown) => Promise<unknown>): Promise<unknown>;
+	delete(id: string): Promise<void>;
+}> {
+	const url = pathToFileURL(join(getPackageDir(), "dist", "core", "auth-storage.js")).href;
+	const module = (await import(url)) as {
+		AuthStorage: {
+			create(authPath?: string): {
+				modify(id: string, fn: (current: unknown) => Promise<unknown>): Promise<unknown>;
+				delete(id: string): Promise<void>;
+			};
+		};
+	};
+
+	return module.AuthStorage.create();
+}
+
+function catalogPayload(id: string) {
+	const providers = builtinProviders().map((provider) => ({
+		id: provider.id,
+		name: provider.name,
+		oauth: provider.auth.oauth
+			? { name: provider.auth.oauth.name, loginLabel: provider.auth.oauth.loginLabel ?? "" }
+			: null,
+		// A provider whose api-key auth has no login() is ambient-only: there is
+		// nothing to broker, so it carries no api method.
+		api: provider.auth.apiKey?.login ? { name: provider.auth.apiKey.name } : null,
+	}));
+
+	return { id, kind: "catalog", providers };
+}
+
+// The probe answers every provider it was asked about, holding the empty string
+// where nothing is stored. The value is the residence signal; emitting only the
+// occupied providers would make the presence of a key the signal instead, which
+// is a coupling the reader on the Go side of this boundary cannot see it is
+// relying on.
+function probePayload(id: string, providerIds: string[]) {
+	const entries: Record<string, string> = {};
+	for (const providerId of providerIds) {
+		entries[providerId] = readStoredCredential(providerId)?.type ?? "";
+	}
+
+	return { id, kind: "probe", entries };
+}
+
+// pi executes any credential value beginning with "!" as a shell command and
+// caches its stdout, so a brokered value that reached a credential field would
+// be a remote command channel into the worker.
+function rejectsShellCredential(credential: unknown): boolean {
+	const key = (credential as { key?: unknown } | undefined)?.key;
+
+	return typeof key === "string" && key.startsWith("!");
+}
+
+async function runLogin(ctx: ExtensionCommandContext, request: AuthRequest) {
+	const provider = builtinProviders().find((entry) => entry.id === request.providerId);
+	if (!provider) return { id: request.id, kind: "result", ok: false, cause: "native_veto" };
+
+	const login =
+		request.method === "oauth" ? provider.auth.oauth?.login.bind(provider.auth.oauth) : provider.auth.apiKey?.login?.bind(provider.auth.apiKey);
+	if (!login) return { id: request.id, kind: "result", ok: false, cause: "native_veto" };
+
+	// notify() is synchronous and returns no promise, so an event is queued and
+	// drained on a chain of its own. The chain starts the moment the event
+	// arrives rather than at the next prompt: a device-code login notifies its
+	// presentation and then polls to completion without ever prompting, so a
+	// queue drained only at a prompt boundary strands the one message the
+	// authorize leg is waiting for. The chain still serialises, so events reach
+	// the wrapper in order and ahead of any prompt that follows them.
+	const queued: AuthEvent[] = [];
+	let pump: Promise<void> = Promise.resolve();
+	const drain = () => {
+		pump = pump
+			.then(async () => {
+				while (queued.length > 0) {
+					await announce(ctx, { id: request.id, kind: "event", event: queued.shift() });
+				}
+			})
+			.catch(() => {});
+
+		return pump;
+	};
+
+	const abort = watchAbort(ctx, request.id);
+	const interaction = {
+		signal: abort.signal,
+		async prompt(prompt: AuthPrompt): Promise<string> {
+			await drain();
+
+			return ask(ctx, {
+				id: request.id,
+				kind: "prompt",
+				prompt: prompt.type,
+				message: prompt.message ?? "",
+				placeholder: prompt.placeholder ?? "",
+				options: (prompt.options ?? []).map((option) => option.id),
+			});
+		},
+		notify(event: AuthEvent) {
+			queued.push(event);
+			void drain();
+		},
+	};
+
+	let credential: unknown;
+	try {
+		credential = await login(interaction);
+	} catch {
+		await drain();
+		abort.abort();
+
+		return { id: request.id, kind: "result", ok: false, cause: "provider_refused" };
+	}
+
+	await drain();
+	abort.abort();
+
+	if (rejectsShellCredential(credential)) {
+		return { id: request.id, kind: "result", ok: false, cause: "native_veto" };
+	}
+
+	try {
+		const storage = await authStorage();
+		await storage.modify(provider.id, async () => credential);
+	} catch {
+		return { id: request.id, kind: "result", ok: false, cause: "harvest_failed" };
+	}
+
+	const stored = credential as { type?: string; expires?: number };
+
+	return {
+		id: request.id,
+		kind: "result",
+		ok: true,
+		credentialType: stored.type ?? "",
+		expires: typeof stored.expires === "number" ? stored.expires : 0,
+	};
+}
+
+async function runRemove(request: AuthRequest) {
+	try {
+		const storage = await authStorage();
+		await storage.delete(request.providerId ?? "");
+	} catch {
+		return { id: request.id, kind: "result", ok: false, cause: "process" };
+	}
+
+	return { id: request.id, kind: "result", ok: true };
+}
+
+async function runAuthCommand(args: string, ctx: ExtensionCommandContext) {
+	let request: AuthRequest;
+	try {
+		request = JSON.parse(args) as AuthRequest;
+	} catch {
+		return;
+	}
+
+	if (typeof request?.id !== "string" || request.id === "") return;
+
+	switch (request.op) {
+		case "catalog":
+			await announce(ctx, catalogPayload(request.id));
+
+			return;
+		case "probe":
+			await announce(ctx, probePayload(request.id, request.providerIds ?? []));
+
+			return;
+		case "login":
+			await announce(ctx, await runLogin(ctx, request));
+
+			return;
+		case "remove":
+			await announce(ctx, await runRemove(request));
+
+			return;
+		default:
+			return;
+	}
+}
+
 export default function (pi: ExtensionAPI) {
+	// The wrapper drives every provider-auth leg through this command: pi's RPC
+	// surface has no verb that invokes an extension, and prompt() runs a
+	// registered command to completion without a model turn even mid-stream.
+	pi.registerCommand(AUTH_COMMAND, {
+		description: "ACP provider-auth bridge",
+		handler: runAuthCommand,
+	});
+
 	pi.registerTool({
 		name: QUESTION_TOOL,
 		label: "Question",

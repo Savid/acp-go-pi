@@ -141,6 +141,29 @@ func TestParsePermissionTitle(t *testing.T) {
 	}
 }
 
+func TestProviderAuthCommandEncodingAndTitleParsing(t *testing.T) {
+	request := AuthRequest{ID: "flow-1", Op: AuthOpCatalog, ProviderID: "anthropic", ProviderIDs: []string{"one"}}
+	command := EncodeAuthCommand(request)
+	require.Equal(t, "/"+AuthCommandName+` {"id":"flow-1","op":"catalog","providerId":"anthropic","providerIds":["one"]}`, command)
+
+	message := AuthMessage{ID: "flow-1", Kind: AuthKindResult}
+	payload, err := json.Marshal(message)
+	require.NoError(t, err)
+	parsed, ok := ParseAuthTitle(AuthTitleMarker + string(payload))
+	require.True(t, ok)
+	require.Equal(t, message, parsed)
+
+	for _, title := range []string{
+		"ordinary title",
+		AuthTitleMarker + "{",
+		AuthTitleMarker + `{"id":"","kind":"result"}`,
+		AuthTitleMarker + `{"id":"flow","kind":" "}`,
+	} {
+		_, ok = ParseAuthTitle(title)
+		require.False(t, ok, title)
+	}
+}
+
 func TestWriteMCPConfig(t *testing.T) {
 	t.Parallel()
 

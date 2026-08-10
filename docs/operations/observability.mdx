@@ -25,15 +25,16 @@ Embedded hosts receive the same value once through
 `RuntimeResourceHooks.ObserveContainment`; `Agent.ContainmentMode` exposes it
 directly.
 
-A Linux agent whose configured native identity is the identity the process
-already runs as reports `containment=shared_identity`. The subreaper tree, the
-descendant reaping and the process-group teardown are unchanged, so the
-whole-tree lifecycle proof and every process snapshot are the authoritative
-ones; the attribute records that the agent holds no credentials of its own.
+An agent with no explicit process-isolation policy reports
+`containment=shared_identity` on every supported platform. It runs as the
+current root or non-root identity and manages direct-process liveness, but it
+does not install identity authority, inventory descendants, or claim
+whole-tree quiescence. Consequently it emits no `provider_descendant`
+snapshot, including zero.
 
 Darwin opt-in logs a structured warning with `containment=best_effort`, and the
 standalone binary prints a plain warning even without `-debug`. Best-effort
-mode emits no `provider_descendant` process snapshot, including zero, because
+mode likewise emits no `provider_descendant` process snapshot, including zero, because
 the process group cannot inventory escaped descendants. Resource admissions
 still describe wrapper-managed native roots and scratch roots; they must not
 be interpreted as a bound on escaped provider work.
@@ -48,7 +49,7 @@ shape; use the `cause` to route the investigation:
 | --- | --- |
 | `process_exit` | The `message` carries the real exit status and a stderr tail — inspect it; confirm the `pi` CLI is installed and is version 0.80.6+. |
 | `transport` | A stream broke mid-turn; check for client disconnects or a pi process killed out from under the adapter. |
-| `provider` | pi reported a provider error verbatim — a missing or refused key, quota, or an upstream failure; check that credentials were injected for the session (ambient shell keys are scrubbed). |
+| `provider` | pi reported a provider error verbatim — a missing or refused key, quota, or an upstream failure; check deliberate credential injection or the `_pi/auth/inventory` residence proof (ambient shell keys are scrubbed). |
 | `timeout` | A `WithTurnTimeout` deadline expired; raise the bound or investigate why the turn ran long. |
 
 <Note>

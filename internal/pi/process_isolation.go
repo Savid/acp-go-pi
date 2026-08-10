@@ -11,8 +11,9 @@ import (
 	"strings"
 )
 
-// ProcessIsolation is the internal launch policy copied from the public
-// adapter option. A nil policy is never a request to inherit ambient state.
+// ProcessIsolation is the internal explicit launch policy copied from the
+// public adapter option. A nil policy selects ordinary current-identity
+// execution with the separately captured sanitized environment.
 type ProcessIdentityLockCapability interface {
 	Duplicate() (*os.File, error)
 }
@@ -35,19 +36,47 @@ const (
 	envIsolationUID  = privateEnvPrefix + "ISOLATION_UID"
 	envIsolationGID  = privateEnvPrefix + "ISOLATION_GID"
 	envIsolationTest = privateEnvPrefix + "ISOLATION_TEST_ONLY"
-
-	processIsolationLinux = "linux"
 )
 
 var processIsolationGOOS = runtime.GOOS
 
-// sharedIdentitySupervisorRemedy states what an operator can change when the
-// supervisor was asked to launch the native process under the very identity it
-// already runs as and the shape it was handed describes something else. There
-// is no privilege boundary to cross in that deployment, so the two answers are
-// to give the supervisor one, or to describe the launch as what it is.
-const sharedIdentitySupervisorRemedy = "run the supervisor as root to isolate the agent identity, " +
-	"or launch the agent under the identity the supervisor already holds"
+var ordinaryEnvironmentEntries = os.Environ
+var ordinaryExecutableAbs = filepath.Abs
+
+// CaptureOrdinaryEnvironment captures Pi's deliberately narrow, non-secret
+// execution baseline. Provider credentials and loader variables are ambient
+// state and never cross this boundary; explicit agent/session Env remains the
+// credential route.
+func CaptureOrdinaryEnvironment() map[string]string {
+	environment := make(map[string]string)
+
+	for _, entry := range ordinaryEnvironmentEntries() {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || !ordinaryEnvironmentKey(key) {
+			continue
+		}
+
+		environment[key] = value
+	}
+
+	return environment
+}
+
+func ordinaryEnvironmentKey(key string) bool {
+	upper := strings.ToUpper(key)
+	if strings.HasPrefix(upper, privateEnvPrefix) || !safeExplicitEnvKey(key) {
+		return false
+	}
+
+	switch upper {
+	case envPath, envHome, "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP",
+		"LANG", "TERM", "COLORTERM", "NO_COLOR", "FORCE_COLOR", "SYSTEMROOT",
+		"WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "__CF_USER_TEXT_ENCODING":
+		return true
+	default:
+		return strings.HasPrefix(upper, "LC_")
+	}
+}
 
 func validateProcessIsolation(isolation *ProcessIsolation) error {
 	if isolation == nil {
@@ -87,6 +116,39 @@ func isolationEnvironment(isolation *ProcessIsolation, overlays ...map[string]st
 	env := make(map[string]string, len(isolation.BaseEnvironment))
 	for key, value := range isolation.BaseEnvironment {
 		env[key] = value
+	}
+
+	for _, overlay := range overlays {
+		for key, value := range overlay {
+			if !validEnvironmentName(key) || strings.HasPrefix(strings.ToUpper(key), privateEnvPrefix) {
+				return nil, fmt.Errorf("process environment contains invalid key %q", key)
+			}
+
+			env[key] = value
+		}
+	}
+
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, key+"="+env[key])
+	}
+
+	return out, nil
+}
+
+func ordinaryEnvironment(base map[string]string, overlays ...map[string]string) ([]string, error) {
+	env := make(map[string]string, len(base))
+	for key, value := range base {
+		if ordinaryEnvironmentKey(key) {
+			env[key] = value
+		}
 	}
 
 	for _, overlay := range overlays {
@@ -156,6 +218,41 @@ func lookPathInEnvironment(file string, environment []string) (string, error) {
 	return "", fmt.Errorf("executable %q not found in policy PATH", file)
 }
 
+func lookPathInOrdinaryEnvironment(file string, environment []string) (string, error) {
+	if file == "" {
+		return "", errors.New("executable name is empty")
+	}
+
+	resolve := func(path string) (string, error) {
+		if !filepath.IsAbs(path) {
+			absolute, err := ordinaryExecutableAbs(path)
+			if err != nil {
+				return "", err
+			}
+
+			path = absolute
+		}
+
+		return executableFile(path)
+	}
+
+	if strings.ContainsRune(file, os.PathSeparator) {
+		return resolve(file)
+	}
+
+	for _, dir := range filepath.SplitList(environmentValue(environment, envPath)) {
+		if dir == "" {
+			dir = "."
+		}
+
+		if path, err := resolve(filepath.Join(dir, file)); err == nil {
+			return path, nil
+		}
+	}
+
+	return "", fmt.Errorf("executable %q not found in PATH", file)
+}
+
 func executableFile(path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -169,9 +266,20 @@ func executableFile(path string) (string, error) {
 	return path, nil
 }
 
-// ResolveExecutable resolves file only through the complete policy
-// environment plus explicit overlays.
-func ResolveExecutable(file string, isolation *ProcessIsolation, overlays ...map[string]string) (string, error) {
+// ResolveExecutable resolves file through the explicit closed policy when
+// present, otherwise through the captured ordinary environment. Ordinary PATH
+// entries and configured paths are not subject to explicit-policy absolute
+// path constraints.
+func ResolveExecutable(file string, isolation *ProcessIsolation, ordinary map[string]string, overlays ...map[string]string) (string, error) {
+	if isolation == nil {
+		environment, err := ordinaryEnvironment(ordinary, overlays...)
+		if err != nil {
+			return "", err
+		}
+
+		return lookPathInOrdinaryEnvironment(file, environment)
+	}
+
 	environment, err := isolationEnvironment(isolation, overlays...)
 	if err != nil {
 		return "", err

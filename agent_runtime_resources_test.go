@@ -135,6 +135,7 @@ func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
 			func() { nativeReleases++ },
 			root,
 			func() { scratchReleases++ },
+			nil,
 		)
 
 		require.ErrorIs(t, err, runtimeErr)
@@ -153,6 +154,7 @@ func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
 			func() { nativeReleases++ },
 			root,
 			func() { scratchReleases++ },
+			nil,
 		)
 
 		require.ErrorIs(t, err, internalpi.ErrProcessContainmentIncomplete)
@@ -179,6 +181,7 @@ func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
 			func() { nativeReleases++ },
 			root,
 			func() { scratchReleases++ },
+			nil,
 		)
 
 		require.ErrorIs(t, err, deleteErr)

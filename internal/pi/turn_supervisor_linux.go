@@ -32,7 +32,6 @@ const (
 	turnSupervisorDoneLine         = "done\n"
 	turnSupervisorOriginBorrowed   = "borrowed"
 	turnSupervisorOriginStandalone = "standalone"
-	turnSupervisorOriginShared     = "shared"
 
 	// turnSupervisorFailure prefixes the terminal readiness frame a supervisor
 	// writes in place of the readiness it never reached. A refusal reason is
@@ -216,6 +215,16 @@ func turnSupervisorBootstrap() {
 }
 
 func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*processTreeCommand, error) {
+	if containment.Isolation == nil {
+		if containment.DarwinBestEffort {
+			return nil, fmt.Errorf("%w: Darwin best-effort containment is invalid on linux", ErrProcessContainmentIncomplete)
+		}
+
+		configureProcessCommandPlatform(native)
+
+		return &processTreeCommand{cmd: native, ordinary: true}, nil
+	}
+
 	if containment.DarwinBestEffort {
 		return nil, fmt.Errorf("%w: Darwin best-effort containment is invalid on linux", ErrProcessContainmentIncomplete)
 	}
@@ -241,15 +250,8 @@ func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*
 		IdentityLock:    containment.Isolation.IdentityLock != nil,
 		AuthorityDomain: containment.Isolation.AuthorityDomain != nil,
 	}
-	// The origin travels in the sealed config so the guardian and the liveness
-	// child inherit the one decision the parent made. Each of them re-derives it
-	// from its own identity and refuses a config that disagrees, so the stamp can
-	// direct the launch without being trusted on its own.
-	switch {
-	case config.IdentityLock:
+	if config.IdentityLock {
 		config.AuthorityOrigin = turnSupervisorOriginBorrowed
-	case sharedProcessIdentity(containment.Isolation):
-		config.AuthorityOrigin = turnSupervisorOriginShared
 	}
 
 	if config.Path == "" || len(config.Args) == 0 {
@@ -681,9 +683,6 @@ func validateTurnSupervisorConfigDisposition(config turnSupervisorConfig, testOn
 	switch config.AuthorityOrigin {
 	case "":
 		return nil
-	case turnSupervisorOriginShared:
-		// There is no durable disposition to read back: the arm never wrote one.
-		return nil
 	case turnSupervisorOriginBorrowed:
 		return validateBorrowedAgentIdentityDisposition(
 			config.Isolation.UID, config.Isolation.GID, testOnly, config.Isolation.TestOnlyIdentityLockRoot,
@@ -720,13 +719,6 @@ func acquireTurnSupervisorAuthority(
 	canceled <-chan struct{},
 	signals <-chan os.Signal,
 ) (*turnSupervisorAuthority, error) {
-	// A shared identity carries no authority. The durable registry records who
-	// may enter an identity nobody is in, and the supervisor is already in this
-	// one, so there is nothing to claim, adopt, publish or release.
-	if config.AuthorityOrigin == turnSupervisorOriginShared {
-		return &turnSupervisorAuthority{}, nil
-	}
-
 	if !config.IdentityLock && config.Isolation.TestOnlyNoCredential &&
 		config.Isolation.StandaloneOwnerID == "" && config.Isolation.StandaloneStateRoot == "" {
 		return &turnSupervisorAuthority{
@@ -788,7 +780,6 @@ func startTurnSupervisorLiveness(
 		domain = authority.domain
 	}
 
-	shared := config.AuthorityOrigin == turnSupervisorOriginShared
 	borrowedAuthority := identity != nil && identity.file != nil && domain != nil && domain.file != nil
 	config.IdentityLock = borrowedAuthority
 	config.AuthorityDomain = borrowedAuthority
@@ -802,10 +793,6 @@ func startTurnSupervisorLiveness(
 		config.StandaloneOwner = &owner
 	case borrowedAuthority:
 		config.AuthorityOrigin = turnSupervisorOriginBorrowed
-	case shared:
-		// The liveness child holds no authority either, and the origin it is
-		// handed still has to name the identity it will run as.
-		config.AuthorityOrigin = turnSupervisorOriginShared
 	}
 
 	config.Isolation.IdentityLock = nil
@@ -960,14 +947,6 @@ func validateTurnSupervisorConfig(config turnSupervisorConfig) error {
 		return errors.New("pi native supervisor identity lock and authority domain must be provided together")
 	}
 
-	// Every process in the tree derives the origin from its own identity, and a
-	// child that disagrees with the config it was handed refuses rather than
-	// following it: the stamp decides which steps run, so a stamp that does not
-	// describe the process running them can only be wrong.
-	if sharedProcessIdentity(&config.Isolation) != (config.AuthorityOrigin == turnSupervisorOriginShared) {
-		return errors.New("pi native supervisor authority origin does not match the identity it runs as")
-	}
-
 	if err := validateTurnSupervisorConfigOrigin(config); err != nil {
 		return err
 	}
@@ -995,11 +974,6 @@ func validateTurnSupervisorConfigOrigin(config turnSupervisorConfig) error {
 	case "":
 		if config.IdentityLock || config.StandaloneOwner != nil {
 			return errors.New("pi native supervisor inherited authority origin is required")
-		}
-	case turnSupervisorOriginShared:
-		if config.IdentityLock || config.StandaloneOwner != nil ||
-			config.Isolation.StandaloneOwnerID != "" || config.Isolation.StandaloneStateRoot != "" {
-			return errors.New("pi native supervisor shared authority origin is inconsistent")
 		}
 	case turnSupervisorOriginBorrowed:
 		if !config.IdentityLock || config.StandaloneOwner != nil {
@@ -1053,9 +1027,8 @@ func runTurnSupervisorLiveness(configInput io.Reader, controlInput io.Reader, re
 }
 
 // acquireTurnSupervisorNativeAuthority establishes the agent identity authority this
-// launch runs under: the empty pair a shared identity holds, the pair the
-// caller borrowed and passed down, the empty pair the credential-free tests
-// use, or a standalone identity claimed here.
+// launch runs under: the pair the caller borrowed and passed down, the empty
+// pair credential-free tests use, or a standalone identity claimed here.
 // The standalone result is returned alongside so the caller can release the
 // whole claim rather than the two locks it lends out.
 func acquireTurnSupervisorNativeAuthority(
@@ -1066,8 +1039,6 @@ func acquireTurnSupervisorNativeAuthority(
 	signals <-chan os.Signal,
 ) (*agentIdentityLock, *agentIdentityLock, *agentStandaloneIdentity, error) {
 	switch {
-	case config.AuthorityOrigin == turnSupervisorOriginShared:
-		return &agentIdentityLock{}, &agentIdentityLock{}, nil, nil
 	case config.IdentityLock:
 		identityLock, adoptErr := adoptAgentIdentityLock(
 			turnSupervisorOpenFile(identityFD, "pi-agent-identity-lock"),
@@ -1329,14 +1300,6 @@ func validateTurnSupervisorGuardianPeer(peer *os.File, done <-chan struct{}) err
 func validateTurnSupervisorIdentity(isolation *ProcessIsolation) error {
 	if isolation == nil {
 		return errors.New("process isolation is required")
-	}
-
-	// The supervisor drops privilege to reach the native identity, so it has to
-	// hold a higher one first. When the native identity is the one it already
-	// runs as there is no descent to make, and demanding root would refuse the
-	// only launch such a deployment can perform.
-	if sharedProcessIdentity(isolation) {
-		return nil
 	}
 
 	effectiveUID := turnSupervisorEffectiveUID()

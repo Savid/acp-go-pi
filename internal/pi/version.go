@@ -32,8 +32,10 @@ func ProbeVersion(ctx context.Context, executablePath string, agentDir string, c
 		return "", contextErr
 	}
 
-	if err := validateProcessIsolation(containment.Isolation); err != nil {
-		return "", fmt.Errorf("validate pi version process isolation: %w", err)
+	if containment.Isolation != nil {
+		if err := validateProcessIsolation(containment.Isolation); err != nil {
+			return "", fmt.Errorf("validate pi version process isolation: %w", err)
+		}
 	}
 
 	expectedAgentDir := filepath.Join(containment.GenerationRoot, "probe-agent")
@@ -44,7 +46,17 @@ func ProbeVersion(ctx context.Context, executablePath string, agentDir string, c
 
 	environment := (LaunchSpec{AgentDir: agentDir, Containment: containment}).Environ()
 
-	resolved, err := lookPathInEnvironment(executablePath, environment)
+	var (
+		resolved string
+		err      error
+	)
+
+	if containment.Isolation == nil {
+		resolved, err = lookPathInOrdinaryEnvironment(executablePath, environment)
+	} else {
+		resolved, err = lookPathInEnvironment(executablePath, environment)
+	}
+
 	if err != nil {
 		return "", fmt.Errorf("resolve pi version executable: %w", err)
 	}
@@ -62,7 +74,7 @@ func ProbeVersion(ctx context.Context, executablePath string, agentDir string, c
 		return "", fmt.Errorf("prepare pi version probe: %w", err)
 	}
 
-	if !launch.nativeIsolation {
+	if !launch.nativeIsolation && containment.Isolation != nil {
 		if isolationErr := applyProcessIsolation(launch.cmd, containment.Isolation); isolationErr != nil {
 			launch.close()
 

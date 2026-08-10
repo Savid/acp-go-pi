@@ -1,43 +1,67 @@
 ---
 title: "Run Modes"
-description: "Choose between the standalone binary and embedding the adapter directly in your Go host"
+description: "Choose ordinary execution or explicit Linux isolation from the CLI or an embedded host"
 ---
 
-The adapter offers the same behavior through two entry points. Pick by where the
-ACP transport lives: use the standalone binary when an editor or host spawns a
-subprocess and pipes JSON-RPC over stdio, and embed `Serve` when your host owns
-the reader/writer streams directly.
+The adapter offers the same ACP behavior through two entry points. Use the
+standalone binary when an editor or host spawns a subprocess and pipes JSON-RPC
+over stdio; embed `Serve` when your Go host owns the streams directly.
 
-## Standalone
+## Ordinary execution is the default
 
-Standalone native mode is Linux-only. The root supervisor must receive
-`-process-isolation-config=/absolute/path/process-isolation.json`; the strict
-file schema, account/home checks, closed environment, and explicit
-`inheritEnvironment` behavior are documented in the
-[CLI reference](/docs/reference/cli). `-version` and Darwin containment
-diagnostics do not require the policy. There is no Darwin or Windows
-standalone-launch fallback.
-
-`acp-go-pi` is launched by an ACP client, which drives it over stdin/stdout.
-stdout carries ACP JSON-RPC only; diagnostics go to stderr (and `-debug` when
-present).
+With no process-isolation option, the adapter runs Pi as its current root or
+non-root identity. This is the portable default on Linux, Darwin, FreeBSD,
+OpenBSD, and Windows. It needs no privileged setup, identity authority, or
+descendant inventory. `Agent.ContainmentMode()` reports `shared_identity`:
+direct-process liveness is managed, but descendant absence and whole-tree
+quiescence are not claimed.
 
 ```sh
-acp-go-pi -process-isolation-config /etc/acp-go/pi-isolation.json -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt-4o
+acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt-4o
 ```
 
-## Embedded
+The adapter captures a narrow environment once at construction, removes
+provider credentials and loader hooks, then applies explicit agent/session
+overlays. Ordinary executable and PATH values may be relative; the stricter
+absolute-PATH rules belong only to an explicit isolation policy.
 
-`Serve` runs the agent against reader/writer streams you supply, so your host
-can back the transport with any pipe, socket, or in-memory buffer:
+## Explicit Linux isolation
+
+`-process-isolation-config=/absolute/path/process-isolation.json` opts into the
+trusted-root Linux boundary. The policy is strict and fail-closed: it must name
+a distinct non-root identity and valid authority, environment, home, and state
+roots. A missing, malformed, untrusted, same-identity, or non-Linux policy
+fails before `Serve`; there is no ordinary or Darwin fallback.
+
+```sh
+sudo acp-go-pi \
+  -process-isolation-config /etc/acp-go/pi-isolation.json \
+  -path /usr/local/bin/pi \
+  -scratch-dir /tmp/pi-scratch
+```
+
+The durable Pi home used by the provider-auth broker is intentionally not
+available in this distinct-identity posture until a safe credential-delivery
+design is proven. Configure provider auth only in ordinary mode.
+
+## Embedded
 
 ```go
 err := piacp.Serve(ctx, input, output,
 	piacp.WithExecutablePath("/usr/local/bin/pi"),
-	piacp.WithProcessIsolation(piacp.ProcessIsolation{UID: 20001, GID: 20001, BaseEnvironment: isolationEnvironment}),
 	piacp.WithScratchDir("/tmp/pi-scratch"),
 	piacp.WithDefaultModel("openai/gpt-4o"),
 )
+```
+
+To opt into Linux hardening, add an explicit `WithProcessIsolation` policy:
+
+```go
+piacp.WithProcessIsolation(piacp.ProcessIsolation{
+	UID: 20001,
+	GID: 20001,
+	BaseEnvironment: isolationEnvironment,
+})
 ```
 
 Every serve-mode flag has an option equivalent:
@@ -45,23 +69,15 @@ Every serve-mode flag has an option equivalent:
 | Flag | Option |
 | --- | --- |
 | `-path` | `WithExecutablePath` |
+| `-home` | `WithHome` |
 | `-scratch-dir` | `WithScratchDir` |
+| `-provider-auth-root` | `WithProviderAuthRoot` |
+| `-provider-auth-direct-home` | `WithProviderAuthDirectHome` |
 | `-model` | `WithDefaultModel` |
 | `-seed-file` | `WithSeedFiles` |
 | `-process-isolation-config` | constructs `WithProcessIsolation` |
 
-Embed-only options carry no flag. Use `WithSessionStore` when the host wants
-durable session storage, plus `WithEnv` for credential injection,
-`WithTurnTimeout`, `WithConcurrencyLimits`, and the
-OpenTelemetry providers. See the [Go API reference](/docs/reference/go-api)
-for the full catalog.
-
-The standalone binary is Linux-only. Embedded hosts may explicitly select
-Darwin best-effort containment through `WithDarwinBestEffortContainment` and
-receive the selected mode through `Agent.ContainmentMode`,
-`RuntimeResourceHooks.ObserveContainment`, structured logs, and the
-`acp_go_pi.runtime.containment` metric. Linux remains authoritative. Windows is
-unavailable for native launch because the mandatory Unix UID/GID identity
-boundary cannot be applied; cross-compilation proves only that refusal path
-builds, not runtime support. FreeBSD, OpenBSD, and unsupported platforms also
-remain unavailable.
+`WithSessionStore`, `WithEnv`, `WithTurnTimeout`, concurrency limits, and
+OpenTelemetry providers remain embed-only. Embedded Darwin hosts may separately
+select `WithDarwinBestEffortContainment`; it never accepts or replaces an
+explicit `ProcessIsolation` policy. See the [Go API](/docs/reference/go-api).

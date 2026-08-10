@@ -47,6 +47,31 @@ func TestAgentDirWriteManagedSettings(t *testing.T) {
 	require.JSONEq(t, `["settings.json"]`, string(data))
 }
 
+func TestAgentDirWritesExplicitAuthJSON(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "agent")
+	auth := []byte(`{"anthropic":{"type":"api_key","key":"test-only"}}`)
+	require.NoError(t, (AgentDir{Root: root, AuthJSON: auth}).Write())
+
+	path := filepath.Join(root, AuthFileName)
+	contents, err := os.ReadFile(path) // #nosec G304 -- test temp dir.
+	require.NoError(t, err)
+	require.Equal(t, auth, contents)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+
+	restoreAgentDirSeams(t)
+	realWrite := fsWriteFile
+	fsWriteFile = func(name string, data []byte, mode os.FileMode) error {
+		if filepath.Base(name) == AuthFileName {
+			return os.ErrPermission
+		}
+
+		return realWrite(name, data, mode)
+	}
+	require.ErrorContains(t, (AgentDir{Root: filepath.Join(t.TempDir(), "blocked"), AuthJSON: auth}).Write(), "write auth file")
+}
+
 func TestAgentDirWriteSeedMerge(t *testing.T) {
 	t.Parallel()
 

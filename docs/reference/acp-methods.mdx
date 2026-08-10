@@ -62,8 +62,10 @@ re-drives the turn. A single malformed native line is skipped and counted, not
 escalated into a dead session.
 
 <Note>
-This adapter advertises no ACP auth methods, so an authentication failure is a
-`provider` failure under `-32603` — it never emits the `-32000` auth-required
-variant. A user cancel that races a timeout resolves as a successful
-`cancelled` response, not a failure.
+This adapter advertises no standard ACP `authenticate` method, so a provider
+failure during a prompt is a `provider` failure under `-32603`. When the
+optional Pi provider-auth broker is enabled, its `_pi/auth/*` extension legs
+can return `-32000` with the closed `pi_auth_failed` cause shape; they never
+return credential material. A user cancel that races a timeout resolves as a
+successful `cancelled` response, not a failure.
 </Note>

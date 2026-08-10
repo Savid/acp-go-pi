@@ -5,7 +5,7 @@
 GOLANGCI_LINT_VERSION ?= v2.12.2
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
-.PHONY: build lint fmt-check fmt test coverage-check test-cross-compile test-integration-smoke test-integration-live test-integration-cover test-integration-native-browser docs-audit clean tidy vuln vuln-sarif modernize-check audit test/cover help
+.PHONY: build lint fmt-check fmt test coverage-check test-cross-compile test-integration-smoke test-integration-live test-integration-cover test-integration-attended test-integration-keystore test-integration-native-browser docs-audit clean tidy vuln vuln-sarif modernize-check audit test/cover help
 
 ## build: compile all packages
 build:
@@ -24,10 +24,8 @@ fmt:
 	gofmt -w $$(find . -name '*.go' -not -path './.git/*')
 	$(GOLANGCI_LINT) fmt ./...
 
-# Every isolated native launch claims the standalone agent identity, and that
-# claim proves the identity vacant across every task in the PID namespace. In
-# the initial namespace the suite requires, that is the whole host, so the
-# adapter package runs far past the ten-minute default.
+# Explicit isolated launches prove their standalone identity vacant across the
+# PID namespace. Those hardening tests run far past the ordinary default suite.
 GO_TEST_TIMEOUT ?= 40m
 
 ## test: run unit tests with race detector and shuffled order
@@ -82,11 +80,25 @@ test-integration-smoke:
 test-integration-live:
 	ACP_GO_PI_RUN_INTEGRATION=1 ACP_GO_PI_RUN_LIVE_TOKENS=1 go test -race -count=1 -tags=integration -timeout=900s -parallel=4 -v ./integration/...
 
-## test-integration-native-browser: require one Linux removed-extension no-launch proof
+## test-integration-attended: run provider-auth flows a human must approve in real time
+test-integration-attended:
+	@log=$$(mktemp); rc=$$(mktemp); \
+	{ ACP_GO_PI_RUN_INTEGRATION=1 ACP_GO_PI_RUN_ATTENDED=1 go test -race -count=1 -tags=integration -timeout=1200s -v -run '^TestAttended' ./integration/... 2>&1; echo $$? >"$$rc"; } | tee "$$log"; \
+	status=$$(cat "$$rc"); passed=$$(grep -c '^--- PASS: TestAttended' "$$log" || true); empty=$$(grep -c 'no tests to run' "$$log" || true); \
+	rm -f "$$log" "$$rc"; \
+	[ "$$status" -eq 0 ] || exit "$$status"; \
+	[ "$$passed" -gt 0 ] || { echo 'no attended provider-auth login ran'; exit 1; }; \
+	[ "$$empty" -eq 0 ] || { echo 'attended provider-auth selector ran no tests'; exit 1; }
+
+## test-integration-keystore: run credential-residence tests against the container fixture
+test-integration-keystore:
+	ACP_GO_PI_RUN_INTEGRATION=1 ACP_GO_PI_RUN_KEYSTORE=1 go test -race -count=1 -tags=integration -timeout=600s -v -run '^TestKeystore' ./...
+
+## test-integration-native-browser: require one Linux explicit-isolation no-auth-launch proof
 test-integration-native-browser:
 	@log=$$(mktemp); rc=$$(mktemp); \
-	{ ACP_GO_PI_RUN_INTEGRATION=1 go test -race -count=1 -tags=integration -timeout=1200s -v -run '^TestNativeLinuxRemovedExtensionExecsNoNativeOrBrowser$$' ./integration/... 2>&1; echo $$? >"$$rc"; } | tee "$$log"; \
-	status=$$(cat "$$rc"); passed=$$(grep -c '^--- PASS: TestNativeLinuxRemovedExtensionExecsNoNativeOrBrowser ' "$$log" || true); skipped=$$(grep -Ec '^[[:space:]]*--- SKIP: TestNativeLinuxRemovedExtensionExecsNoNativeOrBrowser(/| )' "$$log" || true); empty=$$(grep -c 'no tests to run' "$$log" || true); \
+	{ ACP_GO_PI_RUN_INTEGRATION=1 go test -race -count=1 -tags=integration -timeout=1200s -v -run '^TestNativeLinuxExplicitIsolationDoesNotDispatchProviderAuth$$' ./integration/... 2>&1; echo $$? >"$$rc"; } | tee "$$log"; \
+	status=$$(cat "$$rc"); passed=$$(grep -c '^--- PASS: TestNativeLinuxExplicitIsolationDoesNotDispatchProviderAuth ' "$$log" || true); skipped=$$(grep -Ec '^[[:space:]]*--- SKIP: TestNativeLinuxExplicitIsolationDoesNotDispatchProviderAuth(/| )' "$$log" || true); empty=$$(grep -c 'no tests to run' "$$log" || true); \
 	rm -f "$$log" "$$rc"; \
 	[ "$$status" -eq 0 ] || exit "$$status"; \
 	[ "$$passed" -eq 1 ] || { echo "native browser pass count $$passed, want exactly 1"; exit 1; }; \
@@ -105,8 +117,8 @@ test-integration-cover:
 ## docs-audit: check public docs, examples, required files, CLI flags, and removed terms
 docs-audit:
 	@missing=0; for file in README.md doc.go docs.json example_test.go AGENTS.md docs/overview.mdx docs/core/sessions.mdx docs/core/prompt-streaming.mdx docs/features/authentication.mdx docs/features/elicitation.mdx docs/features/mcp.mdx docs/features/models-config.mdx docs/features/permissions.mdx docs/features/raw-events.mdx docs/features/session-store.mdx docs/get-started/examples.mdx docs/get-started/install.mdx docs/get-started/quickstart.mdx docs/get-started/run-modes.mdx docs/operations/observability.mdx docs/operations/security.mdx docs/operations/troubleshooting.mdx docs/reference/acp-methods.mdx docs/reference/cli.mdx docs/reference/go-api.mdx docs/reference/meta.mdx docs/reference/updates.mdx examples/minimal-client/main.go examples/resume-from-file/main.go examples/interactive-chat/main.go; do if [ ! -f "$$file" ]; then echo "missing required docs file: $$file"; missing=1; fi; done; exit $$missing
-	@for flag in -path -scratch-dir -process-isolation-config -model -seed-file -debug -version; do rg -q -- "$$flag" docs/reference/cli.mdx || { echo "missing CLI flag in docs/reference/cli.mdx: $$flag"; exit 1; }; done
-	@for flag in path scratch-dir process-isolation-config model seed-file debug version; do rg -q -- "\"$$flag\"" cmd/acp-go-pi/*.go || { echo "missing CLI flag registration in command code: $$flag"; exit 1; }; done
+	@for flag in -path -home -scratch-dir -provider-auth-root -provider-auth-direct-home -process-isolation-config -model -seed-file -debug -version; do rg -q -- "$$flag" docs/reference/cli.mdx || { echo "missing CLI flag in docs/reference/cli.mdx: $$flag"; exit 1; }; done
+	@for flag in path home scratch-dir provider-auth-root provider-auth-direct-home process-isolation-config model seed-file debug version; do rg -q -- "\"$$flag\"" cmd/acp-go-pi/*.go || { echo "missing CLI flag registration in command code: $$flag"; exit 1; }; done
 	@! rg -n -- '--cli|proxy|compatibility|deprecated|legacy|migration|session/import|sdkMessage|setGoal|goals|NES|SSE MCP|mcpCapabilities\.acp' README.md doc.go docs.json docs examples cmd/acp-go-pi/*.go AGENTS.md
 	@rg -q 'SupervisorGuardianSIGKILL' Makefile
 	@rg -q 'SupervisorLivenessSIGKILL' Makefile

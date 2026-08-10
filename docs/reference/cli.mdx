@@ -9,11 +9,12 @@ description: "Every flag the acp-go-pi binary accepts and what it maps to"
 acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt-4o
 ```
 
-## Required standalone isolation policy
+## Optional Linux isolation policy
 
-Normal serve mode is Linux-only and requires
-`-process-isolation-config=/absolute/path/process-isolation.json`.
-`-version` and the Darwin containment diagnostic subcommands are exempt.
+Normal serve mode needs no isolation flag and runs Pi as the command's current
+root or non-root identity. `-process-isolation-config` explicitly selects the
+trusted-root Linux-only boundary. Once supplied, it is never ignored or
+reinterpreted as ordinary execution, including on non-Linux platforms.
 The policy must be a root-owned, single-link regular file with mode `0600`.
 Every component is opened from `/` without following symlinks, and every
 ancestor must be root-owned and not writable by group or other. Unknown JSON
@@ -52,12 +53,14 @@ that same-name private primary group, no supplementary groups, and a target-owne
 `0700` home matching `HOME`, reached without symlinks beneath protected
 root-owned ancestry; `/root` and `/nonexistent` are forbidden. `USER` and
 `LOGNAME` must match the account.
-`PATH` must contain existing canonical absolute directories. The child gets
+`PATH` must contain existing canonical absolute directories. The isolated child gets
 only `baseEnvironment` plus variables explicitly named in
 `inheritEnvironment`; identity, search-path, loader, interpreter, XDG/native
 home, and adapter-private variables cannot be inherited. Unset or duplicate
 inheritance entries fail startup. Darwin, Windows, and other platforms refuse
-standalone native mode rather than weakening this contract.
+an explicit policy rather than weakening this contract. Without this flag,
+ordinary execution remains portable and does not apply these absolute-PATH or
+account constraints.
 
 Provision the target as a locked system account with a non-login shell, its
 same-name private group, and no sudo policy. Its UID and primary GID cannot be
@@ -70,8 +73,11 @@ home for native tools.
 | Flag | Purpose |
 | --- | --- |
 | `-path` | pi CLI executable (default: search `PATH`). |
-| `-process-isolation-config` | Required absolute path to the standalone Linux isolation policy described above. |
+| `-home` | Durable per-instance `PI_CODING_AGENT_DIR`. Empty gives sessions ephemeral agent directories. Required with `-provider-auth-root` to advertise provider auth. |
+| `-process-isolation-config` | Optional absolute path to the strict standalone Linux isolation policy described above. A supplied invalid policy fails before serving. |
 | `-scratch-dir` | Parent directory for all ephemeral scratch (isolated per-session agent and session directories, hydration temp files, and the version probe's isolated `PI_CODING_AGENT_DIR`/settings residence). Empty means the system temp directory. |
+| `-provider-auth-root` | Durable root for Pi's values-free provider-auth ledger. Empty leaves the seven `_pi/auth/*` legs unadvertised. |
+| `-provider-auth-direct-home` | Account-wide auth-home gate from the family API. Pi has no such leg, so any non-empty value is refused. |
 | `-model` | Default model for new sessions, as `"provider/id"`. |
 | `-seed-file` | Write a host file into each session's agent directory as `<relpath>=<hostpath>`; repeatable. |
 | `-debug` | Emit debug logs to stderr. |
@@ -79,17 +85,18 @@ home for native tools.
 
 <Note>
 Not every embedded option has a flag. Turn timeouts, concurrency limits,
-credential env injection, OpenTelemetry providers, and the session store are
+per-session credential env injection, OpenTelemetry providers, and the session store are
 embedded-Go only — configure them with the [Go API](/docs/reference/go-api)
-options such as `WithTurnTimeout`, `WithEnv`, and `WithSessionStore`.
+options such as `WithTurnTimeout`, `WithPiEnv`, and `WithSessionStore`.
 </Note>
 
 ## Darwin containment operations
 
-The standalone command never launches native work on Darwin. These operational
-commands remain available to inspect generations left by an embedded host
-using `WithDarwinBestEffortContainment`; that embedded mode does not establish
-that `setsid` descendants are absent.
+Ordinary standalone execution launches directly on Darwin. These operational
+commands inspect only generations left by an embedded host that explicitly
+uses `WithDarwinBestEffortContainment`; ordinary sessions create no such
+record, and best effort does not establish that `setsid` descendants are
+absent.
 
 Each actual Darwin native launch gets a fresh `0700` generation root and a
 128-bit runtime id. Inspect current records without changing processes or

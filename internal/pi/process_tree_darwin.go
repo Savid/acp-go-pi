@@ -24,4 +24,5 @@ type processTree struct {
 	direct       *directChildWait
 	cleanupOnce  sync.Once
 	cleanupErr   error
+	ordinary     bool
 }

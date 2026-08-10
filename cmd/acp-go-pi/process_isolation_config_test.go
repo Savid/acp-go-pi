@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
+
+	piacp "github.com/savid/acp-go-pi"
 )
 
 const testProcessIsolationConfigPath = "/test/process-isolation.json"
@@ -58,22 +62,46 @@ func TestDecodeProcessIsolationConfigStrict(t *testing.T) {
 	}
 }
 
-func TestRunRequiresProcessIsolationConfig(t *testing.T) {
-	var stderr strings.Builder
-	if code := run(t.Context(), nil, strings.NewReader(""), &strings.Builder{}, &stderr); code != 2 {
-		t.Fatalf("run code = %d, stderr = %q", code, stderr.String())
+func TestRunWithoutProcessIsolationConfigUsesOrdinaryMode(t *testing.T) {
+	disableTelemetry(t)
+	restoreMainSeams(t)
+
+	processIsolationConfigLoader = func(string) (processIsolationConfig, error) {
+		t.Fatal("ordinary mode loaded an isolation policy")
+
+		return processIsolationConfig{}, nil
 	}
-	if !strings.Contains(stderr.String(), "-"+processIsolationConfigFlag+" is required") {
-		t.Fatalf("stderr = %q", stderr.String())
+	serve = func(_ context.Context, _ io.Reader, _ io.Writer, opts ...piacp.Option) error {
+		options := piacp.Options{}
+		for _, opt := range opts {
+			opt(&options)
+		}
+		if options.ProcessIsolation != nil {
+			t.Fatalf("ordinary mode ProcessIsolation = %#v", options.ProcessIsolation)
+		}
+
+		return nil
+	}
+
+	if code := run(t.Context(), nil, strings.NewReader(""), &strings.Builder{}, &strings.Builder{}); code != 0 {
+		t.Fatalf("run code = %d", code)
 	}
 }
 
-func TestRunRejectsInvalidProcessIsolationConfig(t *testing.T) {
+func TestRunWithExplicitProcessIsolationConfigIsFailClosed(t *testing.T) {
+	disableTelemetry(t)
+	restoreMainSeams(t)
+
 	original := processIsolationConfigLoader
 	processIsolationConfigLoader = func(string) (processIsolationConfig, error) {
 		return processIsolationConfig{}, errors.New("invalid policy")
 	}
 	t.Cleanup(func() { processIsolationConfigLoader = original })
+	serve = func(context.Context, io.Reader, io.Writer, ...piacp.Option) error {
+		t.Fatal("serve called after explicit policy load failed")
+
+		return nil
+	}
 
 	var stderr strings.Builder
 	code := run(

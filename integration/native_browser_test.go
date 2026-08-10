@@ -30,7 +30,7 @@ const (
 	nativeBrowserTracePath          = "/tmp/native-browser.trace"
 	nativeBrowserHostname           = "native-browser-canary"
 	nativeBrowserInsideEnv          = "ACP_GO_PI_NATIVE_BROWSER_INSIDE"
-	nativeBrowserTestName           = "TestNativeLinuxRemovedExtensionExecsNoNativeOrBrowser"
+	nativeBrowserTestName           = "TestNativeLinuxExplicitIsolationDoesNotDispatchProviderAuth"
 	nativeBrowserCanaryUID   uint32 = 10001
 	nativeBrowserCanaryGID   uint32 = 10001
 )
@@ -49,11 +49,11 @@ var nativeBrowserLauncherNames = []string{
 	"chromium-browser",
 }
 
-func TestNativeLinuxRemovedExtensionExecsNoNativeOrBrowser(t *testing.T) {
+func TestNativeLinuxExplicitIsolationDoesNotDispatchProviderAuth(t *testing.T) {
 	requireRunIntegration(t)
 
 	if os.Getenv(nativeBrowserInsideEnv) == "1" {
-		runRemovedExtensionCanary(t)
+		runExplicitIsolationAuthCanary(t)
 
 		return
 	}
@@ -160,16 +160,16 @@ func TestNativeLinuxRemovedExtensionExecsNoNativeOrBrowser(t *testing.T) {
 		t.Fatalf("trace lacks positive adapter exec evidence:\n%s", trace)
 	}
 	if traceExecsBase(trace, filepath.Base(nativeBrowserPiPath)) {
-		t.Fatalf("removed auth dispatch launched the native Pi binary:\n%s", trace)
+		t.Fatalf("unadvertised isolated-auth dispatch launched the native Pi binary:\n%s", trace)
 	}
 	for _, launcher := range nativeBrowserLauncherNames {
 		if traceExecsBase(trace, launcher) {
-			t.Fatalf("removed auth dispatch attempted browser launcher %q:\n%s", launcher, trace)
+			t.Fatalf("unadvertised isolated-auth dispatch attempted browser launcher %q:\n%s", launcher, trace)
 		}
 	}
 }
 
-func runRemovedExtensionCanary(t *testing.T) {
+func runExplicitIsolationAuthCanary(t *testing.T) {
 	t.Helper()
 
 	root, err := os.MkdirTemp("/tmp", "acp-go-pi-native-browser-")

@@ -8,6 +8,10 @@ import (
 )
 
 func settleDirectProcessExit(tree *processTree, waitErr error) error {
+	if tree != nil && tree.ordinary {
+		return waitErr
+	}
+
 	containmentErr := tree.terminateAndWait(defaultProcessTreeWait)
 	if containmentErr == nil && errors.Is(waitErr, exec.ErrWaitDelay) {
 		waitErr = nil

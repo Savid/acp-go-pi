@@ -54,6 +54,7 @@ func startProcessTree(launch *processTreeCommand) (*processTree, error) {
 		pgid:        pgid,
 		process:     launch.cmd.Process,
 		direct:      direct,
+		ordinary:    launch.ordinary,
 	}
 	tree.control = launch.control
 	tree.supervised = launch.control != nil

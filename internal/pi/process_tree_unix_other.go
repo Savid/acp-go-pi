@@ -23,4 +23,5 @@ type processTree struct {
 	boundaryOnce sync.Once
 	boundaryErr  error
 	direct       *directChildWait
+	ordinary     bool
 }

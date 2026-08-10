@@ -205,3 +205,34 @@ func TestSessionStoreLoadTimeoutDefaults(t *testing.T) {
 	require.Equal(t, time.Second, agent.sessionStoreLoadTimeout())
 	require.Equal(t, defaultSessionStoreLoadTimeout, NewAgent().sessionStoreLoadTimeout())
 }
+
+func TestDurableHomeMaterialization(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		home := filepath.Join(t.TempDir(), "durable-home")
+		dirs := sessionDirs{AgentDir: "/generated"}
+		require.NoError(t, NewAgent(WithHome(home)).applyDurableHome(&dirs))
+		require.Equal(t, home, dirs.AgentDir)
+		info, err := os.Stat(home)
+		require.NoError(t, err)
+		require.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+	})
+
+	t.Run("relative path", func(t *testing.T) {
+		err := NewAgent(WithHome("relative/home")).applyDurableHome(&sessionDirs{})
+		require.ErrorContains(t, err, "clean absolute path")
+	})
+
+	t.Run("create failure", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		materializeMkdirAll = func(string, os.FileMode) error { return errors.New("create durable") }
+		err := NewAgent(WithHome(filepath.Join(t.TempDir(), "home"))).applyDurableHome(&sessionDirs{})
+		require.ErrorContains(t, err, "create durable agent directory")
+	})
+
+	t.Run("chmod failure", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		materializeChmod = func(string, os.FileMode) error { return errors.New("chmod durable") }
+		err := NewAgent(WithHome(filepath.Join(t.TempDir(), "home"))).applyDurableHome(&sessionDirs{})
+		require.ErrorContains(t, err, "protect durable agent directory")
+	})
+}

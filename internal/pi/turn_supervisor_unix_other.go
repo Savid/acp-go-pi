@@ -3,15 +3,22 @@
 package pi
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 )
 
-func prepareProcessTreeCommand(*exec.Cmd, ContainmentSpec) (*processTreeCommand, error) {
-	return nil, fmt.Errorf(
-		"%w: platform cannot prove pi descendants that escape a process group",
-		ErrProcessContainmentIncomplete,
-	)
+func prepareProcessTreeCommand(native *exec.Cmd, containment ContainmentSpec) (*processTreeCommand, error) {
+	if containment.Isolation != nil {
+		return nil, errors.New("explicit process isolation is supported only on linux")
+	}
+	if containment.DarwinBestEffort {
+		return nil, fmt.Errorf("%w: Darwin best-effort containment is invalid on this platform", ErrProcessContainmentIncomplete)
+	}
+
+	configureProcessCommandPlatform(native)
+
+	return &processTreeCommand{cmd: native, ordinary: true}, nil
 }
 
 func awaitProcessTreeReady(*processTreeCommand) error { return nil }

@@ -19,10 +19,14 @@ func testContainmentSpec(t *testing.T) ContainmentSpec {
 	if uid == 0 {
 		uid, gid = 11, 22
 	}
-	isolation := &ProcessIsolation{
-		UID: uid, GID: gid,
-		BaseEnvironment:      map[string]string{"PATH": pathEnvironment, "HOME": os.Getenv("HOME")},
-		TestOnlyNoCredential: true,
+	var isolation *ProcessIsolation
+	ordinary := map[string]string{"PATH": pathEnvironment, "HOME": os.Getenv("HOME")}
+	if runtime.GOOS == "linux" {
+		isolation = &ProcessIsolation{
+			UID: uid, GID: gid,
+			BaseEnvironment:      ordinary,
+			TestOnlyNoCredential: true,
+		}
 	}
 	parent := t.TempDir()
 	root, err := os.MkdirTemp(parent, "acp-go-pi-runtime-*")
@@ -35,12 +39,13 @@ func testContainmentSpec(t *testing.T) ContainmentSpec {
 	}
 
 	return ContainmentSpec{
-		DarwinBestEffort: runtime.GOOS == "darwin",
-		ScratchParent:    parent,
-		GenerationRoot:   filepath.Clean(root),
-		RuntimeID:        hex.EncodeToString(identity),
-		LifecycleKind:    "discovery",
-		Isolation:        isolation,
+		DarwinBestEffort:    runtime.GOOS == "darwin",
+		ScratchParent:       parent,
+		GenerationRoot:      filepath.Clean(root),
+		RuntimeID:           hex.EncodeToString(identity),
+		LifecycleKind:       "discovery",
+		Isolation:           isolation,
+		OrdinaryEnvironment: ordinary,
 	}
 }
 

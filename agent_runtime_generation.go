@@ -121,12 +121,13 @@ func (a *Agent) containmentSpecForRoot(
 	}
 
 	return internalpi.ContainmentSpec{
-		DarwinBestEffort: a.ContainmentMode() == RuntimeContainmentBestEffort,
-		ScratchParent:    absoluteParent,
-		GenerationRoot:   absoluteRoot,
-		RuntimeID:        hex.EncodeToString(identity),
-		LifecycleKind:    string(kind),
-		Isolation:        internalProcessIsolation(a.options.ProcessIsolation, a.options.testOnlyNoCredential, a.options.testOnlyIdentityLockRoot),
+		DarwinBestEffort:    a.ContainmentMode() == RuntimeContainmentBestEffort,
+		ScratchParent:       absoluteParent,
+		GenerationRoot:      absoluteRoot,
+		RuntimeID:           hex.EncodeToString(identity),
+		LifecycleKind:       string(kind),
+		Isolation:           internalProcessIsolation(a.options.ProcessIsolation, a.options.testOnlyNoCredential, a.options.testOnlyIdentityLockRoot),
+		OrdinaryEnvironment: cloneStringMap(a.ordinaryEnvironment),
 	}, nil
 }
 

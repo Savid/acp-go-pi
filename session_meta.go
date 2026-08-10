@@ -43,8 +43,8 @@ type PiOptions struct {
 	Env map[string]string `json:"env,omitempty"`
 	// ExtraPathDirs are absolute directories prepended, in order, to the PATH
 	// of this session's pi process, so the first entry resolves ahead of every
-	// other. A raw PATH in Env stays rejected: this is the whole sanctioned
-	// surface for placing a host-owned executable in front of the child.
+	// other. Env may also carry an explicit PATH; this field is for callers that
+	// need to prepend individual host-owned executable directories.
 	ExtraPathDirs []string `json:"extraPathDirs,omitempty"`
 	// OutputSchema requests JSON Schema structured output. pi has no native
 	// structured-output surface, so setting it fails closed at session start.

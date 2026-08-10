@@ -21,7 +21,10 @@ func TestApplyOptionsDefaults(t *testing.T) {
 	require.Equal(t, "acp-go-pi", options.AgentTitle)
 	require.Equal(t, "0.1.0", options.AgentVersion)
 	require.Empty(t, options.ExecutablePath)
+	require.Empty(t, options.Home)
 	require.Empty(t, options.ScratchDir)
+	require.Empty(t, options.ProviderAuthRoot)
+	require.Empty(t, options.ProviderAuthDirectHome)
 	require.Empty(t, options.DefaultModel)
 	require.Nil(t, options.Env)
 	require.Nil(t, options.ExtraPathDirs)
@@ -50,7 +53,10 @@ func TestApplyOptionsSetters(t *testing.T) {
 		WithAgentTitle("title"),
 		WithAgentVersion("9.9.9"),
 		WithExecutablePath("/usr/bin/pi"),
+		WithHome("/srv/pi-home"),
 		WithScratchDir("/srv/pi-scratch"),
+		WithProviderAuthRoot("/srv/pi-auth"),
+		WithProviderAuthDirectHome("/srv/pi-direct"),
 		WithDefaultModel("openai/gpt-4o"),
 		WithEnv(env),
 		WithExtraPathDirs(extraPathDirs...),
@@ -69,7 +75,10 @@ func TestApplyOptionsSetters(t *testing.T) {
 	require.Equal(t, "title", options.AgentTitle)
 	require.Equal(t, "9.9.9", options.AgentVersion)
 	require.Equal(t, "/usr/bin/pi", options.ExecutablePath)
+	require.Equal(t, "/srv/pi-home", options.Home)
 	require.Equal(t, "/srv/pi-scratch", options.ScratchDir)
+	require.Equal(t, "/srv/pi-auth", options.ProviderAuthRoot)
+	require.Equal(t, "/srv/pi-direct", options.ProviderAuthDirectHome)
 	require.Equal(t, "openai/gpt-4o", options.DefaultModel)
 	require.Equal(t, env, options.Env)
 	require.Equal(t, []string{"/opt/shim/bin"}, options.ExtraPathDirs)
@@ -108,7 +117,7 @@ func TestProcessIsolationOptionClonesAndFailsClosed(t *testing.T) {
 	require.Empty(t, testOnly.StandaloneOwnerID)
 	require.Empty(t, testOnly.StandaloneStateRoot)
 
-	require.Error(t, validateProcessIsolationOption(nil))
+	require.NoError(t, validateProcessIsolationOption(nil))
 	require.Error(t, validateProcessIsolationOption(&ProcessIsolation{UID: 0, GID: 1}))
 	require.Error(t, validateProcessIsolationOption(&ProcessIsolation{UID: 1, GID: 0}))
 

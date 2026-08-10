@@ -94,48 +94,17 @@ func TestProcessIsolationOptionIsRefusedOnWindows(t *testing.T) {
 	require.ErrorContains(
 		t,
 		validateProcessIsolationOption(isolation),
-		"process isolation is unsupported on windows",
+		"explicit process isolation is supported only on linux",
 	)
 
 	agentRuntimePlatform = darwinPlatform
-	require.NoError(t, validateProcessIsolationOption(isolation))
+	require.ErrorContains(t, validateProcessIsolationOption(isolation), "supported only on linux")
 }
 
-// TestSharedIdentityProcessIsolationOptionCarriesNoOwnerFields proves the public
-// option accepts the only shape a shared identity can have and refuses fields
-// that promise a durable record the supervisor will never write, while the
-// isolated shape keeps every rule it has today.
-func TestSharedIdentityProcessIsolationOptionCarriesNoOwnerFields(t *testing.T) {
-	restoreSharedIdentitySeams(t)
+func TestProviderAuthDirectHomeIsRefusedAtSessionStart(t *testing.T) {
+	agent := NewAgent(WithProviderAuthDirectHome("/srv/pi-direct"))
 
-	agentRuntimePlatform = linuxPlatform
-	processIsolationEffectiveUID = func() int { return 1000 }
-
-	canonical := &ProcessIsolation{UID: 1000, GID: 1000, BaseEnvironment: map[string]string{}}
-	require.NoError(t, validateProcessIsolationOption(canonical))
-
-	withOwner := *canonical
-	withOwner.StandaloneOwnerID = "shared-option-test"
-	require.ErrorContains(
-		t,
-		validateProcessIsolationOption(&withOwner),
-		"standalone owner fields describe an identity the supervisor already holds",
-	)
-
-	withStateRoot := *canonical
-	withStateRoot.StandaloneStateRoot = "/var/tmp/acp-go-pi-shared"
-	require.ErrorContains(
-		t,
-		validateProcessIsolationOption(&withStateRoot),
-		"standalone owner fields describe an identity the supervisor already holds",
-	)
-
-	require.False(t, sharedProcessIdentity(nil))
-
-	processIsolationEffectiveUID = func() int { return 0 }
-	require.EqualError(
-		t,
-		validateProcessIsolationOption(canonical),
-		"standalone owner id must be 1..256 valid UTF-8 bytes without whitespace or control characters",
-	)
+	err := agent.sessionStartConfigurationError()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), optionFieldProviderAuthDirectHome)
 }

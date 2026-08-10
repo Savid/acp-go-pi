@@ -74,6 +74,9 @@ type Agent struct {
 	options Options
 	log     *slog.Logger
 	observe *observer.Observer
+	// ordinaryEnvironment is captured and sanitized once at construction so
+	// later ambient changes cannot cross into an existing agent generation.
+	ordinaryEnvironment map[string]string
 
 	// Lock order: acquire mu before any session lock. Do not call session
 	// close methods while holding mu.
@@ -95,6 +98,12 @@ type Agent struct {
 
 	versionMu      sync.Mutex
 	versionChecked bool
+
+	// providerAuth is nil when the durable native residence or values-free
+	// ledger is not configured, or hardened distinct-identity isolation was
+	// selected.
+	providerAuth *providerAuth
+
 	startPiProcess func(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error)
 	probeVersion   func(ctx context.Context, executablePath string, agentDir string, containment pi.ContainmentSpec) (string, error)
 	lookPath       func(file string) (string, error)
@@ -123,28 +132,32 @@ func NewAgent(opts ...Option) *Agent {
 	})
 	mode := containmentMode(options)
 	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe, mode)
+	ordinaryEnvironment := pi.CaptureOrdinaryEnvironment()
 
 	agent := &Agent{
-		options:          options,
-		log:              log,
-		observe:          observe,
-		sessions:         make(map[acp.SessionId]*agentSession),
-		store:            NewInMemorySessionStore(),
-		deleted:          make(map[acp.SessionId]struct{}),
-		positionEncoding: acp.PositionEncodingKindUtf16,
+		options:             options,
+		log:                 log,
+		observe:             observe,
+		ordinaryEnvironment: ordinaryEnvironment,
+		sessions:            make(map[acp.SessionId]*agentSession),
+		store:               NewInMemorySessionStore(),
+		deleted:             make(map[acp.SessionId]struct{}),
+		positionEncoding:    acp.PositionEncodingKindUtf16,
 		activeLimitErr: errors.Join(
 			validateConcurrencyLimits(options.ConcurrencyLimits),
 			validateContainmentOption(options),
 			validateImageLimits(options.ImageLimits),
 			validateInputHandoffRoot(options.InputHandoffRoot),
+			validateProviderAuthRoot(options),
 		),
 		startPiProcess: startRealPiProcess,
 		probeVersion:   pi.ProbeVersion,
 		lookPath: func(file string) (string, error) {
-			return pi.ResolveExecutable(file, internalProcessIsolation(options.ProcessIsolation, options.testOnlyNoCredential, options.testOnlyIdentityLockRoot), options.Env)
+			return pi.ResolveExecutable(file, internalProcessIsolation(options.ProcessIsolation, options.testOnlyNoCredential, options.testOnlyIdentityLockRoot), ordinaryEnvironment, options.Env)
 		},
 	}
 	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
+	agent.providerAuth = newProviderAuth(agent)
 
 	observeRuntimeContainment(context.Background(), options.RuntimeResourceHooks, mode)
 
@@ -169,27 +182,34 @@ func (a *Agent) ContainmentMode() RuntimeContainmentMode {
 }
 
 func containmentMode(options Options) RuntimeContainmentMode {
-	switch agentRuntimePlatform {
-	case linuxPlatform:
-		if options.DarwinBestEffortContainment {
-			return RuntimeContainmentUnavailable
-		}
+	if options.DarwinBestEffortContainment && agentRuntimePlatform != darwinPlatform {
+		return RuntimeContainmentUnavailable
+	}
 
-		if sharedProcessIdentity(options.ProcessIsolation) {
-			return RuntimeContainmentSharedIdentity
-		}
+	if options.ProcessIsolation != nil && options.DarwinBestEffortContainment {
+		return RuntimeContainmentUnavailable
+	}
 
-		return RuntimeContainmentAuthoritative
-	case darwinPlatform:
+	if options.ProcessIsolation == nil {
 		if options.DarwinBestEffortContainment {
 			return RuntimeContainmentBestEffort
 		}
+
+		return RuntimeContainmentSharedIdentity
+	}
+
+	if agentRuntimePlatform == linuxPlatform {
+		return RuntimeContainmentAuthoritative
 	}
 
 	return RuntimeContainmentUnavailable
 }
 
 func validateContainmentOption(options Options) error {
+	if options.ProcessIsolation != nil && options.DarwinBestEffortContainment {
+		return errors.New("explicit process isolation cannot be combined with darwin best-effort containment")
+	}
+
 	if options.DarwinBestEffortContainment && agentRuntimePlatform != darwinPlatform {
 		return errors.New("darwin best-effort containment is only valid on darwin")
 	}
@@ -409,6 +429,11 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 		capabilityMeta[handoffMetaKey] = map[string]any{metaFieldVersions: []int{handoffVersion}}
 	}
 
+	if a.providerAuth != nil {
+		piCapabilities, _ := capabilityMeta[piMetaKey].(map[string]any)
+		piCapabilities[providerAuthCapabilityKey] = a.providerAuth.capability()
+	}
+
 	resp = acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentInfo: &acp.Implementation{
@@ -462,6 +487,10 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 		return nil, err
 	}
 
+	if result, handled, err := a.handleAuthExtensionMethod(ctx, method, params); handled {
+		return result, err
+	}
+
 	switch method {
 	case ForkSessionMethod:
 		return a.handleForkSession(ctx, params)
@@ -483,7 +512,7 @@ func (a *Agent) ensureVersion(ctx context.Context) error {
 		return err
 	}
 
-	if a.ContainmentMode() == RuntimeContainmentUnavailable {
+	if a.options.ProcessIsolation != nil && a.ContainmentMode() == RuntimeContainmentUnavailable {
 		return fmt.Errorf("%w: native process containment is unavailable", ErrProcessContainmentIncomplete)
 	}
 

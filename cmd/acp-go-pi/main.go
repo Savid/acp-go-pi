@@ -82,8 +82,11 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	flags.SetOutput(stderr)
 
 	piPath := flags.String("path", "", "path to pi CLI")
+	piHome := flags.String("home", "", "durable per-instance PI_CODING_AGENT_DIR; empty gives each session an ephemeral one")
 	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
-	isolationConfigPath := flags.String(processIsolationConfigFlag, "", "absolute path to the required root-owned mode-0600 Linux child-isolation policy")
+	providerAuthRoot := flags.String("provider-auth-root", "", "durable root for the values-free provider-auth ledger; empty leaves provider auth unadvertised")
+	providerAuthDirectHome := flags.String("provider-auth-direct-home", "", "account-wide provider-auth home gate; rejected by Pi because no leg uses it")
+	isolationConfigPath := flags.String(processIsolationConfigFlag, "", "optional absolute path to the root-owned mode-0600 Linux child-isolation policy")
 	model := flags.String("model", "", "default pi model as provider/id")
 	seedFiles := &seedFileFlag{}
 	flags.Var(seedFiles, "seed-file", "seed file written into each session's pi agent dir as <relpath>=<hostpath>; repeatable")
@@ -102,17 +105,17 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		return 0
 	}
 
-	if *isolationConfigPath == "" {
-		_, _ = fmt.Fprintf(stderr, "acp-go-pi: -%s is required for standalone native mode\n", processIsolationConfigFlag)
+	var isolation *processIsolationConfig
 
-		return 2
-	}
+	if *isolationConfigPath != "" {
+		loaded, err := processIsolationConfigLoader(*isolationConfigPath)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "acp-go-pi: process isolation: %v\n", err)
 
-	isolation, err := processIsolationConfigLoader(*isolationConfigPath)
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "acp-go-pi: process isolation: %v\n", err)
+			return 1
+		}
 
-		return 1
+		isolation = &loaded
 	}
 
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -140,22 +143,28 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	ctx, stop := signal.NotifyContext(ctx, signals...)
 	defer stop()
 
-	serveOptions := make([]piacp.Option, 0, 7+len(telemetry.options))
+	serveOptions := make([]piacp.Option, 0, 10+len(telemetry.options))
 
 	serveOptions = append(serveOptions,
 		piacp.WithAgentVersion(version),
 		piacp.WithExecutablePath(*piPath),
+		piacp.WithHome(*piHome),
 		piacp.WithScratchDir(*scratchDir),
+		piacp.WithProviderAuthRoot(*providerAuthRoot),
+		piacp.WithProviderAuthDirectHome(*providerAuthDirectHome),
 		piacp.WithDefaultModel(*model),
 		piacp.WithLogger(logger),
-		piacp.WithProcessIsolation(piacp.ProcessIsolation{
+	)
+
+	if isolation != nil {
+		serveOptions = append(serveOptions, piacp.WithProcessIsolation(piacp.ProcessIsolation{
 			UID:                 isolation.UID,
 			GID:                 isolation.GID,
 			BaseEnvironment:     isolation.BaseEnvironment,
 			StandaloneOwnerID:   isolation.StandaloneOwnerID,
 			StandaloneStateRoot: isolation.StandaloneStateRoot,
-		}),
-	)
+		}))
+	}
 
 	if len(seedFiles.files) > 0 {
 		serveOptions = append(serveOptions, piacp.WithSeedFiles(seedFiles.files))

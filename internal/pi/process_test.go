@@ -340,13 +340,13 @@ func TestProcessMethodControlBranches(t *testing.T) {
 	t.Run("shutdown exits after kill", func(t *testing.T) {
 		restoreProcessSeams(t)
 		processTreeTerminate = func(*processTree) error { return nil }
-		processTreeKill = func(*processTree) error { return nil }
 		processTreeTerminateAndWait = func(*processTree, time.Duration) error { return wantErr }
 		process := newProcess(t, false)
-		go func() {
-			time.Sleep(3 * time.Millisecond)
+		processTreeKill = func(*processTree) error {
 			close(process.exited)
-		}()
+
+			return nil
+		}
 		require.ErrorIs(t, process.Shutdown(t.Context()), wantErr)
 	})
 
@@ -375,8 +375,18 @@ func TestStartProcessValidation(t *testing.T) {
 
 	_, err := StartProcess(t.Context(), LaunchSpec{})
 	require.ErrorContains(t, err, "executable path is required")
-	_, err = StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true"})
+	_, err = StartProcess(t.Context(), LaunchSpec{
+		ExecutablePath: "/usr/bin/true",
+		Containment: ContainmentSpec{Isolation: &ProcessIsolation{
+			UID: 0, GID: 1, BaseEnvironment: map[string]string{},
+		}},
+	})
 	require.ErrorContains(t, err, "validate pi process isolation")
+	process, err := StartProcess(t.Context(), LaunchSpec{ExecutablePath: "/usr/bin/true"})
+	require.NoError(t, err)
+	require.NoError(t, process.CloseStdin())
+	<-process.Exited()
+	require.NoError(t, process.Close())
 
 	_, err = StartProcess(t.Context(), LaunchSpec{ExecutablePath: filepath.Join(t.TempDir(), "missing"), Containment: testContainmentSpec(t)})
 	require.ErrorContains(t, err, "resolve pi executable")

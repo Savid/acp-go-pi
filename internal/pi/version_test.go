@@ -117,6 +117,10 @@ func TestProbeVersionStageBranches(t *testing.T) {
 	cancel()
 	_, err := ProbeVersion(cancelled, "/usr/bin/true", "", ContainmentSpec{})
 	require.ErrorIs(t, err, context.Canceled)
+	_, err = ProbeVersion(t.Context(), "/usr/bin/true", "", ContainmentSpec{Isolation: &ProcessIsolation{
+		UID: 0, GID: 1, BaseEnvironment: map[string]string{},
+	}})
+	require.ErrorContains(t, err, "validate pi version process isolation")
 
 	t.Run("prepare command", func(t *testing.T) {
 		restoreVersionSeams(t)
@@ -126,7 +130,7 @@ func TestProbeVersionStageBranches(t *testing.T) {
 	})
 
 	_, err = ProbeVersion(t.Context(), "/usr/bin/true", "", ContainmentSpec{})
-	require.ErrorContains(t, err, "validate pi version process isolation")
+	require.ErrorContains(t, err, "isolated agent directory")
 	containment := testContainmentSpec(t)
 	_, err = ProbeVersion(t.Context(), "/usr/bin/true", filepath.Join(containment.GenerationRoot, "wrong"), containment)
 	require.ErrorContains(t, err, "isolated agent directory")

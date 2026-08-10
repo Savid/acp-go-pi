@@ -32,27 +32,27 @@ otherwise return normally or with context cancellation. A host that receives
 it must retain or quarantine any resources the native runtime may still
 reach. It does not mean that every descendant can be inventoried on Darwin.
 
-`Agent.ContainmentMode()` returns `RuntimeContainmentAuthoritative` on Linux,
-`RuntimeContainmentSharedIdentity` on a Linux agent whose configured native
-identity is the identity the process already runs as,
-`RuntimeContainmentBestEffort` on an opted-in Darwin agent, and
-`RuntimeContainmentUnavailable` otherwise. Windows native launch is unavailable
-because the mandatory Unix UID/GID identity boundary with empty supplementary
-groups cannot be applied. A Windows cross-compile proves only that this refusal
-path builds; it is not runtime support. Darwin fails closed unless
-`WithDarwinBestEffortContainment` is supplied; that option is invalid off
-Darwin.
+`Agent.ContainmentMode()` returns `RuntimeContainmentSharedIdentity` when
+`ProcessIsolation` is omitted. That portable ordinary mode runs as the current
+root or non-root identity and owns only direct-process liveness; it emits no
+descendant inventory and claims no whole-tree quiescence or identity authority.
+An explicit valid Linux policy returns `RuntimeContainmentAuthoritative`.
+Explicit policies are distinct-identity, trusted-root, Linux-only, and never
+downgrade after failure. `RuntimeContainmentBestEffort` is reserved for the
+separate Darwin opt-in; `RuntimeContainmentUnavailable` reports an invalid
+platform/option combination.
 
 ## Process options
 
 | Option | Purpose |
 | --- | --- |
 | `WithExecutablePath` | Set the pi CLI path (default: search `PATH`). |
-| `WithProcessIsolation` | Mandatory non-root UID/GID and complete replacement environment for native pi processes. On Linux the embedded supervisor stays trusted root; only `pi --mode rpc` receives the configured identity, with supplementary groups cleared. |
+| `WithProcessIsolation` | Optional explicit hardening. Requires a distinct non-root UID/GID and complete replacement environment. Linux keeps a trusted-root supervisor; only `pi --mode rpc` receives the configured identity, with supplementary groups cleared. Invalid or unsupported policies fail closed. |
+| `WithHome` | Durable per-instance `PI_CODING_AGENT_DIR`. Empty gives sessions ephemeral homes. Required with `WithProviderAuthRoot` for provider auth, and refused with explicit distinct-identity isolation. |
 | `WithScratchDir` | Parent directory for all ephemeral on-disk state (isolated per-session agent and session directories, hydration temp files, and the version probe's isolated `PI_CODING_AGENT_DIR`/settings residence). Empty means the system temp directory; created `0700` when missing. |
 | `WithDefaultModel` | Default model for new sessions, as `"provider/id"`. |
-| `WithEnv` | Overlay environment variables on `ProcessIsolation.BaseEnvironment` for every pi child. Invalid names plus `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `LD_*`, and `DYLD_*` are rejected; ambient variables are never inherited. |
-| `WithExtraPathDirs` | Prepend absolute directories, in order, to the `PATH` of every pi child. The sanctioned counterpart to the rejected raw `PATH` key; a relative entry or an embedded list separator fails session start. |
+| `WithEnv` | Overlay environment variables on the sanitized ordinary base or `ProcessIsolation.BaseEnvironment`. Invalid names plus `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `LD_*`, and `DYLD_*` are rejected. Explicit PATH is allowed; ordinary relative entries are not subjected to isolation-policy absolute constraints. |
+| `WithExtraPathDirs` | Prepend individual absolute directories, in order, to every child PATH. A relative entry or embedded list separator fails session start. |
 | `WithSeedFiles` | Write files into each isolated agent directory. Seeded extensions, prompts, and skills in their conventional subdirectories are loaded by exact path. |
 | `WithSessionStore` | Install durable session storage. |
 | `WithSessionStoreLoadTimeout` | Bound store load/list operations used during resume. |
@@ -78,6 +78,8 @@ processes receive neither capability nor descriptor.
 
 | Option | Purpose |
 | --- | --- |
+| `WithProviderAuthRoot` | Durable root for the values-free provider-auth ledger. Together with `WithHome`, enables all seven `_pi/auth/*` legs in ordinary mode. |
+| `WithProviderAuthDirectHome` | Family-surface account mutation gate. Pi has no account-wide leg, so non-empty is refused. |
 
 ## Per-session options
 
@@ -130,12 +132,22 @@ path as `PI_CODING_AGENT_DIR`. Pi acquires discovery and per-session native
 permits immediately before their launches, reserves scratch before making each
 isolated agent directory, and releases only after the selected boundary
 completes and directory deletion succeeds; incomplete containment quarantines
-the generation and holds both reservations. Pi is lockless and emits no
+the generation and holds both reservations. The adapter emits no
 home-lock-supervisor count. Provider descendant snapshots are emitted only
-when inventory is authoritative; Darwin best-effort emits no provider
-snapshot, including zero. `ObserveContainment` is called once with the
+when inventory is authoritative; ordinary shared identity and Darwin best
+effort emit no provider snapshot, including zero. `ObserveContainment` is called once with the
 effective mode. Startup observations distinguish spawn, readiness,
 configuration, and native session setup.
+
+## Provider-auth extension constants
+
+`AuthMethodsMethod`, `AuthAuthorizeMethod`, `AuthCallbackMethod`,
+`AuthStatusMethod`, `AuthCancelMethod`, `AuthInventoryMethod`, and
+`AuthDisconnectMethod` name Pi's seven session-scoped extension legs. The
+broker advertises whenever both durable roots are configured and usable,
+including when no provider credential exists yet. It exposes catalog,
+flow-state, residence-proof, and fenced-disconnect metadata, never credential
+values. See [Authentication](/docs/features/authentication).
 
 Session-store surface: `SessionStore`, `SessionKey`, `SessionSummary`,
 `SessionStoreReplacement`, `InMemorySessionStore`, and the constants

@@ -34,6 +34,15 @@ func TestSessionCloseTurnWaitFailure(t *testing.T) {
 	require.Error(t, session.Close(t.Context()))
 }
 
+func TestRuntimeRelaunchRefusesDurableHomeWithExplicitIsolation(t *testing.T) {
+	sessionRoot := t.TempDir()
+	agent := NewAgent(testProcessIsolationOption(), WithHome(filepath.Join(t.TempDir(), "home")))
+	session := &agentSession{agent: agent, sessionRoot: sessionRoot}
+
+	_, err := session.nextRuntimeLaunch(pi.LaunchSpec{}, "")
+	require.ErrorContains(t, err, "durable pi agent directory is unavailable with explicit process isolation")
+}
+
 func TestSessionRetainsIncompleteNativeContainment(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	session := &agentSession{agent: agent}

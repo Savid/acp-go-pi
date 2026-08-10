@@ -15,8 +15,8 @@ import (
 // Option configures the pi ACP agent.
 type Option func(*Options)
 
-// ProcessIsolation is the mandatory operating-system identity and complete
-// base environment for every native pi process.
+// ProcessIsolation is an explicit hardened Linux identity policy. Omitting
+// WithProcessIsolation selects ordinary execution as the current identity.
 type ProcessIdentityLockCapability interface {
 	Duplicate() (*os.File, error)
 }
@@ -65,12 +65,10 @@ type RuntimeContainmentMode string
 const (
 	RuntimeContainmentAuthoritative RuntimeContainmentMode = "authoritative"
 	RuntimeContainmentBestEffort    RuntimeContainmentMode = "best_effort"
-	// RuntimeContainmentSharedIdentity is the boundary a supervisor proves when
-	// the native identity is the identity it already runs as. The subreaper
-	// tree, the descendant reaping and the process-group teardown are the
-	// authoritative ones, so whole-tree lifecycle is still proven; what is
-	// absent is the credential separation between the supervisor and the agent,
-	// and the host-global record of who holds the identity.
+	// RuntimeContainmentSharedIdentity is ordinary, non-authoritative execution
+	// as the adapter's current identity. It proves direct-child liveness only;
+	// it carries no descendant inventory, whole-tree quiescence, or credential
+	// separation claim.
 	RuntimeContainmentSharedIdentity RuntimeContainmentMode = "shared_identity"
 	RuntimeContainmentUnavailable    RuntimeContainmentMode = "unavailable"
 )
@@ -97,9 +95,13 @@ type Options struct {
 
 	// ExecutablePath is the pi CLI executable path. If empty, PATH is searched.
 	ExecutablePath string
-	// ProcessIsolation is the mandatory child identity and complete base
-	// environment. It is installed with WithProcessIsolation.
+	// ProcessIsolation is optional hardened Linux isolation. Nil selects
+	// ordinary execution as the current root or non-root identity.
 	ProcessIsolation *ProcessIsolation
+	// Home is the durable per-instance PI_CODING_AGENT_DIR shared by sessions.
+	// Empty gives each session an ephemeral agent directory. Provider auth is
+	// advertised only with both Home and ProviderAuthRoot configured.
+	Home string
 	// ScratchDir is the parent directory for all ephemeral on-disk
 	// materialization (per-session roots, hydration temp files, and the version
 	// probe's isolated PI_CODING_AGENT_DIR/settings residence). Empty means the
@@ -156,6 +158,14 @@ type Options struct {
 	// The adapter only reads under it and never writes, moves, or removes
 	// anything there.
 	InputHandoffRoot string
+	// ProviderAuthRoot is the absolute host-owned directory containing Pi's
+	// values-free provider-auth ledger. Empty leaves every _pi/auth/* leg
+	// unadvertised.
+	ProviderAuthRoot string
+	// ProviderAuthDirectHome is declared for family API parity. Pi's
+	// disconnect uses AuthStorage.delete for one provider and never performs an
+	// account-wide home mutation, so a non-empty value is rejected.
+	ProviderAuthDirectHome string
 	// imageLimitsSet records whether WithImageLimits supplied the struct; an
 	// omitted option leaves every field at its default.
 	imageLimitsSet           bool
@@ -229,8 +239,9 @@ func WithExecutablePath(path string) Option {
 	}
 }
 
-// WithProcessIsolation requires every native process and probe to run as the
-// supplied non-root identity with no supplementary groups. The
+// WithProcessIsolation explicitly requires every native process and probe to
+// run through the hardened Linux boundary as the supplied non-root identity
+// with no supplementary groups. The
 // base environment is a complete replacement for the adapter environment;
 // WithEnv and session environment values overlay it.
 func WithProcessIsolation(isolation ProcessIsolation) Option {
@@ -238,6 +249,32 @@ func WithProcessIsolation(isolation ProcessIsolation) Option {
 		cloned := isolation
 		cloned.BaseEnvironment = cloneStringMap(isolation.BaseEnvironment)
 		options.ProcessIsolation = &cloned
+	}
+}
+
+// WithHome sets the durable per-instance PI_CODING_AGENT_DIR shared by all
+// sessions. It is required for provider auth so Pi's native cross-process
+// credential lock and credential residence survive session teardown.
+func WithHome(path string) Option {
+	return func(options *Options) {
+		options.Home = path
+	}
+}
+
+// WithProviderAuthRoot sets the durable root for the values-free provider-auth
+// ledger. Omitting it leaves every _pi/auth/* leg unadvertised.
+func WithProviderAuthRoot(path string) Option {
+	return func(options *Options) {
+		options.ProviderAuthRoot = path
+	}
+}
+
+// WithProviderAuthDirectHome names an account-wide native home mutation gate.
+// Pi has no account-wide auth leg, so a non-empty value is rejected at session
+// establishment.
+func WithProviderAuthDirectHome(path string) Option {
+	return func(options *Options) {
+		options.ProviderAuthDirectHome = path
 	}
 }
 
@@ -290,7 +327,8 @@ func WithDefaultModel(model string) Option {
 // WithEnv adds environment variables to every launched pi process. pi children
 // run with a scrubbed environment, so provider API keys must travel here.
 // NODE_OPTIONS, BASH_ENV, ENV, LD_*, DYLD_*, and invalid names are rejected at
-// session start. PATH is an explicit overlay on the isolation policy PATH.
+// session start. PATH is an explicit overlay: ordinary execution accepts its
+// normal relative entries, while explicit isolation resolves it strictly.
 func WithEnv(env map[string]string) Option {
 	return func(options *Options) {
 		options.Env = cloneStringMap(env)
@@ -299,11 +337,10 @@ func WithEnv(env map[string]string) Option {
 
 // WithExtraPathDirs prepends absolute directories, in the order given, to the
 // PATH of every launched pi process, so their executables resolve ahead of
-// every inherited entry. It is the sanctioned counterpart to the rejected raw
-// PATH key: a caller places its own executable in front of the child without
-// being able to replace the search order wholesale. Every directory must be
-// absolute and free of the platform list separator; a bad entry fails session
-// start. Per-session directories are prepended ahead of these.
+// every inherited entry. Unlike an explicit raw PATH overlay, this option
+// always describes individual prefix directories, so every directory must be
+// absolute and free of the platform list separator. Per-session directories
+// are prepended ahead of these.
 func WithExtraPathDirs(dirs ...string) Option {
 	return func(options *Options) {
 		options.ExtraPathDirs = slices.Clone(dirs)

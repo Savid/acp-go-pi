@@ -2,11 +2,14 @@ package piacp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 const defaultSessionStoreLoadTimeout = 10 * time.Second
@@ -34,7 +37,8 @@ type sessionDirs struct {
 }
 
 // createSessionDirs creates a fresh isolated per-session root under the
-// scratch parent (ScratchDir, or the system temp directory when unset).
+// scratch parent. A configured Home replaces only the generated agent
+// directory; session storage and generations remain removable scratch.
 func (a *Agent) createSessionDirs() (sessionDirs, error) {
 	parent, err := ensureScratchParent(a.options.ScratchDir)
 	if err != nil {
@@ -61,7 +65,55 @@ func (a *Agent) createSessionDirs() (sessionDirs, error) {
 
 	dirs.SessionRoot = sessionRoot
 
+	if err := a.applyDurableHome(&dirs); err != nil {
+		_ = materializeRemoveAll(sessionRoot)
+
+		return sessionDirs{}, err
+	}
+
 	return dirs, nil
+}
+
+func (a *Agent) createSessionRuntime() (sessionDirs, *pi.BrowserShim, error) {
+	dirs, err := a.createSessionDirs()
+	if err != nil {
+		return sessionDirs{}, nil, err
+	}
+
+	shim, err := a.newOwnedSessionBrowserShim()
+
+	return dirs, shim, err
+}
+
+// applyDurableHome points one runtime generation at Pi's stable native auth
+// residence. Hardened distinct-identity sessions refuse it until a proven
+// credential-delivery design exists; ordinary current-identity sessions use it
+// directly and Pi's native cross-process lock serializes auth.json updates.
+func (a *Agent) applyDurableHome(dirs *sessionDirs) error {
+	home := a.options.Home
+	if home == "" {
+		return nil
+	}
+
+	if a.options.ProcessIsolation != nil {
+		return errors.New("durable pi agent directory is unavailable with explicit process isolation")
+	}
+
+	if !filepath.IsAbs(home) || filepath.Clean(home) != home {
+		return errors.New("durable pi agent directory must be a clean absolute path")
+	}
+
+	if err := materializeMkdirAll(home, 0o700); err != nil {
+		return fmt.Errorf("create durable agent directory: %w", err)
+	}
+
+	if err := materializeChmod(home, 0o700); err != nil {
+		return fmt.Errorf("protect durable agent directory: %w", err)
+	}
+
+	dirs.AgentDir = home
+
+	return nil
 }
 
 func createSessionGeneration(sessionRoot string) (sessionDirs, error) {

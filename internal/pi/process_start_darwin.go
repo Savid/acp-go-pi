@@ -13,6 +13,17 @@ func handleVanishedProcessGroupLeader(
 	direct *directChildWait,
 ) (*processTree, bool, error) {
 	pid := launch.cmd.Process.Pid
+	if launch.ordinary {
+		tree := &processTree{
+			containment: launch.containment, pgid: pid, process: launch.cmd.Process,
+			direct: direct, ordinary: true,
+		}
+		launch.abortStartGate()
+		direct.begin()
+		launch.close()
+
+		return tree, true, nil
+	}
 
 	probeErr := syscallKill(-pid, 0)
 	if errors.Is(probeErr, syscall.ESRCH) {
