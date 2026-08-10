@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -123,50 +122,44 @@ func (spec LaunchSpec) Args() []string {
 // spec.ExtraPathDirs ahead of PATH,
 // then the wrapper-managed keys, which always win.
 func (spec LaunchSpec) Environ() []string {
-	env := make(map[string]string, len(spec.Env)+2)
+	base := make(map[string]string)
+
 	if spec.Containment.Isolation != nil {
 		for key, value := range spec.Containment.Isolation.BaseEnvironment {
-			env[key] = value
+			base[key] = value
 		}
 	} else {
 		for key, value := range spec.Containment.OrdinaryEnvironment {
 			if ordinaryEnvironmentKey(key) {
-				env[key] = value
+				base[key] = value
 			}
 		}
 	}
 
+	explicit := make(map[string]string, len(spec.Env))
 	for key, value := range spec.Env {
 		if safeExplicitEnvKey(key) {
-			env[key] = value
+			explicit[key] = value
 		}
 	}
 
+	env := ComposeEnvironment(base, explicit)
 	if search := prependPathDirs(env[envPath], spec.ExtraPathDirs); search != "" {
 		env[envPath] = search
 	}
 
-	env["PI_OFFLINE"] = "1"
-
-	env["PI_CODING_AGENT_DIR"] = spec.AgentDir
+	managed := map[string]string{
+		"PI_OFFLINE":          "1",
+		"PI_CODING_AGENT_DIR": spec.AgentDir,
+	}
 	if spec.Containment.DarwinBestEffort {
-		env[envRuntimeID] = spec.Containment.RuntimeID
-		env[envScratchRoot] = spec.Containment.GenerationRoot
+		managed[envRuntimeID] = spec.Containment.RuntimeID
+		managed[envScratchRoot] = spec.Containment.GenerationRoot
 	}
 
-	keys := make([]string, 0, len(env))
-	for key := range env {
-		keys = append(keys, key)
-	}
+	env = ComposeEnvironment(env, managed)
 
-	slices.Sort(keys)
-
-	environ := make([]string, 0, len(keys))
-	for _, key := range keys {
-		environ = append(environ, key+"="+env[key])
-	}
-
-	return spec.BrowserShim.Environ(environ)
+	return spec.BrowserShim.Environ(environmentEntries(env))
 }
 
 // prependPathDirs returns search with dirs ahead of every entry it already
@@ -196,9 +189,7 @@ func prependPathDirs(search string, dirs []string) string {
 
 // safeExplicitEnvKey is defense in depth for internal LaunchSpec callers.
 // Public options reject these keys before launch; this boundary also drops
-// malformed names and loader, shell, and Node injection vectors. An explicit
-// PATH is allowed; strict isolation and ordinary execution resolve it under
-// their respective policies.
+// malformed names, raw PATH, and loader, shell, and Node injection vectors.
 func safeExplicitEnvKey(key string) bool {
 	if key == "" {
 		return false
@@ -214,7 +205,7 @@ func safeExplicitEnvKey(key string) bool {
 	}
 
 	upper := strings.ToUpper(key)
-	if upper == envNodeOptions || upper == envBashEnv || upper == envShellEnv {
+	if upper == envPath || upper == envNodeOptions || upper == envBashEnv || upper == envShellEnv {
 		return false
 	}
 

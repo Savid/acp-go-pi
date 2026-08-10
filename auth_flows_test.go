@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1093,6 +1094,87 @@ func TestCallbackAppliesSecretNatively(t *testing.T) {
 	require.Equal(t, authStatusResult{FlowID: flowID, State: authStateSaved}, status)
 }
 
+func TestTerminalSecretFlowRetainsOnlyValuesFreeReplayState(t *testing.T) {
+	harness := newAuthHarness(t)
+	flowID := startSecretFlow(t, harness)
+
+	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
+		harness.deliver(ctx, pi.AuthMessage{
+			ID: request.ID, Kind: pi.AuthKindResult, Cause: authCauseProviderRefused,
+		})
+
+		return nil
+	})
+
+	_, err := harness.call(t.Context(), AuthCallbackMethod, secretCallbackParams(harness, flowID))
+	requireAuthFailed(t, err, authCauseProviderRefused)
+
+	harness.broker.mu.Lock()
+	flow := harness.broker.byID[flowID]
+	require.Empty(t, flow.pendingSecret)
+	harness.broker.mu.Unlock()
+
+	status, err := harness.call(t.Context(), AuthStatusMethod, map[string]any{
+		authFieldSessionID: string(harness.session.id), authFieldProviderID: "openai", authFieldFlowID: flowID,
+	})
+	require.NoError(t, err)
+	encoded, err := json.Marshal(status)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "sk-live-value")
+
+	_, err = harness.call(t.Context(), AuthCallbackMethod, secretCallbackParams(harness, flowID))
+	requireAuthFailed(t, err, authCauseFlowState)
+}
+
+func TestTerminalRoutesClearPendingSecret(t *testing.T) {
+	tests := []struct {
+		name   string
+		action func(*testing.T, *authHarness, *authFlow)
+	}{
+		{name: "native terminal", action: func(_ *testing.T, harness *authHarness, flow *authFlow) {
+			harness.broker.terminalize(flow, authStateFailed, authReasonProviderRefused, 0)
+		}},
+		{name: "expiry", action: func(_ *testing.T, harness *authHarness, flow *authFlow) {
+			harness.broker.expire(flow)
+		}},
+		{name: "supersede", action: func(t *testing.T, harness *authHarness, flow *authFlow) {
+			t.Helper()
+			harness.broker.supersede(t.Context(), authFlowKey{sessionID: flow.sessionID, providerID: flow.providerID}, authReasonSuperseded)
+		}},
+		{name: "owner cancellation", action: func(t *testing.T, harness *authHarness, flow *authFlow) {
+			t.Helper()
+			_, err := harness.call(t.Context(), AuthCancelMethod, map[string]any{
+				authFieldSessionID:  string(flow.sessionID),
+				authFieldProviderID: flow.providerID,
+				authFieldFlowID:     flow.id,
+			})
+			require.NoError(t, err)
+		}},
+		{name: "session close", action: func(t *testing.T, harness *authHarness, _ *authFlow) {
+			t.Helper()
+			harness.broker.closeSession(t.Context(), harness.session)
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newAuthHarness(t)
+			flowID := startSecretFlow(t, harness)
+			flow := harness.broker.byID[flowID]
+
+			harness.broker.mu.Lock()
+			flow.pendingSecret = "sk-live-value"
+			harness.broker.mu.Unlock()
+
+			test.action(t, harness, flow)
+
+			harness.broker.mu.Lock()
+			require.Empty(t, flow.pendingSecret)
+			harness.broker.mu.Unlock()
+		})
+	}
+}
+
 // TestCallbackRefusesShellCredential pins the refusal that keeps a brokered
 // value out of a field pi executes as a shell command.
 func TestCallbackRefusesShellCredential(t *testing.T) {
@@ -1664,6 +1746,27 @@ func TestAuthorizeReportsLedgerWriteFailure(t *testing.T) {
 
 	_, err := harness.call(t.Context(), AuthAuthorizeMethod, authorizeParams(harness, "anthropic", generation, authMethodTypeOAuth))
 	requireAuthFailed(t, err, authCauseProcess)
+}
+
+func TestAuthorizePreservesUnreadableLedgerLineage(t *testing.T) {
+	harness := newAuthHarness(t)
+	generation := harness.seedCatalog(t.Context(), defaultAuthProviders())
+	path := harness.broker.ledger.path("anthropic")
+	corrupt := []byte(`{"providerId":"anthropic","revision":`)
+	require.NoError(t, os.WriteFile(path, corrupt, authLedgerFileMode))
+
+	harness.scriptBridge(func(_ context.Context, _ pi.AuthRequest) error {
+		require.FailNow(t, "unreadable lineage must stop before native authorization")
+
+		return nil
+	})
+
+	_, err := harness.call(t.Context(), AuthAuthorizeMethod, authorizeParams(harness, "anthropic", generation, authMethodTypeOAuth))
+	requireAuthFailed(t, err, authCauseProcess)
+
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, corrupt, contents)
 }
 
 // TestCallbackReportsConfirmationWriteFailure pins that a confirmation the

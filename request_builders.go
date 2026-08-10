@@ -315,7 +315,8 @@ func WithPiModel(model string) PiOption {
 	}
 }
 
-// WithPiEnv configures pi session environment overrides.
+// WithPiEnv configures pi session environment overrides. PATH is rejected;
+// WithPiExtraPathDirs owns ordered executable search prefixes.
 func WithPiEnv(env map[string]string) PiOption {
 	cloned := cloneStringMap(env)
 

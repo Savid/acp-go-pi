@@ -108,6 +108,12 @@ func TestOrdinaryExecutableLookupAcceptsOrdinaryPaths(t *testing.T) {
 	environment, err := ordinaryEnvironment(map[string]string{"PATH": relativeDir}, map[string]string{"EXPLICIT": "yes"})
 	require.NoError(t, err)
 	require.Contains(t, environment, "EXPLICIT=yes")
+	_, err = ordinaryEnvironment(map[string]string{"PATH": relativeDir}, map[string]string{"Path": "other"})
+	require.ErrorContains(t, err, "ExtraPathDirs")
+	_, err = isolationEnvironment(&ProcessIsolation{
+		UID: 1, GID: 1, BaseEnvironment: map[string]string{"PATH": dir}, TestOnlyNoCredential: true,
+	}, map[string]string{"PATH": dir})
+	require.ErrorContains(t, err, "ExtraPathDirs")
 
 	resolved, err = ResolveExecutable(filepath.Join(relativeDir, "pi"), nil, map[string]string{})
 	require.NoError(t, err)

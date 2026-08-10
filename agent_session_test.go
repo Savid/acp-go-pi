@@ -227,7 +227,7 @@ func TestStartSessionEarlyFailureBranches(t *testing.T) {
 }
 
 func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
-	for _, key := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BAD-NAME"} {
+	for _, key := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "PATH", "Path", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BAD-NAME"} {
 		t.Run(key, func(t *testing.T) {
 			client := newStubPiClient()
 			agent := newStubClientAgent(t, client, WithEnv(map[string]string{key: "unsafe"}))
@@ -240,6 +240,12 @@ func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
 
 			_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 			requireInvalidParams(t, err)
+
+			var requestError *acp.RequestError
+			require.ErrorAs(t, err, &requestError)
+			data, ok := requestError.Data.(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, optionFieldEnv, data[jsonFieldField])
 			require.Zero(t, starts)
 		})
 	}

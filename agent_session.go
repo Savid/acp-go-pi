@@ -672,17 +672,10 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		permission = pi.PermissionModeAsk
 	}
 
-	env := cloneStringMap(a.options.Env)
-	if env == nil {
-		env = make(map[string]string, len(start.MetaOptions.Env)+3)
+	managedEnv := map[string]string{
+		pi.EnvPermissionMode: permission,
+		envAgentVersion:      a.options.AgentVersion,
 	}
-
-	for key, value := range start.MetaOptions.Env {
-		env[key] = value
-	}
-
-	env[pi.EnvPermissionMode] = permission
-	env[envAgentVersion] = a.options.AgentVersion
 
 	if includeMCP {
 		configPath, mcpErr := pi.WriteMCPConfig(dirs.AgentDir, mcpConfigForServers(start.McpServers))
@@ -690,10 +683,15 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 			return nil, mcpErr
 		}
 
-		env[pi.EnvMCPConfig] = configPath
+		managedEnv[pi.EnvMCPConfig] = configPath
 	}
 
-	env = a.observe.InjectTraceEnv(ctx, env)
+	env := pi.ComposeEnvironment(
+		a.options.Env,
+		start.MetaOptions.Env,
+		managedEnv,
+		a.observe.InjectTraceEnv(ctx, nil),
+	)
 
 	managedSettings := map[string]any(nil)
 	if hasModel {

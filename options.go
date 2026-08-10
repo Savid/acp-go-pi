@@ -162,10 +162,6 @@ type Options struct {
 	// values-free provider-auth ledger. Empty leaves every _pi/auth/* leg
 	// unadvertised.
 	ProviderAuthRoot string
-	// ProviderAuthDirectHome is declared for family API parity. Pi's
-	// disconnect uses AuthStorage.delete for one provider and never performs an
-	// account-wide home mutation, so a non-empty value is rejected.
-	ProviderAuthDirectHome string
 	// imageLimitsSet records whether WithImageLimits supplied the struct; an
 	// omitted option leaves every field at its default.
 	imageLimitsSet           bool
@@ -269,15 +265,6 @@ func WithProviderAuthRoot(path string) Option {
 	}
 }
 
-// WithProviderAuthDirectHome names an account-wide native home mutation gate.
-// Pi has no account-wide auth leg, so a non-empty value is rejected at session
-// establishment.
-func WithProviderAuthDirectHome(path string) Option {
-	return func(options *Options) {
-		options.ProviderAuthDirectHome = path
-	}
-}
-
 // WithScratchDir sets the parent directory for all ephemeral on-disk
 // materialization (per-session roots, hydration temp files, and the version
 // probe's isolated PI_CODING_AGENT_DIR/settings residence). Empty means the
@@ -327,8 +314,7 @@ func WithDefaultModel(model string) Option {
 // WithEnv adds environment variables to every launched pi process. pi children
 // run with a scrubbed environment, so provider API keys must travel here.
 // NODE_OPTIONS, BASH_ENV, ENV, LD_*, DYLD_*, and invalid names are rejected at
-// session start. PATH is an explicit overlay: ordinary execution accepts its
-// normal relative entries, while explicit isolation resolves it strictly.
+// session start. PATH is owned by WithExtraPathDirs and is rejected here.
 func WithEnv(env map[string]string) Option {
 	return func(options *Options) {
 		options.Env = cloneStringMap(env)
@@ -336,11 +322,10 @@ func WithEnv(env map[string]string) Option {
 }
 
 // WithExtraPathDirs prepends absolute directories, in the order given, to the
-// PATH of every launched pi process, so their executables resolve ahead of
-// every inherited entry. Unlike an explicit raw PATH overlay, this option
-// always describes individual prefix directories, so every directory must be
-// absolute and free of the platform list separator. Per-session directories
-// are prepended ahead of these.
+// PATH of every launched pi process. It does not select the pi executable;
+// use WithExecutablePath for that. Every directory must be absolute and free
+// of the platform list separator. Per-session directories are prepended ahead
+// of these.
 func WithExtraPathDirs(dirs ...string) Option {
 	return func(options *Options) {
 		options.ExtraPathDirs = slices.Clone(dirs)

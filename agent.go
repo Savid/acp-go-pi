@@ -90,6 +90,7 @@ type Agent struct {
 	clientCapabilities   acp.ClientCapabilities
 	positionEncoding     acp.PositionEncodingKind
 	activeLimitErr       error
+	environmentErr       error
 	processes            *providerProcessTracker
 	nativeContainmentErr error
 	constructions        sync.WaitGroup
@@ -148,8 +149,8 @@ func NewAgent(opts ...Option) *Agent {
 			validateContainmentOption(options),
 			validateImageLimits(options.ImageLimits),
 			validateInputHandoffRoot(options.InputHandoffRoot),
-			validateProviderAuthRoot(options),
 		),
+		environmentErr: validateEnvironment(options.Env, optionFieldEnv),
 		startPiProcess: startRealPiProcess,
 		probeVersion:   pi.ProbeVersion,
 		lookPath: func(file string) (string, error) {
@@ -157,7 +158,10 @@ func NewAgent(opts ...Option) *Agent {
 		},
 	}
 	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
-	agent.providerAuth = newProviderAuth(agent)
+
+	providerAuthErr := configureProviderAuth(agent)
+
+	agent.activeLimitErr = errors.Join(agent.activeLimitErr, providerAuthErr)
 
 	observeRuntimeContainment(context.Background(), options.RuntimeResourceHooks, mode)
 
@@ -370,6 +374,13 @@ func (a *Agent) setConnection(conn agentClient) {
 // session and prompt without ever calling initialize, and options that never
 // validated must not reach a native process.
 func (a *Agent) optionsError() error {
+	if a.environmentErr != nil {
+		return acp.NewInvalidParams(map[string]any{
+			jsonFieldError: a.environmentErr.Error(),
+			jsonFieldField: optionFieldEnv,
+		})
+	}
+
 	if a.activeLimitErr == nil {
 		return nil
 	}

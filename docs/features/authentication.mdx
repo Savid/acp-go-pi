@@ -28,10 +28,9 @@ native messages.
 
 When both roots are usable, `initialize` advertises `providerAuth` with all
 seven method names. No credential needs to exist first: an empty durable home
-still advertises the broker so a host can show Connect. Omitting either root
-leaves the surface unadvertised. `WithProviderAuthDirectHome` is present for
-the shared family API, but Pi has no account-wide auth mutation; a non-empty
-value is refused.
+still advertises the broker so a host can show Connect. Omitting the ledger root
+leaves the surface unadvertised. Supplying a ledger root without a durable home,
+an unusable path, or explicit process isolation fails initialization.
 
 Provider auth is intentionally limited to ordinary nil/default execution.
 Supplying `WithProcessIsolation` selects a distinct trusted-root identity whose
@@ -68,7 +67,9 @@ Ordinary mode captures a narrow base environment once and scrubs ambient
 provider keys, `NODE_OPTIONS`, shell hooks, loader variables, and adapter-private
 state. Pass deliberate provider variables with `WithEnv` for all sessions or
 `WithPiEnv` for one session. Explicit maps still reject invalid names and
-process-hijack keys.
+process-hijack keys, including raw `PATH`. Use `WithExtraPathDirs` or
+`WithPiExtraPathDirs` to prepend ordered executable directories while retaining
+the captured native base path.
 
 For file-backed credentials, seed Pi's `auth.json` into an ephemeral session:
 

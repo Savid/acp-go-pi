@@ -6,9 +6,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +21,119 @@ import (
 )
 
 const envRunAttended = "ACP_GO_PI_RUN_ATTENDED"
+
+// attendedAnswerDeadline bounds one human answer. It is long enough for a real
+// browser approval and short enough that an abandoned run ends by itself.
+const attendedAnswerDeadline = 10 * time.Minute
+
+var (
+	errAttendedNoAnswer = errors.New("the attended tier received no answer")
+	errAttendedTimedOut = errors.New("the attended tier timed out waiting for a human answer")
+)
+
+// attendedConsole is the operator's side of the attended tier: questions go out
+// on one stream and the human's answers arrive on another.
+//
+// The answer stream is the test process's own stdin. Reading /dev/tty instead
+// would bypass whatever the operator actually supplied, so an answer piped in
+// or fed from a wrapper would be ignored in favour of a terminal the process
+// may not even own. One reader is retained across questions because a fresh
+// buffered reader per question discards everything the operator has already
+// typed past the first newline.
+type attendedConsole struct {
+	prompt io.Writer
+	mu     sync.Mutex
+	lines  chan attendedLine
+}
+
+type attendedLine struct {
+	value string
+	err   error
+}
+
+func newAttendedConsole(prompt io.Writer, input io.Reader) *attendedConsole {
+	console := &attendedConsole{prompt: prompt, lines: make(chan attendedLine, 1)}
+	go console.readLines(bufio.NewReader(input))
+
+	return console
+}
+
+func (c *attendedConsole) readLines(input *bufio.Reader) {
+	defer close(c.lines)
+
+	for {
+		line, err := input.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) && line != "" {
+				c.lines <- attendedLine{value: strings.TrimSpace(line)}
+			} else {
+				c.lines <- attendedLine{err: errAttendedNoAnswer}
+			}
+
+			return
+		}
+
+		c.lines <- attendedLine{value: strings.TrimSpace(line)}
+	}
+}
+
+// ask writes one question and returns the trimmed line the human answered with.
+// The answer is never echoed back onto the prompt stream: an authorization code
+// is a bearer credential for the length of its exchange, and the prompt stream
+// is the one place in this tier that gets captured into a log.
+func (c *attendedConsole) ask(question string, deadline time.Duration) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, err := fmt.Fprintf(c.prompt, "\n%s\n> ", question); err != nil {
+		return "", fmt.Errorf("write the attended prompt: %w", err)
+	}
+
+	timer := time.NewTimer(deadline)
+	defer timer.Stop()
+
+	select {
+	case line, ok := <-c.lines:
+		if !ok || line.err != nil {
+			return "", errAttendedNoAnswer
+		}
+
+		if line.value == "" {
+			return "", errAttendedNoAnswer
+		}
+
+		return line.value, nil
+	case <-timer.C:
+		return "", errAttendedTimedOut
+	}
+}
+
+// attendedTierConsole is the real interactive console: questions on stderr so
+// they interleave with a `tee`-captured run, answers on the process's stdin.
+//
+// It is built on first use inside an attended-gated test, never at package
+// init. This binary re-executes itself as the fake pi harness, and that child
+// reads pi's JSONL request stream from the same stdin; a console constructed at
+// init would start a buffered stdin reader in every such child and swallow
+// those records before the harness could decode them.
+//
+// The one instance is owned by the attended tier for the rest of the process:
+// its reader holds the process's stdin, and a read already blocked on stdin
+// cannot be revoked, so there is nothing a per-test close could reclaim.
+// Sharing it is also what carries an operator's typed-ahead lines from one
+// attended test to the next.
+var (
+	attendedTierConsoleOnce sync.Once
+	attendedTierConsole     *attendedConsole
+)
+
+func attendedTierConsoleInstance() *attendedConsole {
+	attendedTierConsoleOnce.Do(func() {
+		attendedTierConsole = newAttendedConsole(os.Stderr, os.Stdin)
+	})
+
+	return attendedTierConsole
+}
 
 // requireRunAttended gates the tier and resolves the pi binary it drives. Once
 // the gate is set a missing CLI fails rather than skips: the operator set it
@@ -39,31 +155,15 @@ func requireRunAttended(t *testing.T) string {
 	return path
 }
 
-// attendedPrompt asks the operator for one value on the terminal. The tier
-// fails rather than skips once its gate is set: an attended suite that quietly
-// went green without a human answering is worse than a red one.
+// attendedPrompt asks the operator for one value. The tier fails rather than
+// skips once its gate is set: an attended suite that quietly went green without
+// a human answering is worse than a red one.
 func attendedPrompt(t *testing.T, question string) string {
 	t.Helper()
 
-	terminal, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	answer, err := attendedTierConsoleInstance().ask(question, attendedAnswerDeadline)
 	if err != nil {
-		t.Fatalf("%s=1 requires a terminal a human can answer on: %v", envRunAttended, err)
-	}
-
-	t.Cleanup(func() { _ = terminal.Close() })
-
-	if _, err := fmt.Fprintf(terminal, "\n%s\n> ", question); err != nil {
-		t.Fatalf("write the attended prompt: %v", err)
-	}
-
-	answer, err := bufio.NewReader(terminal).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read the attended answer: %v", err)
-	}
-
-	answer = strings.TrimSpace(answer)
-	if answer == "" {
-		t.Fatal("the attended answer was empty")
+		t.Fatalf("%s=1 requires a human answering on this process's stdin: %v", envRunAttended, err)
 	}
 
 	return answer
@@ -80,7 +180,7 @@ func TestAttendedProviderAuthOAuthFlow(t *testing.T) {
 	defer cancel()
 
 	home := t.TempDir()
-	agent := startAgentBinary(t, ctx,
+	agent := startOrdinaryAgentBinary(t, ctx,
 		"-path", piPath,
 		"-scratch-dir", t.TempDir(),
 		"-home", home,

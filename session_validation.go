@@ -74,19 +74,8 @@ func (a *Agent) sessionStartConfigurationError() error {
 		return optionsErr
 	}
 
-	if a.options.ProviderAuthDirectHome != "" {
-		return unsupportedField(optionFieldProviderAuthDirectHome)
-	}
-
 	if isolationErr := validateProcessIsolationOption(a.options.ProcessIsolation); isolationErr != nil {
 		return isolationErr
-	}
-
-	if envErr := validateEnvironment(a.options.Env, optionFieldEnv); envErr != nil {
-		return acp.NewInvalidParams(map[string]any{
-			jsonFieldError: envErr.Error(),
-			jsonFieldField: optionFieldEnv,
-		})
 	}
 
 	if pathErr := validateExtraPathDirs(a.options.ExtraPathDirs, optionFieldExtraPathDirs); pathErr != nil {

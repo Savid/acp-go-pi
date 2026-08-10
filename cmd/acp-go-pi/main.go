@@ -85,7 +85,6 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	piHome := flags.String("home", "", "durable per-instance PI_CODING_AGENT_DIR; empty gives each session an ephemeral one")
 	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
 	providerAuthRoot := flags.String("provider-auth-root", "", "durable root for the values-free provider-auth ledger; empty leaves provider auth unadvertised")
-	providerAuthDirectHome := flags.String("provider-auth-direct-home", "", "account-wide provider-auth home gate; rejected by Pi because no leg uses it")
 	isolationConfigPath := flags.String(processIsolationConfigFlag, "", "optional absolute path to the root-owned mode-0600 Linux child-isolation policy")
 	model := flags.String("model", "", "default pi model as provider/id")
 	seedFiles := &seedFileFlag{}
@@ -151,7 +150,6 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		piacp.WithHome(*piHome),
 		piacp.WithScratchDir(*scratchDir),
 		piacp.WithProviderAuthRoot(*providerAuthRoot),
-		piacp.WithProviderAuthDirectHome(*providerAuthDirectHome),
 		piacp.WithDefaultModel(*model),
 		piacp.WithLogger(logger),
 	)

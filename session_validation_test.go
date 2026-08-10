@@ -100,11 +100,3 @@ func TestProcessIsolationOptionIsRefusedOnWindows(t *testing.T) {
 	agentRuntimePlatform = darwinPlatform
 	require.ErrorContains(t, validateProcessIsolationOption(isolation), "supported only on linux")
 }
-
-func TestProviderAuthDirectHomeIsRefusedAtSessionStart(t *testing.T) {
-	agent := NewAgent(WithProviderAuthDirectHome("/srv/pi-direct"))
-
-	err := agent.sessionStartConfigurationError()
-	require.Error(t, err)
-	require.Contains(t, err.Error(), optionFieldProviderAuthDirectHome)
-}

@@ -81,24 +81,39 @@ test-integration-live:
 	ACP_GO_PI_RUN_INTEGRATION=1 ACP_GO_PI_RUN_LIVE_TOKENS=1 go test -race -count=1 -tags=integration -timeout=900s -parallel=4 -v ./integration/...
 
 ## test-integration-attended: run provider-auth flows a human must approve in real time
+# `go test` hands the test binary a closed stdin, so the human's answer can
+# never reach a tier run that way. The tier therefore compiles the binary and
+# runs it directly, leaving stdin attached to whatever the operator supplied —
+# a terminal, or a pipe carrying the pasted code. Output is teed rather than
+# redirected so the relayed authorization URL still reaches the watching
+# operator live, and the guard requires a top-level pass line, which no empty
+# selection and no skip can produce.
 test-integration-attended:
+	rm -rf .tmp/attended
+	mkdir -p .tmp/attended
+	go test -race -c -tags=integration -o .tmp/attended/integration.test ./integration
 	@log=$$(mktemp); rc=$$(mktemp); \
-	{ ACP_GO_PI_RUN_INTEGRATION=1 ACP_GO_PI_RUN_ATTENDED=1 go test -race -count=1 -tags=integration -timeout=1200s -v -run '^TestAttended' ./integration/... 2>&1; echo $$? >"$$rc"; } | tee "$$log"; \
-	status=$$(cat "$$rc"); passed=$$(grep -c '^--- PASS: TestAttended' "$$log" || true); empty=$$(grep -c 'no tests to run' "$$log" || true); \
+	{ ( cd integration && ACP_GO_PI_RUN_INTEGRATION=1 ACP_GO_PI_RUN_ATTENDED=1 \
+	    ../.tmp/attended/integration.test -test.v -test.count=1 -test.timeout=1200s \
+	    -test.run '^TestAttendedProviderAuth' ) 2>&1; echo $$? >"$$rc"; } | tee "$$log"; \
+	status=$$(cat "$$rc"); passed=$$(grep -c '^--- PASS: TestAttendedProviderAuth' "$$log" || true); \
+	skipped=$$(grep -Ec '^[[:space:]]*--- SKIP: TestAttendedProviderAuth(/| )' "$$log" || true); \
+	empty=$$(grep -c 'no tests to run' "$$log" || true); \
 	rm -f "$$log" "$$rc"; \
 	[ "$$status" -eq 0 ] || exit "$$status"; \
 	[ "$$passed" -gt 0 ] || { echo 'no attended provider-auth login ran'; exit 1; }; \
+	[ "$$skipped" -eq 0 ] || { echo 'attended provider-auth login skipped'; exit 1; }; \
 	[ "$$empty" -eq 0 ] || { echo 'attended provider-auth selector ran no tests'; exit 1; }
 
 ## test-integration-keystore: run credential-residence tests against the container fixture
 test-integration-keystore:
 	ACP_GO_PI_RUN_INTEGRATION=1 ACP_GO_PI_RUN_KEYSTORE=1 go test -race -count=1 -tags=integration -timeout=600s -v -run '^TestKeystore' ./...
 
-## test-integration-native-browser: require one Linux explicit-isolation no-auth-launch proof
+## test-integration-native-browser: require one Linux ordinary provider-auth browser-boundary proof
 test-integration-native-browser:
 	@log=$$(mktemp); rc=$$(mktemp); \
-	{ ACP_GO_PI_RUN_INTEGRATION=1 go test -race -count=1 -tags=integration -timeout=1200s -v -run '^TestNativeLinuxExplicitIsolationDoesNotDispatchProviderAuth$$' ./integration/... 2>&1; echo $$? >"$$rc"; } | tee "$$log"; \
-	status=$$(cat "$$rc"); passed=$$(grep -c '^--- PASS: TestNativeLinuxExplicitIsolationDoesNotDispatchProviderAuth ' "$$log" || true); skipped=$$(grep -Ec '^[[:space:]]*--- SKIP: TestNativeLinuxExplicitIsolationDoesNotDispatchProviderAuth(/| )' "$$log" || true); empty=$$(grep -c 'no tests to run' "$$log" || true); \
+	{ ACP_GO_PI_RUN_INTEGRATION=1 go test -race -count=1 -tags=integration -timeout=1800s -v -run '^TestNativeBrowserLinuxOrdinaryProviderAuthReachesNoUnshimmedLauncher$$' ./integration/... 2>&1; echo $$? >"$$rc"; } | tee "$$log"; \
+	status=$$(cat "$$rc"); passed=$$(grep -c '^--- PASS: TestNativeBrowserLinuxOrdinaryProviderAuthReachesNoUnshimmedLauncher ' "$$log" || true); skipped=$$(grep -Ec '^[[:space:]]*--- SKIP: TestNativeBrowserLinuxOrdinaryProviderAuthReachesNoUnshimmedLauncher(/| )' "$$log" || true); empty=$$(grep -c 'no tests to run' "$$log" || true); \
 	rm -f "$$log" "$$rc"; \
 	[ "$$status" -eq 0 ] || exit "$$status"; \
 	[ "$$passed" -eq 1 ] || { echo "native browser pass count $$passed, want exactly 1"; exit 1; }; \
@@ -117,8 +132,8 @@ test-integration-cover:
 ## docs-audit: check public docs, examples, required files, CLI flags, and removed terms
 docs-audit:
 	@missing=0; for file in README.md doc.go docs.json example_test.go AGENTS.md docs/overview.mdx docs/core/sessions.mdx docs/core/prompt-streaming.mdx docs/features/authentication.mdx docs/features/elicitation.mdx docs/features/mcp.mdx docs/features/models-config.mdx docs/features/permissions.mdx docs/features/raw-events.mdx docs/features/session-store.mdx docs/get-started/examples.mdx docs/get-started/install.mdx docs/get-started/quickstart.mdx docs/get-started/run-modes.mdx docs/operations/observability.mdx docs/operations/security.mdx docs/operations/troubleshooting.mdx docs/reference/acp-methods.mdx docs/reference/cli.mdx docs/reference/go-api.mdx docs/reference/meta.mdx docs/reference/updates.mdx examples/minimal-client/main.go examples/resume-from-file/main.go examples/interactive-chat/main.go; do if [ ! -f "$$file" ]; then echo "missing required docs file: $$file"; missing=1; fi; done; exit $$missing
-	@for flag in -path -home -scratch-dir -provider-auth-root -provider-auth-direct-home -process-isolation-config -model -seed-file -debug -version; do rg -q -- "$$flag" docs/reference/cli.mdx || { echo "missing CLI flag in docs/reference/cli.mdx: $$flag"; exit 1; }; done
-	@for flag in path home scratch-dir provider-auth-root provider-auth-direct-home process-isolation-config model seed-file debug version; do rg -q -- "\"$$flag\"" cmd/acp-go-pi/*.go || { echo "missing CLI flag registration in command code: $$flag"; exit 1; }; done
+	@for flag in -path -home -scratch-dir -provider-auth-root -process-isolation-config -model -seed-file -debug -version; do rg -q -- "$$flag" docs/reference/cli.mdx || { echo "missing CLI flag in docs/reference/cli.mdx: $$flag"; exit 1; }; done
+	@for flag in path home scratch-dir provider-auth-root process-isolation-config model seed-file debug version; do rg -q -- "\"$$flag\"" cmd/acp-go-pi/*.go || { echo "missing CLI flag registration in command code: $$flag"; exit 1; }; done
 	@! rg -n -- '--cli|proxy|compatibility|deprecated|legacy|migration|session/import|sdkMessage|setGoal|goals|NES|SSE MCP|mcpCapabilities\.acp' README.md doc.go docs.json docs examples cmd/acp-go-pi/*.go AGENTS.md
 	@rg -q 'SupervisorGuardianSIGKILL' Makefile
 	@rg -q 'SupervisorLivenessSIGKILL' Makefile

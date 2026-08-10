@@ -39,12 +39,12 @@ const (
 type PiOptions struct {
 	// Model selects the pi model for this session as "provider/id".
 	Model string `json:"model,omitempty"`
-	// Env adds environment variables for this pi session's process.
+	// Env adds environment variables for this pi session's process. PATH is
+	// rejected; use ExtraPathDirs for executable search prefixes.
 	Env map[string]string `json:"env,omitempty"`
 	// ExtraPathDirs are absolute directories prepended, in order, to the PATH
 	// of this session's pi process, so the first entry resolves ahead of every
-	// other. Env may also carry an explicit PATH; this field is for callers that
-	// need to prepend individual host-owned executable directories.
+	// other while the captured native base path remains last.
 	ExtraPathDirs []string `json:"extraPathDirs,omitempty"`
 	// OutputSchema requests JSON Schema structured output. pi has no native
 	// structured-output surface, so setting it fails closed at session start.
@@ -274,13 +274,30 @@ func validatePiOptions(options PiOptions) (PiOptions, error) {
 }
 
 func validateEnvironment(env map[string]string, path string) error {
+	keys := make([]string, 0, len(env))
 	for key := range env {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	seen := make(map[string]string, len(keys))
+	for _, key := range keys {
 		if !validEnvName(key) {
 			return fmt.Errorf("%s.%s is not a valid environment variable name", path, key)
 		}
 
 		if blockedEnvKey(key) {
 			return fmt.Errorf("%s.%s is not allowed", path, key)
+		}
+
+		if agentRuntimePlatform == windowsPlatform {
+			canonical := strings.ToUpper(key)
+			if previous, ok := seen[canonical]; ok {
+				return fmt.Errorf("%s contains ambiguous environment keys %q and %q", path, previous, key)
+			}
+
+			seen[canonical] = key
 		}
 	}
 
@@ -387,7 +404,7 @@ func blockedEnvKey(key string) bool {
 	}
 
 	switch upper {
-	case envKeyNodeOptions, envKeyBashEnv, envKeyEnv:
+	case envKeyNodeOptions, envKeyBashEnv, envKeyEnv, envKeyPath:
 		return true
 	default:
 		return strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_")

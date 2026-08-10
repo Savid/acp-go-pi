@@ -118,7 +118,7 @@ func TestLaunchSpecEnviron(t *testing.T) {
 		env[key] = value
 	}
 
-	require.Equal(t, "/tmp/hijack-bin", env["PATH"])
+	require.Equal(t, "/usr/bin", env["PATH"])
 	require.Equal(t, "/home/policy", env["HOME"])
 	require.Equal(t, "explicit-key", env["ANTHROPIC_API_KEY"])
 	require.Equal(t, "explicit-openai-key", env["OPENAI_API_KEY"])
@@ -127,7 +127,6 @@ func TestLaunchSpecEnviron(t *testing.T) {
 	require.NotContains(t, env, "NODE_OPTIONS")
 	require.NotContains(t, env, "LD_PRELOAD")
 	require.NotContains(t, env, "BAD-NAME")
-	require.Equal(t, "/tmp/hijack-bin", env["PATH"])
 	require.NotContains(t, env, "TMPDIR")
 	require.IsIncreasing(t, environ)
 }
@@ -147,7 +146,7 @@ func TestLaunchSpecEnvironPrependsExtraPathDirs(t *testing.T) {
 	require.Contains(
 		t,
 		spec.Environ(),
-		"PATH=/session/bin"+separator+"/agent-wide/bin"+separator+"/tmp/hijack-bin",
+		"PATH=/session/bin"+separator+"/agent-wide/bin"+separator+"/usr/bin",
 	)
 	require.IsIncreasing(t, spec.Environ())
 }
@@ -173,6 +172,8 @@ func TestPrependPathDirsDropsUnusableEntries(t *testing.T) {
 func TestSafeExplicitEnvKeyBoundary(t *testing.T) {
 	require.False(t, safeExplicitEnvKey(""))
 	require.True(t, safeExplicitEnvKey("A1"))
+	require.False(t, safeExplicitEnvKey("PATH"))
+	require.False(t, safeExplicitEnvKey("Path"))
 	require.False(t, safeExplicitEnvKey("ACP_GO_PI_INTERNAL_DARWIN_LAUNCH"))
 	require.False(t, safeExplicitEnvKey("acp_go_pi_internal_turn_supervisor"))
 }

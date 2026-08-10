@@ -24,7 +24,6 @@ func TestApplyOptionsDefaults(t *testing.T) {
 	require.Empty(t, options.Home)
 	require.Empty(t, options.ScratchDir)
 	require.Empty(t, options.ProviderAuthRoot)
-	require.Empty(t, options.ProviderAuthDirectHome)
 	require.Empty(t, options.DefaultModel)
 	require.Nil(t, options.Env)
 	require.Nil(t, options.ExtraPathDirs)
@@ -56,7 +55,6 @@ func TestApplyOptionsSetters(t *testing.T) {
 		WithHome("/srv/pi-home"),
 		WithScratchDir("/srv/pi-scratch"),
 		WithProviderAuthRoot("/srv/pi-auth"),
-		WithProviderAuthDirectHome("/srv/pi-direct"),
 		WithDefaultModel("openai/gpt-4o"),
 		WithEnv(env),
 		WithExtraPathDirs(extraPathDirs...),
@@ -78,7 +76,6 @@ func TestApplyOptionsSetters(t *testing.T) {
 	require.Equal(t, "/srv/pi-home", options.Home)
 	require.Equal(t, "/srv/pi-scratch", options.ScratchDir)
 	require.Equal(t, "/srv/pi-auth", options.ProviderAuthRoot)
-	require.Equal(t, "/srv/pi-direct", options.ProviderAuthDirectHome)
 	require.Equal(t, "openai/gpt-4o", options.DefaultModel)
 	require.Equal(t, env, options.Env)
 	require.Equal(t, []string{"/opt/shim/bin"}, options.ExtraPathDirs)

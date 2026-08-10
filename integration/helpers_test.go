@@ -142,23 +142,47 @@ func integrationContainmentSpec(t *testing.T) internalpi.ContainmentSpec {
 	_, err = rand.Read(identity)
 	require.NoError(t, err)
 
-	uid, gid := os.Geteuid(), os.Getegid()
-	if uid == 0 || gid == 0 {
-		uid, gid = 65534, 65534
+	// Explicit isolation is a Linux-only mode with no fallback, so off Linux the
+	// spec carries the ordinary environment instead. Combining it with Darwin
+	// best effort would ask for two containment modes at once, which the launch
+	// boundary refuses rather than silently picking one.
+	base := integrationBaseEnvironment(t)
+
+	var isolation *internalpi.ProcessIsolation
+
+	if runtime.GOOS == "linux" {
+		uid, gid := os.Geteuid(), os.Getegid()
+		if uid == 0 || gid == 0 {
+			uid, gid = 65534, 65534
+		}
+		isolation = &internalpi.ProcessIsolation{
+			UID: uint32(uid), GID: uint32(gid),
+			BaseEnvironment:      base,
+			TestOnlyNoCredential: true,
+		}
 	}
 
 	return internalpi.ContainmentSpec{
-		DarwinBestEffort: runtime.GOOS == "darwin",
-		ScratchParent:    parent,
-		GenerationRoot:   root,
-		RuntimeID:        hex.EncodeToString(identity),
-		LifecycleKind:    "discovery",
-		Isolation: &internalpi.ProcessIsolation{
-			UID: uint32(uid), GID: uint32(gid),
-			BaseEnvironment:      integrationBaseEnvironment(t),
-			TestOnlyNoCredential: true,
-		},
+		DarwinBestEffort:    runtime.GOOS == "darwin",
+		ScratchParent:       parent,
+		GenerationRoot:      root,
+		RuntimeID:           hex.EncodeToString(identity),
+		LifecycleKind:       "discovery",
+		Isolation:           isolation,
+		OrdinaryEnvironment: base,
 	}
+}
+
+// integrationContainmentEnvironment is the base environment a spec hands its
+// child, whichever containment mode the platform selected. Tests that pin a
+// native home ask for it here rather than reaching into one mode's field, which
+// is nil on the platforms that use the other.
+func integrationContainmentEnvironment(containment internalpi.ContainmentSpec) map[string]string {
+	if containment.Isolation != nil {
+		return containment.Isolation.BaseEnvironment
+	}
+
+	return containment.OrdinaryEnvironment
 }
 
 func integrationVersionProbeSpec(t *testing.T) (string, internalpi.ContainmentSpec) {
@@ -520,6 +544,29 @@ func startAgentBinary(t *testing.T, ctx context.Context, args ...string) *liveAg
 	} else {
 		cmd = standaloneAgentCommand(t, ctx, args...)
 	}
+
+	return startAgentProcess(t, cmd)
+}
+
+// startOrdinaryAgentBinary launches the wrapper in ordinary mode: the pi child
+// runs as the identity the adapter already runs as. That is the containment
+// mode this repository's provider-auth surface is defined for — explicit
+// isolation refuses to broker it — and it is also the only mode the binary
+// tier has on Darwin, so fixing it here keeps a provider-auth test from
+// silently degrading into a skip off Linux.
+func startOrdinaryAgentBinary(t *testing.T, ctx context.Context, args ...string) *liveAgent {
+	t.Helper()
+
+	for _, arg := range args {
+		require.NotEqual(t, "-process-isolation-config", arg,
+			"the ordinary launch helper is the no-isolation mode; pass a policy through startAgentBinary instead")
+	}
+
+	return startAgentProcess(t, agentCommand(t, ctx, args...))
+}
+
+func startAgentProcess(t *testing.T, cmd *exec.Cmd) *liveAgent {
+	t.Helper()
 
 	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)

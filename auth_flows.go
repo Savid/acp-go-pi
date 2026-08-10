@@ -374,7 +374,12 @@ func (p *providerAuth) recordIntent(
 		UpdatedAt:          now.UnixMilli(),
 	}
 
-	if prior, ok, readErr := p.ledger.read(request.providerID); readErr == nil && ok {
+	prior, ok, readErr := p.ledger.read(request.providerID)
+	if readErr != nil {
+		return authLedgerRecord{}, authFailed(authCauseProcess, request.providerID, request.method, "")
+	}
+
+	if ok {
 		record.Revision = prior.Revision + 1
 		record.BindingGeneration = prior.BindingGeneration
 		record.CreatedAt = prior.CreatedAt
@@ -636,6 +641,7 @@ func (p *providerAuth) armCompleter(flow *authFlow) {
 
 func (p *providerAuth) expire(flow *authFlow) {
 	p.mu.Lock()
+	flow.pendingSecret = ""
 
 	if authTerminal(flow.state) {
 		p.mu.Unlock()
@@ -669,6 +675,7 @@ func (p *providerAuth) supersede(ctx context.Context, key authFlowKey, reason st
 	p.mu.Lock()
 
 	if previous, ok := p.retained[key]; ok {
+		previous.pendingSecret = ""
 		p.retire(key, previous.authorizeRequestID)
 	}
 
@@ -681,6 +688,7 @@ func (p *providerAuth) supersede(ctx context.Context, key authFlowKey, reason st
 
 	delete(p.flows, key)
 	delete(p.byID, flow.id)
+	flow.pendingSecret = ""
 
 	if authTerminal(flow.state) {
 		p.mu.Unlock()
@@ -968,6 +976,7 @@ func (p *providerAuth) fail(flow *authFlow, cause string, materialInFlight bool)
 // outcome.
 func (p *providerAuth) terminalize(flow *authFlow, state string, reason string, credentialExpiresAt int64) {
 	p.mu.Lock()
+	flow.pendingSecret = ""
 
 	if authTerminal(flow.state) {
 		p.mu.Unlock()
@@ -1043,6 +1052,7 @@ func (p *providerAuth) cancel(ctx context.Context, params json.RawMessage) (any,
 	}
 
 	p.mu.Lock()
+	flow.pendingSecret = ""
 
 	if authTerminal(flow.state) {
 		p.mu.Unlock()
@@ -1200,6 +1210,7 @@ func (p *providerAuth) closeSession(ctx context.Context, session *agentSession) 
 
 	for key := range p.retained {
 		if key.sessionID == sessionID {
+			p.retained[key].pendingSecret = ""
 			delete(p.retained, key)
 		}
 	}
@@ -1217,6 +1228,7 @@ func (p *providerAuth) closeSession(ctx context.Context, session *agentSession) 
 
 		delete(p.flows, key)
 		delete(p.byID, flow.id)
+		flow.pendingSecret = ""
 
 		if authTerminal(flow.state) {
 			continue

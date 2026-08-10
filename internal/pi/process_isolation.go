@@ -56,7 +56,7 @@ func CaptureOrdinaryEnvironment() map[string]string {
 			continue
 		}
 
-		environment[key] = value
+		environment[canonicalEnvironmentKey(key)] = value
 	}
 
 	return environment
@@ -64,7 +64,7 @@ func CaptureOrdinaryEnvironment() map[string]string {
 
 func ordinaryEnvironmentKey(key string) bool {
 	upper := strings.ToUpper(key)
-	if strings.HasPrefix(upper, privateEnvPrefix) || !safeExplicitEnvKey(key) {
+	if strings.HasPrefix(upper, privateEnvPrefix) || !validEnvironmentName(key) {
 		return false
 	}
 
@@ -108,78 +108,100 @@ func validEnvironmentName(key string) bool {
 	return key != "" && !strings.ContainsRune(key, '=') && strings.IndexByte(key, 0) < 0
 }
 
+// ComposeEnvironment applies environment phases from left to right.
+func ComposeEnvironment(phases ...map[string]string) map[string]string {
+	environment := make(map[string]string)
+
+	for _, phase := range phases {
+		for _, key := range sortedEnvironmentKeys(phase) {
+			environment[canonicalEnvironmentKey(key)] = phase[key]
+		}
+	}
+
+	return environment
+}
+
+func sortedEnvironmentKeys(environment map[string]string) []string {
+	keys := make([]string, 0, len(environment))
+	for key := range environment {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	return keys
+}
+
+func environmentEntries(environment map[string]string) []string {
+	keys := sortedEnvironmentKeys(environment)
+
+	entries := make([]string, 0, len(keys))
+	for _, key := range keys {
+		entries = append(entries, key+"="+environment[key])
+	}
+
+	return entries
+}
+
 func isolationEnvironment(isolation *ProcessIsolation, overlays ...map[string]string) ([]string, error) {
 	if err := validateProcessIsolation(isolation); err != nil {
 		return nil, err
 	}
 
-	env := make(map[string]string, len(isolation.BaseEnvironment))
-	for key, value := range isolation.BaseEnvironment {
-		env[key] = value
-	}
-
 	for _, overlay := range overlays {
-		for key, value := range overlay {
+		for key := range overlay {
 			if !validEnvironmentName(key) || strings.HasPrefix(strings.ToUpper(key), privateEnvPrefix) {
 				return nil, fmt.Errorf("process environment contains invalid key %q", key)
 			}
 
-			env[key] = value
+			if strings.EqualFold(key, envPath) {
+				return nil, errors.New("process environment PATH must use ExtraPathDirs")
+			}
 		}
 	}
 
-	keys := make([]string, 0, len(env))
-	for key := range env {
-		keys = append(keys, key)
-	}
+	phases := make([]map[string]string, 0, len(overlays)+1)
+	phases = append(phases, isolation.BaseEnvironment)
+	phases = append(phases, overlays...)
+	environment := ComposeEnvironment(phases...)
 
-	slices.Sort(keys)
-
-	out := make([]string, 0, len(keys))
-	for _, key := range keys {
-		out = append(out, key+"="+env[key])
-	}
-
-	return out, nil
+	return environmentEntries(environment), nil
 }
 
 func ordinaryEnvironment(base map[string]string, overlays ...map[string]string) ([]string, error) {
-	env := make(map[string]string, len(base))
+	ordinaryBase := make(map[string]string, len(base))
 	for key, value := range base {
 		if ordinaryEnvironmentKey(key) {
-			env[key] = value
+			ordinaryBase[key] = value
 		}
 	}
 
 	for _, overlay := range overlays {
-		for key, value := range overlay {
+		for key := range overlay {
 			if !validEnvironmentName(key) || strings.HasPrefix(strings.ToUpper(key), privateEnvPrefix) {
 				return nil, fmt.Errorf("process environment contains invalid key %q", key)
 			}
 
-			env[key] = value
+			if strings.EqualFold(key, envPath) {
+				return nil, errors.New("process environment PATH must use ExtraPathDirs")
+			}
 		}
 	}
 
-	keys := make([]string, 0, len(env))
-	for key := range env {
-		keys = append(keys, key)
-	}
+	phases := make([]map[string]string, 0, len(overlays)+1)
+	phases = append(phases, ordinaryBase)
+	phases = append(phases, overlays...)
+	environment := ComposeEnvironment(phases...)
 
-	slices.Sort(keys)
-
-	out := make([]string, 0, len(keys))
-	for _, key := range keys {
-		out = append(out, key+"="+env[key])
-	}
-
-	return out, nil
+	return environmentEntries(environment), nil
 }
 
 func environmentValue(environment []string, name string) string {
-	for _, entry := range environment {
+	for index := len(environment) - 1; index >= 0; index-- {
+		entry := environment[index]
+
 		key, value, ok := strings.Cut(entry, "=")
-		if ok && key == name {
+		if ok && environmentKeyEqual(key, name) {
 			return value
 		}
 	}
@@ -216,54 +238,6 @@ func lookPathInEnvironment(file string, environment []string) (string, error) {
 	}
 
 	return "", fmt.Errorf("executable %q not found in policy PATH", file)
-}
-
-func lookPathInOrdinaryEnvironment(file string, environment []string) (string, error) {
-	if file == "" {
-		return "", errors.New("executable name is empty")
-	}
-
-	resolve := func(path string) (string, error) {
-		if !filepath.IsAbs(path) {
-			absolute, err := ordinaryExecutableAbs(path)
-			if err != nil {
-				return "", err
-			}
-
-			path = absolute
-		}
-
-		return executableFile(path)
-	}
-
-	if strings.ContainsRune(file, os.PathSeparator) {
-		return resolve(file)
-	}
-
-	for _, dir := range filepath.SplitList(environmentValue(environment, envPath)) {
-		if dir == "" {
-			dir = "."
-		}
-
-		if path, err := resolve(filepath.Join(dir, file)); err == nil {
-			return path, nil
-		}
-	}
-
-	return "", fmt.Errorf("executable %q not found in PATH", file)
-}
-
-func executableFile(path string) (string, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", err
-	}
-
-	if !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
-		return "", fmt.Errorf("%q is not executable", path)
-	}
-
-	return path, nil
 }
 
 // ResolveExecutable resolves file through the explicit closed policy when

@@ -110,9 +110,7 @@ func validateProviderAuthRoot(options Options) error {
 	return errors.New("provider auth root must be an absolute path")
 }
 
-// newAuthLedger resolves and validates the configured durable root. A root that
-// does not exist and cannot be created, is not a directory, or is not writable
-// leaves the provider-auth surface unadvertised, exactly as an unset one does.
+// newAuthLedger resolves and validates the configured durable root.
 func newAuthLedger(options Options) (*authLedger, error) {
 	if err := validateProviderAuthRoot(options); err != nil {
 		return nil, err

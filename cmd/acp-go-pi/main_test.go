@@ -128,7 +128,6 @@ func TestRunOptionsCancellationAndSignal(t *testing.T) {
 		require.Equal(t, "/agent/home", options.Home)
 		require.Equal(t, "/agent/scratch", options.ScratchDir)
 		require.Equal(t, "/agent/auth-ledger", options.ProviderAuthRoot)
-		require.Empty(t, options.ProviderAuthDirectHome)
 		require.Equal(t, "provider/model", options.DefaultModel)
 		require.Equal(t, `{"theme":"dark"}`, options.SeedFiles["settings.json"])
 		require.NotNil(t, options.Logger)

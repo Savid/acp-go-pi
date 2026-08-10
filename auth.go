@@ -5,8 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"log/slog"
 	"sync"
 
 	"github.com/coder/acp-go-sdk"
@@ -123,22 +123,27 @@ type authFlowKey struct {
 	providerID string
 }
 
-// newProviderAuth requires a durable agent directory and is unavailable when
-// process isolation is configured.
-func newProviderAuth(agent *Agent) *providerAuth {
-	if !authLedgerRootConfigured(agent.options) || agent.options.Home == "" || agent.options.ProcessIsolation != nil {
+// configureProviderAuth prepares every durable path before the capability can be
+// advertised. An omitted ledger root means provider auth was not requested.
+func configureProviderAuth(agent *Agent) error {
+	if !authLedgerRootConfigured(agent.options) {
 		return nil
+	}
+
+	if agent.options.Home == "" {
+		return errors.New("provider auth requires a durable pi home")
+	}
+
+	if err := agent.applyDurableHome(&sessionDirs{}); err != nil {
+		return fmt.Errorf("prepare provider auth home: %w", err)
 	}
 
 	ledger, err := newAuthLedger(agent.options)
 	if err != nil {
-		agent.log.WarnContext(context.Background(), "provider auth surface is unavailable",
-			slog.String(jsonFieldError, err.Error()))
-
-		return nil
+		return fmt.Errorf("prepare provider auth ledger: %w", err)
 	}
 
-	return &providerAuth{
+	agent.providerAuth = &providerAuth{
 		agent:         agent,
 		ledger:        ledger,
 		authorizeGate: newAuthGate[authFlowKey](),
@@ -149,6 +154,8 @@ func newProviderAuth(agent *Agent) *providerAuth {
 		retired:       make(map[authFlowKey]map[string]struct{}),
 		exchanges:     make(map[string]*authExchange),
 	}
+
+	return nil
 }
 
 // capability reports the enabled leg names. The array is the host's only

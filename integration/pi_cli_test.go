@@ -24,7 +24,7 @@ func TestPiCLIVersionProbe(t *testing.T) {
 	agentDir, containment := integrationVersionProbeSpec(t)
 	policyHome := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(policyHome, "sentinel"), []byte("unchanged"), 0o600))
-	containment.Isolation.BaseEnvironment["HOME"] = policyHome
+	integrationContainmentEnvironment(containment)["HOME"] = policyHome
 	version, err := pi.ProbeVersion(ctx, path, agentDir, containment)
 	require.NoError(t, err)
 	require.NotEmpty(t, version)
@@ -101,7 +101,11 @@ Use the deterministic seeded skill.
 		names = append(names, command.Name)
 	}
 	slices.Sort(names)
-	expected := append(expectedBuiltinCommandNames(t, path), "seed-command", "seed-prompt", "skill:seed-skill")
+	// The bridge registers the wrapper-owned provider-auth command natively.
+	// It is deliberately absent from the ACP available-commands list, so the
+	// native listing is the only place its registration is observable.
+	expected := append(expectedBuiltinCommandNames(t, path),
+		pi.AuthCommandName, "seed-command", "seed-prompt", "skill:seed-skill")
 	slices.Sort(expected)
 	require.Equal(t, expected, names)
 	require.Empty(t, process.StderrTail())

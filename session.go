@@ -25,9 +25,8 @@ const (
 	acpFieldSessionID = "sessionId"
 	acpFieldValue     = "value"
 
-	optionFieldEnv                    = "env"
-	optionFieldExtraPathDirs          = "extraPathDirs"
-	optionFieldProviderAuthDirectHome = "providerAuthDirectHome"
+	optionFieldEnv           = "env"
+	optionFieldExtraPathDirs = "extraPathDirs"
 
 	validationRequired    = "required"
 	validationUnsupported = "unsupported"

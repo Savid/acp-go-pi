@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -59,9 +60,10 @@ func newAuthHarness(t *testing.T, opts ...Option) *authHarness {
 
 	client.respondFunc = harness.recordAnswer
 
-	base := make([]Option, 0, 1+len(opts))
-	base = append(base, WithProviderAuthRoot(harness.root))
+	base := make([]Option, 0, 2+len(opts))
+	base = append(base, WithHome(harness.home), WithProviderAuthRoot(harness.root))
 	agent := newStubClientAgent(t, client, append(base, opts...)...)
+	agent.options.Home = ""
 	ledger, err := newAuthLedger(Options{ProviderAuthRoot: harness.root, Home: harness.home})
 	require.NoError(t, err)
 	agent.providerAuth = &providerAuth{
@@ -288,28 +290,45 @@ func requireInvalidAuthField(t *testing.T, err error, field string, context ...a
 	require.Equal(t, field, data[jsonFieldField], context...)
 }
 
-func TestNewProviderAuthRequiresOrdinaryDurableHome(t *testing.T) {
+func TestNewProviderAuthRequiresRequestedDurableResidence(t *testing.T) {
 	t.Parallel()
 
 	client := newStubPiClient()
 
 	require.Nil(t, newStubClientAgent(t, client).providerAuth)
-	require.Nil(t, newStubClientAgent(t, client, WithProviderAuthRoot(t.TempDir())).providerAuth)
 	require.Nil(t, newStubClientAgent(t, client, WithHome(t.TempDir())).providerAuth)
 	require.NotNil(t, newStubClientAgent(t, client, WithProviderAuthRoot(t.TempDir()), WithHome(t.TempDir())).providerAuth)
-	require.Nil(t, newStubClientAgent(
-		t, client, testProcessIsolationOption(), WithProviderAuthRoot(t.TempDir()), WithHome(t.TempDir()),
-	).providerAuth)
 }
 
-// TestNewProviderAuthUnusableRootStaysUnadvertised pins the family rule that a
-// root asked for and not preparable leaves the surface absent, exactly as an
-// unset one does.
-func TestNewProviderAuthUnusableRootStaysUnadvertised(t *testing.T) {
+func TestRequestedProviderAuthResidenceFailsInitializationWhenIncompleteOrUnusable(t *testing.T) {
 	t.Parallel()
 
-	agent := newStubClientAgent(t, newStubPiClient(), WithProviderAuthRoot("relative/root"), WithHome(t.TempDir()))
-	require.Nil(t, agent.providerAuth)
+	rootFile := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(rootFile, []byte("occupied"), 0o600))
+	homeFile := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(homeFile, []byte("occupied"), 0o600))
+
+	for _, test := range []struct {
+		name    string
+		options []Option
+		want    string
+	}{
+		{name: "missing home", options: []Option{WithProviderAuthRoot(t.TempDir())}, want: "requires a durable pi home"},
+		{name: "relative home", options: []Option{WithHome("relative/home"), WithProviderAuthRoot(t.TempDir())}, want: "prepare provider auth home"},
+		{name: "home is a file", options: []Option{WithHome(homeFile), WithProviderAuthRoot(t.TempDir())}, want: "prepare provider auth home"},
+		{name: "relative ledger", options: []Option{WithHome(t.TempDir()), WithProviderAuthRoot("relative/root")}, want: "prepare provider auth ledger"},
+		{name: "ledger is a file", options: []Option{WithHome(t.TempDir()), WithProviderAuthRoot(rootFile)}, want: "prepare provider auth ledger"},
+		{name: "explicit isolation", options: []Option{testProcessIsolationOption(), WithHome(t.TempDir()), WithProviderAuthRoot(t.TempDir())}, want: "prepare provider auth home"},
+	} {
+		agent := NewAgent(test.options...)
+		t.Cleanup(func() { require.NoError(t, agent.Close()) })
+
+		_, err := agent.Initialize(t.Context(), defaultInitializeRequest())
+		requireInvalidParams(t, err)
+		require.ErrorContains(t, err, test.want, test.name)
+		require.ErrorContains(t, agent.sessionStartConfigurationError(), test.want, test.name)
+		require.Nil(t, agent.providerAuth)
+	}
 }
 
 func TestAuthCapabilityAdvertisesSevenLegs(t *testing.T) {
