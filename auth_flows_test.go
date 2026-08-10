@@ -217,6 +217,107 @@ func TestTerminalFlowAbortsTheNativeLogin(t *testing.T) {
 	require.Equal(t, authReasonOwnerCancel, status.Reason)
 }
 
+// TestCancelStopsWaitCompletionBeforeTheNativeResult pins the completion
+// waiter's terminal-flow exit. The native abort and its terminal result are
+// separate messages: cancellation must release the waiter from the flow's own
+// terminal signal without waiting for that result, and a result arriving later
+// must not replace the outcome the owner already chose.
+func TestCancelStopsWaitCompletionBeforeTheNativeResult(t *testing.T) {
+	harness := newAuthHarness(t)
+	generation := harness.seedCatalog(t.Context(), defaultAuthProviders())
+
+	aborted := make(chan struct{})
+	releaseResult := make(chan struct{}, 1)
+	resultDelivered := make(chan struct{})
+
+	t.Cleanup(func() {
+		select {
+		case releaseResult <- struct{}{}:
+		default:
+		}
+	})
+
+	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
+		if request.Op != pi.AuthOpLogin {
+			return nil
+		}
+
+		watch := harness.deliver(ctx, pi.AuthMessage{ID: request.ID, Kind: pi.AuthKindCancel})
+		harness.deliver(ctx, pi.AuthMessage{
+			ID:   request.ID,
+			Kind: pi.AuthKindEvent,
+			Event: &pi.AuthNativeEvent{
+				Type:            authNativeEventDeviceCode,
+				UserCode:        authTestUserCode,
+				VerificationURI: authTestVerify,
+				IntervalSeconds: 5,
+			},
+		})
+
+		<-harness.answered(watch)
+		close(aborted)
+		<-releaseResult
+
+		harness.deliver(ctx, pi.AuthMessage{
+			ID:    request.ID,
+			Kind:  pi.AuthKindResult,
+			Cause: authCauseProviderRefused,
+		})
+		close(resultDelivered)
+
+		return nil
+	})
+
+	authorized, err := harness.call(t.Context(), AuthAuthorizeMethod, authorizeParams(harness, "anthropic", generation, authMethodTypeOAuth))
+	require.NoError(t, err)
+
+	presentation := authorizeResult(t, authorized)
+	require.Equal(t, authInteractionWait, presentation.Interaction)
+
+	flow := harness.broker.byID[presentation.FlowID]
+	claimed := func() bool {
+		harness.broker.mu.Lock()
+		defer harness.broker.mu.Unlock()
+
+		return flow.claimed
+	}
+	require.Eventually(t, claimed, 5*time.Second, 5*time.Millisecond)
+
+	_, err = harness.call(t.Context(), AuthCancelMethod, map[string]any{
+		authFieldSessionID:  string(harness.session.id),
+		authFieldProviderID: "anthropic",
+		authFieldFlowID:     presentation.FlowID,
+	})
+	require.NoError(t, err)
+
+	select {
+	case <-aborted:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "native login was not aborted")
+	}
+
+	require.Eventually(t, func() bool { return !claimed() }, 5*time.Second, 5*time.Millisecond)
+	require.Equal(t, authStatusResult{
+		FlowID: presentation.FlowID,
+		State:  authStateCancelled,
+		Reason: authReasonOwnerCancel,
+	}, harness.statusOf(presentation.FlowID))
+
+	releaseResult <- struct{}{}
+
+	select {
+	case <-resultDelivered:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "native result was not delivered")
+	}
+
+	require.Equal(t, authStatusResult{
+		FlowID: presentation.FlowID,
+		State:  authStateCancelled,
+		Reason: authReasonOwnerCancel,
+	}, harness.statusOf(presentation.FlowID))
+}
+
 // TestAbortWatchArrivingAfterTheFlowEndedIsAnsweredAtOnce pins the race the
 // abort handle has with a mint that already failed: a watch registered against
 // a flow nobody can still terminalize would leave the login running with
