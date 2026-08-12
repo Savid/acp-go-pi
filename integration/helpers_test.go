@@ -336,13 +336,34 @@ type agentPipes struct {
 
 func serveAgentRawForTest(t *testing.T, ctx context.Context, opts ...piacp.Option) agentPipes {
 	t.Helper()
+	baseOptions := []piacp.Option{
+		piacp.WithLogger(integrationLogger), integrationContainmentOption(), integrationProcessIsolationOption(t),
+	}
+
+	return serveAgentWithBaseOptionsForTest(t, ctx, baseOptions, opts...)
+}
+
+// serveEmbeddedAgentRawForTest runs the same real adapter boundary without
+// the Linux-only distinct-identity policy. Darwin still uses the adapter's
+// explicit best-effort containment because native launches fail closed there.
+func serveEmbeddedAgentRawForTest(t *testing.T, ctx context.Context, opts ...piacp.Option) agentPipes {
+	t.Helper()
+	baseOptions := []piacp.Option{piacp.WithLogger(integrationLogger), integrationContainmentOption()}
+
+	return serveAgentWithBaseOptionsForTest(t, ctx, baseOptions, opts...)
+}
+
+func serveAgentWithBaseOptionsForTest(
+	t *testing.T,
+	ctx context.Context,
+	baseOptions []piacp.Option,
+	opts ...piacp.Option,
+) agentPipes {
+	t.Helper()
 
 	c2aR, c2aW := io.Pipe()
 	a2cR, a2cW := io.Pipe()
 	serveCtx, stopServe := context.WithCancel(ctx)
-	baseOptions := []piacp.Option{
-		piacp.WithLogger(integrationLogger), integrationContainmentOption(), integrationProcessIsolationOption(t),
-	}
 
 	serveErr := make(chan error, 1)
 	go func() {
@@ -382,6 +403,20 @@ func connectAgentForTest(
 		acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}, opts...)
 }
 
+func connectEmbeddedAgentForTest(
+	t *testing.T,
+	ctx context.Context,
+	client acp.Client,
+	opts ...piacp.Option,
+) *acp.ClientSideConnection {
+	t.Helper()
+
+	return initializeAgentPipesForTest(t, ctx, client,
+		acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber},
+		serveEmbeddedAgentRawForTest(t, ctx, opts...),
+	)
+}
+
 func connectAgentWithInitForTest(
 	t *testing.T,
 	ctx context.Context,
@@ -391,7 +426,17 @@ func connectAgentWithInitForTest(
 ) *acp.ClientSideConnection {
 	t.Helper()
 
-	pipes := serveAgentRawForTest(t, ctx, opts...)
+	return initializeAgentPipesForTest(t, ctx, client, init, serveAgentRawForTest(t, ctx, opts...))
+}
+
+func initializeAgentPipesForTest(
+	t *testing.T,
+	ctx context.Context,
+	client acp.Client,
+	init acp.InitializeRequest,
+	pipes agentPipes,
+) *acp.ClientSideConnection {
+	t.Helper()
 	conn := acp.NewClientSideConnection(client, pipes.clientInput, pipes.agentOutput)
 
 	_, err := conn.Initialize(ctx, init)

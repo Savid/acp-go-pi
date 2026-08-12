@@ -14,6 +14,9 @@ var bridgeExtensionSource []byte
 //go:embed ext/acp-mcp.ts
 var mcpExtensionSource []byte
 
+//go:embed ext/acp-path.ts
+var pathExtensionSource []byte
+
 var marshalMCPConfig = json.MarshalIndent
 
 const (
@@ -23,6 +26,8 @@ const (
 	// MCPExtensionFileName is the wrapper-owned MCP client extension written
 	// when the session declares MCP servers.
 	MCPExtensionFileName = "acp-mcp.ts"
+	// PathExtensionFileName is the wrapper-owned native-shell PATH extension.
+	PathExtensionFileName = "acp-path.ts"
 	// MCPConfigFileName is the per-session MCP server config consumed by the
 	// MCP extension.
 	MCPConfigFileName = "acp-mcp-config.json"
@@ -31,6 +36,9 @@ const (
 	EnvPermissionMode = "ACP_GO_PI_PERMISSION"
 	// EnvMCPConfig carries the MCP config path for one pi child.
 	EnvMCPConfig = "ACP_GO_PI_MCP_CONFIG"
+	// EnvExtraPathDirs carries the ordered native-shell PATH prefixes for one
+	// pi child, encoded with the platform path-list separator.
+	EnvExtraPathDirs = "ACP_GO_PI_EXTRA_PATH_DIRS"
 
 	// PermissionModeAsk raises a permission dialog for every tool call.
 	PermissionModeAsk = "ask"
@@ -203,7 +211,12 @@ func WriteExtensions(dir string, includeMCP bool) ([]string, error) {
 		return nil, fmt.Errorf("write bridge extension: %w", err)
 	}
 
-	paths := []string{bridgePath}
+	pathExtensionPath := filepath.Join(dir, PathExtensionFileName)
+	if err := fsWriteFile(pathExtensionPath, pathExtensionSource, 0o600); err != nil {
+		return nil, fmt.Errorf("write path extension: %w", err)
+	}
+
+	paths := []string{bridgePath, pathExtensionPath}
 
 	if includeMCP {
 		mcpPath := filepath.Join(dir, MCPExtensionFileName)

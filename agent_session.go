@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -672,9 +673,14 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		permission = pi.PermissionModeAsk
 	}
 
+	extraPathDirs := sessionExtraPathDirs(start.MetaOptions.ExtraPathDirs, a.options.ExtraPathDirs)
+
 	managedEnv := map[string]string{
 		pi.EnvPermissionMode: permission,
 		envAgentVersion:      a.options.AgentVersion,
+	}
+	if len(extraPathDirs) > 0 {
+		managedEnv[pi.EnvExtraPathDirs] = strings.Join(extraPathDirs, string(os.PathListSeparator))
 	}
 
 	if includeMCP {
@@ -742,7 +748,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		SkillPaths:          seededResources.Skills,
 		PromptTemplatePaths: seededResources.PromptTemplates,
 		Env:                 env,
-		ExtraPathDirs:       sessionExtraPathDirs(start.MetaOptions.ExtraPathDirs, a.options.ExtraPathDirs),
+		ExtraPathDirs:       extraPathDirs,
 		Cwd:                 start.Cwd,
 		BrowserShim:         browserShim,
 	}

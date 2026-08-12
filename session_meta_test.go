@@ -2,8 +2,10 @@ package piacp
 
 import (
 	"os"
+	"strings"
 	"testing"
 
+	"github.com/savid/acp-go-pi/internal/pi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -89,10 +91,11 @@ func TestEnvironmentValidation(t *testing.T) {
 	for _, name := range []string{"", "1A", "A-B", "A B", "é"} {
 		require.False(t, validEnvName(name))
 	}
-	for _, name := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "PATH", "Path", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_DARWIN_LAUNCH", "acp_go_pi_internal_turn_supervisor"} {
+	for _, name := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "PATH", "Path", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_DARWIN_LAUNCH", "acp_go_pi_internal_turn_supervisor", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
 		require.True(t, blockedEnvKey(name))
 	}
 	require.Error(t, validateEnvironment(map[string]string{"PATH": "/raw/bin"}, metaOptionPath(metaEnvKey)))
+	require.Error(t, validateEnvironment(map[string]string{pi.EnvExtraPathDirs: "/attacker/bin"}, metaOptionPath(metaEnvKey)))
 
 	originalPlatform := agentRuntimePlatform
 	agentRuntimePlatform = windowsPlatform

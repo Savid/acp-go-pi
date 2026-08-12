@@ -19,7 +19,10 @@ func TestWriteExtensions(t *testing.T) {
 
 		paths, err := WriteExtensions(dir, false)
 		require.NoError(t, err)
-		require.Equal(t, []string{filepath.Join(dir, BridgeExtensionFileName)}, paths)
+		require.Equal(t, []string{
+			filepath.Join(dir, BridgeExtensionFileName),
+			filepath.Join(dir, PathExtensionFileName),
+		}, paths)
 
 		bridge, err := os.ReadFile(paths[0]) // #nosec G304 -- test temp dir.
 		require.NoError(t, err)
@@ -33,6 +36,12 @@ func TestWriteExtensions(t *testing.T) {
 		require.Contains(t, string(bridge), `ctx.ui.select`)
 		require.Contains(t, string(bridge), `event.toolName === QUESTION_TOOL`)
 		require.Contains(t, string(bridge), `toolCallId: event.toolCallId`)
+		pathExtension, err := os.ReadFile(paths[1]) // #nosec G304 -- test temp dir.
+		require.NoError(t, err)
+		require.Equal(t, pathExtensionSource, pathExtension)
+		require.Contains(t, string(pathExtension), EnvExtraPathDirs)
+		require.Contains(t, string(pathExtension), `pi.on("user_bash"`)
+		require.Contains(t, string(pathExtension), "createBashTool")
 		require.NoFileExists(t, filepath.Join(dir, MCPExtensionFileName))
 	})
 
@@ -45,10 +54,11 @@ func TestWriteExtensions(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []string{
 			filepath.Join(dir, BridgeExtensionFileName),
+			filepath.Join(dir, PathExtensionFileName),
 			filepath.Join(dir, MCPExtensionFileName),
 		}, paths)
 
-		mcp, err := os.ReadFile(paths[1]) // #nosec G304 -- test temp dir.
+		mcp, err := os.ReadFile(paths[2]) // #nosec G304 -- test temp dir.
 		require.NoError(t, err)
 		require.Equal(t, mcpExtensionSource, mcp)
 		require.Contains(t, string(mcp), EnvMCPConfig)
@@ -63,6 +73,7 @@ func TestWriteExtensionsFaultInjection(t *testing.T) {
 		wantErr string
 	}{
 		{name: "bridge write failure", failOn: BridgeExtensionFileName, wantErr: "write bridge extension"},
+		{name: "path write failure", failOn: PathExtensionFileName, wantErr: "write path extension"},
 		{name: "mcp write failure", failOn: MCPExtensionFileName, wantErr: "write mcp extension"},
 	}
 

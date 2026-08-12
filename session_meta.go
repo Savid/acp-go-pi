@@ -404,7 +404,7 @@ func blockedEnvKey(key string) bool {
 	}
 
 	switch upper {
-	case envKeyNodeOptions, envKeyBashEnv, envKeyEnv, envKeyPath:
+	case envKeyNodeOptions, envKeyBashEnv, envKeyEnv, envKeyPath, pi.EnvExtraPathDirs:
 		return true
 	default:
 		return strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_")

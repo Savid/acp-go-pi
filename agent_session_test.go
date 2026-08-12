@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -227,7 +228,7 @@ func TestStartSessionEarlyFailureBranches(t *testing.T) {
 }
 
 func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
-	for _, key := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "PATH", "Path", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BAD-NAME"} {
+	for _, key := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "PATH", "Path", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BAD-NAME", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
 		t.Run(key, func(t *testing.T) {
 			client := newStubPiClient()
 			agent := newStubClientAgent(t, client, WithEnv(map[string]string{key: "unsafe"}))
@@ -246,6 +247,27 @@ func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
 			data, ok := requestError.Data.(map[string]any)
 			require.True(t, ok)
 			require.Equal(t, optionFieldEnv, data[jsonFieldField])
+			require.Zero(t, starts)
+		})
+	}
+}
+
+func TestStartSessionRejectsReservedSessionEnvironment(t *testing.T) {
+	for _, key := range []string{pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
+		t.Run(key, func(t *testing.T) {
+			client := newStubPiClient()
+			agent := newStubClientAgent(t, client)
+			starts := 0
+			agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+				starts++
+
+				return newStubProcess(false), client, nil
+			}
+
+			_, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd",
+				WithSessionPiOptions(NewPiOptions(WithPiEnv(map[string]string{key: "/attacker/bin"}))),
+			))
+			requireInvalidParams(t, err)
 			require.Zero(t, starts)
 		})
 	}
@@ -271,6 +293,10 @@ func TestStartSessionOrdersExtraPathDirs(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, session.Close(t.Context())) })
 
 	require.Equal(t, []string{"/session/bin", "/agent-wide/bin"}, launched.ExtraPathDirs)
+	require.Equal(t,
+		strings.Join(launched.ExtraPathDirs, string(os.PathListSeparator)),
+		launched.Env[pi.EnvExtraPathDirs],
+	)
 	require.NotContains(t, launched.Env, "PATH")
 }
 
@@ -317,9 +343,10 @@ func TestStartSessionLoadsExplicitSeedResourcesAndProviderEnv(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, session.Close(t.Context())) })
 
 	require.Equal(t, "explicit-key", launched.Env["OPENAI_API_KEY"])
-	require.Len(t, launched.ExtensionPaths, 2)
+	require.Len(t, launched.ExtensionPaths, 3)
 	require.Contains(t, filepath.ToSlash(launched.ExtensionPaths[0]), "/extensions/command.ts")
 	require.Equal(t, filepath.Join(launched.AgentDir, pi.BridgeExtensionFileName), launched.ExtensionPaths[1])
+	require.Equal(t, filepath.Join(launched.AgentDir, pi.PathExtensionFileName), launched.ExtensionPaths[2])
 	require.Equal(t, []string{filepath.Join(launched.AgentDir, "skills", "review", "SKILL.md")}, launched.SkillPaths)
 	require.Equal(t, []string{filepath.Join(launched.AgentDir, "prompts", "review.md")}, launched.PromptTemplatePaths)
 }
