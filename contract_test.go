@@ -394,6 +394,34 @@ func TestConformanceInitializeShapeAndEncoding(t *testing.T) {
 	}
 }
 
+func TestClientElicitationCapabilityGating(t *testing.T) {
+	t.Parallel()
+
+	var explicitNull acp.ElicitationCapabilities
+	require.NoError(t, json.Unmarshal([]byte(`{"form":null,"url":null}`), &explicitNull))
+
+	for _, test := range []struct {
+		name     string
+		caps     *acp.ElicitationCapabilities
+		wantForm bool
+	}{
+		{name: "nil or omitted top level", caps: nil, wantForm: false},
+		{name: "empty object", caps: &acp.ElicitationCapabilities{}, wantForm: false},
+		{name: "both modes explicit null", caps: &explicitNull, wantForm: false},
+		{name: "url only", caps: &acp.ElicitationCapabilities{Url: &acp.ElicitationUrlCapabilities{}}, wantForm: false},
+		{name: "form only", caps: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}, wantForm: true},
+		{name: "form and url", caps: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}, Url: &acp.ElicitationUrlCapabilities{}}, wantForm: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := NewAgent()
+			agent.clientCapabilities.Elicitation = test.caps
+			require.Equal(t, test.wantForm, agent.clientSupportsFormElicitation())
+		})
+	}
+}
+
 func TestConformanceTurnFailuresT1ThroughT6(t *testing.T) {
 	t.Run("T1 provider error", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -549,14 +577,11 @@ func TestConformancePermissionAndElicitationSeparation(t *testing.T) {
 		client.mu.Unlock()
 	})
 
-	t.Run("nil empty and url-only capabilities", func(t *testing.T) {
-		capabilities := []struct {
-			value   *acp.ElicitationCapabilities
-			accepts bool
-		}{
-			{value: nil},
-			{value: &acp.ElicitationCapabilities{}, accepts: true},
-			{value: &acp.ElicitationCapabilities{Url: &acp.ElicitationUrlCapabilities{}}},
+	t.Run("nil empty and url-only capabilities decline form", func(t *testing.T) {
+		capabilities := []*acp.ElicitationCapabilities{
+			nil,
+			{},
+			{Url: &acp.ElicitationUrlCapabilities{}},
 		}
 		for _, capability := range capabilities {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -565,18 +590,14 @@ func TestConformancePermissionAndElicitationSeparation(t *testing.T) {
 			scenario.ElicitTitle = "Question"
 			client := &conformanceClient{}
 			init := defaultInitializeRequest()
-			init.ClientCapabilities.Elicitation = capability.value
+			init.ClientCapabilities.Elicitation = capability
 			conn := connectConformanceAgent(t, ctx, client, init, scenario)
 			sessionID := newConformanceSession(t, ctx, conn)
 			response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "elicit"))
 			require.NoError(t, err)
 			require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
 			client.mu.Lock()
-			if capability.accepts {
-				require.Len(t, client.elicitations, 1)
-			} else {
-				require.Empty(t, client.elicitations)
-			}
+			require.Empty(t, client.elicitations)
 			client.mu.Unlock()
 			cancel()
 		}

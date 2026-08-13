@@ -12,15 +12,16 @@ extensions are never discovered.
 
 ## Capability gating
 
-Elicitation is only used when the client advertised elicitation support during
-ACP initialize. The adapter checks that capability before sending anything, so
-a client that never opted in is never handed an elicitation request it cannot
-render.
+Elicitation is only used when the client explicitly advertised a non-null
+`form` mode during ACP initialize. An omitted or `null` top-level elicitation
+capability and an empty `elicitation: {}` object advertise no modes. The adapter
+checks the form mode before sending anything, so a client that never opted in
+is never handed an elicitation request it cannot render.
 
 | Client elicitation capability | Adapter behavior |
 | --- | --- |
-| Advertised | The pi dialog is forwarded as an ACP elicitation request. |
-| Absent | No request is sent; the dialog is cancelled deterministically and the turn continues per pi's own logic. |
+| Non-null `form` mode | The pi dialog is forwarded as an ACP elicitation request. |
+| Omitted, `null`, empty, or URL-only | No request is sent; the dialog is cancelled deterministically and the turn continues per pi's own logic. |
 
 <Note>
 Elicitation is not the permission channel. The wrapper's non-side-effecting

@@ -107,6 +107,13 @@ func TestInitializeAdvertisesRouteV1(t *testing.T) {
 	resp, err := NewAgent().Initialize(context.Background(), acp.InitializeRequest{})
 	require.NoError(t, err)
 	require.Equal(t, map[string]any{"versions": []int{1}}, resp.AgentCapabilities.Meta[routeMetaKey])
+
+	piMeta, ok := resp.AgentCapabilities.Meta[piMetaKey].(map[string]any)
+	require.True(t, ok)
+	elicitation, ok := piMeta["elicitation"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, true, elicitation["unstable"])
+	require.Equal(t, "ACP v1 elicitation", elicitation["tracks"])
 }
 
 func TestPromptAndActiveCancelRequireCurrentRoute(t *testing.T) {

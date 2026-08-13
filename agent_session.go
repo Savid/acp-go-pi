@@ -507,8 +507,7 @@ func (a *Agent) clientSupportsFormElicitation() bool {
 		return false
 	}
 
-	// A present but empty elicitation object is equivalent to form support.
-	return caps.Form != nil || caps.Url == nil
+	return caps.Form != nil
 }
 
 func (a *Agent) isDeleted(sessionID acp.SessionId) bool {

@@ -418,7 +418,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 			"elicitation": map[string]any{
 				"unstable": true,
 				"scope":    elicitationScopeSession,
-				"tracks":   "in-progress ACP elicitation RFD",
+				"tracks":   "ACP v1 elicitation",
 			},
 			"rawEvent": map[string]any{
 				"method":         RawEventMethod,
