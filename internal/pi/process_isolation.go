@@ -136,21 +136,28 @@ func environmentEntries(environment map[string]string) []string {
 	return entries
 }
 
+// validateEnvironmentOverlays rejects overlay keys the composed child
+// environment must never carry. PATH is accepted: an overlay PATH is the
+// static base search path the wrapper resolves and launches against.
+func validateEnvironmentOverlays(overlays []map[string]string) error {
+	for _, overlay := range overlays {
+		for key := range overlay {
+			if !validEnvironmentName(key) || strings.HasPrefix(strings.ToUpper(key), privateEnvPrefix) {
+				return fmt.Errorf("process environment contains invalid key %q", key)
+			}
+		}
+	}
+
+	return nil
+}
+
 func isolationEnvironment(isolation *ProcessIsolation, overlays ...map[string]string) ([]string, error) {
 	if err := validateProcessIsolation(isolation); err != nil {
 		return nil, err
 	}
 
-	for _, overlay := range overlays {
-		for key := range overlay {
-			if !validEnvironmentName(key) || strings.HasPrefix(strings.ToUpper(key), privateEnvPrefix) {
-				return nil, fmt.Errorf("process environment contains invalid key %q", key)
-			}
-
-			if strings.EqualFold(key, envPath) {
-				return nil, errors.New("process environment PATH must use ExtraPathDirs")
-			}
-		}
+	if err := validateEnvironmentOverlays(overlays); err != nil {
+		return nil, err
 	}
 
 	phases := make([]map[string]string, 0, len(overlays)+1)
@@ -169,16 +176,8 @@ func ordinaryEnvironment(base map[string]string, overlays ...map[string]string) 
 		}
 	}
 
-	for _, overlay := range overlays {
-		for key := range overlay {
-			if !validEnvironmentName(key) || strings.HasPrefix(strings.ToUpper(key), privateEnvPrefix) {
-				return nil, fmt.Errorf("process environment contains invalid key %q", key)
-			}
-
-			if strings.EqualFold(key, envPath) {
-				return nil, errors.New("process environment PATH must use ExtraPathDirs")
-			}
-		}
+	if err := validateEnvironmentOverlays(overlays); err != nil {
+		return nil, err
 	}
 
 	phases := make([]map[string]string, 0, len(overlays)+1)

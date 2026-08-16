@@ -47,9 +47,9 @@ shape; use the `cause` to route the investigation:
 
 | Cause | First thing to check |
 | --- | --- |
-| `process_exit` | The `message` carries the real exit status and a stderr tail — inspect it; confirm the `pi` CLI is installed and is version 0.80.6+. |
+| `process_exit` | The `message` carries the real exit status and the stderr line naming the cause; the whole retained stderr tail is in the adapter log. Confirm the `pi` CLI is installed and is version 0.80.6+. |
 | `transport` | A stream broke mid-turn; check for client disconnects or a pi process killed out from under the adapter. |
-| `provider` | pi reported a provider error verbatim — a missing or refused key, quota, or an upstream failure; check deliberate credential injection or the `_pi/auth/inventory` residence proof (ambient shell keys are scrubbed). |
+| `provider` | pi reported a provider error — a missing or refused key, quota, or an upstream failure; check deliberate credential injection or the `_pi/auth/inventory` residence proof (ambient shell keys are scrubbed). |
 | `timeout` | A `WithTurnTimeout` deadline expired; raise the bound or investigate why the turn ran long. |
 
 <Note>
@@ -57,3 +57,13 @@ A user cancel that coincides with a `WithTurnTimeout` expiry resolves as a
 successful `cancelled` response, not a `timeout` failure. If you expect
 timeouts but see cancellations, the client is cancelling first.
 </Note>
+
+## Reading the adapter log
+
+The wire surfaces are closed, so the adapter log is where the reasons live.
+At error level the logger records the whole retained stderr tail and exit
+status behind every `process_exit`, the driving error behind every `transport`
+failure and session-start failure, the reason an agent option was refused
+(the client is told only which option), and any adapter fault answered as a
+bare `-32603`. Install a logger with `WithLogger`; the standalone binary
+writes to stderr.

@@ -88,7 +88,7 @@ diagnosis:
 
 | Observation | Conclusion |
 | --- | --- |
-| Session creation or the state probes fail | pi install or wiring problem — confirm `pi` is on `PATH` and is version 0.80.6 or newer, and inspect the `process_exit` stderr tail. |
+| Session creation or the state probes fail | pi install or wiring problem — confirm `pi` is on `PATH` and is version 0.80.6 or newer, and inspect the `process_exit` cause and the stderr tail in the adapter log. |
 | Session creation and probes succeed; prompts fail with cause `provider` | Credential problem — credentials were not injected for the session (ambient shell keys are scrubbed) or the provider refused them. |
 
 <Note>

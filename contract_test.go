@@ -715,6 +715,18 @@ func requireInvalidParams(t *testing.T, err error) {
 	require.Equal(t, -32602, requestError.Code)
 }
 
+// requireUnsupportedField asserts the family's uniform unsupported-field
+// rejection: -32602 whose data carries exactly the two contracted keys.
+func requireUnsupportedField(t *testing.T, err error, field string) {
+	t.Helper()
+
+	var requestError *acp.RequestError
+
+	require.ErrorAs(t, err, &requestError)
+	require.Equal(t, -32602, requestError.Code)
+	require.Equal(t, map[string]any{"error": "unsupported", "field": field}, requestError.Data)
+}
+
 func anyMap(t *testing.T, value any) map[string]any {
 	t.Helper()
 	nested, ok := value.(map[string]any)

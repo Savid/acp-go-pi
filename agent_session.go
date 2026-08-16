@@ -38,7 +38,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 
 	metaOptions, err := piOptionsFromMeta(params.Meta)
 	if err != nil {
-		return acp.NewSessionResponse{}, lifecycleMetaError(err)
+		return acp.NewSessionResponse{}, err
 	}
 
 	additionalDirectories := sessionAdditionalDirectories(params.AdditionalDirectories)
@@ -143,7 +143,7 @@ func (a *Agent) restoreSession(
 ) (*agentSession, []SessionStoreEntry, bool, error) {
 	metaOptions, err := piOptionsFromMeta(meta)
 	if err != nil {
-		return nil, nil, false, lifecycleMetaError(err)
+		return nil, nil, false, err
 	}
 
 	start.MetaOptions = metaOptions
@@ -689,7 +689,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		permission = pi.PermissionModeAsk
 	}
 
-	extraPathDirs := sessionExtraPathDirs(start.MetaOptions.ExtraPathDirs, a.options.ExtraPathDirs)
+	extraPathDirs := slices.Clone(start.MetaOptions.ExtraPathDirs)
 
 	managedEnv := map[string]string{
 		pi.EnvPermissionMode: permission,
@@ -786,7 +786,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	finishStart(err)
 
 	if err != nil {
-		return nil, err
+		return nil, a.nativeStartFailure(ctx, failureCauseProcessExit, err, nil)
 	}
 
 	session = &agentSession{
@@ -879,11 +879,11 @@ func (a *Agent) setUpNativeSession(
 				return emptyForkSessionError()
 			}
 
-			return spawnFailureError(err, proc)
+			return a.nativeStartFailure(ctx, failureCauseTransport, err, proc)
 		}
 
 		if cancelled {
-			return spawnFailureError(errors.New("pi cancelled the clone"), proc)
+			return a.nativeStartFailure(ctx, failureCauseTransport, errors.New("pi cancelled the clone"), proc)
 		}
 	}
 
@@ -891,16 +891,16 @@ func (a *Agent) setUpNativeSession(
 	// native failures surface once, immediately, with the real cause by
 	// default; opted-in sessions let pi absorb transient provider errors.
 	if err := client.SetAutoRetry(ctx, start.MetaOptions.AutoRetry); err != nil {
-		return spawnFailureError(err, proc)
+		return a.nativeStartFailure(ctx, failureCauseTransport, err, proc)
 	}
 
 	state, err := client.GetState(ctx)
 	if err != nil {
-		return spawnFailureError(err, proc)
+		return a.nativeStartFailure(ctx, failureCauseTransport, err, proc)
 	}
 
 	if start.ResumeID != "" && !start.ForkSession && state.SessionID != start.ResumeID {
-		return spawnFailureError(fmt.Errorf("native session id drift: expected %s, got %s", start.ResumeID, state.SessionID), proc)
+		return a.nativeStartFailure(ctx, failureCauseTransport, fmt.Errorf("native session id drift: expected %s, got %s", start.ResumeID, state.SessionID), proc)
 	}
 
 	session.id = acp.SessionId(state.SessionID)
@@ -923,7 +923,7 @@ func (a *Agent) setUpNativeSession(
 
 	if level := start.MetaOptions.ThinkingLevel; level != "" {
 		if levelErr := client.SetThinkingLevel(ctx, level); levelErr != nil {
-			return spawnFailureError(levelErr, proc)
+			return a.nativeStartFailure(ctx, failureCauseTransport, levelErr, proc)
 		}
 
 		session.mu.Lock()
@@ -936,13 +936,12 @@ func (a *Agent) setUpNativeSession(
 		if setErr != nil {
 			var commandErr *pi.CommandError
 			if errors.As(setErr, &commandErr) {
-				return acp.NewInvalidParams(map[string]any{
-					jsonFieldError: commandErr.Message,
-					jsonFieldField: metaOptionPath(metaModelKey),
-				})
+				a.log.ErrorContext(ctx, "pi rejected the configured model", slog.String("message", commandErr.Message))
+
+				return unsupportedField(metaOptionPath(metaModelKey))
 			}
 
-			return spawnFailureError(setErr, proc)
+			return a.nativeStartFailure(ctx, failureCauseTransport, setErr, proc)
 		}
 
 		session.mu.Lock()
@@ -953,12 +952,12 @@ func (a *Agent) setUpNativeSession(
 
 	models, err := client.GetAvailableModels(ctx)
 	if err != nil {
-		return spawnFailureError(err, proc)
+		return a.nativeStartFailure(ctx, failureCauseTransport, err, proc)
 	}
 
 	commands, err := client.GetCommands(ctx)
 	if err != nil {
-		return spawnFailureError(err, proc)
+		return a.nativeStartFailure(ctx, failureCauseTransport, err, proc)
 	}
 
 	session.mu.Lock()
@@ -1002,7 +1001,7 @@ func (a *Agent) resolveInitialModel(options PiOptions) (pi.ModelRef, bool, error
 
 	ref, err := pi.ParseModelRef(model)
 	if err != nil {
-		return pi.ModelRef{}, false, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+		return pi.ModelRef{}, false, unsupportedField(optionFieldDefaultModel)
 	}
 
 	return ref, true, nil
@@ -1177,11 +1176,11 @@ func (a *Agent) listStoreSessions(ctx context.Context, params acp.ListSessionsRe
 func paginateSessionInfos(sessions []acp.SessionInfo, cursor *string) ([]acp.SessionInfo, *string, error) {
 	offset, err := decodeListCursor(cursor)
 	if err != nil {
-		return nil, nil, acp.NewInvalidParams(map[string]any{"cursor": "invalid cursor"})
+		return nil, nil, acp.NewInvalidParams(map[string]any{jsonFieldCursor: "invalid cursor"})
 	}
 
 	if offset > len(sessions) {
-		return nil, nil, acp.NewInvalidParams(map[string]any{"cursor": "cursor is past end"})
+		return nil, nil, acp.NewInvalidParams(map[string]any{jsonFieldCursor: "cursor is past end"})
 	}
 
 	end := offset + listSessionsPageSize

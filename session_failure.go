@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -12,10 +13,11 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
-// Native turn failures share one uniform wire shape so hosts can classify a
-// failed turn without vendor-specific parsing. A native turn failure
-// terminates session/prompt with a JSON-RPC error and no PromptResponse; it
-// is never reported as a stop reason.
+// Native failures share one uniform wire shape so hosts can classify them
+// without vendor-specific parsing. A native turn failure terminates
+// session/prompt with a JSON-RPC error and no PromptResponse; it is never
+// reported as a stop reason. A native session-start failure carries the same
+// shape, because it has the same causes and the same recovery.
 const (
 	turnFailedError = "pi_turn_failed"
 
@@ -25,16 +27,33 @@ const (
 	failureCauseTransport   = "transport"
 	failureCauseProvider    = "provider"
 	failureCauseTimeout     = "timeout"
+
+	// nativeCauseMaxBytes bounds the native cause text the client is told. The
+	// uniform shape carries the cause, not a transcript: a dying pi can print
+	// anything at all to stderr, and the whole retained tail belongs in the
+	// adapter log where the operator reads it, not on the wire.
+	nativeCauseMaxBytes = 2048
 )
 
 // turnFailureError builds the uniform -32603 pi_turn_failed error with the
-// given machine-readable cause and the real native cause text.
+// given machine-readable cause and the real native cause text, bounded.
 func turnFailureError(cause string, message string) *acp.RequestError {
 	return acp.NewInternalError(map[string]any{
 		jsonFieldError:    turnFailedError,
 		failureFieldCause: cause,
-		jsonFieldMessage:  message,
+		jsonFieldMessage:  boundNativeCause(message),
 	})
+}
+
+// boundNativeCause is the single gate every native cause text passes through
+// before it reaches a client.
+func boundNativeCause(message string) string {
+	bounded := strings.TrimSpace(message)
+	if len(bounded) > nativeCauseMaxBytes {
+		bounded = strings.ToValidUTF8(bounded[:nativeCauseMaxBytes], "")
+	}
+
+	return bounded
 }
 
 // processExitClassifyGrace bounds how long failure classification waits for
@@ -46,12 +65,12 @@ var processExitClassifyGrace = 2 * time.Second
 // nativeTurnFailure classifies an error observed while driving a pi turn into
 // the uniform failure shape. A native command rejection (pi answered
 // success:false with a reason, for example a missing provider API key) maps
-// to provider with the native text verbatim — an answered command proves the
-// process was alive, so it skips the exit-classification grace. A dead child
-// maps to process_exit with the real exit status and stderr tail; everything
-// else (stream close, write failure) maps to transport. It never surfaces a
-// fixed placeholder or a bare EOF.
-func (s *agentSession) nativeTurnFailure(err error) error {
+// to provider with the native text — an answered command proves the process
+// was alive, so it skips the exit-classification grace. A dead child maps to
+// process_exit with the recovered exit cause; everything else (stream close,
+// write failure) maps to transport. It never surfaces a fixed placeholder or
+// a bare EOF.
+func (s *agentSession) nativeTurnFailure(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -61,18 +80,19 @@ func (s *agentSession) nativeTurnFailure(err error) error {
 		return turnFailureError(failureCauseProvider, commandErr.Message)
 	}
 
-	if exitMessage, exited := s.processExitMessage(); exited {
+	if exitMessage, exited := s.processExitCause(ctx, "pi process exited"); exited {
 		return turnFailureError(failureCauseProcessExit, exitMessage)
 	}
+
+	s.agent.log.ErrorContext(ctx, "pi turn transport failed", slog.Any("error", err))
 
 	return turnFailureError(failureCauseTransport, err.Error())
 }
 
-// processExitMessage recovers the real native cause of a dead pi child: the
-// exit status plus the retained stderr tail. It waits up to the classify
-// grace for the exit to be reaped, so a death whose stream EOF arrives first
-// still classifies as process_exit.
-func (s *agentSession) processExitMessage() (string, bool) {
+// processExitCause recovers the real native cause of a dead pi child. It waits
+// up to the classify grace for the exit to be reaped, so a death whose stream
+// EOF arrives first still classifies as process_exit.
+func (s *agentSession) processExitCause(ctx context.Context, subject string) (string, bool) {
 	proc := s.process()
 	if proc == nil {
 		return "", false
@@ -84,16 +104,44 @@ func (s *agentSession) processExitMessage() (string, bool) {
 		return "", false
 	}
 
-	message := "pi process exited"
-	if waitErr := proc.WaitErr(); waitErr != nil {
-		message = fmt.Sprintf("pi process exited: %v", waitErr)
+	return nativeExitCause(ctx, s.agent.log, subject, proc), true
+}
+
+// nativeExitCause composes the exit status with the line of the retained
+// stderr tail that names the cause, and logs the whole tail behind it. The
+// tail is an unbounded native transcript: the operator gets all of it, the
+// client gets the cause.
+func nativeExitCause(ctx context.Context, log *slog.Logger, subject string, proc piProcess) string {
+	message := subject
+
+	waitErr := proc.WaitErr()
+	if waitErr != nil {
+		message = fmt.Sprintf("%s: %v", subject, waitErr)
 	}
 
-	if tail := strings.TrimSpace(proc.StderrTail()); tail != "" {
-		message += ": " + tail
+	tail := strings.TrimSpace(proc.StderrTail())
+	log.ErrorContext(ctx, "pi native process exited",
+		slog.String("stage", subject),
+		slog.Any("wait_error", waitErr),
+		slog.String("stderr_tail", tail),
+	)
+
+	if cause := nativeCauseLine(tail); cause != "" {
+		message += ": " + cause
 	}
 
-	return message, true
+	return message
+}
+
+// nativeCauseLine is the line of a captured stderr tail that names the cause:
+// a dying harness prints its fatal reason last, and everything ahead of it is
+// transcript the client has no contract to receive.
+func nativeCauseLine(tail string) string {
+	if index := strings.LastIndexByte(tail, '\n'); index >= 0 {
+		return strings.TrimSpace(tail[index+1:])
+	}
+
+	return tail
 }
 
 func (s *agentSession) process() piProcess {
@@ -120,36 +168,29 @@ func providerTurnFailure(state *promptTurnState) error {
 	return turnFailureError(failureCauseProvider, message)
 }
 
-// spawnFailureError maps a pi process that died during session start (for
-// example an MCP server connect failure, which makes pi exit at startup) into
-// a structured session-start error naming the real native cause.
-func spawnFailureError(err error, proc piProcess) error {
-	message := err.Error()
-
+// nativeStartFailure maps a failed native session start onto the same uniform
+// shape a failed turn uses: the causes are the same, and a host that can
+// classify one can classify the other. A pi that already exited — an MCP
+// server that failed to connect makes pi exit at startup — carries the
+// recovered exit cause; otherwise the stage's own cause stands. Native
+// evidence goes to the adapter log; the client receives the bounded cause.
+func (a *Agent) nativeStartFailure(ctx context.Context, cause string, err error, proc piProcess) error {
 	if proc != nil {
 		select {
 		case <-proc.Exited():
-			message = "pi exited during session start"
-			if waitErr := proc.WaitErr(); waitErr != nil {
-				message = fmt.Sprintf("pi exited during session start: %v", waitErr)
-			}
+			exit := turnFailureError(failureCauseProcessExit, nativeExitCause(ctx, a.log, "pi exited during session start", proc))
 
-			if tail := strings.TrimSpace(proc.StderrTail()); tail != "" {
-				message += ": " + tail
-			}
+			return errors.Join(exit, err)
 		default:
 		}
 	}
 
-	requestErr := acp.NewInternalError(map[string]any{
-		jsonFieldError:   "pi_session_start_failed",
-		jsonFieldMessage: message,
-	})
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return errors.Join(requestErr, err)
-	}
+	a.log.ErrorContext(ctx, "pi session start failed", slog.String(failureFieldCause, cause), slog.Any("error", err))
 
-	return requestErr
+	// The driving error is joined rather than discarded: the wire answer is
+	// the RequestError the mapper produces, while adapter-internal callers
+	// still match containment and cancellation identity on the same value.
+	return errors.Join(turnFailureError(cause, err.Error()), err)
 }
 
 // emptyCloneError reports whether a native command failure names a missing

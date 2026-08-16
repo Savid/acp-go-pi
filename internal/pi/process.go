@@ -189,7 +189,9 @@ func prependPathDirs(search string, dirs []string) string {
 
 // safeExplicitEnvKey is defense in depth for internal LaunchSpec callers.
 // Public options reject these keys before launch; this boundary also drops
-// malformed names, raw PATH, and loader, shell, and Node injection vectors.
+// malformed names and loader, shell, and Node injection vectors. PATH is
+// carried through: it is the static base search path spec.ExtraPathDirs are
+// placed ahead of.
 func safeExplicitEnvKey(key string) bool {
 	if key == "" {
 		return false
@@ -205,7 +207,7 @@ func safeExplicitEnvKey(key string) bool {
 	}
 
 	upper := strings.ToUpper(key)
-	if upper == envPath || upper == envNodeOptions || upper == envBashEnv || upper == envShellEnv {
+	if upper == envNodeOptions || upper == envBashEnv || upper == envShellEnv {
 		return false
 	}
 

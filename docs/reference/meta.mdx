@@ -137,8 +137,8 @@ Session-lifecycle requests accept options and the raw-event opt-in:
 | Key | Meaning |
 | --- | --- |
 | `model` | Session model as `"provider/id"`; catalog-validated. |
-| `env` | Extra environment variables for this session's pi process. Raw `PATH` is rejected; use `extraPathDirs`. |
-| `extraPathDirs` | Absolute directories prepended, in order, to this session's child `PATH`, ahead of the directories `WithExtraPathDirs` supplies and everything inherited. This launch-only field does not select the pi executable. Each entry must be absolute and free of the platform list separator. |
+| `env` | Extra environment variables for this session's pi process. `PATH` is rejected: `extraPathDirs` is the only session `PATH` authority. |
+| `extraPathDirs` | Absolute directories prepended, in the order given, to this session's child `PATH`, ahead of the static base `PATH` from `WithEnv` and everything inherited. Order and duplicates are preserved. This launch-only field does not select the pi executable. Each entry must be absolute and free of the platform list separator. |
 | `thinkingLevel` | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; adapter-validated. |
 | `permission` | Permission mode: `ask` (default) or `allow`. |
 | `autoRetry` | Opt in to pi's native automatic retry of transient provider errors (5xx, timeouts). Default `false`: a native failure surfaces once, immediately, with the real cause. |

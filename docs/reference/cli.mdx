@@ -72,7 +72,7 @@ home for native tools.
 
 | Flag | Purpose |
 | --- | --- |
-| `-path` | pi CLI executable (default: search the captured ordinary `PATH`). Embedded and per-session extra path directories affect the launched child's `PATH`, not this lookup. |
+| `-path` | pi CLI executable (default: search the captured ordinary `PATH`, or a static base `PATH` an embedding host set through `WithEnv`). Per-session extra path directories affect the launched child's `PATH`, not this lookup. |
 | `-home` | Durable per-instance `PI_CODING_AGENT_DIR`. Empty gives sessions ephemeral agent directories. Required when `-provider-auth-root` is supplied. |
 | `-process-isolation-config` | Optional absolute path to the strict standalone Linux isolation policy described above. A supplied invalid policy fails before serving. |
 | `-scratch-dir` | Parent directory for all ephemeral scratch (isolated per-session agent and session directories, hydration temp files, and the version probe's isolated `PI_CODING_AGENT_DIR`/settings residence). Empty means the system temp directory. |

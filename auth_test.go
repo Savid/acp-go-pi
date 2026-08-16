@@ -1,10 +1,12 @@
 package piacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -320,13 +322,15 @@ func TestRequestedProviderAuthResidenceFailsInitializationWhenIncompleteOrUnusab
 		{name: "ledger is a file", options: []Option{WithHome(t.TempDir()), WithProviderAuthRoot(rootFile)}, want: "prepare provider auth ledger"},
 		{name: "explicit isolation", options: []Option{testProcessIsolationOption(), WithHome(t.TempDir()), WithProviderAuthRoot(t.TempDir())}, want: "prepare provider auth home"},
 	} {
-		agent := NewAgent(test.options...)
+		var logs bytes.Buffer
+
+		agent := NewAgent(append([]Option{WithLogger(slog.New(slog.NewTextHandler(&logs, nil)))}, test.options...)...)
 		t.Cleanup(func() { require.NoError(t, agent.Close()) })
 
 		_, err := agent.Initialize(t.Context(), defaultInitializeRequest())
-		requireInvalidParams(t, err)
-		require.ErrorContains(t, err, test.want, test.name)
-		require.ErrorContains(t, agent.sessionStartConfigurationError(), test.want, test.name)
+		requireUnsupportedField(t, err, optionFieldProviderAuthRoot)
+		requireUnsupportedField(t, agent.sessionStartConfigurationError(), optionFieldProviderAuthRoot)
+		require.Contains(t, logs.String(), test.want, test.name)
 		require.Nil(t, agent.providerAuth)
 	}
 }

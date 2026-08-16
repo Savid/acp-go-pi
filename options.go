@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"os"
-	"slices"
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
@@ -44,9 +43,14 @@ const (
 	RuntimeResourceDiscovery RuntimeResourceKind = "discovery"
 )
 
+// RuntimeProcessKind identifies a class of sibling-owned process a host may
+// account for. Pi holds no cross-process native home lock, so it never reports
+// RuntimeProcessHomeLockSupervisor; only provider-descendant snapshots are
+// emitted, and only where the containment boundary can prove the inventory.
 type RuntimeProcessKind string
 
 const (
+	RuntimeProcessHomeLockSupervisor RuntimeProcessKind = "home_lock_supervisor"
 	RuntimeProcessProviderDescendant RuntimeProcessKind = "provider_descendant"
 )
 
@@ -73,7 +77,11 @@ const (
 	RuntimeContainmentUnavailable    RuntimeContainmentMode = "unavailable"
 )
 
-// RuntimeResourceHooks lets an embedding host enforce native-root and scratch-root limits.
+// RuntimeResourceHooks lets an embedding host enforce native-root and
+// scratch-root limits. ObserveStartupStage receives the stage result as a Go
+// error because the host is the trusted in-process embedder that already owns
+// this adapter's process; it is not the ACP client, which only ever sees the
+// closed contracted error shapes.
 type RuntimeResourceHooks struct {
 	AcquireNativeRoot      func(context.Context, RuntimeResourceKind) (func(), error)
 	ReserveScratchRoot     func(context.Context, RuntimeResourceKind) (func(), error)
@@ -113,15 +121,13 @@ type Options struct {
 	// DefaultModel selects the model for newly created pi sessions when
 	// non-empty, as "provider/id" (for example "openai/gpt-4o").
 	DefaultModel string
-	// Env is added to every launched pi process environment. pi children run
-	// with a scrubbed environment, so provider API keys must travel here (or
-	// per session) rather than relying on ambient variables. Process-loader,
-	// shell-loader, PATH, and Node loader keys are rejected at session start.
+	// Env is the static agent-scoped addition to every launched pi process
+	// environment. pi children run with a scrubbed environment, so provider API
+	// keys must travel here (or per session) rather than relying on ambient
+	// variables. PATH here is the static native base search path every session
+	// resolves against. Process-loader, shell-loader, and Node loader keys are
+	// rejected at session start.
 	Env map[string]string
-	// ExtraPathDirs are absolute directories prepended, in order, to the PATH
-	// of every launched pi process. Per-session directories from
-	// _meta.pi.options.extraPathDirs are prepended ahead of these.
-	ExtraPathDirs []string
 
 	// Logger receives structured diagnostic logs. If nil, the default logger is used.
 	Logger *slog.Logger
@@ -311,24 +317,16 @@ func WithDefaultModel(model string) Option {
 	}
 }
 
-// WithEnv adds environment variables to every launched pi process. pi children
-// run with a scrubbed environment, so provider API keys must travel here.
+// WithEnv sets the static agent-scoped environment every launched pi process
+// runs with. pi children run with a scrubbed environment, so provider API keys
+// must travel here. A PATH entry here is the static native base search path
+// used for executable lookup, version probing, and native launch; per-session
+// directories from WithPiExtraPathDirs are prepended ahead of it.
 // NODE_OPTIONS, BASH_ENV, ENV, LD_*, DYLD_*, and invalid names are rejected at
-// session start. PATH is owned by WithExtraPathDirs and is rejected here.
+// session start.
 func WithEnv(env map[string]string) Option {
 	return func(options *Options) {
 		options.Env = cloneStringMap(env)
-	}
-}
-
-// WithExtraPathDirs prepends absolute directories, in the order given, to the
-// PATH of every launched pi process. It does not select the pi executable;
-// use WithExecutablePath for that. Every directory must be absolute and free
-// of the platform list separator. Per-session directories are prepended ahead
-// of these.
-func WithExtraPathDirs(dirs ...string) Option {
-	return func(options *Options) {
-		options.ExtraPathDirs = slices.Clone(dirs)
 	}
 }
 

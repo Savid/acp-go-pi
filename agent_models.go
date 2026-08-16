@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -22,12 +23,9 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	case params.ValueId != nil:
 		return a.setSessionConfigValue(ctx, params.ValueId)
 	case params.Boolean != nil:
-		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{
-			jsonFieldError: validationUnsupported,
-			jsonFieldField: "boolean",
-		})
+		return acp.SetSessionConfigOptionResponse{}, unsupportedField("boolean")
 	default:
-		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{acpFieldConfig: validationRequired})
+		return acp.SetSessionConfigOptionResponse{}, unsupportedField(acpFieldConfig)
 	}
 }
 
@@ -47,7 +45,7 @@ func (a *Agent) setSessionConfigValue(
 	switch params.ConfigId {
 	case configModel, configThoughtLevel:
 	default:
-		return acp.SetSessionConfigOptionResponse{}, acp.NewInvalidParams(map[string]any{acpFieldConfig: "unsupported option"})
+		return acp.SetSessionConfigOptionResponse{}, unsupportedField(acpFieldConfigID)
 	}
 
 	releaseTurn, err := session.acquireTurn(ctx)
@@ -84,14 +82,16 @@ func (a *Agent) setSessionConfigValue(
 func (s *agentSession) applyModelSelection(ctx context.Context, value string) error {
 	ref, err := pi.ParseModelRef(value)
 	if err != nil {
-		return acp.NewInvalidParams(map[string]any{acpFieldValue: err.Error()})
+		return unsupportedField(acpFieldValue)
 	}
 
 	selected, err := s.currentClient().SetModel(ctx, ref.Provider, ref.ID)
 	if err != nil {
 		var commandErr *pi.CommandError
 		if errors.As(err, &commandErr) {
-			return acp.NewInvalidParams(map[string]any{acpFieldValue: commandErr.Message})
+			s.agent.log.ErrorContext(ctx, "pi rejected the selected model", slog.String("message", commandErr.Message))
+
+			return unsupportedField(acpFieldValue)
 		}
 
 		return err
@@ -109,7 +109,7 @@ func (s *agentSession) applyThinkingLevelSelection(ctx context.Context, value st
 	// pi accepts invalid levels with success and silently coerces them, so
 	// the wrapper validates the enum itself.
 	if !pi.IsValidThinkingLevel(value) {
-		return acp.NewInvalidParams(map[string]any{acpFieldValue: "unsupported thought level: " + value})
+		return unsupportedField(acpFieldValue)
 	}
 
 	if err := s.currentClient().SetThinkingLevel(ctx, value); err != nil {

@@ -277,7 +277,7 @@ func TestStartSessionEarlyFailureBranches(t *testing.T) {
 }
 
 func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
-	for _, key := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "PATH", "Path", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BAD-NAME", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
+	for _, key := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BAD-NAME", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
 		t.Run(key, func(t *testing.T) {
 			client := newStubPiClient()
 			agent := newStubClientAgent(t, client, WithEnv(map[string]string{key: "unsafe"}))
@@ -289,14 +289,34 @@ func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
 			}
 
 			_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-			requireInvalidParams(t, err)
-
-			var requestError *acp.RequestError
-			require.ErrorAs(t, err, &requestError)
-			data, ok := requestError.Data.(map[string]any)
-			require.True(t, ok)
-			require.Equal(t, optionFieldEnv, data[jsonFieldField])
+			requireUnsupportedField(t, err, optionFieldEnv+"."+key)
 			require.Zero(t, starts)
+		})
+	}
+}
+
+// A static base PATH is the one thing the agent-scoped environment owns that
+// the session-scoped one does not, so it must reach the launch instead of
+// failing session start.
+func TestStartSessionAcceptsAgentScopedBasePath(t *testing.T) {
+	for _, key := range []string{"PATH", "Path"} {
+		t.Run(key, func(t *testing.T) {
+			client := newStubPiClient()
+			client.state = pi.SessionState{SessionID: "id"}
+			agent := newStubClientAgent(t, client, WithEnv(map[string]string{key: "/base/bin"}))
+
+			var launched pi.LaunchSpec
+
+			agent.startPiProcess = func(_ context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
+				launched = spec
+
+				return newStubProcess(false), client, nil
+			}
+
+			session, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, session.Close(t.Context())) })
+			require.Equal(t, "/base/bin", launched.Env[key])
 		})
 	}
 }
@@ -322,10 +342,13 @@ func TestStartSessionRejectsReservedSessionEnvironment(t *testing.T) {
 	}
 }
 
-func TestStartSessionOrdersExtraPathDirs(t *testing.T) {
+// The session-scoped list is the only PATH prefix authority: it reaches the
+// launch verbatim, and the agent-scoped WithEnv PATH is the static base behind
+// it rather than a second ordered list merged into it.
+func TestStartSessionCarriesOnlySessionExtraPathDirs(t *testing.T) {
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "id"}
-	agent := newStubClientAgent(t, client, WithExtraPathDirs("/agent-wide/bin"))
+	agent := newStubClientAgent(t, client, WithEnv(map[string]string{"PATH": "/base/bin"}))
 
 	var launched pi.LaunchSpec
 	agent.startPiProcess = func(_ context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
@@ -336,36 +359,31 @@ func TestStartSessionOrdersExtraPathDirs(t *testing.T) {
 
 	session, err := agent.startSession(t.Context(), sessionStart{
 		Cwd:         "/cwd",
-		MetaOptions: PiOptions{ExtraPathDirs: []string{"/session/bin"}},
+		MetaOptions: PiOptions{ExtraPathDirs: []string{"/session/bin", "/session/bin"}},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, session.Close(t.Context())) })
 
-	require.Equal(t, []string{"/session/bin", "/agent-wide/bin"}, launched.ExtraPathDirs)
+	require.Equal(t, []string{"/session/bin", "/session/bin"}, launched.ExtraPathDirs)
 	require.Equal(t,
 		strings.Join(launched.ExtraPathDirs, string(os.PathListSeparator)),
 		launched.Env[pi.EnvExtraPathDirs],
 	)
-	require.NotContains(t, launched.Env, "PATH")
+	require.Equal(t, "/base/bin", launched.Env["PATH"])
+	require.Contains(t,
+		launchedEnvironValue(launched, "PATH"),
+		"/session/bin"+string(os.PathListSeparator)+"/session/bin"+string(os.PathListSeparator)+"/base/bin",
+	)
 }
 
-func TestStartSessionRejectsUnusableGlobalExtraPathDir(t *testing.T) {
-	for _, dir := range []string{"relative/bin", "", "/opt/bin" + string(os.PathListSeparator) + "/srv/bin"} {
-		t.Run(dir, func(t *testing.T) {
-			client := newStubPiClient()
-			agent := newStubClientAgent(t, client, WithExtraPathDirs(dir))
-			starts := 0
-			agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
-				starts++
-
-				return newStubProcess(false), client, nil
-			}
-
-			_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-			requireInvalidParams(t, err)
-			require.Zero(t, starts)
-		})
+func launchedEnvironValue(spec pi.LaunchSpec, key string) string {
+	for _, entry := range spec.Environ() {
+		if name, value, ok := strings.Cut(entry, "="); ok && name == key {
+			return value
+		}
 	}
+
+	return ""
 }
 
 func TestStartSessionLoadsExplicitSeedResourcesAndProviderEnv(t *testing.T) {

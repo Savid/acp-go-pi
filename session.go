@@ -10,6 +10,7 @@ import (
 )
 
 const (
+	jsonFieldCursor  = "cursor"
 	jsonFieldCwd     = "cwd"
 	jsonFieldError   = "error"
 	jsonFieldField   = "field"
@@ -17,15 +18,22 @@ const (
 	jsonFieldMessage = "message"
 	jsonFieldMethod  = "method"
 	jsonFieldMode    = "mode"
+	jsonFieldParams  = "params"
 	jsonFieldServer  = "server"
 	jsonFieldURL     = "url"
 
 	acpFieldConfig    = "config"
+	acpFieldConfigID  = "configId"
 	acpFieldSessionID = "sessionId"
 	acpFieldValue     = "value"
 
-	optionFieldEnv           = "env"
-	optionFieldExtraPathDirs = "extraPathDirs"
+	optionFieldConcurrencyLimits = "concurrencyLimits"
+	optionFieldContainment       = "containment"
+	optionFieldDefaultModel      = "defaultModel"
+	optionFieldEnv               = "env"
+	optionFieldImageLimits       = "imageLimits"
+	optionFieldInputHandoffRoot  = "inputHandoffRoot"
+	optionFieldProviderAuthRoot  = "providerAuthRoot"
 
 	validationRequired    = "required"
 	validationUnsupported = "unsupported"

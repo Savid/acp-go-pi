@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 
 	"github.com/coder/acp-go-sdk"
 )
@@ -62,28 +63,31 @@ func scopedElicitationParams(
 	return json.Marshal(payload)
 }
 
-func requestError(err error) *acp.RequestError {
+// requestError maps a handler error onto the wire. An honored $/cancel_request
+// is the only thing that cancels a request context with cause
+// context.Canceled: connection teardown cancels the parent with the transport
+// error, and an adapter deadline yields context.DeadlineExceeded. So that
+// cause — not errors.Is on the returned error — is what identifies a cancel,
+// and it is answered before any embedded RequestError, because a cancelled
+// request must not serialize as whatever error it happened to be carrying.
+// Everything else that is not already a contracted error is an adapter fault:
+// the client gets the closed internal error and the operator gets the detail
+// in the log.
+func requestError(ctx context.Context, log *slog.Logger, err error) *acp.RequestError {
 	if err == nil {
 		return nil
 	}
 
+	if context.Cause(ctx) == context.Canceled {
+		return acp.NewRequestCancelled(nil)
+	}
+
 	var reqErr *acp.RequestError
 	if errors.As(err, &reqErr) {
 		return reqErr
 	}
 
-	if errors.Is(err, context.Canceled) {
-		return acp.NewRequestCancelled(map[string]any{jsonFieldError: err.Error()})
-	}
+	log.ErrorContext(ctx, "acp request failed", slog.Any("error", err))
 
-	return acp.NewInternalError(map[string]any{jsonFieldError: err.Error()})
-}
-
-func lifecycleMetaError(err error) error {
-	var reqErr *acp.RequestError
-	if errors.As(err, &reqErr) {
-		return reqErr
-	}
-
-	return acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+	return acp.NewInternalError(nil)
 }

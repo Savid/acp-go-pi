@@ -18,11 +18,20 @@ const extraPathDirs = (process.env.ACP_GO_PI_EXTRA_PATH_DIRS ?? "")
 	.split(delimiter)
 	.filter(Boolean);
 
+// Windows path comparison is case-insensitive, so C:\Tools and c:\tools name
+// one directory there and must dedupe against the inherited tail; every other
+// platform compares byte-exact. Only the identity key is folded — the adapter's
+// own ordered list keeps the caller's exact spelling, order, and duplicates.
+const identityKey =
+	process.platform === "win32"
+		? (entry: string) => entry.toLowerCase()
+		: (entry: string) => entry;
+
 function withExtraPathDirs(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-	const owned = new Set(extraPathDirs);
+	const owned = new Set(extraPathDirs.map(identityKey));
 	const inherited = (env.PATH ?? "")
 		.split(delimiter)
-		.filter((entry) => entry && !owned.has(entry));
+		.filter((entry) => entry && !owned.has(identityKey(entry)));
 
 	return { ...env, PATH: [...extraPathDirs, ...inherited].join(delimiter) };
 }

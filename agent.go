@@ -89,8 +89,7 @@ type Agent struct {
 	clientCalls          chan struct{}
 	clientCapabilities   acp.ClientCapabilities
 	positionEncoding     acp.PositionEncodingKind
-	activeLimitErr       error
-	environmentErr       error
+	optionErr            error
 	processes            *providerProcessTracker
 	nativeContainmentErr error
 	constructions        sync.WaitGroup
@@ -144,13 +143,13 @@ func NewAgent(opts ...Option) *Agent {
 		store:               NewInMemorySessionStore(),
 		deleted:             make(map[acp.SessionId]struct{}),
 		positionEncoding:    acp.PositionEncodingKindUtf16,
-		activeLimitErr: errors.Join(
-			validateConcurrencyLimits(options.ConcurrencyLimits),
-			validateContainmentOption(options),
-			validateImageLimits(options.ImageLimits),
-			validateInputHandoffRoot(options.InputHandoffRoot),
+		optionErr: errors.Join(
+			optionFailure(log, optionFieldEnv, validateEnvironment(options.Env, optionFieldEnv, blockedAgentEnvKey)),
+			optionFailure(log, optionFieldConcurrencyLimits, validateConcurrencyLimits(options.ConcurrencyLimits)),
+			optionFailure(log, optionFieldContainment, validateContainmentOption(options)),
+			optionFailure(log, optionFieldImageLimits, validateImageLimits(options.ImageLimits)),
+			optionFailure(log, optionFieldInputHandoffRoot, validateInputHandoffRoot(options.InputHandoffRoot)),
 		),
-		environmentErr: validateEnvironment(options.Env, optionFieldEnv),
 		startPiProcess: startRealPiProcess,
 		probeVersion:   pi.ProbeVersion,
 		lookPath: func(file string) (string, error) {
@@ -159,9 +158,10 @@ func NewAgent(opts ...Option) *Agent {
 	}
 	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
 
-	providerAuthErr := configureProviderAuth(agent)
-
-	agent.activeLimitErr = errors.Join(agent.activeLimitErr, providerAuthErr)
+	agent.optionErr = errors.Join(
+		agent.optionErr,
+		optionFailure(log, optionFieldProviderAuthRoot, configureProviderAuth(agent)),
+	)
 
 	observeRuntimeContainment(context.Background(), options.RuntimeResourceHooks, mode)
 
@@ -374,18 +374,31 @@ func (a *Agent) setConnection(conn agentClient) {
 // session and prompt without ever calling initialize, and options that never
 // validated must not reach a native process.
 func (a *Agent) optionsError() error {
-	if a.environmentErr != nil {
-		return acp.NewInvalidParams(map[string]any{
-			jsonFieldError: a.environmentErr.Error(),
-			jsonFieldField: optionFieldEnv,
-		})
-	}
-
-	if a.activeLimitErr == nil {
+	var reqErr *acp.RequestError
+	if !errors.As(a.optionErr, &reqErr) {
 		return nil
 	}
 
-	return acp.NewInvalidParams(map[string]any{jsonFieldError: a.activeLimitErr.Error()})
+	return reqErr
+}
+
+// optionFailure answers a construction-time option verdict as the uniform
+// two-key unsupported error naming the option. Which option the agent refuses
+// to serve under is the client's business; why it refused is the operator's,
+// so the reason goes to the log and never onto the wire.
+func optionFailure(log *slog.Logger, field string, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	log.ErrorContext(context.Background(), "pi agent option rejected", slog.String(jsonFieldField, field), slog.Any("error", err))
+
+	var reqErr *acp.RequestError
+	if errors.As(err, &reqErr) {
+		return reqErr
+	}
+
+	return unsupportedField(field)
 }
 
 // Initialize implements ACP initialize.
@@ -551,12 +564,15 @@ func (a *Agent) ensureVersion(ctx context.Context) error {
 	err = generation.finalize(err)
 	releaseNativeRootWhenComplete(nativeRelease, err)
 
+	// The probe is a native process launch, so a probe that would not run, died,
+	// or reported an unsupported version is the readiness stage of a native
+	// start and carries the uniform failure shape.
 	if err != nil {
-		return err
+		return a.nativeStartFailure(ctx, failureCauseProcessExit, err, nil)
 	}
 
 	if err := pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion); err != nil {
-		return err
+		return a.nativeStartFailure(ctx, failureCauseProcessExit, err, nil)
 	}
 
 	a.versionChecked = true

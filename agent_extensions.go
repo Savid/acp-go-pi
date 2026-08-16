@@ -29,16 +29,16 @@ func (a *Agent) handleForkSession(
 ) (acp.UnstableForkSessionResponse, error) {
 	var params acp.UnstableForkSessionRequest
 	if err := json.Unmarshal(raw, &params); err != nil {
-		return acp.UnstableForkSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+		return acp.UnstableForkSessionResponse{}, unsupportedField(jsonFieldParams)
 	}
 
 	if err := params.Validate(); err != nil {
-		return acp.UnstableForkSessionResponse{}, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+		return acp.UnstableForkSessionResponse{}, unsupportedField(jsonFieldParams)
 	}
 
 	metaOptions, err := piOptionsFromMeta(params.Meta)
 	if err != nil {
-		return acp.UnstableForkSessionResponse{}, lifecycleMetaError(err)
+		return acp.UnstableForkSessionResponse{}, err
 	}
 
 	additionalDirectories := sessionAdditionalDirectories(params.AdditionalDirectories)

@@ -51,8 +51,7 @@ platform/option combination.
 | `WithHome` | Durable per-instance `PI_CODING_AGENT_DIR`. Empty gives sessions ephemeral homes. Required with `WithProviderAuthRoot` for provider auth, and refused with explicit distinct-identity isolation. |
 | `WithScratchDir` | Parent directory for all ephemeral on-disk state (isolated per-session agent and session directories, hydration temp files, and the version probe's isolated `PI_CODING_AGENT_DIR`/settings residence). Empty means the system temp directory; created `0700` when missing. |
 | `WithDefaultModel` | Default model for new sessions, as `"provider/id"`. |
-| `WithEnv` | Overlay environment variables on the sanitized ordinary base or `ProcessIsolation.BaseEnvironment`. Invalid names plus raw `PATH`, `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `LD_*`, and `DYLD_*` are rejected. |
-| `WithExtraPathDirs` | Prepend individual absolute directories, in order, to every child PATH while retaining the captured native base path. These directories are launch-only and do not select the pi executable; use `WithExecutablePath` for that. A relative entry or embedded list separator fails session start. |
+| `WithEnv` | The static agent-scoped environment overlaid on the sanitized ordinary base or `ProcessIsolation.BaseEnvironment`. A `PATH` here is the static native base search path used for executable lookup and native launch, and session `extraPathDirs` are placed ahead of it. Invalid names plus `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `LD_*`, and `DYLD_*` are rejected. |
 | `WithSeedFiles` | Write files into each isolated agent directory. Seeded extensions, prompts, and skills in their conventional subdirectories are loaded by exact path. |
 | `WithSessionStore` | Install durable session storage. |
 | `WithSessionStoreLoadTimeout` | Bound store load/list operations used during resume. |
@@ -88,8 +87,8 @@ processes receive neither capability nor descriptor.
 | Option | Purpose |
 | --- | --- |
 | `WithPiModel` | Session model as `"provider/id"`. |
-| `WithPiEnv` | Extra environment variables for this session's pi process. Raw `PATH` is rejected; use `WithPiExtraPathDirs`. |
-| `WithPiExtraPathDirs` | Prepend absolute directories to this session's child `PATH`. This launch-only value does not select the pi executable. |
+| `WithPiEnv` | Extra environment variables for this session's pi process. `PATH` is rejected; `WithPiExtraPathDirs` is the only session `PATH` authority. |
+| `WithPiExtraPathDirs` | Prepend absolute directories, in the order given, to this session's child `PATH`, ahead of the static base `PATH` from `WithEnv` and everything inherited. Order and duplicates are preserved. This launch-only value does not select the pi executable. |
 | `WithPiThinkingLevel` | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
 | `WithPiPermission` | Permission mode: `ask` (default) or `allow`. |
 | `WithPiAutoRetry` | Opt in to pi's native automatic retry of transient provider errors (5xx, timeouts). Default `false`: a native failure surfaces once, immediately, with the real cause. |
@@ -132,8 +131,8 @@ path as `PI_CODING_AGENT_DIR`. Pi acquires discovery and per-session native
 permits immediately before their launches, reserves scratch before making each
 isolated agent directory, and releases only after the selected boundary
 completes and directory deletion succeeds; incomplete containment quarantines
-the generation and holds both reservations. The adapter emits no
-home-lock-supervisor count. Provider descendant snapshots are emitted only
+the generation and holds both reservations. Pi holds no cross-process native home lock, so it emits no
+`home_lock_supervisor` count. Provider descendant snapshots are emitted only
 when inventory is authoritative; ordinary shared identity and Darwin best
 effort emit no provider snapshot, including zero. `ObserveContainment` is called once with the
 effective mode. Startup observations distinguish spawn, readiness,

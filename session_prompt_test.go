@@ -161,7 +161,7 @@ func TestTurnTerminalPathsReturnContainmentProofFailure(t *testing.T) {
 	var timedOut atomic.Bool
 	messageID := "message"
 
-	_, err := session.transportEndedTurn(&messageID, &timedOut)
+	_, err := session.transportEndedTurn(t.Context(), &messageID, &timedOut)
 	require.ErrorIs(t, err, fenceErr)
 	_, err = session.contextEndedTurn(&messageID, &timedOut)
 	require.ErrorIs(t, err, fenceErr)
@@ -360,15 +360,15 @@ func TestTurnTerminationBranches(t *testing.T) {
 	var timedOut atomic.Bool
 	messageID := "message"
 
-	response, err := session.transportEndedTurn(&messageID, &timedOut)
+	response, err := session.transportEndedTurn(t.Context(), &messageID, &timedOut)
 	requirePiTurnFailure(t, err, failureCauseTransport)
 	require.Empty(t, response.StopReason)
 	client.err = errors.New("native stream")
-	_, err = session.transportEndedTurn(&messageID, &timedOut)
+	_, err = session.transportEndedTurn(t.Context(), &messageID, &timedOut)
 	requirePiTurnFailure(t, err, failureCauseTransport)
 
 	timedOut.Store(true)
-	_, err = session.transportEndedTurn(&messageID, &timedOut)
+	_, err = session.transportEndedTurn(t.Context(), &messageID, &timedOut)
 	requirePiTurnFailure(t, err, failureCauseTimeout)
 	_, err = session.contextEndedTurn(&messageID, &timedOut)
 	requirePiTurnFailure(t, err, failureCauseTimeout)
@@ -378,7 +378,7 @@ func TestTurnTerminationBranches(t *testing.T) {
 	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
 
 	session.turnCancelled = true
-	response, err = session.transportEndedTurn(&messageID, &timedOut)
+	response, err = session.transportEndedTurn(t.Context(), &messageID, &timedOut)
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
 	response, err = session.contextEndedTurn(&messageID, &timedOut)
@@ -387,7 +387,7 @@ func TestTurnTerminationBranches(t *testing.T) {
 
 	session.turnCancelled = false
 	session.proc = newStubProcess(true)
-	_, err = session.transportEndedTurn(&messageID, &timedOut)
+	_, err = session.transportEndedTurn(t.Context(), &messageID, &timedOut)
 	requirePiTurnFailure(t, err, failureCauseProcessExit)
 
 	original := errors.New("emit")

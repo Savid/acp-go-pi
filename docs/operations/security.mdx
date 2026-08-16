@@ -29,9 +29,10 @@ ordinary set such as PATH, home/user identity, temp, locale, terminal, and
 Windows process variables is retained. Ambient provider credentials, loader
 hooks, shell hooks, Node hooks, and adapter-private re-exec state are removed.
 Explicit `WithEnv` and `WithPiEnv` overlays are the deliberate credential route
-and are cloned before use. Raw PATH overlays are rejected; `WithExtraPathDirs`
-and `WithPiExtraPathDirs` prepend absolute directories while preserving the
-captured native base. Captured ordinary PATH entries and configured executables
+and are cloned before use. A `PATH` in `WithEnv` replaces the captured base as
+the static native search path; session `WithPiEnv` rejects `PATH`, and
+`WithPiExtraPathDirs` prepends absolute directories ahead of that base.
+Captured ordinary PATH entries and configured executables
 may be relative; the absolute-path rules below apply only to explicit isolation.
 Extra path directories affect child launch PATH only and do not select the Pi
 executable; use `WithExecutablePath` or CLI `-path` for that lookup.

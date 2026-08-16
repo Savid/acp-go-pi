@@ -104,7 +104,6 @@ func TestLaunchSpecEnviron(t *testing.T) {
 			"NODE_OPTIONS":      "--require=/tmp/hijack.js",
 			"LD_PRELOAD":        "/tmp/hijack.so",
 			"BAD-NAME":          "bad",
-			"PATH":              "/tmp/hijack-bin",
 			"PI_OFFLINE":        "0", // managed keys always win
 		},
 	}
@@ -139,16 +138,31 @@ func TestLaunchSpecEnvironPrependsExtraPathDirs(t *testing.T) {
 	spec := LaunchSpec{
 		AgentDir:      "/agent",
 		Containment:   ContainmentSpec{Isolation: &ProcessIsolation{UID: 1, GID: 1, BaseEnvironment: map[string]string{"PATH": "/usr/bin"}}},
-		ExtraPathDirs: []string{"/session/bin", "/agent-wide/bin"},
-		Env:           map[string]string{"PATH": "/tmp/hijack-bin"},
+		ExtraPathDirs: []string{"/session/bin", "/session/bin"},
 	}
 
 	require.Contains(
 		t,
 		spec.Environ(),
-		"PATH=/session/bin"+separator+"/agent-wide/bin"+separator+"/usr/bin",
+		"PATH=/session/bin"+separator+"/session/bin"+separator+"/usr/bin",
 	)
 	require.IsIncreasing(t, spec.Environ())
+}
+
+// An explicit PATH is the static agent-scoped base search path: it replaces the
+// policy base and the ordered session prefix is placed ahead of it, rather than
+// being silently dropped as a hijack attempt.
+func TestLaunchSpecEnvironUsesExplicitPathAsTheBase(t *testing.T) {
+	separator := string(os.PathListSeparator)
+
+	spec := LaunchSpec{
+		AgentDir:      "/agent",
+		Containment:   ContainmentSpec{Isolation: &ProcessIsolation{UID: 1, GID: 1, BaseEnvironment: map[string]string{"PATH": "/usr/bin"}}},
+		ExtraPathDirs: []string{"/session/bin"},
+		Env:           map[string]string{"PATH": "/base/bin"},
+	}
+
+	require.Contains(t, spec.Environ(), "PATH=/session/bin"+separator+"/base/bin")
 }
 
 func TestLaunchSpecEnvironExtraPathDirsWithoutAmbientPath(t *testing.T) {
@@ -172,8 +186,11 @@ func TestPrependPathDirsDropsUnusableEntries(t *testing.T) {
 func TestSafeExplicitEnvKeyBoundary(t *testing.T) {
 	require.False(t, safeExplicitEnvKey(""))
 	require.True(t, safeExplicitEnvKey("A1"))
-	require.False(t, safeExplicitEnvKey("PATH"))
-	require.False(t, safeExplicitEnvKey("Path"))
+	require.True(t, safeExplicitEnvKey("PATH"))
+	require.False(t, safeExplicitEnvKey("NODE_OPTIONS"))
+	require.False(t, safeExplicitEnvKey("BASH_ENV"))
+	require.False(t, safeExplicitEnvKey("ENV"))
+	require.False(t, safeExplicitEnvKey("LD_PRELOAD"))
 	require.False(t, safeExplicitEnvKey("ACP_GO_PI_INTERNAL_DARWIN_LAUNCH"))
 	require.False(t, safeExplicitEnvKey("acp_go_pi_internal_turn_supervisor"))
 }

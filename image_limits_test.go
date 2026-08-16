@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"bytes"
 	"log/slog"
 	"testing"
 
@@ -52,11 +53,19 @@ func TestImageLimitsNegativeRejectedAtConstruction(t *testing.T) {
 // which never calls initialize still cannot open a session against options that
 // failed validation at construction.
 func TestSessionEstablishmentRejectsUnvalidatedOptions(t *testing.T) {
-	agent := newStubClientAgent(t, newStubPiClient(), WithImageLimits(ImageLimits{MaxOutputBytesPerImage: -1}))
+	var logs bytes.Buffer
+
+	agent := newStubClientAgent(t, newStubPiClient(),
+		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+		WithImageLimits(ImageLimits{MaxOutputBytesPerImage: -1}),
+	)
 
 	_, err := agent.NewSession(t.Context(), NewSessionRequest(t.TempDir()))
-	requireInvalidParams(t, err)
-	require.ErrorContains(t, err, "MaxOutputBytesPerImage")
+
+	// The client is told which option the agent refuses to serve under and
+	// nothing else; the reason is the operator's, and it is in the log.
+	requireUnsupportedField(t, err, optionFieldImageLimits)
+	require.Contains(t, logs.String(), "MaxOutputBytesPerImage")
 }
 
 func TestEffectiveOutputImageLimit(t *testing.T) {

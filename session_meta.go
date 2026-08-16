@@ -246,23 +246,19 @@ func validatePiOptions(options PiOptions) (PiOptions, error) {
 
 	if options.Model != "" {
 		if _, err := pi.ParseModelRef(options.Model); err != nil {
-			return PiOptions{}, fmt.Errorf("%s must be \"provider/id\"", metaOptionPath(metaModelKey))
+			return PiOptions{}, unsupportedField(metaOptionPath(metaModelKey))
 		}
 	}
 
 	if options.ThinkingLevel != "" && !pi.IsValidThinkingLevel(options.ThinkingLevel) {
-		return PiOptions{}, fmt.Errorf(
-			"%s must be one of %s",
-			metaOptionPath(metaThinkingLevelKey),
-			strings.Join(pi.ThinkingLevels(), ", "),
-		)
+		return PiOptions{}, unsupportedField(metaOptionPath(metaThinkingLevelKey))
 	}
 
 	if options.Permission != "" && options.Permission != pi.PermissionModeAsk && options.Permission != pi.PermissionModeAllow {
-		return PiOptions{}, fmt.Errorf("%s must be %q or %q", metaOptionPath(metaPermissionKey), pi.PermissionModeAsk, pi.PermissionModeAllow)
+		return PiOptions{}, unsupportedField(metaOptionPath(metaPermissionKey))
 	}
 
-	if err := validateEnvironment(options.Env, metaOptionPath(metaEnvKey)); err != nil {
+	if err := validateEnvironment(options.Env, metaOptionPath(metaEnvKey), blockedSessionEnvKey); err != nil {
 		return PiOptions{}, err
 	}
 
@@ -273,7 +269,7 @@ func validatePiOptions(options PiOptions) (PiOptions, error) {
 	return options, nil
 }
 
-func validateEnvironment(env map[string]string, path string) error {
+func validateEnvironment(env map[string]string, path string, blocked func(key string) bool) error {
 	keys := make([]string, 0, len(env))
 	for key := range env {
 		keys = append(keys, key)
@@ -281,23 +277,19 @@ func validateEnvironment(env map[string]string, path string) error {
 
 	slices.Sort(keys)
 
-	seen := make(map[string]string, len(keys))
+	seen := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
-		if !validEnvName(key) {
-			return fmt.Errorf("%s.%s is not a valid environment variable name", path, key)
-		}
-
-		if blockedEnvKey(key) {
-			return fmt.Errorf("%s.%s is not allowed", path, key)
+		if !validEnvName(key) || blocked(key) {
+			return unsupportedField(path + "." + key)
 		}
 
 		if agentRuntimePlatform == windowsPlatform {
 			canonical := strings.ToUpper(key)
-			if previous, ok := seen[canonical]; ok {
-				return fmt.Errorf("%s contains ambiguous environment keys %q and %q", path, previous, key)
+			if _, ok := seen[canonical]; ok {
+				return unsupportedField(path + "." + key)
 			}
 
-			seen[canonical] = key
+			seen[canonical] = struct{}{}
 		}
 	}
 
@@ -310,19 +302,15 @@ func validateEnvironment(env map[string]string, path string) error {
 // separator would splice in directories the caller never named.
 func validateExtraPathDirs(dirs []string, path string) error {
 	for index, dir := range dirs {
-		if !filepath.IsAbs(dir) {
-			return fmt.Errorf("%s[%d] %s: %q", path, index, validationAbsolutePath, dir)
-		}
-
-		if strings.ContainsRune(dir, os.PathListSeparator) {
-			return fmt.Errorf("%s[%d] must not contain %q: %q", path, index, string(os.PathListSeparator), dir)
+		if !filepath.IsAbs(dir) || strings.ContainsRune(dir, os.PathListSeparator) {
+			return unsupportedField(fmt.Sprintf("%s[%d]", path, index))
 		}
 	}
 
 	return nil
 }
 
-func unsupportedField(path string) error {
+func unsupportedField(path string) *acp.RequestError {
 	return acp.NewInvalidParams(map[string]any{
 		jsonFieldError: validationUnsupported,
 		jsonFieldField: path,
@@ -395,34 +383,31 @@ func validEnvName(name string) bool {
 	return true
 }
 
-// blockedEnvKey rejects env names that could hijack the pi child process
-// (loader/preload and node/shell injection vectors).
-func blockedEnvKey(key string) bool {
+// blockedAgentEnvKey rejects env names that could hijack the pi child process
+// (loader/preload and node/shell injection vectors). PATH is absent: the
+// agent-scoped environment is where the static native base search path is
+// established.
+func blockedAgentEnvKey(key string) bool {
 	upper := strings.ToUpper(key)
 	if strings.HasPrefix(upper, privateEnvPrefix) {
 		return true
 	}
 
 	switch upper {
-	case envKeyNodeOptions, envKeyBashEnv, envKeyEnv, envKeyPath, pi.EnvExtraPathDirs:
+	case envKeyNodeOptions, envKeyBashEnv, envKeyEnv, pi.EnvExtraPathDirs:
 		return true
 	default:
 		return strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_")
 	}
 }
 
-func sessionAdditionalDirectories(primary []string) []string {
-	return append([]string(nil), primary...)
+// blockedSessionEnvKey additionally rejects PATH. The ordered extraPathDirs
+// option is the only session-scoped PATH authority; a second session owner
+// would make the effective search order depend on merge order.
+func blockedSessionEnvKey(key string) bool {
+	return blockedAgentEnvKey(key) || strings.EqualFold(key, envKeyPath)
 }
 
-// sessionExtraPathDirs orders the PATH prefix one session's pi process runs
-// with. Per-session directories lead the agent-wide ones for the same reason
-// per-session env overrides agent-wide env: the narrower scope is the later
-// decision.
-func sessionExtraPathDirs(session []string, agent []string) []string {
-	if len(session) == 0 && len(agent) == 0 {
-		return nil
-	}
-
-	return append(slices.Clone(session), agent...)
+func sessionAdditionalDirectories(primary []string) []string {
+	return append([]string(nil), primary...)
 }

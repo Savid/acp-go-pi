@@ -2,23 +2,16 @@ package piacp
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"unicode"
 	"unicode/utf8"
-
-	"github.com/coder/acp-go-sdk"
 )
 
-const validationAbsolutePath = "must be an absolute path"
-
 func validateRequiredAbsolutePath(field string, path string) error {
-	if path == "" {
-		return acp.NewInvalidParams(map[string]any{field: validationRequired})
-	}
-
 	if !filepath.IsAbs(path) {
-		return acp.NewInvalidParams(map[string]any{field: validationAbsolutePath})
+		return unsupportedField(field)
 	}
 
 	return nil
@@ -30,27 +23,16 @@ func validateOptionalAbsolutePath(field string, path *string) error {
 	}
 
 	if !filepath.IsAbs(*path) {
-		return acp.NewInvalidParams(map[string]any{field: validationAbsolutePath})
+		return unsupportedField(field)
 	}
 
 	return nil
 }
 
 func validateAbsolutePaths(field string, paths []string) error {
-	for i, path := range paths {
-		if path == "" {
-			return acp.NewInvalidParams(map[string]any{field: map[string]any{
-				jsonFieldIndex: i,
-				jsonFieldError: validationRequired,
-			}})
-		}
-
+	for index, path := range paths {
 		if !filepath.IsAbs(path) {
-			return acp.NewInvalidParams(map[string]any{field: map[string]any{
-				jsonFieldIndex: i,
-				"path":         path,
-				jsonFieldError: validationAbsolutePath,
-			}})
+			return unsupportedField(fmt.Sprintf("%s[%d]", field, index))
 		}
 	}
 
@@ -74,18 +56,7 @@ func (a *Agent) sessionStartConfigurationError() error {
 		return optionsErr
 	}
 
-	if isolationErr := validateProcessIsolationOption(a.options.ProcessIsolation); isolationErr != nil {
-		return isolationErr
-	}
-
-	if pathErr := validateExtraPathDirs(a.options.ExtraPathDirs, optionFieldExtraPathDirs); pathErr != nil {
-		return acp.NewInvalidParams(map[string]any{
-			jsonFieldError: pathErr.Error(),
-			jsonFieldField: optionFieldExtraPathDirs,
-		})
-	}
-
-	return nil
+	return validateProcessIsolationOption(a.options.ProcessIsolation)
 }
 
 func validateProcessIsolationOption(isolation *ProcessIsolation) error {

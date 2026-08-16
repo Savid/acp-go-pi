@@ -26,7 +26,6 @@ func TestApplyOptionsDefaults(t *testing.T) {
 	require.Empty(t, options.ProviderAuthRoot)
 	require.Empty(t, options.DefaultModel)
 	require.Nil(t, options.Env)
-	require.Nil(t, options.ExtraPathDirs)
 	require.Nil(t, options.SessionStore)
 	require.Zero(t, options.SessionStoreLoadTimeout)
 	require.Zero(t, options.TurnTimeout)
@@ -43,7 +42,6 @@ func TestApplyOptionsSetters(t *testing.T) {
 	meterProvider := noop.NewMeterProvider()
 	propagator := propagation.TraceContext{}
 	env := map[string]string{"ANTHROPIC_API_KEY": "k"}
-	extraPathDirs := []string{"/opt/shim/bin"}
 	seeds := map[string]string{"settings.json": "{}"}
 
 	options := applyOptions([]Option{
@@ -57,7 +55,6 @@ func TestApplyOptionsSetters(t *testing.T) {
 		WithProviderAuthRoot("/srv/pi-auth"),
 		WithDefaultModel("openai/gpt-4o"),
 		WithEnv(env),
-		WithExtraPathDirs(extraPathDirs...),
 		WithTracerProvider(tracerProvider),
 		WithMeterProvider(meterProvider),
 		WithTextMapPropagator(propagator),
@@ -78,7 +75,6 @@ func TestApplyOptionsSetters(t *testing.T) {
 	require.Equal(t, "/srv/pi-auth", options.ProviderAuthRoot)
 	require.Equal(t, "openai/gpt-4o", options.DefaultModel)
 	require.Equal(t, env, options.Env)
-	require.Equal(t, []string{"/opt/shim/bin"}, options.ExtraPathDirs)
 	require.Equal(t, tracerProvider, options.TracerProvider)
 	require.Equal(t, meterProvider, options.MeterProvider)
 	require.Equal(t, propagator, options.TextMapPropagator)
@@ -88,12 +84,10 @@ func TestApplyOptionsSetters(t *testing.T) {
 	require.Equal(t, ConcurrencyLimits{MaxActiveSessions: 4, MaxConcurrentClientCalls: 2}, options.ConcurrencyLimits)
 	require.Equal(t, seeds, options.SeedFiles)
 
-	// Env, extra path dirs, and seed maps are cloned, not aliased.
+	// Env and seed maps are cloned, not aliased.
 	env["ANTHROPIC_API_KEY"] = "mutated"
-	extraPathDirs[0] = "/opt/mutated"
 	seeds["settings.json"] = "mutated"
 	require.Equal(t, "k", options.Env["ANTHROPIC_API_KEY"])
-	require.Equal(t, "/opt/shim/bin", options.ExtraPathDirs[0])
 	require.Equal(t, "{}", options.SeedFiles["settings.json"])
 }
 

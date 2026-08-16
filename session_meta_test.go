@@ -85,25 +85,38 @@ func TestEnvironmentValidation(t *testing.T) {
 	valid := []string{"A", "_A", "a1", "A_B_2"}
 	for _, name := range valid {
 		require.True(t, validEnvName(name))
-		require.False(t, blockedEnvKey(name))
+		require.False(t, blockedAgentEnvKey(name))
+		require.False(t, blockedSessionEnvKey(name))
 	}
 
 	for _, name := range []string{"", "1A", "A-B", "A B", "é"} {
 		require.False(t, validEnvName(name))
 	}
-	for _, name := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "PATH", "Path", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_DARWIN_LAUNCH", "acp_go_pi_internal_turn_supervisor", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
-		require.True(t, blockedEnvKey(name))
+
+	for _, name := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_DARWIN_LAUNCH", "acp_go_pi_internal_turn_supervisor", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
+		require.True(t, blockedAgentEnvKey(name))
+		require.True(t, blockedSessionEnvKey(name))
 	}
-	require.Error(t, validateEnvironment(map[string]string{"PATH": "/raw/bin"}, metaOptionPath(metaEnvKey)))
-	require.Error(t, validateEnvironment(map[string]string{pi.EnvExtraPathDirs: "/attacker/bin"}, metaOptionPath(metaEnvKey)))
+
+	// The dedicated ordered option is the only session PATH authority, while
+	// the agent-scoped environment is where the static base PATH is set.
+	for _, name := range []string{"PATH", "Path"} {
+		require.False(t, blockedAgentEnvKey(name))
+		require.True(t, blockedSessionEnvKey(name))
+	}
+
+	require.NoError(t, validateEnvironment(map[string]string{"PATH": "/base/bin"}, optionFieldEnv, blockedAgentEnvKey))
+	requireUnsupportedField(t, validateEnvironment(map[string]string{"PATH": "/raw/bin"}, metaOptionPath(metaEnvKey), blockedSessionEnvKey), metaOptionPath(metaEnvKey)+".PATH")
+	requireUnsupportedField(t, validateEnvironment(map[string]string{pi.EnvExtraPathDirs: "/attacker/bin"}, metaOptionPath(metaEnvKey), blockedSessionEnvKey), metaOptionPath(metaEnvKey)+"."+pi.EnvExtraPathDirs)
+	requireUnsupportedField(t, validateEnvironment(map[string]string{"1A": "x"}, optionFieldEnv, blockedAgentEnvKey), optionFieldEnv+".1A")
 
 	originalPlatform := agentRuntimePlatform
 	agentRuntimePlatform = windowsPlatform
 	t.Cleanup(func() { agentRuntimePlatform = originalPlatform })
-	require.ErrorContains(
+	requireUnsupportedField(
 		t,
-		validateEnvironment(map[string]string{"Provider_Key": "session", "PROVIDER_KEY": "agent"}, metaOptionPath(metaEnvKey)),
-		"ambiguous environment keys",
+		validateEnvironment(map[string]string{"Provider_Key": "session", "PROVIDER_KEY": "agent"}, metaOptionPath(metaEnvKey), blockedSessionEnvKey),
+		metaOptionPath(metaEnvKey)+".Provider_Key",
 	)
 }
 
@@ -123,22 +136,11 @@ func TestExtraPathDirsValidation(t *testing.T) {
 		require.Error(t, validateExtraPathDirs(dirs, metaExtraPathDirsKey))
 	}
 
-	err := validateExtraPathDirs([]string{"/opt/bin", "relative/bin"}, metaExtraPathDirsKey)
-	require.ErrorContains(t, err, metaExtraPathDirsKey+"[1]")
-}
-
-func TestSessionExtraPathDirsOrdersSessionFirst(t *testing.T) {
-	t.Parallel()
-
-	require.Nil(t, sessionExtraPathDirs(nil, nil))
-
-	session := []string{"/session/bin"}
-	require.Equal(
+	requireUnsupportedField(
 		t,
-		[]string{"/session/bin", "/agent-wide/bin"},
-		sessionExtraPathDirs(session, []string{"/agent-wide/bin"}),
+		validateExtraPathDirs([]string{"/opt/bin", "relative/bin"}, metaExtraPathDirsKey),
+		metaExtraPathDirsKey+"[1]",
 	)
-	require.Equal(t, []string{"/session/bin"}, session)
 }
 
 func TestPiOptionsMeta(t *testing.T) {

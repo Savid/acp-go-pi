@@ -3,7 +3,9 @@ package piacp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -138,13 +140,40 @@ func TestAgentConnectionAndErrorMapping(t *testing.T) {
 	_, err = connection.CreateElicitation(t.Context(), acp.UnstableCreateElicitationRequest{}, elicitationScope{})
 	require.Error(t, err)
 
-	require.Nil(t, requestError(nil))
+	log := slog.New(slog.DiscardHandler)
+	require.Nil(t, requestError(t.Context(), log, nil))
+
 	requestErr := acp.NewInvalidParams(nil)
-	require.Same(t, requestErr, requestError(requestErr))
-	require.Equal(t, -32800, requestError(context.Canceled).Code)
-	require.Equal(t, -32603, requestError(errors.New("failure")).Code)
-	require.Same(t, requestErr, lifecycleMetaError(requestErr))
-	var lifecycleRequestError *acp.RequestError
-	require.ErrorAs(t, lifecycleMetaError(errors.New("bad meta")), &lifecycleRequestError)
-	require.Equal(t, -32602, lifecycleRequestError.Code)
+	require.Same(t, requestErr, requestError(t.Context(), log, requestErr))
+
+	internal := requestError(t.Context(), log, errors.New("failure"))
+	require.Equal(t, -32603, internal.Code)
+	require.Nil(t, internal.Data)
+}
+
+// An honored $/cancel_request is the only thing that cancels a request context
+// with cause context.Canceled, so that cause outranks any RequestError the
+// handler happened to return and carries no error text of its own.
+func TestRequestErrorPrefersHonoredCancelOverEmbeddedRequestError(t *testing.T) {
+	t.Parallel()
+
+	log := slog.New(slog.DiscardHandler)
+
+	cancelled, cancel := context.WithCancelCause(t.Context())
+	cancel(context.Canceled)
+
+	reqErr := requestError(cancelled, log, acp.NewInvalidParams(map[string]any{"error": "unsupported", "field": "cwd"}))
+	require.Equal(t, -32800, reqErr.Code)
+	require.Nil(t, reqErr.Data)
+
+	// A wrapped context.Canceled that no honored cancel produced keeps the
+	// caller-owned error it carries.
+	wrapped := requestError(t.Context(), log, fmt.Errorf("drain: %w", context.Canceled))
+	require.Equal(t, -32603, wrapped.Code)
+
+	// An adapter deadline is an internal failure, never a client cancel.
+	expired, cancelDeadline := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancelDeadline()
+
+	require.Equal(t, -32603, requestError(expired, log, context.DeadlineExceeded).Code)
 }

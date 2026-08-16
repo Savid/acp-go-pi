@@ -107,7 +107,7 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 	if strings.HasPrefix(method, "_") {
 		result, err := c.agent.HandleExtensionMethod(ctx, method, params)
 
-		reqErr := requestError(err)
+		reqErr := requestError(ctx, c.agent.log, err)
 		if reqErr == nil {
 			c.enqueueLifecycleCommandHook(ctx, method, params, result)
 		}
@@ -382,7 +382,7 @@ func localResponse[Req any, ReqPtr localAgentParams[Req], Resp any](
 
 		resp, err := call(agent, ctx, value)
 		if err != nil {
-			return nil, requestError(err)
+			return nil, requestError(ctx, agent.log, err)
 		}
 
 		return resp, nil
@@ -399,7 +399,7 @@ func localNotification[Req any, ReqPtr localAgentParams[Req]](
 		}
 
 		if err := call(agent, ctx, value); err != nil {
-			return nil, requestError(err)
+			return nil, requestError(ctx, agent.log, err)
 		}
 
 		return nil, nil
@@ -409,11 +409,11 @@ func localNotification[Req any, ReqPtr localAgentParams[Req]](
 func decodeLocalAgentParams[Req any, ReqPtr localAgentParams[Req]](params json.RawMessage) (Req, *acp.RequestError) {
 	var value Req
 	if err := json.Unmarshal(params, &value); err != nil {
-		return value, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+		return value, unsupportedField(jsonFieldParams)
 	}
 
 	if err := ReqPtr(&value).Validate(); err != nil {
-		return value, acp.NewInvalidParams(map[string]any{jsonFieldError: err.Error()})
+		return value, unsupportedField(jsonFieldParams)
 	}
 
 	return value, nil

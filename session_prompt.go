@@ -19,8 +19,6 @@ const (
 	fieldPromptImage    = "prompt.image"
 	fieldPromptResource = "prompt.resource"
 
-	errMissingResourceData = "missing resource data or uri"
-
 	assistantEventTextDelta     = "text_delta"
 	assistantEventThinkingDelta = "thinking_delta"
 
@@ -50,7 +48,7 @@ type piPrompt struct {
 // deterministic and stops on the first failing block in request order.
 func promptToPi(ctx context.Context, prompt []acp.ContentBlock, limits ImageLimits, handoffRoot string) (piPrompt, error) {
 	if len(prompt) == 0 {
-		return piPrompt{}, acp.NewInvalidParams(map[string]any{jsonFieldError: validationUnsupported, jsonFieldField: fieldPrompt})
+		return piPrompt{}, unsupportedField(fieldPrompt)
 	}
 
 	textParts := make([]string, 0, len(prompt))
@@ -99,13 +97,13 @@ func promptToPi(ctx context.Context, prompt []acp.ContentBlock, limits ImageLimi
 				images = append(images, *image)
 			}
 		default:
-			return piPrompt{}, acp.NewInvalidParams(map[string]any{jsonFieldError: validationUnsupported, jsonFieldField: fieldPrompt})
+			return piPrompt{}, unsupportedField(fieldPrompt)
 		}
 	}
 
 	message := strings.Join(append(textParts, contextParts...), "\n")
 	if strings.TrimSpace(message) == "" && len(images) == 0 {
-		return piPrompt{}, acp.NewInvalidParams(map[string]any{jsonFieldError: validationUnsupported, jsonFieldField: fieldPrompt})
+		return piPrompt{}, unsupportedField(fieldPrompt)
 	}
 
 	return piPrompt{Message: message, Images: images, ImageField: budget.firstImageField}, nil
@@ -139,10 +137,10 @@ func resourceToPi(resource acp.EmbeddedResourceResource, budget *promptImageBudg
 			return "", "", &image, nil
 		}
 
-		return "", "", nil, acp.NewInvalidParams(map[string]any{jsonFieldError: validationUnsupported, jsonFieldField: fieldPromptResource})
+		return "", "", nil, unsupportedField(fieldPromptResource)
 	}
 
-	return "", "", nil, acp.NewInvalidParams(map[string]any{jsonFieldField: fieldPromptResource, jsonFieldError: errMissingResourceData})
+	return "", "", nil, unsupportedField(fieldPromptResource)
 }
 
 func textAudienceIsUserOnly(annotations *acp.Annotations) bool {
@@ -206,7 +204,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	}
 
 	if err := s.refreshMCPTools(ctx); err != nil {
-		return acp.PromptResponse{}, s.nativeTurnFailure(err)
+		return acp.PromptResponse{}, s.nativeTurnFailure(ctx, err)
 	}
 	defer s.observeProviderProcess(context.WithoutCancel(ctx))
 
@@ -269,7 +267,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	if promptErr := client.Prompt(turnCtx, mapped.Message, mapped.Images); promptErr != nil {
 		fenceErr := s.fenceTurnAfterFailure(context.WithoutCancel(ctx))
 
-		return acp.PromptResponse{}, errors.Join(s.nativeTurnFailure(promptErr), fenceErr)
+		return acp.PromptResponse{}, errors.Join(s.nativeTurnFailure(ctx, promptErr), fenceErr)
 	}
 
 	state := &promptTurnState{}
@@ -282,7 +280,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 					return acp.PromptResponse{}, fenceErr
 				}
 
-				return s.transportEndedTurn(params.MessageId, &timedOut)
+				return s.transportEndedTurn(ctx, params.MessageId, &timedOut)
 			}
 
 			s.emitRawPiEvent(turnCtx, event.RawJSON())
@@ -681,7 +679,7 @@ func (s *agentSession) currentModelContextWindow() int64 {
 // transportEndedTurn maps a mid-turn native transport end. The cancel guard
 // runs first; otherwise the real cause is recovered from the child exit
 // status and stderr tail before falling back to a transport classification.
-func (s *agentSession) transportEndedTurn(messageID *string, timedOut *atomic.Bool) (acp.PromptResponse, error) {
+func (s *agentSession) transportEndedTurn(ctx context.Context, messageID *string, timedOut *atomic.Bool) (acp.PromptResponse, error) {
 	if fenceErr := s.awaitTurnFence(); fenceErr != nil {
 		return acp.PromptResponse{}, fenceErr
 	}
@@ -694,7 +692,7 @@ func (s *agentSession) transportEndedTurn(messageID *string, timedOut *atomic.Bo
 		return acp.PromptResponse{}, turnFailureError(failureCauseTimeout, fmt.Sprintf("pi turn exceeded %s", s.agent.turnTimeout()))
 	}
 
-	if exitMessage, exited := s.processExitMessage(); exited {
+	if exitMessage, exited := s.processExitCause(ctx, "pi process exited"); exited {
 		s.agent.observe.RecordPiProcessExit(context.Background(), "unexpected", nil)
 
 		return acp.PromptResponse{}, turnFailureError(failureCauseProcessExit, exitMessage)
@@ -705,6 +703,7 @@ func (s *agentSession) transportEndedTurn(messageID *string, timedOut *atomic.Bo
 	if client := s.currentClient(); client != nil {
 		if err := client.Err(); err != nil {
 			message = err.Error()
+			s.agent.log.ErrorContext(ctx, "pi turn transport failed", slog.Any("error", err))
 		}
 	}
 

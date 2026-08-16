@@ -69,10 +69,10 @@ func browserShimEnviron(env []string, dir string) []string {
 			continue
 		}
 
-		switch key {
-		case browserShimPathEnv:
+		switch {
+		case environmentKeyEqual(key, browserShimPathEnv):
 			search = dir + string(os.PathListSeparator) + value
-		case browserShimBrowserEnv:
+		case environmentKeyEqual(key, browserShimBrowserEnv):
 		default:
 			kept = append(kept, entry)
 		}

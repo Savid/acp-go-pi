@@ -98,12 +98,19 @@ func TestOrdinaryExecutableLookupAcceptsOrdinaryPaths(t *testing.T) {
 	environment, err := ordinaryEnvironment(map[string]string{"PATH": relativeDir}, map[string]string{"EXPLICIT": "yes"})
 	require.NoError(t, err)
 	require.Contains(t, environment, "EXPLICIT=yes")
-	_, err = ordinaryEnvironment(map[string]string{"PATH": relativeDir}, map[string]string{"Path": "other"})
-	require.ErrorContains(t, err, "ExtraPathDirs")
-	_, err = isolationEnvironment(&ProcessIsolation{
-		UID: 1, GID: 1, BaseEnvironment: map[string]string{"PATH": dir}, TestOnlyNoCredential: true,
+	// An overlay PATH is the static base search path, not a rejected hijack.
+	environment, err = ordinaryEnvironment(map[string]string{"PATH": "/ambient/bin"}, map[string]string{"PATH": relativeDir})
+	require.NoError(t, err)
+	require.Contains(t, environment, "PATH="+relativeDir)
+
+	environment, err = isolationEnvironment(&ProcessIsolation{
+		UID: 1, GID: 1, BaseEnvironment: map[string]string{"PATH": "/policy/bin"}, TestOnlyNoCredential: true,
 	}, map[string]string{"PATH": dir})
-	require.ErrorContains(t, err, "ExtraPathDirs")
+	require.NoError(t, err)
+	require.Contains(t, environment, "PATH="+dir)
+
+	_, err = ordinaryEnvironment(map[string]string{"PATH": relativeDir}, map[string]string{"BAD=NAME": "x"})
+	require.ErrorContains(t, err, "invalid key")
 
 	resolved, err = ResolveExecutable(filepath.Join(relativeDir, "pi"), nil, map[string]string{})
 	require.NoError(t, err)
