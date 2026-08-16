@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 func TestGeneratedNativeTreeDistinctIdentityTraversal(t *testing.T) {
@@ -838,4 +840,150 @@ func TestEffectiveIdentityFailsClosedOnAnUnrepresentableKernelAnswer(t *testing.
 	effectiveGIDSource = func() int { return 65533 }
 	require.Equal(t, uint32(65534), effectiveUID())
 	require.Equal(t, uint32(65533), effectiveGID())
+}
+
+// TestGeneratedNativeTreeHandsOffAWholeSessionTree proves the handoff accepts
+// every mode a real session publishes into the tree it hands to the isolated
+// identity. The per-session residence is write-once and published
+// owner-read-only, which is stricter than the rest of the tree; an enumeration
+// of the modes the tree happened to contain refused it and failed the session
+// before pi started.
+func TestGeneratedNativeTreeHandsOffAWholeSessionTree(t *testing.T) {
+	native := nativeOwnershipTestRoot(t)
+
+	agentDir := filepath.Join(native, "agent")
+	sessionDir := filepath.Join(native, "sessions")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o700))
+
+	require.NoError(t, (pi.AgentDir{
+		Root:      agentDir,
+		SeedFiles: map[string]string{"settings.json": `{"defaultProvider":"anthropic"}`},
+		AuthJSON:  []byte(`{"anthropic":{"type":"api_key","key":"test-only"}}`),
+	}).Write())
+
+	residence, files, err := pi.CreateSessionResidence(agentDir, &pi.MCPConfig{
+		Servers: []pi.MCPServer{{Name: "fixture", Command: "/bin/true"}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = residence.Remove() })
+	require.NotEmpty(t, files.ExtensionPaths)
+	require.NotEmpty(t, files.MCPConfigPath)
+
+	require.NoError(t, os.WriteFile(filepath.Join(sessionDir, "hydrated.jsonl"), []byte("{}\n"), 0o600))
+
+	published := nativeOwnershipTreeModes(t, native)
+	require.Contains(t, published, os.FileMode(0o400), "the residence must still be published write-once")
+	require.Contains(t, published, os.FileMode(0o600))
+	require.Contains(t, published, os.FileMode(0o700))
+
+	require.NoError(t, handoffGeneratedNativeTree(native, nativeOwnershipTestIdentity()))
+
+	target := nativeOwnershipTestIdentity()
+	require.NoError(t, filepath.WalkDir(native, func(path string, _ os.DirEntry, walkErr error) error {
+		require.NoError(t, walkErr)
+		uid, gid := nativeOwnershipOwner(t, path)
+		require.Equal(t, target.UID, uid, path)
+		require.Equal(t, target.GID, gid, path)
+
+		return nil
+	}))
+}
+
+// nativeOwnershipTreeModes is the set of permission bits the tree carries, so
+// a proof can name what it actually exercised instead of assuming it.
+func nativeOwnershipTreeModes(t *testing.T, root string) map[os.FileMode]struct{} {
+	t.Helper()
+
+	modes := map[os.FileMode]struct{}{}
+	require.NoError(t, filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		require.NoError(t, walkErr)
+		info, err := entry.Info()
+		require.NoError(t, err)
+		modes[info.Mode().Perm()] = struct{}{}
+
+		return nil
+	}))
+
+	return modes
+}
+
+// TestGeneratedNativeFileModeRefusesEverythingReachableByAnotherIdentity pins
+// the property the handoff enforces on a regular file, in both directions.
+func TestGeneratedNativeFileModeRefusesEverythingReachableByAnotherIdentity(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []uint32{0o400, 0o500, 0o600, 0o700} {
+		require.True(t, nativeFileModeIsPrivate(mode), "%#o is owner-only and readable", mode)
+	}
+
+	for _, mode := range []uint32{
+		0o644, 0o640, 0o666, 0o604, 0o060, 0o006,
+		0o4600, 0o2600, 0o1600,
+		0o200, 0o300, 0o000, 0o100,
+	} {
+		require.False(t, nativeFileModeIsPrivate(mode), "%#o must stay refused", mode)
+	}
+}
+
+// TestValidateHandoffAcceptsEverySessionPublishedMode walks the tree a real
+// session publishes and proves the inode rule accepts every entry in it. Only
+// the chown at the end of the handoff needs privilege, which is how the
+// privileged lane came to be the only thing that ever ran a session
+// publishing a residence and then handing its tree off.
+func TestValidateHandoffAcceptsEverySessionPublishedMode(t *testing.T) {
+	t.Parallel()
+
+	root := filepath.Join(t.TempDir(), "runtime")
+	require.NoError(t, os.Mkdir(root, 0o700))
+
+	agentDir := filepath.Join(root, "agent")
+	sessionDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o700))
+
+	require.NoError(t, (pi.AgentDir{
+		Root:      agentDir,
+		SeedFiles: map[string]string{"settings.json": `{"defaultProvider":"anthropic"}`},
+		AuthJSON:  []byte(`{"anthropic":{"type":"api_key","key":"test-only"}}`),
+	}).Write())
+
+	residence, files, err := pi.CreateSessionResidence(agentDir, &pi.MCPConfig{
+		Servers: []pi.MCPServer{{Name: "fixture", Command: "/bin/true"}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = residence.Remove() })
+	require.NotEmpty(t, files.ExtensionPaths)
+
+	require.NoError(t, os.WriteFile(filepath.Join(sessionDir, "hydrated.jsonl"), []byte("{}\n"), 0o600))
+
+	uid, gid := effectiveUID(), effectiveGID()
+	inspected := 0
+
+	require.NoError(t, filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		require.NoError(t, walkErr)
+
+		kind := uint32(unix.S_IFREG)
+		flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW
+
+		if entry.IsDir() {
+			kind = unix.S_IFDIR
+			flags |= unix.O_DIRECTORY
+		}
+
+		fd, openErr := unix.Open(path, flags, 0)
+		require.NoError(t, openErr, path)
+
+		defer func() { require.NoError(t, unix.Close(fd)) }()
+
+		inspected++
+
+		info, infoErr := entry.Info()
+		require.NoError(t, infoErr)
+
+		require.NoError(t, validateHandoffNativeInode(fd, kind, uid, gid, uid, gid, kind == unix.S_IFREG),
+			"session published %s as %#o and the handoff refused it", path, info.Mode().Perm())
+
+		return nil
+	}))
+
+	require.Greater(t, inspected, 5, "the fixture must cover the whole published tree")
 }

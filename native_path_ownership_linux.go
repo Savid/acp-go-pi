@@ -288,11 +288,23 @@ func validateHandoffNativeInode(
 		return fmt.Errorf("generated native directory mode %#o is unsafe", mode)
 	}
 
-	if kind == unix.S_IFREG && mode != 0o600 && mode != 0o700 {
-		return fmt.Errorf("generated native inode mode %#o is unsafe", stat.Mode&0o7777)
+	if kind == unix.S_IFREG && !nativeFileModeIsPrivate(mode) {
+		return fmt.Errorf("generated native inode mode %#o is unsafe", mode)
 	}
 
 	return nil
+}
+
+// nativeFileModeIsPrivate reports whether a regular file in the generated
+// native tree is safe to hand to the target identity. The tree belongs to that
+// one identity, so the property is: nothing group- or other-accessible, no
+// setuid, setgid, or sticky bit, and readable by the owner about to receive
+// it. Write-once files such as the per-session residence are published
+// owner-read-only, which is stricter than the rest of the tree rather than
+// looser, so the rule is the property and not a list of the modes the tree
+// happens to contain today.
+func nativeFileModeIsPrivate(mode uint32) bool {
+	return mode&(0o7000|0o077) == 0 && mode&0o400 != 0
 }
 
 func chownAndVerifyNativeInode(fd int, kind uint32, uid uint32, gid uint32, singleLink bool) error {
