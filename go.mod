@@ -1,7 +1,7 @@
 module github.com/savid/acp-go-pi
 
 // Minimum Go language version required by consumers of this library.
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/coder/acp-go-sdk v0.13.5
