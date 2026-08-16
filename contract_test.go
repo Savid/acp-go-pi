@@ -732,6 +732,19 @@ func requireUnsupportedField(t *testing.T, err error, field string) {
 	require.Equal(t, map[string]any{"error": "unsupported", "field": field}, requestError.Data)
 }
 
+// requireUnsupportedOption asserts a construction-time option rejection: the
+// same two contracted keys naming the option, but -32603, because the caller's
+// params were valid and the fault is in the agent the host built.
+func requireUnsupportedOption(t *testing.T, err error, field string) {
+	t.Helper()
+
+	var requestError *acp.RequestError
+
+	require.ErrorAs(t, err, &requestError)
+	require.Equal(t, -32603, requestError.Code)
+	require.Equal(t, map[string]any{"error": "unsupported", "field": field}, requestError.Data)
+}
+
 func anyMap(t *testing.T, value any) map[string]any {
 	t.Helper()
 	nested, ok := value.(map[string]any)

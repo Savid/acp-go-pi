@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
 	"github.com/savid/acp-go-pi/internal/pi"
@@ -198,10 +197,7 @@ func TestWithProviderAuthRootRejectsRelativePath(t *testing.T) {
 
 	_, err := NewAgent(WithProviderAuthRoot("relative/auth")).Initialize(t.Context(), defaultInitializeRequest())
 
-	var requestError *acp.RequestError
-
-	require.ErrorAs(t, err, &requestError)
-	require.Equal(t, -32602, requestError.Code)
+	requireUnsupportedOption(t, err, optionFieldProviderAuthRoot)
 }
 
 func TestNewAuthLedgerReportsFilesystemFailures(t *testing.T) {

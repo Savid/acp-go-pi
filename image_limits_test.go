@@ -46,7 +46,7 @@ func TestImageLimitsNegativeRejectedAtConstruction(t *testing.T) {
 		WithImageLimits(ImageLimits{MaxOutputBytesPerImage: -1}),
 	)
 	_, err = agent.Initialize(t.Context(), acp.InitializeRequest{})
-	requireInvalidParams(t, err)
+	requireUnsupportedOption(t, err, optionFieldImageLimits)
 }
 
 // TestSessionEstablishmentRejectsUnvalidatedOptions pins that an embedded host
@@ -64,7 +64,7 @@ func TestSessionEstablishmentRejectsUnvalidatedOptions(t *testing.T) {
 
 	// The client is told which option the agent refuses to serve under and
 	// nothing else; the reason is the operator's, and it is in the log.
-	requireUnsupportedField(t, err, optionFieldImageLimits)
+	requireUnsupportedOption(t, err, optionFieldImageLimits)
 	require.Contains(t, logs.String(), "MaxOutputBytesPerImage")
 }
 

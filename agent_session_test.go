@@ -290,7 +290,7 @@ func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
 			}
 
 			_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-			requireUnsupportedField(t, err, optionFieldEnv+"."+key)
+			requireUnsupportedOption(t, err, optionFieldEnv+"."+key)
 			require.Zero(t, starts)
 		})
 	}

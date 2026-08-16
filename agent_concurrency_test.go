@@ -30,7 +30,7 @@ func TestAgentConcurrencyAndErrors(t *testing.T) {
 
 	invalid := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: -1}))
 	_, err = invalid.Initialize(t.Context(), defaultInitializeRequest())
-	requireInvalidParams(t, err)
+	requireUnsupportedOption(t, err, optionFieldConcurrencyLimits)
 	require.Equal(t, defaultMaxActiveSessions, NewAgent().maxActiveSessions())
 	require.Equal(t, defaultMaxConcurrentClientCalls, NewAgent().maxConcurrentClientCalls())
 	require.Equal(t, 5*time.Second, NewAgent(WithTurnTimeout(5*time.Second)).turnTimeout())

@@ -991,10 +991,7 @@ func TestValidateInputHandoffRoot(t *testing.T) {
 func TestWithInputHandoffRootRejectsRelativePath(t *testing.T) {
 	_, err := NewAgent(WithInputHandoffRoot("relative/handoff")).Initialize(t.Context(), defaultInitializeRequest())
 
-	var requestError *acp.RequestError
-
-	require.ErrorAs(t, err, &requestError)
-	require.Equal(t, -32602, requestError.Code)
+	requireUnsupportedOption(t, err, optionFieldInputHandoffRoot)
 }
 
 func TestHandoffErrorReportsItsCause(t *testing.T) {

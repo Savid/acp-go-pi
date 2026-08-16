@@ -75,6 +75,13 @@ whose `data` is exactly two keys,
 `session/set_session_config_option`, which no longer echoes the caller's value
 or a native error string back.
 
+An option the embedding host handed `NewAgent` and this adapter refuses is
+answered with those same two keys naming the option, but under **`-32603`**:
+the caller's params were valid, and it is the constructed agent that cannot
+serve them. Both `initialize` and session establishment report it, because an
+embedded host can open a session and prompt without ever handshaking. Why the
+option was refused stays in the adapter log.
+
 The other `-32602` shapes are fixed by the wire contract and are unchanged:
 
 | Case | `data` |
@@ -93,7 +100,8 @@ Image rejections carry the structured image data documented in
 A request the client cancels with `$/cancel_request` is answered **`-32800`**
 with no `data`, ahead of whatever error the in-flight handler returned. An
 adapter-internal deadline is never reported as a cancel. Any remaining
-adapter fault is **`-32603`** with no `data`; its detail is in the adapter log.
+adapter fault, the refused-option verdict above aside, is **`-32603`** with no
+`data`; its detail is in the adapter log.
 
 <Note>
 This adapter advertises no standard ACP `authenticate` method, so a provider

@@ -368,18 +368,21 @@ func (a *Agent) setConnection(conn agentClient) {
 	a.conn = conn
 }
 
-// optionsError reports a construction-time option failure as the uniform
-// invalid-params error, or nil when every option validated. Both the handshake
-// and session establishment report it, because an embedded host can open a
-// session and prompt without ever calling initialize, and options that never
-// validated must not reach a native process.
+// optionsError reports a construction-time option failure as an internal
+// error naming the refused option, or nil when every option validated. The
+// caller's params are blameless here — the embedding host built an agent this
+// process cannot serve under — so the verdict keeps the option-naming data but
+// carries the internal-error code. Both the handshake and session
+// establishment report it, because an embedded host can open a session and
+// prompt without ever calling initialize, and options that never validated
+// must not reach a native process.
 func (a *Agent) optionsError() error {
 	var reqErr *acp.RequestError
 	if !errors.As(a.optionErr, &reqErr) {
 		return nil
 	}
 
-	return reqErr
+	return acp.NewInternalError(reqErr.Data)
 }
 
 // optionFailure answers a construction-time option verdict as the uniform

@@ -328,8 +328,8 @@ func TestRequestedProviderAuthResidenceFailsInitializationWhenIncompleteOrUnusab
 		t.Cleanup(func() { require.NoError(t, agent.Close()) })
 
 		_, err := agent.Initialize(t.Context(), defaultInitializeRequest())
-		requireUnsupportedField(t, err, optionFieldProviderAuthRoot)
-		requireUnsupportedField(t, agent.sessionStartConfigurationError(), optionFieldProviderAuthRoot)
+		requireUnsupportedOption(t, err, optionFieldProviderAuthRoot)
+		requireUnsupportedOption(t, agent.sessionStartConfigurationError(), optionFieldProviderAuthRoot)
 		require.Contains(t, logs.String(), test.want, test.name)
 		require.Nil(t, agent.providerAuth)
 	}
