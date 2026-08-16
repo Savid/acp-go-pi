@@ -83,7 +83,7 @@ func TestPromptSecondPoisonCheck(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := newStubPiClient()
 	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
-	lateCtx := &poisonOnDoneContext{session: session}
+	lateCtx := &poisonOnAdmissionContext{session: session}
 
 	_, err := session.Prompt(lateCtx, TextPromptRequest("id", "test-turn", "hi"))
 	require.Error(t, err)

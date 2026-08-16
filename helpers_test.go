@@ -169,20 +169,20 @@ func (s *faultySessionStore) Load(ctx context.Context, key SessionKey) ([]Sessio
 	return s.InMemorySessionStore.Load(ctx, key)
 }
 
-// poisonOnDoneContext poisons its session the first time Done is observed,
-// simulating a session poisoned mid-request.
-type poisonOnDoneContext struct {
+// poisonOnAdmissionContext poisons its session the first time turn admission
+// inspects it, simulating a session poisoned mid-request.
+type poisonOnAdmissionContext struct {
 	session *agentSession
 	once    sync.Once
 }
 
-func (*poisonOnDoneContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (*poisonOnAdmissionContext) Deadline() (time.Time, bool) { return time.Time{}, false }
 
-func (*poisonOnDoneContext) Err() error { return nil }
+func (*poisonOnAdmissionContext) Value(any) any { return nil }
 
-func (*poisonOnDoneContext) Value(any) any { return nil }
+func (*poisonOnAdmissionContext) Done() <-chan struct{} { return nil }
 
-func (c *poisonOnDoneContext) Done() <-chan struct{} {
+func (c *poisonOnAdmissionContext) Err() error {
 	c.once.Do(func() {
 		c.session.mu.Lock()
 		c.session.poisonCause = "late poison"
@@ -245,16 +245,19 @@ func messageRow(t *testing.T, message pi.AgentMessage) SessionStoreEntry {
 }
 
 type stubProcess struct {
-	exited     chan struct{}
-	waitErr    error
-	stderr     string
-	shutdown   error
-	kill       error
-	close      error
-	killFunc   func() error
-	closeFunc  func() error
-	killCalls  int
-	closeCalls int
+	exited        chan struct{}
+	waitErr       error
+	stderr        string
+	shutdown      error
+	kill          error
+	close         error
+	killFunc      func() error
+	closeFunc     func() error
+	shutdownFunc  func(context.Context) error
+	onExited      func()
+	killCalls     int
+	closeCalls    int
+	shutdownCalls int
 }
 
 func newStubProcess(exited bool) *stubProcess {
@@ -266,11 +269,24 @@ func newStubProcess(exited bool) *stubProcess {
 	return process
 }
 
-func (*stubProcess) CloseStdin() error                { return nil }
-func (p *stubProcess) Exited() <-chan struct{}        { return p.exited }
-func (p *stubProcess) WaitErr() error                 { return p.waitErr }
-func (p *stubProcess) StderrTail() string             { return p.stderr }
-func (p *stubProcess) Shutdown(context.Context) error { return p.shutdown }
+func (*stubProcess) CloseStdin() error { return nil }
+func (p *stubProcess) Exited() <-chan struct{} {
+	if p.onExited != nil {
+		p.onExited()
+	}
+
+	return p.exited
+}
+func (p *stubProcess) WaitErr() error     { return p.waitErr }
+func (p *stubProcess) StderrTail() string { return p.stderr }
+func (p *stubProcess) Shutdown(ctx context.Context) error {
+	p.shutdownCalls++
+	if p.shutdownFunc != nil {
+		return p.shutdownFunc(ctx)
+	}
+
+	return p.shutdown
+}
 func (p *stubProcess) Kill() error {
 	p.killCalls++
 	if p.killFunc != nil {

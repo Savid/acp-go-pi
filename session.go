@@ -3,7 +3,6 @@ package piacp
 import (
 	"context"
 	"sync"
-	"time"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -39,8 +38,6 @@ const (
 	configThoughtLevel acp.SessionConfigId = "thought_level"
 
 	configTypeSelect = "select"
-
-	defaultSessionCloseTurnWait = 5 * time.Second
 )
 
 // agentSession is the internal handle for one pi RPC-mode process owned by an
@@ -112,13 +109,21 @@ type agentSession struct {
 	rawEventSequence     int64
 	mirroredRows         int
 	turnImagesEmitted    bool
-	closeTurnWait        time.Duration
 	nativeRootRelease    func()
 	scratchRootRelease   func()
 	nativeContainmentErr error
 	providerProcessRoot  *providerProcessRoot
 	browserShim          *pi.BrowserShim
+	residence            *pi.SessionResidence
 	authClosed           bool
+
+	// closing is the session's terminal state: once the first Close claims it
+	// the session admits no prompt, relaunch, or MCP-tool refresh ever again,
+	// and every later Close waits on closeDone and reports closeErr rather than
+	// tearing the same resources down a second time.
+	closing   bool
+	closeDone chan struct{}
+	closeErr  error
 }
 
 // turnToolCall is the exact-ID lifecycle published for one native tool call.

@@ -38,10 +38,14 @@ servers := []acp.McpServer{
 
 ## How servers reach pi
 
-The adapter writes a per-session MCP config into the session's isolated agent
-directory with mode `0600` and loads its MCP extension alongside the bridge
-extension. It is removed with that session directory. The
-extension connects to every declared server during lifecycle establishment.
+The adapter gives every session a private residence under its agent directory
+and writes that session's MCP config and wrapper extensions into it. Each file
+is published once and left read-only, and the residence is removed with the
+session. Because a configured `WithHome` makes every session share one agent
+directory, the residence is what keeps one session's server commands,
+arguments, environment, and credential-bearing headers unreadable and
+unreplaceable by another. The extension connects to every declared server
+during lifecycle establishment.
 Because some hosts deliberately expose only a side-effect-free readiness
 surface until an operation is authorized, the adapter rebuilds pi's fixed
 extension-tool registry once more at the first user turn. Every tool then

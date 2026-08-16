@@ -90,9 +90,9 @@ func startHarness(t *testing.T, ctx context.Context, executable string, withBrid
 	}
 
 	if withBridge {
-		extensions, err := pi.WriteExtensions(agentDir, false)
+		_, residence, err := pi.CreateSessionResidence(agentDir, nil)
 		require.NoError(t, err)
-		spec.ExtensionPaths = extensions
+		spec.ExtensionPaths = residence.ExtensionPaths
 		spec.Env = map[string]string{pi.EnvPermissionMode: pi.PermissionModeAsk}
 	}
 

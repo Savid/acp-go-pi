@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"strconv"
 	"strings"
 )
 
@@ -31,12 +30,6 @@ type ProcessIsolation struct {
 }
 
 var errProcessIsolationRequired = errors.New("process isolation policy is required")
-
-const (
-	envIsolationUID  = privateEnvPrefix + "ISOLATION_UID"
-	envIsolationGID  = privateEnvPrefix + "ISOLATION_GID"
-	envIsolationTest = privateEnvPrefix + "ISOLATION_TEST_ONLY"
-)
 
 var processIsolationGOOS = runtime.GOOS
 
@@ -260,25 +253,4 @@ func ResolveExecutable(file string, isolation *ProcessIsolation, ordinary map[st
 	}
 
 	return lookPathInEnvironment(file, environment)
-}
-
-func supervisorEnvironment(native []string, isolation *ProcessIsolation, modeKey, modeValue string) ([]string, error) {
-	if err := validateProcessIsolation(isolation); err != nil {
-		return nil, err
-	}
-
-	environment := make([]string, 0, len(native)+3)
-	for _, entry := range native {
-		name, _, ok := strings.Cut(entry, "=")
-		if ok && name != modeKey && name != envIsolationUID && name != envIsolationGID && name != envIsolationTest {
-			environment = append(environment, entry)
-		}
-	}
-
-	return append(environment,
-		modeKey+"="+modeValue,
-		envIsolationUID+"="+strconv.FormatUint(uint64(isolation.UID), 10),
-		envIsolationGID+"="+strconv.FormatUint(uint64(isolation.GID), 10),
-		envIsolationTest+"="+strconv.FormatBool(isolation.TestOnlyNoCredential),
-	), nil
 }

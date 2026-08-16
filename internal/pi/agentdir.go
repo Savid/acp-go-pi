@@ -35,7 +35,11 @@ var (
 	fsReadFile  = os.ReadFile
 	fsWriteFile = os.WriteFile
 	fsMkdirAll  = os.MkdirAll
+	fsMkdirTemp = os.MkdirTemp
 	fsStat      = os.Stat
+	fsLink      = os.Link
+	fsRemove    = os.Remove
+	fsRemoveAll = os.RemoveAll
 )
 
 // SeedFileError reports an invalid or unwritable seed file; the root package

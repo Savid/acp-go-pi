@@ -136,6 +136,7 @@ func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
 			root,
 			func() { scratchReleases++ },
 			nil,
+			nil,
 		)
 
 		require.ErrorIs(t, err, runtimeErr)
@@ -154,6 +155,7 @@ func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
 			func() { nativeReleases++ },
 			root,
 			func() { scratchReleases++ },
+			nil,
 			nil,
 		)
 
@@ -181,6 +183,7 @@ func TestSessionRuntimeCleanupProofBoundaries(t *testing.T) {
 			func() { nativeReleases++ },
 			root,
 			func() { scratchReleases++ },
+			nil,
 			nil,
 		)
 

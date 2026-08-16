@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -154,7 +153,6 @@ func TestDarwinLaunchBootstrapDispatch(t *testing.T) {
 		darwinLaunchInput, darwinLaunchExit, darwinLaunchExec = originalInput, originalExit, originalExec
 	})
 	t.Setenv(darwinLaunchBootstrapEnv, darwinLaunchBootstrapMode)
-	setTestIsolationBootstrapEnv(t)
 	darwinLaunchExec = func(string, []string, []string) error { return nil }
 
 	var exits []int
@@ -975,11 +973,4 @@ func TestDarwinFastExitRaceStress(t *testing.T) {
 	for err := range errs {
 		require.NoError(t, err)
 	}
-}
-
-func setTestIsolationBootstrapEnv(t *testing.T) {
-	t.Helper()
-	t.Setenv(envIsolationUID, strconv.Itoa(os.Geteuid()))
-	t.Setenv(envIsolationGID, strconv.Itoa(os.Getegid()))
-	t.Setenv(envIsolationTest, "true")
 }

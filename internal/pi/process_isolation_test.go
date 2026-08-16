@@ -35,7 +35,7 @@ func TestProcessIsolationEnvironmentIdentityAndLookup(t *testing.T) {
 	require.Error(t, validateProcessIsolation(&ProcessIsolation{UID: 1, GID: 0}))
 	_, err = isolationEnvironment(isolation, map[string]string{"BAD=KEY": "x"})
 	require.Error(t, err)
-	_, err = isolationEnvironment(isolation, map[string]string{envIsolationTest: "true"})
+	_, err = isolationEnvironment(isolation, map[string]string{privateEnvPrefix + "RESERVED": "true"})
 	require.Error(t, err)
 	_, err = isolationEnvironment(nil)
 	require.Error(t, err)
@@ -53,16 +53,6 @@ func TestProcessIsolationEnvironmentIdentityAndLookup(t *testing.T) {
 	require.NoError(t, os.WriteFile(nonExecutable, []byte("x"), 0o600))
 	_, err = ResolveExecutable(nonExecutable, isolation, nil)
 	require.Error(t, err)
-	_, err = supervisorEnvironment(nil, nil, "MODE", "1")
-	require.Error(t, err)
-	supervisorEnv, err := supervisorEnvironment(
-		[]string{"A=B", "MODE=old", envIsolationUID + "=old", envIsolationGID + "=old", envIsolationTest + "=old"},
-		&ProcessIsolation{UID: 1, GID: 2, BaseEnvironment: map[string]string{}, TestOnlyNoCredential: true}, "MODE", "1",
-	)
-	require.NoError(t, err)
-	require.Contains(t, supervisorEnv, "A=B")
-	require.Contains(t, supervisorEnv, "MODE=1")
-	require.Contains(t, supervisorEnv, envIsolationTest+"=true")
 }
 
 func TestCaptureOrdinaryEnvironmentIsSanitizedAndStable(t *testing.T) {

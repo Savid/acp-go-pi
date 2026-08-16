@@ -290,18 +290,15 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 		return acp.CloseSessionResponse{}, err
 	}
 
-	_ = session.cancelForClose(ctx)
-	closeErr := session.Close(ctx)
-
-	a.mu.Lock()
-	_, existed := a.sessions[params.SessionId]
-	delete(a.sessions, params.SessionId)
-	a.mu.Unlock()
-
-	if existed {
+	// Detaching before teardown closes the window where a prompt could still
+	// resolve this id and relaunch the process being closed.
+	if a.detachSession(params.SessionId, session) {
 		a.observe.AddActiveSession(ctx, -1)
 	}
 
+	_ = session.cancelForClose(ctx)
+
+	closeErr := session.Close(ctx)
 	if closeErr != nil {
 		return acp.CloseSessionResponse{}, closeErr
 	}
@@ -321,7 +318,11 @@ func (a *Agent) UnstableDeleteSession(
 
 	a.mu.Lock()
 	session := a.sessions[params.SessionId]
-	delete(a.sessions, params.SessionId)
+
+	if session != nil {
+		delete(a.sessions, params.SessionId)
+	}
+
 	a.deleted[params.SessionId] = struct{}{}
 	a.mu.Unlock()
 
@@ -400,19 +401,25 @@ func promptResultForObserver(resp acp.PromptResponse, err error, session *agentS
 	return result
 }
 
-func (a *Agent) removeSession(ctx context.Context, sessionID acp.SessionId, session *agentSession) {
+// detachSession removes an id from the active map only while it still resolves
+// to this exact session. A replacement stored under the same id belongs to a
+// different lifecycle, and a closer of the superseded session must never evict
+// it.
+func (a *Agent) detachSession(sessionID acp.SessionId, session *agentSession) bool {
 	a.mu.Lock()
-	removed := false
+	defer a.mu.Unlock()
 
-	if a.sessions[sessionID] == session {
-		delete(a.sessions, sessionID)
-
-		removed = true
+	if a.sessions[sessionID] != session {
+		return false
 	}
 
-	a.mu.Unlock()
+	delete(a.sessions, sessionID)
 
-	if removed {
+	return true
+}
+
+func (a *Agent) removeSession(ctx context.Context, sessionID acp.SessionId, session *agentSession) {
+	if a.detachSession(sessionID, session) {
 		a.observe.AddActiveSession(context.Background(), -1)
 	}
 
@@ -630,13 +637,14 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		dirs          sessionDirs
 		nativeRelease func()
 		browserShim   *pi.BrowserShim
+		residence     *pi.SessionResidence
 	)
 
 	keepScratch := false
 	defer func() {
 		if !keepScratch {
 			err = finalizeSessionRuntimeResources(
-				err, nativeRelease, dirs.SessionRoot, scratchRelease, browserShim,
+				err, nativeRelease, dirs.SessionRoot, scratchRelease, browserShim, residence,
 			)
 		}
 	}()
@@ -660,12 +668,21 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	}
 
 	configurationStarted := time.Now()
-	includeMCP := len(start.McpServers) > 0
 
-	extensionPaths, err := pi.WriteExtensions(dirs.AgentDir, includeMCP)
+	var mcpConfig *pi.MCPConfig
+
+	includeMCP := len(start.McpServers) > 0
+	if includeMCP {
+		config := mcpConfigForServers(start.McpServers)
+		mcpConfig = &config
+	}
+
+	residence, residenceFiles, err := pi.CreateSessionResidence(dirs.AgentDir, mcpConfig)
 	if err != nil {
 		return nil, err
 	}
+
+	extensionPaths := residenceFiles.ExtensionPaths
 
 	permission := start.MetaOptions.Permission
 	if permission == "" {
@@ -683,12 +700,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	}
 
 	if includeMCP {
-		configPath, mcpErr := pi.WriteMCPConfig(dirs.AgentDir, mcpConfigForServers(start.McpServers))
-		if mcpErr != nil {
-			return nil, mcpErr
-		}
-
-		managedEnv[pi.EnvMCPConfig] = configPath
+		managedEnv[pi.EnvMCPConfig] = residenceFiles.MCPConfigPath
 	}
 
 	env := pi.ComposeEnvironment(
@@ -785,6 +797,7 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		launch:                spec,
 		sessionRoot:           dirs.SessionRoot,
 		browserShim:           browserShim,
+		residence:             residence,
 		permissionMode:        permission,
 		autoRetry:             start.MetaOptions.AutoRetry,
 		mcpRefreshPending:     includeMCP,

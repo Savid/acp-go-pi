@@ -134,7 +134,7 @@ func configureProviderAuth(agent *Agent) error {
 		return errors.New("provider auth requires a durable pi home")
 	}
 
-	if err := agent.applyDurableHome(&sessionDirs{}); err != nil {
+	if _, err := agent.durableHome(); err != nil {
 		return fmt.Errorf("prepare provider auth home: %w", err)
 	}
 

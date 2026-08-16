@@ -67,7 +67,7 @@ func TestConfigSelectionFailureBranches(t *testing.T) {
 
 	late := &agentSession{agent: agent, id: "late", turn: make(chan struct{}, 1)}
 	agent.sessions[late.id] = late
-	lateCtx := &poisonOnDoneContext{session: late}
+	lateCtx := &poisonOnAdmissionContext{session: late}
 	_, err = agent.SetSessionConfigOption(lateCtx, SetModelRequest(late.id, "p/model"))
 	require.Error(t, err)
 

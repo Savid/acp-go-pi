@@ -40,6 +40,55 @@ func TestRemoveSessionCloseError(t *testing.T) {
 	agent.removeSession(t.Context(), "unmapped", session)
 }
 
+// TestSameSessionIDKeepsOneLinearizedOwner proves the close-versus-same-id
+// race: a load, resume, or fork that stores a replacement under a live id takes
+// ownership of that id, the superseded session is closed exactly once, and its
+// closer can never evict the replacement from any removal site.
+func TestSameSessionIDKeepsOneLinearizedOwner(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	superseded := &agentSession{
+		agent: agent, id: "id", proc: newStubProcess(false), sessionRoot: t.TempDir(),
+	}
+
+	agent.mu.Lock()
+	agent.sessions[superseded.id] = superseded
+	agent.mu.Unlock()
+
+	replacement := &agentSession{
+		agent: agent, id: "id", proc: newStubProcess(false), sessionRoot: t.TempDir(),
+	}
+	require.NoError(t, agent.storeStartedSession(t.Context(), replacement))
+
+	supersededProcess, ok := superseded.proc.(*stubProcess)
+	require.True(t, ok)
+	require.Equal(t, 1, supersededProcess.closeCalls)
+
+	agent.mu.Lock()
+	require.Same(t, replacement, agent.sessions["id"])
+	agent.mu.Unlock()
+
+	require.False(t, agent.detachSession("id", superseded))
+	agent.removeSession(t.Context(), "id", superseded)
+
+	agent.mu.Lock()
+	require.Same(t, replacement, agent.sessions["id"], "a superseded closer evicted the replacement")
+	agent.mu.Unlock()
+
+	require.Equal(t, 1, supersededProcess.closeCalls, "the superseded session was torn down twice")
+
+	_, err := agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: "id"})
+	require.NoError(t, err)
+
+	agent.mu.Lock()
+	require.NotContains(t, agent.sessions, acp.SessionId("id"))
+	agent.mu.Unlock()
+
+	replacementProcess, ok := replacement.proc.(*stubProcess)
+	require.True(t, ok)
+	require.Equal(t, 1, replacementProcess.closeCalls)
+	require.Empty(t, replacement.turn, "close left the replacement's turn admission unbalanced")
+}
+
 func TestNewSessionBackpressure(t *testing.T) {
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "fresh"}
@@ -342,11 +391,13 @@ func TestStartSessionLoadsExplicitSeedResourcesAndProviderEnv(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, session.Close(t.Context())) })
 
+	residence := session.residence.Root()
 	require.Equal(t, "explicit-key", launched.Env["OPENAI_API_KEY"])
 	require.Len(t, launched.ExtensionPaths, 3)
 	require.Contains(t, filepath.ToSlash(launched.ExtensionPaths[0]), "/extensions/command.ts")
-	require.Equal(t, filepath.Join(launched.AgentDir, pi.BridgeExtensionFileName), launched.ExtensionPaths[1])
-	require.Equal(t, filepath.Join(launched.AgentDir, pi.PathExtensionFileName), launched.ExtensionPaths[2])
+	require.Equal(t, filepath.Join(residence, pi.BridgeExtensionFileName), launched.ExtensionPaths[1])
+	require.Equal(t, filepath.Join(residence, pi.PathExtensionFileName), launched.ExtensionPaths[2])
+	require.Equal(t, launched.AgentDir, filepath.Dir(filepath.Dir(residence)))
 	require.Equal(t, []string{filepath.Join(launched.AgentDir, "skills", "review", "SKILL.md")}, launched.SkillPaths)
 	require.Equal(t, []string{filepath.Join(launched.AgentDir, "prompts", "review.md")}, launched.PromptTemplatePaths)
 }
@@ -365,38 +416,36 @@ func TestStartSessionHydrateWriteFailure(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestStartSessionExtensionAndConfigFailures(t *testing.T) {
+// TestStartSessionRefusesAnUnusableSessionResidence proves a session that
+// cannot get a private residence inside its agent directory never launches: the
+// residence root is blocked by a file, so no session can fall back to writing
+// its MCP servers and headers at a path another session also addresses.
+func TestStartSessionRefusesAnUnusableSessionResidence(t *testing.T) {
 	original := materializeMkdirAll
 	t.Cleanup(func() { materializeMkdirAll = original })
 
-	mkdirAllPlacingDir := func(child string) func(string, os.FileMode) error {
-		return func(path string, mode os.FileMode) error {
-			if mkErr := original(path, mode); mkErr != nil {
-				return mkErr
-			}
+	materializeMkdirAll = func(path string, mode os.FileMode) error {
+		if mkErr := original(path, mode); mkErr != nil {
+			return mkErr
+		}
 
-			if filepath.Base(path) == "agent" {
-				return original(filepath.Join(path, child), 0o700)
-			}
-
+		if filepath.Base(path) != "agent" {
 			return nil
 		}
+
+		return os.WriteFile(filepath.Join(path, ".acp-session"), nil, 0o600)
 	}
 
-	bridgeAsDir := newStubClientAgent(t, nil)
-	materializeMkdirAll = mkdirAllPlacingDir(pi.BridgeExtensionFileName)
-	_, err := bridgeAsDir.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-	require.Error(t, err)
+	blocked := newStubClientAgent(t, nil)
+	_, err := blocked.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	require.ErrorContains(t, err, "create session residence root")
 
-	configClient := newStubPiClient()
-	configClient.state = pi.SessionState{SessionID: "id"}
-	configAsDir := newStubClientAgent(t, configClient)
-	materializeMkdirAll = mkdirAllPlacingDir(pi.MCPConfigFileName)
-	_, err = configAsDir.startSession(t.Context(), sessionStart{
+	blockedWithMCP := newStubClientAgent(t, nil)
+	_, err = blockedWithMCP.startSession(t.Context(), sessionStart{
 		Cwd:        "/cwd",
 		McpServers: []acp.McpServer{StdioMCPServer("stdio", "/bin/true", nil, nil)},
 	})
-	require.Error(t, err)
+	require.ErrorContains(t, err, "create session residence root")
 }
 
 func TestStartSessionSeedWriteFailure(t *testing.T) {

@@ -6,8 +6,8 @@ import (
 )
 
 func TestSessionCoreDefaults(t *testing.T) {
-	if defaultSessionCloseTurnWait != 5*time.Second {
-		t.Fatalf("default close wait = %v", defaultSessionCloseTurnWait)
+	if sessionCloseTurnWait != 5*time.Second {
+		t.Fatalf("close turn wait = %v", sessionCloseTurnWait)
 	}
 	if configThoughtLevel != "thought_level" || configTypeSelect != "select" {
 		t.Fatalf("config constants = %q, %q", configThoughtLevel, configTypeSelect)

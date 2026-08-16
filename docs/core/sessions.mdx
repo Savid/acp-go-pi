@@ -34,6 +34,18 @@ pi creates its session file lazily: a brand-new session has no file (and
 nothing to mirror) until the first conversation entry lands. Listing sessions
 right after `session/new` therefore reflects the store, not a native file.
 
+## Closing
+
+`session/close` and `session/delete` are terminal. Closing first removes the id
+from the active map and marks the session closing, so a concurrent prompt is
+answered with the uniform unknown-session error rather than lazily relaunching
+the process being torn down. Close then waits, up to a bounded interval, for an
+in-flight turn to release the session's single turn admission before it
+contains the native process and removes the session's directories; a turn that
+never releases surrenders its claim and the wait is reported in the close
+error. Close is idempotent: repeated or concurrent calls run teardown once and
+observe the same result.
+
 ## Store keys and subpaths
 
 Durable storage is keyed by session id plus a subpath:

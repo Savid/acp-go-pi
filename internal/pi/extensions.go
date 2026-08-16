@@ -3,6 +3,7 @@ package pi
 import (
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -31,6 +32,16 @@ const (
 	// MCPConfigFileName is the per-session MCP server config consumed by the
 	// MCP extension.
 	MCPConfigFileName = "acp-mcp-config.json"
+
+	// sessionResidenceDir is the agent-directory subtree holding one residence
+	// per session. A durable agent directory is shared by every session the
+	// adapter runs, so nothing a session writes may live at a fixed path
+	// inside it.
+	sessionResidenceDir = ".acp-session"
+
+	// residenceStagingSuffix names the carrier an immutable residence file is
+	// written through before it is published under its final name.
+	residenceStagingSuffix = ".staging"
 
 	// EnvPermissionMode selects the bridge permission mode for one pi child.
 	EnvPermissionMode = "ACP_GO_PI_PERMISSION"
@@ -198,36 +209,129 @@ func ParseAuthTitle(title string) (AuthMessage, bool) {
 	return message, true
 }
 
-// WriteExtensions writes the wrapper-owned extensions into dir and returns
-// their absolute paths in -e load order. The MCP extension is written only
-// when includeMCP is set.
-func WriteExtensions(dir string, includeMCP bool) ([]string, error) {
-	if err := fsMkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create extension directory: %w", err)
+// SessionResidence is one session's private subtree inside a pi agent
+// directory. Sessions can share a single agent directory when a durable home is
+// configured, and the files a session writes there carry its MCP stdio
+// commands, arguments, environment, and credential-bearing HTTP headers, so
+// every session gets a residence of its own and every file in it is published
+// exactly once and left read-only.
+type SessionResidence struct {
+	root string
+}
+
+// SessionResidenceFiles are the launch paths one session's residence provides.
+type SessionResidenceFiles struct {
+	// ExtensionPaths are the wrapper-owned extensions in -e load order.
+	ExtensionPaths []string
+	// MCPConfigPath is the session's MCP config for EnvMCPConfig, empty when
+	// the session declared no MCP servers.
+	MCPConfigPath string
+}
+
+// CreateSessionResidence creates one session's residence under agentDir and
+// publishes everything it holds: the wrapper-owned extensions, plus the MCP
+// extension and config when mcp is supplied. The residence is complete when it
+// returns, so nothing ever writes into it again.
+func CreateSessionResidence(agentDir string, mcp *MCPConfig) (*SessionResidence, SessionResidenceFiles, error) {
+	parent := filepath.Join(agentDir, sessionResidenceDir)
+	if err := fsMkdirAll(parent, 0o700); err != nil {
+		return nil, SessionResidenceFiles{}, fmt.Errorf("create session residence root: %w", err)
 	}
 
-	bridgePath := filepath.Join(dir, BridgeExtensionFileName)
-	if err := fsWriteFile(bridgePath, bridgeExtensionSource, 0o600); err != nil {
-		return nil, fmt.Errorf("write bridge extension: %w", err)
+	root, err := fsMkdirTemp(parent, "session-*")
+	if err != nil {
+		return nil, SessionResidenceFiles{}, fmt.Errorf("create session residence: %w", err)
 	}
 
-	pathExtensionPath := filepath.Join(dir, PathExtensionFileName)
-	if err := fsWriteFile(pathExtensionPath, pathExtensionSource, 0o600); err != nil {
-		return nil, fmt.Errorf("write path extension: %w", err)
+	residence := &SessionResidence{root: root}
+
+	files, err := residence.publishAll(mcp)
+	if err != nil {
+		return nil, SessionResidenceFiles{}, errors.Join(err, residence.Remove())
 	}
 
-	paths := []string{bridgePath, pathExtensionPath}
+	return residence, files, nil
+}
 
-	if includeMCP {
-		mcpPath := filepath.Join(dir, MCPExtensionFileName)
-		if err := fsWriteFile(mcpPath, mcpExtensionSource, 0o600); err != nil {
-			return nil, fmt.Errorf("write mcp extension: %w", err)
-		}
+// Root is the residence directory holding this session's files.
+func (r *SessionResidence) Root() string {
+	return r.root
+}
 
-		paths = append(paths, mcpPath)
+// Remove deletes this session's residence, and never anything else in the
+// agent directory it may share with other sessions.
+func (r *SessionResidence) Remove() error {
+	if r == nil {
+		return nil
 	}
 
-	return paths, nil
+	if err := fsRemoveAll(r.root); err != nil {
+		return fmt.Errorf("remove session residence: %w", err)
+	}
+
+	return nil
+}
+
+// publish writes one immutable residence file. Contents land in a staging
+// carrier and are linked onto the final name, so a reader never observes a
+// partial file and a name that already exists fails the write instead of
+// replacing a file a running pi child was launched from.
+func (r *SessionResidence) publish(name string, contents []byte) (string, error) {
+	path := filepath.Join(r.root, name)
+	staging := path + residenceStagingSuffix
+
+	if err := fsWriteFile(staging, contents, 0o400); err != nil {
+		return "", fmt.Errorf("stage session residence file %q: %w", name, err)
+	}
+
+	if err := fsLink(staging, path); err != nil {
+		_ = fsRemove(staging)
+
+		return "", fmt.Errorf("publish session residence file %q: %w", name, err)
+	}
+
+	if err := fsRemove(staging); err != nil {
+		return "", fmt.Errorf("clean session residence staging %q: %w", name, err)
+	}
+
+	return path, nil
+}
+
+func (r *SessionResidence) publishAll(mcp *MCPConfig) (SessionResidenceFiles, error) {
+	bridgePath, err := r.publish(BridgeExtensionFileName, bridgeExtensionSource)
+	if err != nil {
+		return SessionResidenceFiles{}, err
+	}
+
+	pathExtensionPath, err := r.publish(PathExtensionFileName, pathExtensionSource)
+	if err != nil {
+		return SessionResidenceFiles{}, err
+	}
+
+	files := SessionResidenceFiles{ExtensionPaths: []string{bridgePath, pathExtensionPath}}
+
+	if mcp == nil {
+		return files, nil
+	}
+
+	mcpPath, err := r.publish(MCPExtensionFileName, mcpExtensionSource)
+	if err != nil {
+		return SessionResidenceFiles{}, err
+	}
+
+	files.ExtensionPaths = append(files.ExtensionPaths, mcpPath)
+
+	encoded, err := marshalMCPConfig(*mcp, "", "  ")
+	if err != nil {
+		return SessionResidenceFiles{}, fmt.Errorf("encode mcp config: %w", err)
+	}
+
+	files.MCPConfigPath, err = r.publish(MCPConfigFileName, append(encoded, '\n'))
+	if err != nil {
+		return SessionResidenceFiles{}, err
+	}
+
+	return files, nil
 }
 
 // PermissionPrompt is the payload the bridge extension encodes into a
@@ -274,20 +378,4 @@ type MCPServer struct {
 // extension.
 type MCPConfig struct {
 	Servers []MCPServer `json:"servers"`
-}
-
-// WriteMCPConfig writes the per-session MCP config into dir and returns its
-// path for EnvMCPConfig.
-func WriteMCPConfig(dir string, config MCPConfig) (string, error) {
-	encoded, err := marshalMCPConfig(config, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("encode mcp config: %w", err)
-	}
-
-	path := filepath.Join(dir, MCPConfigFileName)
-	if err := fsWriteFile(path, append(encoded, '\n'), 0o600); err != nil {
-		return "", fmt.Errorf("write mcp config: %w", err)
-	}
-
-	return path, nil
 }

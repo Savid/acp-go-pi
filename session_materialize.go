@@ -65,7 +65,7 @@ func (a *Agent) createSessionDirs() (sessionDirs, error) {
 
 	dirs.SessionRoot = sessionRoot
 
-	if err := a.applyDurableHome(&dirs); err != nil {
+	if err := a.applyGenerationAgentDir(&dirs); err != nil {
 		_ = materializeRemoveAll(sessionRoot)
 
 		return sessionDirs{}, err
@@ -85,33 +85,56 @@ func (a *Agent) createSessionRuntime() (sessionDirs, *pi.BrowserShim, error) {
 	return dirs, shim, err
 }
 
-// applyDurableHome points one runtime generation at Pi's stable native auth
-// residence. Hardened distinct-identity sessions refuse it until a proven
-// credential-delivery design exists; ordinary current-identity sessions use it
-// directly and Pi's native cross-process lock serializes auth.json updates.
-func (a *Agent) applyDurableHome(dirs *sessionDirs) error {
+// durableHome materializes Pi's stable native auth residence and reports its
+// path, or the empty string when no durable home is configured. Hardened
+// distinct-identity sessions refuse it until a proven credential-delivery
+// design exists; ordinary current-identity sessions use it directly and Pi's
+// native cross-process lock serializes auth.json updates.
+func (a *Agent) durableHome() (string, error) {
 	home := a.options.Home
 	if home == "" {
-		return nil
+		return "", nil
 	}
 
 	if a.options.ProcessIsolation != nil {
-		return errors.New("durable pi agent directory is unavailable with explicit process isolation")
+		return "", errors.New("durable pi agent directory is unavailable with explicit process isolation")
 	}
 
 	if !filepath.IsAbs(home) || filepath.Clean(home) != home {
-		return errors.New("durable pi agent directory must be a clean absolute path")
+		return "", errors.New("durable pi agent directory must be a clean absolute path")
 	}
 
 	if err := materializeMkdirAll(home, 0o700); err != nil {
-		return fmt.Errorf("create durable agent directory: %w", err)
+		return "", fmt.Errorf("create durable agent directory: %w", err)
 	}
 
 	if err := materializeChmod(home, 0o700); err != nil {
-		return fmt.Errorf("protect durable agent directory: %w", err)
+		return "", fmt.Errorf("protect durable agent directory: %w", err)
 	}
 
-	dirs.AgentDir = home
+	return home, nil
+}
+
+// applyGenerationAgentDir points one runtime generation at the durable home
+// when one is configured, and otherwise creates the generation's own private
+// agent directory. Exactly one of the two is ever created, so a configured home
+// leaves no unused generation agent directory behind.
+func (a *Agent) applyGenerationAgentDir(dirs *sessionDirs) error {
+	home, err := a.durableHome()
+	if err != nil {
+		return err
+	}
+
+	if home != "" {
+		dirs.AgentDir = home
+
+		return nil
+	}
+
+	dirs.AgentDir = filepath.Join(dirs.Root, "agent")
+	if err := materializeMkdirAll(dirs.AgentDir, 0o700); err != nil {
+		return fmt.Errorf("create session directory: %w", err)
+	}
 
 	return nil
 }
@@ -122,14 +145,11 @@ func createSessionGeneration(sessionRoot string) (sessionDirs, error) {
 		return sessionDirs{}, fmt.Errorf("create session runtime generation: %w", err)
 	}
 
-	dirs := sessionDirs{Root: root, AgentDir: filepath.Join(root, "agent"), SessionDir: filepath.Join(root, "sessions")}
+	dirs := sessionDirs{Root: root, SessionDir: filepath.Join(root, "sessions")}
+	if err := materializeMkdirAll(dirs.SessionDir, 0o700); err != nil {
+		_ = materializeRemoveAll(root)
 
-	for _, dir := range []string{dirs.AgentDir, dirs.SessionDir} {
-		if err := materializeMkdirAll(dir, 0o700); err != nil {
-			_ = materializeRemoveAll(root)
-
-			return sessionDirs{}, fmt.Errorf("create session directory: %w", err)
-		}
+		return sessionDirs{}, fmt.Errorf("create session directory: %w", err)
 	}
 
 	return dirs, nil

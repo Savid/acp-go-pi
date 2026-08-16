@@ -70,14 +70,14 @@ Use the deterministic seeded skill.
 	require.NoError(t, seed.Write())
 	resources, err := seed.ExplicitResources()
 	require.NoError(t, err)
-	wrapper, err := pi.WriteExtensions(agentDir, false)
+	_, wrapper, err := pi.CreateSessionResidence(agentDir, nil)
 	require.NoError(t, err)
 
 	process, err := pi.StartProcess(ctx, pi.LaunchSpec{
 		ExecutablePath:      path,
 		AgentDir:            agentDir,
 		SessionDir:          sessionDir,
-		ExtensionPaths:      append(resources.Extensions, wrapper...),
+		ExtensionPaths:      append(resources.Extensions, wrapper.ExtensionPaths...),
 		SkillPaths:          resources.Skills,
 		PromptTemplatePaths: resources.PromptTemplates,
 		Cwd:                 root,

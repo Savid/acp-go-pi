@@ -159,11 +159,53 @@ func init() {
 	turnSupervisorBootstrap()
 }
 
+// installTurnSupervisorHangupGuard takes SIGHUP away from its default
+// terminate disposition for the whole life of a supervisor process. The
+// guardian deliberately outlives the host and carries no Pdeathsig, so its
+// process group is orphaned as a matter of normal operation; the kernel sends
+// SIGHUP to a newly orphaned group that has stopped members, and the default
+// disposition would kill the dedicated subreaper, strand every Pi descendant on
+// init and skip the containment proof the host waits for. The handler is
+// installed with signal.Notify rather than signal.Ignore because SIG_IGN
+// survives exec and would leak into the Pi child, while a Go handler is reset
+// to the default disposition there. Received hangups are drained and dropped:
+// quiescence belongs to the control channel and the authenticated signal set,
+// never to a signal the kernel sends for a topology change.
+func installTurnSupervisorHangupGuard() func() {
+	hangups := make(chan os.Signal, 1)
+
+	turnSupervisorSignalNotify(hangups, syscall.SIGHUP)
+
+	done := make(chan struct{})
+	drained := make(chan struct{})
+
+	go func() {
+		defer close(drained)
+
+		for {
+			select {
+			case <-hangups:
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		turnSupervisorSignalStop(hangups)
+		close(done)
+		<-drained
+	}
+}
+
 func turnSupervisorBootstrap() {
 	mode := os.Getenv(turnSupervisorModeEnv)
 	if mode != turnSupervisorMode && mode != turnSupervisorLivenessMode {
 		return
 	}
+
+	stopHangupGuard := installTurnSupervisorHangupGuard()
+	defer stopHangupGuard()
 
 	var (
 		err             error
