@@ -115,6 +115,30 @@ func (a *Agent) durableHome() (string, error) {
 	return home, nil
 }
 
+// reconcileHomeStartupDefaults puts the durable home's settings.json back to
+// the operator baseline for the keys pi reads at process start to choose a
+// model and thinking level. Every session launches against that one file and
+// pi writes its own choice into it whenever a session changes model or
+// thinking level, so without this a launch would start on whatever another
+// session last selected. The restored content is the operator's, identical for
+// every session, so concurrent launches cannot disagree about it. An ephemeral
+// per-session agent directory shares nothing and needs no reconciliation.
+func (a *Agent) reconcileHomeStartupDefaults(agentDir string) error {
+	if a.options.Home == "" {
+		return nil
+	}
+
+	a.startupDefaultsOnce.Do(func() {
+		a.startupDefaults, a.startupDefaultsErr = pi.CaptureStartupDefaults(agentDir)
+	})
+
+	if a.startupDefaultsErr != nil {
+		return a.startupDefaultsErr
+	}
+
+	return a.startupDefaults.Restore(agentDir)
+}
+
 // applyGenerationAgentDir points one runtime generation at the durable home
 // when one is configured, and otherwise creates the generation's own private
 // agent directory. Exactly one of the two is ever created, so a configured home

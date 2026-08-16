@@ -405,6 +405,13 @@ func (s *agentSession) nextRuntimeLaunch(previous pi.LaunchSpec, lastSessionFile
 		return fail(agentDirErr)
 	}
 
+	// A relaunch reads settings.json exactly like a first launch, so a session
+	// whose own model came from pi's defaults would otherwise adopt whatever
+	// another session selected while this one was running.
+	if reconcileErr := s.agent.reconcileHomeStartupDefaults(dirs.AgentDir); reconcileErr != nil {
+		return fail(reconcileErr)
+	}
+
 	// A durable home keeps one agent directory across every generation, and the
 	// session's residence inside it is private and already carries this
 	// session's extensions and MCP config; only a generation-private agent

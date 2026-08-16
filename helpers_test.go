@@ -402,7 +402,9 @@ type stubPiClient struct {
 	statsErr     error
 	model        pi.Model
 	setModelErr  error
+	setModelFunc func(provider string, id string)
 	thinkingErr  error
+	thinkingFunc func(level string)
 	startErr     error
 	cloneCancel  bool
 	cloneErr     error
@@ -464,10 +466,20 @@ func (c *stubPiClient) GetState(context.Context) (pi.SessionState, error) {
 func (c *stubPiClient) GetAvailableModels(context.Context) ([]pi.Model, error) {
 	return c.models, c.modelsErr
 }
-func (c *stubPiClient) SetModel(context.Context, string, string) (pi.Model, error) {
+func (c *stubPiClient) SetModel(_ context.Context, provider string, id string) (pi.Model, error) {
+	if c.setModelFunc != nil {
+		c.setModelFunc(provider, id)
+	}
+
 	return c.model, c.setModelErr
 }
-func (c *stubPiClient) SetThinkingLevel(context.Context, string) error { return c.thinkingErr }
+func (c *stubPiClient) SetThinkingLevel(_ context.Context, level string) error {
+	if c.thinkingFunc != nil {
+		c.thinkingFunc(level)
+	}
+
+	return c.thinkingErr
+}
 func (c *stubPiClient) SetAutoRetry(_ context.Context, enabled bool) error {
 	c.autoRetrySet = append(c.autoRetrySet, enabled)
 

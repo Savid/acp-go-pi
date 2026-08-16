@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
@@ -871,15 +872,152 @@ func TestListStoredSessionFiltering(t *testing.T) {
 	require.Len(t, response.Sessions, 1)
 }
 
-// TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel proves the durable-home
-// isolation rule for pi's settings.json. A configured home is one agent
-// directory shared by every session, pi reads settings.json once at process
-// start to pick its model, and pi rewrites that same file whenever a session
-// changes model. A session's requested model therefore may not be written
-// there: it would decide the startup model of whichever concurrent session
-// spawned next. The barrier below makes the overlap exact — both sessions
-// finish authoring their agent directory before either process is spawned, so
-// a shared write is guaranteed to be visible to the other session's launch.
+// launchBarrier holds every launch of a proof until all of them have arrived,
+// with a deadline. A regression that fails a session before it spawns must
+// surface at that session's own assertion, not as a package-wide test timeout
+// on the launches still waiting for it.
+type launchBarrier struct {
+	mu        sync.Mutex
+	parties   int
+	remaining int
+	ready     chan struct{}
+}
+
+func newLaunchBarrier(parties int) *launchBarrier {
+	return &launchBarrier{parties: parties, remaining: parties, ready: make(chan struct{})}
+}
+
+func (b *launchBarrier) arrive(timeout time.Duration) error {
+	b.mu.Lock()
+	b.remaining--
+
+	if b.remaining == 0 {
+		close(b.ready)
+	}
+
+	b.mu.Unlock()
+
+	select {
+	case <-b.ready:
+		return nil
+	case <-time.After(timeout):
+		b.mu.Lock()
+		arrived := b.parties - b.remaining
+		b.mu.Unlock()
+
+		return fmt.Errorf("launch barrier timed out with %d of %d launches arrived", arrived, b.parties)
+	}
+}
+
+// nativeSettingsWriter mimics pi's own persistence: pi rewrites
+// defaultProvider, defaultModel, and defaultThinkingLevel in its agent
+// directory whenever a session changes model or thinking level, and every
+// session of a configured home shares that one file.
+func nativeSettingsWriter(t *testing.T, home string) (func(provider string, id string), func(level string)) {
+	t.Helper()
+
+	var mu sync.Mutex
+
+	persist := func(values map[string]string) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		settings := map[string]string{}
+
+		data, err := os.ReadFile(filepath.Join(home, pi.SettingsFileName)) // #nosec G304 -- the path is this test's own temp dir.
+		if err == nil {
+			require.NoError(t, json.Unmarshal(data, &settings))
+		}
+
+		for key, value := range values {
+			settings[key] = value
+		}
+
+		encoded, err := json.Marshal(settings)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(home, pi.SettingsFileName), encoded, 0o600))
+	}
+
+	setModel := func(provider string, id string) {
+		persist(map[string]string{"defaultProvider": provider, "defaultModel": id})
+	}
+	setThinkingLevel := func(level string) {
+		persist(map[string]string{"defaultThinkingLevel": level})
+	}
+
+	return setModel, setThinkingLevel
+}
+
+// TestSessionStartsOnOperatorDefaultsNotAnotherSessionsSelection is the
+// durable-home isolation rule. A configured home is one agent directory shared
+// by every session; pi reads settings.json there once at process start to pick
+// its model and thinking level, and writes its own selection back into that
+// same file whenever a session changes either. Without reconciliation the next
+// session to launch — precisely the one that asked for nothing and so has
+// nothing to override with — would start on the previous session's choice.
+func TestSessionStartsOnOperatorDefaultsNotAnotherSessionsSelection(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	agent := newStubClientAgent(t, nil, WithHome(home))
+
+	selecting := newStubPiClient()
+	selecting.state = pi.SessionState{SessionID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+	selecting.model = pi.Model{Provider: "openai", ID: "gpt-4o"}
+	selecting.setModelFunc, selecting.thinkingFunc = nativeSettingsWriter(t, home)
+
+	inheriting := newStubPiClient()
+	inheriting.state = pi.SessionState{SessionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}
+
+	clients := map[string]*stubPiClient{"/selecting": selecting, "/inheriting": inheriting}
+	launched := make(map[string]string, len(clients))
+
+	agent.startPiProcess = func(_ context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
+		client, ok := clients[spec.Cwd]
+		if !ok {
+			return nil, nil, fmt.Errorf("unexpected launch cwd %q", spec.Cwd)
+		}
+
+		settings, readErr := os.ReadFile(filepath.Join(spec.AgentDir, pi.SettingsFileName)) // #nosec G304 -- the path is this test's own temp dir.
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return nil, nil, readErr
+		}
+
+		launched[spec.Cwd] = string(settings)
+
+		return newStubProcess(false), client, nil
+	}
+
+	first, err := agent.NewSession(t.Context(), NewSessionRequest("/selecting",
+		WithSessionPiOptions(NewPiOptions(WithPiModel("openai/gpt-4o"), WithPiThinkingLevel(pi.ThinkingLevelHigh))),
+	))
+	require.NoError(t, err)
+
+	// The hazard: pi has now recorded this session's selection in the one file
+	// every later launch reads.
+	persisted, err := os.ReadFile(filepath.Join(home, pi.SettingsFileName)) // #nosec G304 -- the path is this test's own temp dir.
+	require.NoError(t, err)
+	require.Contains(t, string(persisted), "gpt-4o")
+	require.Contains(t, string(persisted), pi.ThinkingLevelHigh)
+
+	second, err := agent.NewSession(t.Context(), NewSessionRequest("/inheriting"))
+	require.NoError(t, err)
+
+	require.NotContains(t, launched["/inheriting"], "gpt-4o",
+		"a session that asked for no model launched against another session's model")
+	require.NotContains(t, launched["/inheriting"], pi.ThinkingLevelHigh,
+		"a session that asked for no thinking level launched against another session's level")
+
+	for _, id := range []acp.SessionId{first.SessionId, second.SessionId} {
+		session, sessionErr := agent.session(id)
+		require.NoError(t, sessionErr)
+		t.Cleanup(func() { require.NoError(t, session.Close(t.Context())) })
+	}
+}
+
+// TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel proves the same rule
+// under overlap. The barrier makes it exact: every session finishes authoring
+// the shared home before any of them spawns, so anything one launch wrote
+// there is guaranteed visible to the others, and the session that requested no
+// model is the one with nothing of its own to override an inherited value.
 func TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel(t *testing.T) {
 	type sessionCase struct {
 		cwd       string
@@ -891,27 +1029,35 @@ func TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel(t *testing.T) {
 	cases := []*sessionCase{
 		{cwd: "/first", model: "openai/gpt-4o", sessionID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
 		{cwd: "/second", model: "anthropic/claude-sonnet-4-5", sessionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"},
+		{cwd: "/third", sessionID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc"},
 	}
 
 	byCwd := make(map[string]*sessionCase, len(cases))
 
+	home := filepath.Join(t.TempDir(), "home")
+	agent := newStubClientAgent(t, nil, WithHome(home))
+	setModel, setThinkingLevel := nativeSettingsWriter(t, home)
+
 	for _, test := range cases {
-		provider, id, _ := strings.Cut(test.model, "/")
 		test.client = newStubPiClient()
 		test.client.state = pi.SessionState{SessionID: test.sessionID}
-		test.client.model = pi.Model{Provider: provider, ID: id}
+		test.client.setModelFunc, test.client.thinkingFunc = setModel, setThinkingLevel
+
+		if test.model != "" {
+			provider, id, _ := strings.Cut(test.model, "/")
+			test.client.model = pi.Model{Provider: provider, ID: id}
+		}
+
 		byCwd[test.cwd] = test
 	}
 
-	home := filepath.Join(t.TempDir(), "home")
-	agent := newStubClientAgent(t, nil, WithHome(home))
+	var observed sync.Map
 
-	var (
-		spawned  sync.WaitGroup
-		observed sync.Map
-	)
-
-	spawned.Add(len(cases))
+	// Two phases: every launch finishes authoring the shared home before any of
+	// them reads it, and every read finishes before any launch returns into the
+	// post-spawn commands that make pi rewrite the same file.
+	authored := newLaunchBarrier(len(cases))
+	inspected := newLaunchBarrier(len(cases))
 
 	agent.startPiProcess = func(_ context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
 		test, ok := byCwd[spec.Cwd]
@@ -919,10 +1065,9 @@ func TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel(t *testing.T) {
 			return nil, nil, fmt.Errorf("unexpected launch cwd %q", spec.Cwd)
 		}
 
-		// Hold every launch until all of them have authored the shared home,
-		// then read what this session's pi process would read at startup.
-		spawned.Done()
-		spawned.Wait()
+		if err := authored.arrive(30 * time.Second); err != nil {
+			return nil, nil, err
+		}
 
 		settings, readErr := os.ReadFile(filepath.Join(spec.AgentDir, pi.SettingsFileName)) // #nosec G304 -- the path is this test's own temp dir.
 		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
@@ -930,6 +1075,10 @@ func TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel(t *testing.T) {
 		}
 
 		observed.Store(test.cwd, string(settings))
+
+		if err := inspected.arrive(30 * time.Second); err != nil {
+			return nil, nil, err
+		}
 
 		return newStubProcess(false), test.client, nil
 	}
@@ -945,8 +1094,13 @@ func TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel(t *testing.T) {
 		go func() {
 			defer running.Done()
 
+			options := []PiOption{}
+			if test.model != "" {
+				options = append(options, WithPiModel(test.model))
+			}
+
 			response, err := agent.NewSession(t.Context(), NewSessionRequest(test.cwd,
-				WithSessionPiOptions(NewPiOptions(WithPiModel(test.model))),
+				WithSessionPiOptions(NewPiOptions(options...)),
 			))
 			if err != nil {
 				errs <- err
@@ -979,12 +1133,21 @@ func TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel(t *testing.T) {
 		require.True(t, ok, "session %s never launched", test.cwd)
 
 		for _, other := range cases {
+			if other.model == "" {
+				continue
+			}
+
 			require.NotContains(t, settings, other.model[strings.Index(other.model, "/")+1:],
 				"session %s launched against a shared settings.json naming a session model", test.cwd)
 		}
 
 		session, err := agent.session(acp.SessionId(test.sessionID))
 		require.NoError(t, err)
+
+		if test.model == "" {
+			continue
+		}
+
 		require.Equal(t, test.model, session.currentModel(),
 			"session %s did not keep its own model", test.cwd)
 	}

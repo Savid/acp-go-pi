@@ -14,8 +14,10 @@ import (
 const (
 	// SettingsFileName is pi's per-agent-dir settings file. A durable agent
 	// directory is shared by every session, and pi rewrites this file itself
-	// whenever a session changes model, so the wrapper writes it only when the
-	// operator seeds it and never puts session-scoped values in it.
+	// whenever a session changes model, so the wrapper never puts
+	// session-scoped values in it: it writes an operator seed verbatim and
+	// otherwise only restores the operator baseline for the startup keys
+	// StartupDefaults owns.
 	SettingsFileName = "settings.json"
 	// AuthFileName is pi's provider credential file. It may be explicitly
 	// injected into an ephemeral agent directory or owned natively by a durable

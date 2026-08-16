@@ -714,6 +714,8 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	// set_model command below. It is never written to settings.json: a durable
 	// home puts that file at one path shared by every concurrent session, so a
 	// model recorded there would decide some other session's startup model.
+	// What that file may hold at launch is the operator baseline, restored
+	// below.
 	agentDir := pi.AgentDir{
 		Root:      dirs.AgentDir,
 		SeedFiles: a.options.SeedFiles,
@@ -727,6 +729,14 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		}
 
 		return nil, writeErr
+	}
+
+	// Reconciled after the seed write, so an operator-seeded settings.json is
+	// the baseline this and every later launch starts from.
+	if reconcileErr := a.reconcileHomeStartupDefaults(dirs.AgentDir); reconcileErr != nil {
+		observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, reconcileErr)
+
+		return nil, reconcileErr
 	}
 
 	seededResources, err := agentDirExplicitResources(agentDir)

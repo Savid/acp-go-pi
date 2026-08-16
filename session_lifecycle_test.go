@@ -873,6 +873,41 @@ func TestNextRuntimeLaunchFailureBranches(t *testing.T) {
 		require.ErrorIs(t, err, wantErr)
 	})
 
+	t.Run("startup defaults", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		session, previous, _ := fixture(t)
+		home := filepath.Join(t.TempDir(), "home")
+		require.NoError(t, os.MkdirAll(home, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(home, pi.SettingsFileName), []byte(`{"defaultModel":`), 0o600))
+		session.agent.options.Home = home
+		_, err := session.nextRuntimeLaunch(previous, "")
+		require.ErrorContains(t, err, "decode pi settings")
+	})
+
+	// A relaunch reads settings.json exactly like a first launch, so the home
+	// is reconciled again before the new generation spawns.
+	t.Run("reconciles the home", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		session, previous, _ := fixture(t)
+		home := filepath.Join(t.TempDir(), "home")
+		require.NoError(t, os.MkdirAll(home, 0o700))
+		session.agent.options.Home = home
+		previous.AgentDir = home
+
+		_, err := session.nextRuntimeLaunch(previous, "")
+		require.NoError(t, err)
+
+		settings := filepath.Join(home, pi.SettingsFileName)
+		require.NoError(t, os.WriteFile(settings, []byte(`{"defaultModel":"gpt-4o"}`), 0o600))
+
+		spec, err := session.nextRuntimeLaunch(previous, "")
+		require.NoError(t, err)
+		require.Equal(t, home, spec.AgentDir)
+		contents, err := os.ReadFile(settings) // #nosec G304 -- the path is this test's own temp dir.
+		require.NoError(t, err)
+		require.NotContains(t, string(contents), "gpt-4o")
+	})
+
 	t.Run("copy agent", func(t *testing.T) {
 		restoreMaterializeSeams(t)
 		session, previous, _ := fixture(t)

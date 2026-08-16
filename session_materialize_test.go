@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 type materializeTestDirEntry struct {
@@ -249,5 +251,42 @@ func TestDurableHomeMaterialization(t *testing.T) {
 		materializeChmod = func(string, os.FileMode) error { return errors.New("chmod durable") }
 		err := NewAgent(WithHome(filepath.Join(t.TempDir(), "home"))).applyGenerationAgentDir(&sessionDirs{})
 		require.ErrorContains(t, err, "protect durable agent directory")
+	})
+}
+
+// A settings.json pi cannot load takes effect nowhere and says so nowhere, so
+// a home the wrapper cannot reconcile fails the session start rather than
+// letting a launch inherit whatever is in the file.
+func TestReconcileHomeStartupDefaultsFailsClosed(t *testing.T) {
+	t.Run("baseline capture", func(t *testing.T) {
+		home := filepath.Join(t.TempDir(), "home")
+		require.NoError(t, os.MkdirAll(home, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(home, pi.SettingsFileName), []byte(`{"defaultModel":`), 0o600))
+
+		agent := newStubClientAgent(t, newStubPiClient(), WithHome(home))
+		_, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+		require.ErrorContains(t, err, "decode pi settings")
+
+		// The captured failure is the home's, not the session's: it holds for
+		// every later session too.
+		_, err = agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+		require.ErrorContains(t, err, "decode pi settings")
+	})
+
+	t.Run("restore", func(t *testing.T) {
+		home := filepath.Join(t.TempDir(), "home")
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+		agent := newStubClientAgent(t, client, WithHome(home))
+
+		response, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+		require.NoError(t, err)
+		session, err := agent.session(response.SessionId)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, session.Close(t.Context())) })
+
+		require.NoError(t, os.WriteFile(filepath.Join(home, pi.SettingsFileName), []byte(`{"defaultModel":`), 0o600))
+		_, err = agent.NewSession(t.Context(), NewSessionRequest("/other"))
+		require.ErrorContains(t, err, "decode pi settings")
 	})
 }

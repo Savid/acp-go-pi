@@ -52,20 +52,17 @@ The same values travel on the wire as `_meta.pi.options.model` and
 
 ## Seeding pi settings
 
-`WithSeedFiles` (CLI: `-seed-file`) writes files into each session's isolated
-pi agent directory before the pi process launches, so the CLI reads them as
-its own config. Because every session gets a fresh isolated directory, seeds
-never touch the operator's real pi home.
+`WithSeedFiles` (CLI: `-seed-file`) writes files into the pi agent directory a
+session launches against, before the pi process starts, so the CLI reads them
+as its own config. Without `WithHome` that directory is a fresh isolated one
+per session and seeds never touch a durable pi home. With `WithHome` it is the
+one durable directory every session launches against, and each launch writes
+the seeds there again, so the operator's files are what pi reads however a
+previous session left them.
 
-Every seed, `settings.json` included, is written verbatim. The adapter never
-authors `settings.json` itself and never records a session's own model there:
-`WithHome` gives every session one shared agent directory, pi reads
-`settings.json` at process start to choose its model, and pi rewrites that same
-file whenever a session changes model, so a per-session value written there
-would decide a concurrent session's startup model. The requested model reaches
-each pi process on its own RPC channel instead. A seeded `settings.json` that
-is not valid JSON fails closed at session start, because pi would otherwise
-discard it in silence. Seeded resources under
+Every seed, `settings.json` included, is written verbatim. A seeded
+`settings.json` that is not valid JSON fails closed at session start, because
+pi would otherwise discard it in silence. Seeded resources under
 `extensions/*.ts` or `extensions/*.js`, `prompts/*.md`, and
 `skills/**/SKILL.md` are additionally passed to pi by exact path. This keeps
 ambient and project discovery disabled while making the operator's explicit
@@ -83,3 +80,32 @@ err := piacp.Serve(ctx, input, output,
 
 Keep secrets in `WithEnv` rather than in seeded files; see
 [Authentication](/docs/features/authentication) for the credential paths.
+
+## Startup state under a shared home
+
+pi reads `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` from
+`settings.json` once at process start to choose what a session begins on, and
+writes its own selection back into those same keys whenever a session changes
+model or thinking level. `WithHome` gives every session one shared agent
+directory, so those three keys are the one channel through which a session's
+runtime choice could reach another session's startup.
+
+The adapter never records a session's own model or thinking level there. Both
+travel to each pi process on its own RPC channel. Instead the adapter captures
+the operator baseline for those three keys on the first launch against the
+home — after any seeded `settings.json` has been applied — and restores that
+baseline before every later launch and relaunch. A session therefore starts on
+what the operator configured: one that requests no model gets the operator's
+default, or pi's own when the operator set none, never whatever another session
+last selected. Every other key in the file stays exactly as pi left it, a home
+that already matches its baseline is not written to at all, and the write takes
+pi's own `settings.json` lock so it cannot interleave with a concurrent
+session's native write.
+
+<Note>
+The baseline is restored immediately before the pi child spawns. A model or
+thinking-level change another session commits inside that child's startup
+window is the one value that can still reach it, because holding pi's settings
+lock across a child's startup would block every other session's settings write.
+A host that needs an exact model or thinking level for a session sends one.
+</Note>

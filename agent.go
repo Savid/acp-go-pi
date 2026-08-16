@@ -99,6 +99,14 @@ type Agent struct {
 	versionMu      sync.Mutex
 	versionChecked bool
 
+	// startupDefaults is the durable home's operator baseline for the
+	// settings.json keys pi consults at process start. It is captured on the
+	// first launch against the home, before any session of this agent has been
+	// able to change model or thinking level there.
+	startupDefaultsOnce sync.Once
+	startupDefaults     pi.StartupDefaults
+	startupDefaultsErr  error
+
 	// providerAuth is nil when the durable native residence or values-free
 	// ledger is not configured, or hardened distinct-identity isolation was
 	// selected.
