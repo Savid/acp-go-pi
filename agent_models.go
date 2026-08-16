@@ -23,13 +23,15 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	case params.ValueId != nil:
 		return a.setSessionConfigValue(ctx, params.ValueId)
 	case params.Boolean != nil:
-		// Both variants are json:"-"; the SDK picks this one off the "type"
-		// discriminator, so "type" is the only JSON path the caller can correct.
+		// Both variants are json:"-", and the union takes this one whenever
+		// "value" is absent, so "type" is the only JSON path the caller can
+		// correct — including for a request that named no discriminator.
 		return acp.SetSessionConfigOptionResponse{}, unsupportedField(jsonFieldType)
 	default:
-		// The value-id variant is the union's default, and it also absorbs an
-		// unknown "type" whose payload is a string, so a request that decoded
-		// to neither variant is one that carried no usable "value".
+		// No variant at all is unreachable from JSON: the union keys on
+		// "value" and takes the boolean form when it is absent, and a "type"
+		// it does not recognise fails to decode before reaching here. Only an
+		// in-process caller reaches this arm, and it left out "value".
 		return acp.SetSessionConfigOptionResponse{}, unsupportedField(acpFieldValue)
 	}
 }
