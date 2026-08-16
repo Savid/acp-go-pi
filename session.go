@@ -23,7 +23,6 @@ const (
 	jsonFieldType    = "type"
 	jsonFieldURL     = "url"
 
-	acpFieldConfig    = "config"
 	acpFieldConfigID  = "configId"
 	acpFieldSessionID = "sessionId"
 	acpFieldValue     = "value"

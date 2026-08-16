@@ -57,10 +57,15 @@ pi agent directory before the pi process launches, so the CLI reads them as
 its own config. Because every session gets a fresh isolated directory, seeds
 never touch the operator's real pi home.
 
-`settings.json` is special: the adapter authors it to pin session behavior, so
-a seeded `settings.json` is deep-merged **under** the adapter's managed keys —
-the adapter wins for keys it owns, the seed supplies everything else. All
-other filenames are written verbatim. Seeded resources under
+Every seed, `settings.json` included, is written verbatim. The adapter never
+authors `settings.json` itself and never records a session's own model there:
+`WithHome` gives every session one shared agent directory, pi reads
+`settings.json` at process start to choose its model, and pi rewrites that same
+file whenever a session changes model, so a per-session value written there
+would decide a concurrent session's startup model. The requested model reaches
+each pi process on its own RPC channel instead. A seeded `settings.json` that
+is not valid JSON fails closed at session start, because pi would otherwise
+discard it in silence. Seeded resources under
 `extensions/*.ts` or `extensions/*.js`, `prompts/*.md`, and
 `skills/**/SKILL.md` are additionally passed to pi by exact path. This keeps
 ambient and project discovery disabled while making the operator's explicit

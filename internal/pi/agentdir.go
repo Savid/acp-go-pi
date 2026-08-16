@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	// SettingsFileName is pi's per-agent-dir settings file. It is the
-	// wrapper's deep-merge seed filename: the wrapper's managed keys win, a
-	// seeded settings.json supplies everything else.
+	// SettingsFileName is pi's per-agent-dir settings file. A durable agent
+	// directory is shared by every session, and pi rewrites this file itself
+	// whenever a session changes model, so the wrapper writes it only when the
+	// operator seeds it and never puts session-scoped values in it.
 	SettingsFileName = "settings.json"
 	// AuthFileName is pi's provider credential file. It may be explicitly
 	// injected into an ephemeral agent directory or owned natively by a durable
@@ -57,17 +58,13 @@ func (e *SeedFileError) Error() string {
 	return fmt.Sprintf("invalid seed file %q", e.Name)
 }
 
-// AgentDir describes one isolated per-session pi agent directory.
+// AgentDir describes one pi agent directory a session launches against.
 type AgentDir struct {
 	// Root is the directory pi sees as PI_CODING_AGENT_DIR.
 	Root string
-	// ManagedSettings are the wrapper-owned settings.json keys (for example
-	// defaultProvider/defaultModel). They are deep-merged on top of any
-	// seeded settings.json; the wrapper wins for keys it manages.
-	ManagedSettings map[string]any
 	// SeedFiles maps relative paths to contents written into Root before
-	// launch. settings.json participates in the deep merge; all other files
-	// are written verbatim.
+	// launch. Every entry is agent-scoped operator configuration and is
+	// written verbatim.
 	SeedFiles map[string]string
 	// AuthJSON, when non-empty, is written to auth.json at hydrate time. It
 	// is credential material: excluded from the store, never seeded.
@@ -116,8 +113,8 @@ func (d AgentDir) ExplicitResources() (ExplicitResources, error) {
 	return resources, nil
 }
 
-// Write materializes the agent directory: validates seed paths, deep-merges
-// settings.json, and writes every seeded file under a provenance manifest.
+// Write materializes the agent directory: validates seed paths and writes
+// every seeded file under a provenance manifest.
 func (d AgentDir) Write() error {
 	if strings.TrimSpace(d.Root) == "" {
 		return &SeedFileError{}
@@ -127,12 +124,11 @@ func (d AgentDir) Write() error {
 		return fmt.Errorf("create agent directory: %w", err)
 	}
 
-	files, err := d.effectiveFiles()
-	if err != nil {
+	if err := validateSettingsSeed(d.SeedFiles); err != nil {
 		return err
 	}
 
-	if err := writeSeedFiles(d.Root, files); err != nil {
+	if err := writeSeedFiles(d.Root, d.SeedFiles); err != nil {
 		return err
 	}
 
@@ -145,56 +141,22 @@ func (d AgentDir) Write() error {
 	return nil
 }
 
-// effectiveFiles resolves the final file contents: every seed verbatim,
-// except settings.json, which is the seed deep-merged under the managed keys
-// and is always present.
-func (d AgentDir) effectiveFiles() (map[string]string, error) {
-	files := make(map[string]string, len(d.SeedFiles)+1)
-	for name, content := range d.SeedFiles {
-		files[name] = content
+// validateSettingsSeed rejects a seeded settings.json that pi would discard in
+// silence: pi records a load error for unparseable settings and then runs on
+// its own defaults, so an operator's malformed seed would take effect nowhere
+// and say so nowhere.
+func validateSettingsSeed(files map[string]string) error {
+	seed, ok := files[SettingsFileName]
+	if !ok {
+		return nil
 	}
 
-	settings := map[string]any{}
-
-	if seed, ok := files[SettingsFileName]; ok {
-		if err := json.Unmarshal([]byte(seed), &settings); err != nil {
-			return nil, &SeedFileError{Name: SettingsFileName}
-		}
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(seed), &settings); err != nil {
+		return &SeedFileError{Name: SettingsFileName}
 	}
 
-	merged := mergeJSONMaps(settings, d.ManagedSettings)
-
-	encoded, err := json.MarshalIndent(merged, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("encode settings.json: %w", err)
-	}
-
-	files[SettingsFileName] = string(encoded) + "\n"
-
-	return files, nil
-}
-
-// mergeJSONMaps returns base with overlay applied on top: overlay wins for
-// scalar conflicts, maps merge recursively.
-func mergeJSONMaps(base map[string]any, overlay map[string]any) map[string]any {
-	result := make(map[string]any, len(base)+len(overlay))
-	for key, value := range base {
-		result[key] = value
-	}
-
-	for key, value := range overlay {
-		if overlayMap, ok := value.(map[string]any); ok {
-			if baseMap, ok := result[key].(map[string]any); ok {
-				result[key] = mergeJSONMaps(baseMap, overlayMap)
-
-				continue
-			}
-		}
-
-		result[key] = value
-	}
-
-	return result
+	return nil
 }
 
 // seedTarget is one resolved seed write with its precomputed disk state.

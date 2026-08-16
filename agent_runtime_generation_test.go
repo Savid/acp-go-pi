@@ -126,9 +126,8 @@ func TestEnsureVersionProbeResidenceLifetime(t *testing.T) {
 				require.Equal(t, filepath.Join(generationRoot, "probe-agent"), agentDir)
 				require.Equal(t, scratch, filepath.Dir(generationRoot))
 				require.Equal(t, agentDir, environmentValue(internalpi.LaunchSpec{AgentDir: agentDir, Containment: containment}.Environ(), "PI_CODING_AGENT_DIR"))
-				settings, err := os.ReadFile(filepath.Join(agentDir, internalpi.SettingsFileName))
-				require.NoError(t, err)
-				require.JSONEq(t, `{}`, string(settings))
+				require.DirExists(t, agentDir)
+				require.NoFileExists(t, filepath.Join(agentDir, internalpi.SettingsFileName))
 
 				return internalpi.DefaultMinimumVersion, test.probeErr
 			}

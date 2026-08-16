@@ -27,7 +27,10 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 		// discriminator, so "type" is the only JSON path the caller can correct.
 		return acp.SetSessionConfigOptionResponse{}, unsupportedField(jsonFieldType)
 	default:
-		return acp.SetSessionConfigOptionResponse{}, unsupportedField(acpFieldConfig)
+		// The value-id variant is the union's default, and it also absorbs an
+		// unknown "type" whose payload is a string, so a request that decoded
+		// to neither variant is one that carried no usable "value".
+		return acp.SetSessionConfigOptionResponse{}, unsupportedField(acpFieldValue)
 	}
 }
 

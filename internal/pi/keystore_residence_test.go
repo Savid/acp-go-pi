@@ -88,7 +88,7 @@ func TestKeystoreResidenceMatrix(t *testing.T) {
 		names = append(names, entry.Name())
 	}
 
-	require.ElementsMatch(t, []string{AuthFileName, SettingsFileName, seedManifestFileName}, names,
+	require.ElementsMatch(t, []string{AuthFileName}, names,
 		"the agent directory holds what the session write path wrote and no keystore sidecar")
 }
 

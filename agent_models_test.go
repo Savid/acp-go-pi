@@ -49,7 +49,7 @@ func TestModelMetadataMapping(t *testing.T) {
 func TestConfigSelectionFailureBranches(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	_, err := agent.SetSessionConfigOption(t.Context(), acp.SetSessionConfigOptionRequest{})
-	requireInvalidParams(t, err)
+	requireUnsupportedField(t, err, acpFieldValue)
 
 	_, err = agent.SetSessionConfigOption(t.Context(), SetModelRequest("missing", "p/model"))
 	requireInvalidParams(t, err)

@@ -68,8 +68,8 @@ The main entry log uses the empty subpath (`SessionStoreMainSubpath`).
 `UpdatedAtUnixMilli` in Unix milliseconds.
 
 Only conversation rows are durable. Credential and config files in the agent
-directory — `auth.json`, `settings.json`, trust state — are wrapper-authored
-or injected at hydrate time and are never mirrored into the store.
+directory — `auth.json`, `settings.json`, trust state — are seeded, injected at
+hydrate time, or written by pi itself, and are never mirrored into the store.
 
 <Note>
 `WithSessionStoreLoadTimeout` bounds load and list operations during resume.

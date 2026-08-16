@@ -710,18 +710,13 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		a.observe.InjectTraceEnv(ctx, nil),
 	)
 
-	managedSettings := map[string]any(nil)
-	if hasModel {
-		managedSettings = map[string]any{
-			"defaultProvider": modelRef.Provider,
-			"defaultModel":    modelRef.ID,
-		}
-	}
-
+	// The requested model reaches this session's pi child on the per-session
+	// set_model command below. It is never written to settings.json: a durable
+	// home puts that file at one path shared by every concurrent session, so a
+	// model recorded there would decide some other session's startup model.
 	agentDir := pi.AgentDir{
-		Root:            dirs.AgentDir,
-		ManagedSettings: managedSettings,
-		SeedFiles:       a.options.SeedFiles,
+		Root:      dirs.AgentDir,
+		SeedFiles: a.options.SeedFiles,
 	}
 	if writeErr := agentDir.Write(); writeErr != nil {
 		observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, writeErr)

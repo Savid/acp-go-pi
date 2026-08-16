@@ -125,9 +125,8 @@ agent rejects the resulting prompt or active-turn cancellation.
 `ObserveContainment`.
 Admission callbacks receive `runtime`, `session`, `prompt`, or `discovery`; nil
 means unbounded standalone operation. Before `pi --version`, Pi reserves a
-runtime generation below `WithScratchDir`, materializes a target-owned
-`probe-agent` directory with isolated `settings.json`, and passes that exact
-path as `PI_CODING_AGENT_DIR`. Pi acquires discovery and per-session native
+runtime generation below `WithScratchDir`, materializes an empty target-owned
+`probe-agent` directory, and passes that exact path as `PI_CODING_AGENT_DIR`. Pi acquires discovery and per-session native
 permits immediately before their launches, reserves scratch before making each
 isolated agent directory, and releases only after the selected boundary
 completes and directory deletion succeeds; incomplete containment quarantines

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -868,4 +869,123 @@ func TestListStoredSessionFiltering(t *testing.T) {
 	response, err := agent.ListSessions(t.Context(), ListSessionsRequest())
 	require.NoError(t, err)
 	require.Len(t, response.Sessions, 1)
+}
+
+// TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel proves the durable-home
+// isolation rule for pi's settings.json. A configured home is one agent
+// directory shared by every session, pi reads settings.json once at process
+// start to pick its model, and pi rewrites that same file whenever a session
+// changes model. A session's requested model therefore may not be written
+// there: it would decide the startup model of whichever concurrent session
+// spawned next. The barrier below makes the overlap exact — both sessions
+// finish authoring their agent directory before either process is spawned, so
+// a shared write is guaranteed to be visible to the other session's launch.
+func TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel(t *testing.T) {
+	type sessionCase struct {
+		cwd       string
+		model     string
+		sessionID string
+		client    *stubPiClient
+	}
+
+	cases := []*sessionCase{
+		{cwd: "/first", model: "openai/gpt-4o", sessionID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+		{cwd: "/second", model: "anthropic/claude-sonnet-4-5", sessionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"},
+	}
+
+	byCwd := make(map[string]*sessionCase, len(cases))
+
+	for _, test := range cases {
+		provider, id, _ := strings.Cut(test.model, "/")
+		test.client = newStubPiClient()
+		test.client.state = pi.SessionState{SessionID: test.sessionID}
+		test.client.model = pi.Model{Provider: provider, ID: id}
+		byCwd[test.cwd] = test
+	}
+
+	home := filepath.Join(t.TempDir(), "home")
+	agent := newStubClientAgent(t, nil, WithHome(home))
+
+	var (
+		spawned  sync.WaitGroup
+		observed sync.Map
+	)
+
+	spawned.Add(len(cases))
+
+	agent.startPiProcess = func(_ context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
+		test, ok := byCwd[spec.Cwd]
+		if !ok {
+			return nil, nil, fmt.Errorf("unexpected launch cwd %q", spec.Cwd)
+		}
+
+		// Hold every launch until all of them have authored the shared home,
+		// then read what this session's pi process would read at startup.
+		spawned.Done()
+		spawned.Wait()
+
+		settings, readErr := os.ReadFile(filepath.Join(spec.AgentDir, pi.SettingsFileName)) // #nosec G304 -- the path is this test's own temp dir.
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return nil, nil, readErr
+		}
+
+		observed.Store(test.cwd, string(settings))
+
+		return newStubProcess(false), test.client, nil
+	}
+
+	started := make(chan acp.SessionId, len(cases))
+	errs := make(chan error, len(cases))
+
+	var running sync.WaitGroup
+
+	running.Add(len(cases))
+
+	for _, test := range cases {
+		go func() {
+			defer running.Done()
+
+			response, err := agent.NewSession(t.Context(), NewSessionRequest(test.cwd,
+				WithSessionPiOptions(NewPiOptions(WithPiModel(test.model))),
+			))
+			if err != nil {
+				errs <- err
+
+				return
+			}
+
+			started <- response.SessionId
+		}()
+	}
+
+	running.Wait()
+	close(errs)
+	close(started)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	require.Len(t, started, len(cases))
+
+	for id := range started {
+		session, err := agent.session(id)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, session.Close(t.Context())) })
+	}
+
+	for _, test := range cases {
+		settings, ok := observed.Load(test.cwd)
+		require.True(t, ok, "session %s never launched", test.cwd)
+
+		for _, other := range cases {
+			require.NotContains(t, settings, other.model[strings.Index(other.model, "/")+1:],
+				"session %s launched against a shared settings.json naming a session model", test.cwd)
+		}
+
+		session, err := agent.session(acp.SessionId(test.sessionID))
+		require.NoError(t, err)
+		require.Equal(t, test.model, session.currentModel(),
+			"session %s did not keep its own model", test.cwd)
+	}
 }

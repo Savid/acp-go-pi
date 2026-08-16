@@ -1,7 +1,6 @@
 package pi
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,41 +9,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func readJSONFile(t *testing.T, path string) map[string]any {
-	t.Helper()
-
-	data, err := os.ReadFile(path) // #nosec G304 -- test reads from its own temp dir.
-	require.NoError(t, err)
-
-	var values map[string]any
-
-	require.NoError(t, json.Unmarshal(data, &values))
-
-	return values
-}
-
-func TestAgentDirWriteManagedSettings(t *testing.T) {
+// A durable agent directory is shared by every session, and pi rewrites
+// settings.json itself on each model change, so an unseeded write path must
+// leave that file alone rather than author one of its own.
+func TestAgentDirWriteAuthorsNoSettings(t *testing.T) {
 	t.Parallel()
 
 	root := filepath.Join(t.TempDir(), "agent")
+	require.NoError(t, AgentDir{Root: root}.Write())
 
-	dir := AgentDir{
-		Root: root,
-		ManagedSettings: map[string]any{
-			"defaultProvider": "openai",
-			"defaultModel":    "gpt-4o",
-		},
-	}
-	require.NoError(t, dir.Write())
+	require.NoFileExists(t, filepath.Join(root, SettingsFileName))
+	require.NoFileExists(t, filepath.Join(root, seedManifestFileName))
 
-	settings := readJSONFile(t, filepath.Join(root, SettingsFileName))
-	require.Equal(t, "openai", settings["defaultProvider"])
-	require.Equal(t, "gpt-4o", settings["defaultModel"])
-
-	manifest := filepath.Join(root, seedManifestFileName)
-	data, err := os.ReadFile(manifest) // #nosec G304 -- test reads from its own temp dir.
+	entries, err := os.ReadDir(root)
 	require.NoError(t, err)
-	require.JSONEq(t, `["settings.json"]`, string(data))
+	require.Empty(t, entries)
 }
 
 func TestAgentDirWritesExplicitAuthJSON(t *testing.T) {
@@ -72,41 +51,34 @@ func TestAgentDirWritesExplicitAuthJSON(t *testing.T) {
 	require.ErrorContains(t, (AgentDir{Root: filepath.Join(t.TempDir(), "blocked"), AuthJSON: auth}).Write(), "write auth file")
 }
 
-func TestAgentDirWriteSeedMerge(t *testing.T) {
+// A seeded settings.json is operator configuration, identical for every
+// session, so it lands verbatim like every other seed.
+func TestAgentDirWriteSeedsSettingsVerbatim(t *testing.T) {
 	t.Parallel()
 
 	root := filepath.Join(t.TempDir(), "agent")
+	seeded := `{"defaultProvider": "anthropic", "theme": "light"}`
 
 	dir := AgentDir{
 		Root: root,
-		ManagedSettings: map[string]any{
-			"defaultProvider": "anthropic",
-			"compaction":      map[string]any{"enabled": true},
-		},
 		SeedFiles: map[string]string{
-			SettingsFileName: `{
-				"defaultProvider": "seeded-provider",
-				"theme": "light",
-				"compaction": {"enabled": false, "reserveTokens": 4096}
-			}`,
+			SettingsFileName:  seeded,
 			"notes/README.md": "seeded verbatim",
 		},
 	}
 	require.NoError(t, dir.Write())
 
-	settings := readJSONFile(t, filepath.Join(root, SettingsFileName))
-	// Managed keys win; the seed supplies everything else, maps merge deep.
-	require.Equal(t, "anthropic", settings["defaultProvider"])
-	require.Equal(t, "light", settings["theme"])
-
-	compaction, ok := settings["compaction"].(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, true, compaction["enabled"])
-	require.InDelta(t, 4096.0, compaction["reserveTokens"], 0)
+	settings, err := os.ReadFile(filepath.Join(root, SettingsFileName)) // #nosec G304 -- test temp dir.
+	require.NoError(t, err)
+	require.Equal(t, seeded, string(settings))
 
 	verbatim, err := os.ReadFile(filepath.Join(root, "notes", "README.md")) // #nosec G304 -- test temp dir.
 	require.NoError(t, err)
 	require.Equal(t, "seeded verbatim", string(verbatim))
+
+	manifest, err := os.ReadFile(filepath.Join(root, seedManifestFileName)) // #nosec G304 -- test temp dir.
+	require.NoError(t, err)
+	require.JSONEq(t, `["notes/README.md","settings.json"]`, string(manifest))
 }
 
 func TestAgentDirWriteInvalidSettingsSeed(t *testing.T) {
@@ -267,36 +239,6 @@ func TestWriteSeedFilesProvenanceGuard(t *testing.T) {
 	})
 }
 
-func TestMergeJSONMaps(t *testing.T) {
-	t.Parallel()
-
-	base := map[string]any{
-		"keep":   "base",
-		"clash":  "base",
-		"nested": map[string]any{"a": 1, "b": 2},
-		"type":   map[string]any{"was": "map"},
-	}
-	overlay := map[string]any{
-		"clash":  "overlay",
-		"nested": map[string]any{"b": 3, "c": 4},
-		"type":   "now-scalar",
-		"added":  true,
-	}
-
-	merged := mergeJSONMaps(base, overlay)
-
-	require.Equal(t, "base", merged["keep"])
-	require.Equal(t, "overlay", merged["clash"])
-	require.Equal(t, "now-scalar", merged["type"])
-	require.Equal(t, true, merged["added"])
-
-	nested, ok := merged["nested"].(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, 1, nested["a"])
-	require.Equal(t, 3, nested["b"])
-	require.Equal(t, 4, nested["c"])
-}
-
 func TestSeedFileErrorMessages(t *testing.T) {
 	t.Parallel()
 
@@ -318,7 +260,7 @@ func TestAgentDirWriteFaultInjection(t *testing.T) {
 			wantErr: "create agent directory",
 		},
 		{
-			name: "settings write failure",
+			name: "seed write failure",
 			breakFn: func() {
 				fsWriteFile = func(string, []byte, os.FileMode) error { return fmt.Errorf("disk full") }
 			},
@@ -359,20 +301,13 @@ func TestAgentDirWriteFaultInjection(t *testing.T) {
 			restoreAgentDirSeams(t)
 			test.breakFn()
 
-			dir := AgentDir{Root: filepath.Join(t.TempDir(), "agent")}
+			dir := AgentDir{
+				Root:      filepath.Join(t.TempDir(), "agent"),
+				SeedFiles: map[string]string{SettingsFileName: `{}`},
+			}
 			require.ErrorContains(t, dir.Write(), test.wantErr)
 		})
 	}
-}
-
-func TestAgentDirWriteUnencodableManagedSettings(t *testing.T) {
-	t.Parallel()
-
-	dir := AgentDir{
-		Root:            filepath.Join(t.TempDir(), "agent"),
-		ManagedSettings: map[string]any{"bad": func() {}},
-	}
-	require.ErrorContains(t, dir.Write(), "encode settings.json")
 }
 
 func TestWriteSeedFilesBackupFailure(t *testing.T) {

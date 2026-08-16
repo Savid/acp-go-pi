@@ -631,6 +631,9 @@ func TestConformanceConfigOptions(t *testing.T) {
 		Boolean: &acp.SetSessionConfigOptionBoolean{SessionId: sessionID, ConfigId: "bool", Value: true},
 	})
 	requireUnsupportedField(t, err, jsonFieldType)
+	// An empty union has no variant to marshal, so this one never reaches the
+	// wire; the in-process rejection it would earn is pinned in
+	// TestConfigSelectionFailureBranches.
 	_, err = conn.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{})
 	requireInvalidParams(t, err)
 

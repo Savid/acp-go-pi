@@ -30,7 +30,7 @@ func TestPiCLIVersionProbe(t *testing.T) {
 	require.NotEmpty(t, version)
 	require.NoError(t, pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion),
 		"installed pi %s is older than the supported minimum %s", version, pi.DefaultMinimumVersion)
-	require.FileExists(t, filepath.Join(agentDir, pi.SettingsFileName))
+	require.DirExists(t, agentDir)
 	require.NoDirExists(t, filepath.Join(policyHome, ".pi"))
 	entries, err := os.ReadDir(policyHome)
 	require.NoError(t, err)
