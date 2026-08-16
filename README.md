@@ -96,11 +96,8 @@ session storage, permissions, raw events, and OpenTelemetry providers.
 
 - ACP session lifecycle: create, prompt, cancel, close, list, load, resume,
   and extension-based fork.
-- pi RPC-mode subprocess management with isolated per-session agent
-  directories and a scrubbed child environment.
-- A target-owned version-probe agent directory below `WithScratchDir`, passed
-  as an exact non-empty `PI_CODING_AGENT_DIR` so policy `HOME` is never used as
-  pi's fallback settings root.
+- pi RPC-mode subprocess management with isolated per-session and
+  version-probe agent directories and a scrubbed child environment.
 - Prompt streaming for messages, thoughts, tool calls, tool results, usage,
   and session metadata.
 - Permission prompts through a wrapper-owned pi bridge extension with
@@ -110,41 +107,15 @@ session storage, permissions, raw events, and OpenTelemetry providers.
 - MCP stdio and HTTP server declarations through a wrapper-owned,
   dependency-free pi MCP client extension.
 - Deliberate provider credential injection through the child environment or a
-  seeded `auth.json`.
-- Optional seven-leg provider-auth brokerage backed by Pi's durable native
-  credential home and a separate values-free ownership ledger.
-- Optional durable mirroring through a host-provided `SessionStore`.
-- Optional raw pi event extension notifications.
+  seeded `auth.json`, plus an optional seven-leg provider-auth brokerage over
+  Pi's durable native credential home and a values-free ownership ledger.
+- Ordinary same-identity execution by default, with fail-closed opt-in to
+  hardened trusted-root Linux isolation or Darwin best-effort cleanup, reported
+  by `Agent.ContainmentMode` — see [security](docs/operations/security.mdx).
+- Optional durable mirroring through a host-provided `SessionStore` and
+  optional raw pi event extension notifications.
 - OpenTelemetry spans, metrics, trace propagation, and structured logs
   without recording prompt or tool secrets by default.
-
-## Process containment
-
-The default is ordinary execution. Omitting `WithProcessIsolation` (or the CLI
-`-process-isolation-config`) launches Pi as the adapter's current root or
-non-root identity on Linux, Darwin, FreeBSD, OpenBSD, and Windows. It reports
-`shared_identity`, uses portable direct-process liveness and locking, and makes
-no descendant-inventory, whole-tree-quiescence, credential-separation, or
-host-authority claim. It creates no identity lease or privileged supervisor.
-
-Supplying `WithProcessIsolation` is a distinct hardened posture: a trusted root
-Linux supervisor launches Pi as the configured non-root UID/GID with an empty
-supplementary-group set and a closed policy environment. Any invalid policy,
-missing authority, same-identity request, or unsupported platform fails closed;
-it never retries as ordinary execution or as Darwin best effort. The effective
-mode is available from `Agent.ContainmentMode`.
-
-Darwin best-effort mode reaps the direct child and applies a bounded
-TERM-to-KILL ladder to the captured original process group. It does not claim
-that escaped descendants are absent. It is a separate embedded-only opt-in,
-never an explicit-isolation fallback. The adapter prints a warning on startup
-and retains runtime records that operators can inspect with `acp-go-pi
-containment diagnose`; see the [CLI reference](docs/reference/cli.mdx) and
-[security limits](docs/operations/security.mdx).
-Only `group_absent` records expire after 30 days; `running` and
-`cleanup_incomplete` records remain actionable. Forced PID-by-PID cleanup has
-a PID-reuse time-of-check/time-of-use race and can signal an unrelated reused
-PID despite immediate identity revalidation.
 
 ## Slash Commands
 

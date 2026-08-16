@@ -229,7 +229,9 @@ numeric PGID reuse can also affect unrelated work. The mode therefore emits a
 warning, reports `best_effort`, and exposes no descendant inventory.
 
 Best-effort launches retain strict runtime records and generation roots for
-operator diagnosis. `acp-go-pi containment diagnose` is read-only. Forced
+operator diagnosis. Only `group_absent` records expire, after 30 days; `running`
+and `cleanup_incomplete` records stay in the registry because they remain
+actionable. `acp-go-pi containment diagnose` is read-only. Forced
 cleanup revalidates same-UID process markers before signalling, but PID reuse
 still creates a collateral-signalling race and even successful cleanup is not
 proof that an unmarked escaped descendant is absent.

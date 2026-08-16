@@ -625,10 +625,12 @@ func TestConformanceConfigOptions(t *testing.T) {
 	requireInvalidParams(t, err)
 	_, err = conn.SetSessionConfigOption(ctx, SetConfigOptionRequest(sessionID, "unsupported", "value"))
 	requireInvalidParams(t, err)
+	// The boolean variant carries no wire field of its own: the SDK selects it
+	// from "type", so that discriminator is the path the rejection must name.
 	_, err = conn.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{
 		Boolean: &acp.SetSessionConfigOptionBoolean{SessionId: sessionID, ConfigId: "bool", Value: true},
 	})
-	requireInvalidParams(t, err)
+	requireUnsupportedField(t, err, jsonFieldType)
 	_, err = conn.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{})
 	requireInvalidParams(t, err)
 

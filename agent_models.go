@@ -23,7 +23,9 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	case params.ValueId != nil:
 		return a.setSessionConfigValue(ctx, params.ValueId)
 	case params.Boolean != nil:
-		return acp.SetSessionConfigOptionResponse{}, unsupportedField("boolean")
+		// Both variants are json:"-"; the SDK picks this one off the "type"
+		// discriminator, so "type" is the only JSON path the caller can correct.
+		return acp.SetSessionConfigOptionResponse{}, unsupportedField(jsonFieldType)
 	default:
 		return acp.SetSessionConfigOptionResponse{}, unsupportedField(acpFieldConfig)
 	}

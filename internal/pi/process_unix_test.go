@@ -25,7 +25,6 @@ const adapterDeathHelperEnv = "ACP_GO_PI_ADAPTER_DEATH_TEST_HELPER"
 const (
 	detachedNativePathEnv = "ACP_GO_PI_DETACHED_NATIVE_PATH"
 	detachedPIDFileEnv    = "ACP_GO_PI_DETACHED_PID_FILE"
-	detachedSentinelEnv   = "ACP_GO_PI_DETACHED_SENTINEL"
 	detachedAgentDirEnv   = "ACP_GO_PI_DETACHED_AGENT_DIR"
 )
 
@@ -103,15 +102,14 @@ func TestProcessKillReportsUnreapedRoot(t *testing.T) {
 func TestShutdownWaitsForDescendantTreeQuiescence(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "child.pid")
-	script := writeScript(t, `(trap '' TERM; while :; do sleep 1; done) &
-echo $! > "$PI_CHILD_PID_FILE"
+	script := writeScript(t, fmt.Sprintf(`(trap '' TERM; while :; do sleep 1; done) &
+echo $! > %s
 cat >/dev/null
-exit 0`)
+exit 0`, strconv.Quote(pidFile)))
 
 	process := startScriptProcess(t, LaunchSpec{
 		ExecutablePath: script,
 		AgentDir:       dir,
-		Env:            map[string]string{"PI_CHILD_PID_FILE": pidFile},
 	})
 	t.Cleanup(func() { _ = process.Close() })
 
@@ -284,10 +282,6 @@ func TestLinuxSupervisorAdapterDeathContainsDetachedDescendant(t *testing.T) {
 			ExecutablePath: os.Getenv(detachedNativePathEnv),
 			AgentDir:       os.Getenv(detachedAgentDirEnv),
 			Containment:    testContainmentSpec(t),
-			Env: map[string]string{
-				"PI_DETACHED_PID_FILE": os.Getenv(detachedPIDFileEnv),
-				"PI_DETACHED_SENTINEL": os.Getenv(detachedSentinelEnv),
-			},
 		})
 		if err != nil {
 			os.Exit(21)
@@ -310,14 +304,13 @@ func TestLinuxSupervisorAdapterDeathContainsDetachedDescendant(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "detached.pid")
 	sentinel := filepath.Join(dir, "leaked")
-	script := detachedNativeScript(t, 2*time.Second)
+	script := detachedNativeScript(t, 2*time.Second, pidFile, sentinel)
 
 	helper := exec.Command(os.Args[0], "-test.run", "^TestLinuxSupervisorAdapterDeathContainsDetachedDescendant$")
 	helper.Env = append(os.Environ(),
 		adapterDeathHelperEnv+"=1",
 		detachedNativePathEnv+"="+script,
 		detachedPIDFileEnv+"="+pidFile,
-		detachedSentinelEnv+"="+sentinel,
 		detachedAgentDirEnv+"="+dir,
 	)
 	require.NoError(t, helper.Run())
@@ -335,15 +328,11 @@ func TestLinuxSupervisorPeerDeathRetainsContainmentProof(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "detached.pid")
 	sentinel := filepath.Join(dir, "leaked")
-	script := detachedNativeScript(t, 20*time.Second)
+	script := detachedNativeScript(t, 20*time.Second, pidFile, sentinel)
 	process, err := StartProcess(context.Background(), LaunchSpec{
 		ExecutablePath: script,
 		AgentDir:       dir,
 		Containment:    testContainmentSpec(t),
-		Env: map[string]string{
-			"PI_DETACHED_PID_FILE": pidFile,
-			"PI_DETACHED_SENTINEL": sentinel,
-		},
 	})
 	require.NoError(t, err)
 
@@ -357,12 +346,16 @@ func TestLinuxSupervisorPeerDeathRetainsContainmentProof(t *testing.T) {
 	require.Eventually(t, func() bool { return !processPIDAlive(pid) }, 5*time.Second, 10*time.Millisecond)
 }
 
-func detachedNativeScript(t *testing.T, delay time.Duration) string {
+// detachedNativeScript writes a native stand-in that detaches a descendant into
+// its own session. The pid file and leak sentinel are baked into the script
+// body rather than handed over in the child's environment, so the fixture
+// claims no name in the product's environment namespace.
+func detachedNativeScript(t *testing.T, delay time.Duration, pidFile, sentinel string) string {
 	t.Helper()
 
-	return writeScript(t, fmt.Sprintf(`setsid /bin/sh -c 'trap "" INT TERM; echo $$ > "$1"; sleep %d; echo LEAK > "$2"' ignored "$PI_DETACHED_PID_FILE" "$PI_DETACHED_SENTINEL" &
+	return writeScript(t, fmt.Sprintf(`setsid /bin/sh -c 'trap "" INT TERM; echo $$ > "$1"; sleep %d; echo LEAK > "$2"' ignored %s %s &
 trap '' INT TERM
-while :; do sleep 1; done`, int(delay/time.Second)))
+while :; do sleep 1; done`, int(delay/time.Second), strconv.Quote(pidFile), strconv.Quote(sentinel)))
 }
 
 func readProcessPID(t *testing.T, path string) int {

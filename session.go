@@ -20,6 +20,7 @@ const (
 	jsonFieldMode    = "mode"
 	jsonFieldParams  = "params"
 	jsonFieldServer  = "server"
+	jsonFieldType    = "type"
 	jsonFieldURL     = "url"
 
 	acpFieldConfig    = "config"

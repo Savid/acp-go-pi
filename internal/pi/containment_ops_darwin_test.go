@@ -2103,9 +2103,33 @@ func TestCorrelatedCandidatesAndRevalidation(t *testing.T) {
 	require.Equal(t, containmentCandidateAmbiguous, revalidateContainmentCandidate(record, candidate))
 }
 
+// Roles for the two re-exec generations of the setsid-escape fixture. Each
+// generation is handed its role and pid-file path in argv, so the escaped
+// descendant carries no name in the product's environment namespace — the same
+// environment the containment markers are read out of.
+const (
+	darwinSetsidParentRole     = "darwin-setsid-parent"
+	darwinSetsidDescendantRole = "darwin-setsid-descendant"
+)
+
+// darwinSetsidRoleFromArgs reports the re-exec role and pid-file path this
+// process was handed, or empty strings when it is the ordinary test run.
+func darwinSetsidRoleFromArgs() (string, string) {
+	if len(os.Args) < 3 {
+		return "", ""
+	}
+
+	role, pidFile := os.Args[len(os.Args)-2], os.Args[len(os.Args)-1]
+	if role != darwinSetsidParentRole && role != darwinSetsidDescendantRole {
+		return "", ""
+	}
+
+	return role, pidFile
+}
+
 func TestDarwinSetsidEscapeIsDiagnosableAndExplicitlyCleaned(t *testing.T) {
-	if role := os.Getenv("PI_TEST_SETSID_ROLE"); role != "" {
-		runDarwinSetsidHelper(role)
+	if role, rolePIDFile := darwinSetsidRoleFromArgs(); role != "" {
+		runDarwinSetsidHelper(role, rolePIDFile)
 
 		return
 	}
@@ -2116,17 +2140,14 @@ func TestDarwinSetsidEscapeIsDiagnosableAndExplicitlyCleaned(t *testing.T) {
 	runtimeID := strings.Repeat("9", 32)
 	pidFile := filepath.Join(parent, "detached.pid")
 	script := filepath.Join(parent, "pi-helper")
-	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\nexec \"$PI_TEST_BINARY\" -test.run=TestDarwinSetsidEscapeIsDiagnosableAndExplicitlyCleaned\n"), 0o700))
+	require.NoError(t, os.WriteFile(script, fmt.Appendf(nil,
+		"#!/bin/sh\nexec %s -test.run=TestDarwinSetsidEscapeIsDiagnosableAndExplicitlyCleaned %s %s\n",
+		strconv.Quote(os.Args[0]), darwinSetsidParentRole, strconv.Quote(pidFile)), 0o700))
 
 	process, err := StartProcess(t.Context(), LaunchSpec{
 		ExecutablePath: script,
 		AgentDir:       filepath.Join(root, "agent"),
 		SessionDir:     filepath.Join(root, "sessions"),
-		Env: map[string]string{
-			"PI_TEST_BINARY":      os.Args[0],
-			"PI_TEST_SETSID_ROLE": "parent",
-			"PI_TEST_PID_FILE":    pidFile,
-		},
 		Containment: ContainmentSpec{
 			DarwinBestEffort: true, ScratchParent: parent, GenerationRoot: root,
 			RuntimeID: runtimeID, LifecycleKind: "session",
@@ -2179,17 +2200,13 @@ func TestDarwinSetsidEscapeIsDiagnosableAndExplicitlyCleaned(t *testing.T) {
 	require.True(t, waitDarwinPIDGone(detachedPID, 5*time.Second), "cleanup reported success while detached pid remained observable")
 }
 
-func runDarwinSetsidHelper(role string) {
+func runDarwinSetsidHelper(role, pidFile string) {
 	switch role {
-	case "parent":
-		command := exec.Command(os.Args[0], "-test.run=TestDarwinSetsidEscapeIsDiagnosableAndExplicitlyCleaned") // #nosec G204 -- test helper binary.
-		command.Env = make([]string, 0, len(os.Environ()))
-		for _, entry := range os.Environ() {
-			if !strings.HasPrefix(entry, "PI_TEST_SETSID_ROLE=") {
-				command.Env = append(command.Env, entry)
-			}
-		}
-		command.Env = append(command.Env, "PI_TEST_SETSID_ROLE=descendant")
+	case darwinSetsidParentRole:
+		command := exec.Command(os.Args[0], // #nosec G204 -- test helper binary.
+			"-test.run=TestDarwinSetsidEscapeIsDiagnosableAndExplicitlyCleaned",
+			darwinSetsidDescendantRole, pidFile,
+		)
 		command.Stdout = os.Stdout
 		command.Stderr = os.Stderr
 		if err := command.Start(); err != nil {
@@ -2197,17 +2214,17 @@ func runDarwinSetsidHelper(role string) {
 		}
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
-			if _, err := os.Stat(os.Getenv("PI_TEST_PID_FILE")); err == nil {
+			if _, err := os.Stat(pidFile); err == nil {
 				os.Exit(0)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
 		os.Exit(92)
-	case "descendant":
+	case darwinSetsidDescendantRole:
 		if _, err := unix.Setsid(); err != nil {
 			os.Exit(93)
 		}
-		if err := os.WriteFile(os.Getenv("PI_TEST_PID_FILE"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
 			os.Exit(94)
 		}
 		for {

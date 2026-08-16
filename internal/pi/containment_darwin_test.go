@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -561,8 +562,13 @@ func TestDarwinVanishedLeaderFailureBranches(t *testing.T) {
 	})
 }
 
+// darwinLinkedExecArg re-enters this binary as the linked-exec child. The role
+// travels in argv because the child's environment is precisely what this proof
+// inspects: a carrier there would have to survive the very scrub under test.
+const darwinLinkedExecArg = "darwin-linked-exec-child"
+
 func TestDarwinLaunchBootstrapScrubsPrivateModeBeforeLinkedExec(t *testing.T) {
-	if os.Getenv("PI_TEST_DARWIN_LINKED_EXEC") == "1" {
+	if os.Args[len(os.Args)-1] == darwinLinkedExecArg {
 		require.Empty(t, os.Getenv("ACP_GO_PI_INTERNAL_DARWIN_LAUNCH"))
 		require.Empty(t, os.Getenv("acp_go_pi_internal_turn_supervisor"))
 
@@ -570,9 +576,10 @@ func TestDarwinLaunchBootstrapScrubsPrivateModeBeforeLinkedExec(t *testing.T) {
 	}
 
 	spec := testContainmentSpec(t)
-	native := exec.Command(os.Args[0], "-test.run=^TestDarwinLaunchBootstrapScrubsPrivateModeBeforeLinkedExec$")
+	native := exec.Command(os.Args[0],
+		"-test.run=^TestDarwinLaunchBootstrapScrubsPrivateModeBeforeLinkedExec$", darwinLinkedExecArg,
+	)
 	native.Env = append(os.Environ(),
-		"PI_TEST_DARWIN_LINKED_EXEC=1",
 		"ACP_GO_PI_INTERNAL_DARWIN_LAUNCH=1",
 		"acp_go_pi_internal_turn_supervisor=1",
 	)
@@ -813,7 +820,8 @@ func TestDarwinActivationFailureCleansCapturedGroup(t *testing.T) {
 	require.NoError(t, err)
 	pidFile := filepath.Join(parent, "descendant.pid")
 	script := filepath.Join(parent, "pi-helper")
-	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\necho $$ > \"$PI_TEST_PID_FILE\"\nsleep 60\n"), 0o700))
+	require.NoError(t, os.WriteFile(script,
+		fmt.Appendf(nil, "#!/bin/sh\necho $$ > %s\nsleep 60\n", strconv.Quote(pidFile)), 0o700))
 	var helperPID, helperPGID int
 	activateProcessContainmentRecord = func(_ containmentRecord, pid int, pgid int) error {
 		helperPID, helperPGID = pid, pgid
@@ -825,7 +833,6 @@ func TestDarwinActivationFailureCleansCapturedGroup(t *testing.T) {
 		ExecutablePath: script,
 		AgentDir:       filepath.Join(root, "agent"),
 		SessionDir:     filepath.Join(root, "sessions"),
-		Env:            map[string]string{"PI_TEST_PID_FILE": pidFile},
 		Containment: ContainmentSpec{
 			DarwinBestEffort: true, ScratchParent: parent, GenerationRoot: root,
 			RuntimeID: strings.Repeat("d", 32), LifecycleKind: "session",

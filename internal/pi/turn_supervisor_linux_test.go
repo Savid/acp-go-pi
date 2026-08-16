@@ -1378,13 +1378,22 @@ func startSupervisorPeerDeathFixture(t *testing.T, uid, gid uint32, ownerID stri
 	if err = os.WriteFile(double, []byte("#!/bin/sh\n\"$1\" \"$2\" &\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// Every path this fixture needs arrives as a positional parameter named
+	// locally by the script, so the topology claims no environment name.
 	nativeBody := `#!/bin/sh
 set -eu
-echo $$ > "$PI_TEST_NATIVE_PID"
-"$PI_TEST_LEAF" "$PI_TEST_ORDINARY_PID" &
-"$PI_TEST_SETSID" "$PI_TEST_LEAF" "$PI_TEST_SESSION_PID" &
-"$PI_TEST_SETSID" "$PI_TEST_DOUBLE" "$PI_TEST_LEAF" "$PI_TEST_DOUBLE_PID" &
-while [ ! -s "$PI_TEST_ORDINARY_PID" ] || [ ! -s "$PI_TEST_SESSION_PID" ] || [ ! -s "$PI_TEST_DOUBLE_PID" ]; do sleep 0.01; done
+native_pid="$1"
+ordinary_pid="$2"
+session_pid="$3"
+double_pid="$4"
+leaf="$5"
+double="$6"
+setsid="$7"
+echo $$ > "$native_pid"
+"$leaf" "$ordinary_pid" &
+"$setsid" "$leaf" "$session_pid" &
+"$setsid" "$double" "$leaf" "$double_pid" &
+while [ ! -s "$ordinary_pid" ] || [ ! -s "$session_pid" ] || [ ! -s "$double_pid" ]; do sleep 0.01; done
 while :; do sleep 30; done
 `
 	if err = os.WriteFile(nativeScript, []byte(nativeBody), 0o700); err != nil {
@@ -1394,13 +1403,10 @@ while :; do sleep 30; done
 		filepath.Join(state, "native.pid"), filepath.Join(state, "ordinary.pid"),
 		filepath.Join(state, "session.pid"), filepath.Join(state, "double.pid"),
 	}
-	native := exec.Command(nativeScript)
-	native.Env = []string{
-		"PATH=/usr/bin:/bin", "PI_TEST_NATIVE_PID=" + pidPaths[0],
-		"PI_TEST_ORDINARY_PID=" + pidPaths[1], "PI_TEST_SESSION_PID=" + pidPaths[2],
-		"PI_TEST_DOUBLE_PID=" + pidPaths[3], "PI_TEST_LEAF=" + leaf,
-		"PI_TEST_DOUBLE=" + double, "PI_TEST_SETSID=" + setsid,
-	}
+	native := exec.Command(
+		nativeScript, pidPaths[0], pidPaths[1], pidPaths[2], pidPaths[3], leaf, double, setsid,
+	)
+	native.Env = []string{"PATH=/usr/bin:/bin"}
 	identityRoot := t.TempDir()
 	isolation := &ProcessIsolation{
 		UID: uid, GID: gid, BaseEnvironment: map[string]string{},
