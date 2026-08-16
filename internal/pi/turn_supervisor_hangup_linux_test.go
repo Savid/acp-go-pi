@@ -20,119 +20,96 @@ import (
 )
 
 const (
-	orphanHangupRoleEnv          = "ACP_GO_PI_TEST_ORPHAN_HANGUP_ROLE"
-	orphanHangupRoleIntermediate = "intermediate"
-	orphanHangupRoleWorker       = "worker"
-	orphanHangupRoleDescendant   = "descendant"
+	// orphanHangupSupervisorArg re-enters the test binary as the supervisor
+	// generation. The role travels in argv and is consumed before testing parses
+	// flags, so the proof claims no name in the product's environment namespace.
+	orphanHangupSupervisorArg = "orphan-hangup-supervisor"
+
+	// orphanHangupIntermediateScript is the generation whose death orphans the
+	// supervisor. It leads its own session, so whoever adopts the supervisor
+	// afterwards is guaranteed to sit outside the supervisor's session and the
+	// supervisor's process group is genuinely orphaned no matter who reaps it.
+	orphanHangupIntermediateScript = `"$1" "$2" &
+wait
+`
+
+	// orphanHangupWitnessScript is both the stopped group member the kernel
+	// requires before it hangs up a newly orphaned group and the only observer of
+	// that hangup. Its trap reports on the supervisor's own report pipe, so the
+	// proof reads the kernel's delivery receipt instead of inferring it. Arming is
+	// announced on a second descriptor: a witness stopped before its trap exists
+	// would meet a real hangup with the default disposition and turn the proof
+	// into a silent lie.
+	orphanHangupWitnessScript = `trap 'echo hangup >&3' HUP
+echo armed >&4
+while :; do sleep 30; done
+`
 
 	orphanHangupDeadline = 30 * time.Second
+	orphanHangupQuiet    = 250 * time.Millisecond
 	orphanHangupPoll     = 5 * time.Millisecond
 )
 
-// The orphan proof needs three generations of real processes, so the test
-// binary re-enters itself in one of the helper roles before any test runs.
 func init() {
-	role := os.Getenv(orphanHangupRoleEnv)
-	if role == "" {
+	if len(os.Args) != 2 || os.Args[1] != orphanHangupSupervisorArg {
 		return
 	}
 
-	os.Exit(runOrphanHangupRole(role))
+	os.Exit(runOrphanHangupSupervisor())
 }
 
-func runOrphanHangupRole(role string) int {
-	switch role {
-	case orphanHangupRoleIntermediate:
-		return runOrphanHangupIntermediate()
-	case orphanHangupRoleWorker:
-		return runOrphanHangupWorker()
-	case orphanHangupRoleDescendant:
-		// Held open by the test, so the descendant outlives every step until
-		// the worker's containment kills it.
-		_, _ = io.Copy(io.Discard, os.NewFile(3, "hold"))
-
-		return 0
-	default:
-		fmt.Fprintln(os.Stderr, "unknown orphan hangup role", role)
-
-		return 2
-	}
-}
-
-func orphanHangupEnvironment(role string) []string {
-	return []string{orphanHangupRoleEnv + "=" + role}
-}
-
-// runOrphanHangupIntermediate is the generation whose death orphans the worker.
-// It leads its own session, so whichever process adopts the worker afterwards
-// is guaranteed to sit outside the worker's session and the worker's process
-// group is genuinely orphaned no matter who reaps it.
-func runOrphanHangupIntermediate() int {
-	topology := os.NewFile(3, "topology")
-
-	executable, err := os.Executable()
-	if err != nil {
-		fmt.Fprintf(topology, "error:%v\n", err)
-
-		return 1
-	}
-
-	worker := exec.Command(executable)
-	worker.Env = orphanHangupEnvironment(orphanHangupRoleWorker)
-	worker.ExtraFiles = []*os.File{
-		os.NewFile(4, "report"), os.NewFile(5, "control"), os.NewFile(6, "hold"),
-	}
-	worker.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if err = worker.Start(); err != nil {
-		fmt.Fprintf(topology, "error:%v\n", err)
-
-		return 1
-	}
-
-	fmt.Fprintf(topology, "worker:%d\n", worker.Process.Pid)
-
-	for {
-		time.Sleep(time.Minute)
-	}
-}
-
-// runOrphanHangupWorker stands in for a supervisor role: it installs the
-// production hangup guard, owns a descendant in its own process group exactly
-// as the guardian owns the liveness supervisor, and quiesces only when its
-// control channel closes.
-func runOrphanHangupWorker() int {
+// runOrphanHangupSupervisor stands in for a supervisor role: it installs the
+// production hangup guard, leads its own process group as the guardian and the
+// liveness supervisor do, owns a descendant inside that group, and quiesces only
+// when its control channel closes — then exits through the production
+// containment wait, so its completion report means the whole tree reached
+// ECHILD.
+func runOrphanHangupSupervisor() int {
 	report := os.NewFile(3, "report")
 	control := os.NewFile(4, "control")
-	hold := os.NewFile(5, "hold")
 
 	stopHangupGuard := installTurnSupervisorHangupGuard()
 	defer stopHangupGuard()
 
-	executable, err := os.Executable()
+	if err := syscall.Setpgid(0, 0); err != nil {
+		fmt.Fprintf(report, "setpgid:%v\n", err)
+
+		return 1
+	}
+
+	armedRead, armedWrite, err := os.Pipe()
 	if err != nil {
-		fmt.Fprintf(report, "error:%v\n", err)
+		fmt.Fprintf(report, "pipe:%v\n", err)
 
 		return 1
 	}
 
-	descendant := exec.Command(executable)
-	descendant.Env = orphanHangupEnvironment(orphanHangupRoleDescendant)
-	descendant.ExtraFiles = []*os.File{hold}
-	descendant.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	witness := exec.Command("/bin/sh", "-c", orphanHangupWitnessScript)
+	witness.ExtraFiles = []*os.File{report, armedWrite}
+	witness.Stderr = os.Stderr
 
-	if err = descendant.Start(); err != nil {
-		fmt.Fprintf(report, "error:%v\n", err)
+	if err = witness.Start(); err != nil {
+		fmt.Fprintf(report, "witness:%v\n", err)
 
 		return 1
 	}
 
-	fmt.Fprintf(report, "ready:%d\n", descendant.Process.Pid)
+	_ = armedWrite.Close()
+
+	if _, err = bufio.NewReader(armedRead).ReadString('\n'); err != nil {
+		fmt.Fprintf(report, "armed:%v\n", err)
+
+		return 1
+	}
+
+	_ = armedRead.Close()
+
+	fmt.Fprintf(report, "ready:%d:%d\n", os.Getpid(), witness.Process.Pid)
 
 	_, _ = io.Copy(io.Discard, control)
 
 	if err = awaitLinuxSupervisorContainment(os.Getpid(), 0); err != nil {
-		fmt.Fprintf(report, "error:%v\n", err)
+		fmt.Fprintf(report, "containment:%v\n", err)
 
 		return 1
 	}
@@ -217,36 +194,36 @@ func awaitOrphanHangupExit(t *testing.T, pid int) {
 	}
 }
 
-func readOrphanHangupLine(t *testing.T, reader *bufio.Reader, prefix string) string {
+// readOrphanHangupReport takes one line off the report pipe under a deadline, so
+// a supervisor the kernel killed fails the proof here instead of hanging it.
+func readOrphanHangupReport(t *testing.T, pipe *os.File, reports *bufio.Reader) string {
 	t.Helper()
 
-	line, err := reader.ReadString('\n')
-	require.NoErrorf(t, err, "read %q report", prefix)
+	require.NoError(t, pipe.SetReadDeadline(time.Now().Add(orphanHangupDeadline)))
 
-	value, found := strings.CutPrefix(strings.TrimSuffix(line, "\n"), prefix)
-	require.Truef(t, found, "report %q is not a %q line", line, prefix)
+	line, err := reports.ReadString('\n')
+	require.NoError(t, err, "read supervisor report")
+	require.NoError(t, pipe.SetReadDeadline(time.Time{}))
 
-	return value
+	return strings.TrimSuffix(line, "\n")
 }
 
 // TestOrphanedSupervisorGroupSurvivesHangupUntilAuthenticatedQuiescence proves
-// the containment property SIGHUP used to break: a stopped supervisor group
-// that becomes orphaned — the guardian's ordinary fate, since it deliberately
-// outlives the host and carries no Pdeathsig — is signalled SIGHUP by the
-// kernel and must survive it, keeping its subreaper role and its descendants
-// until its authenticated control channel closes and the whole tree reaches
-// ECHILD.
+// the containment property SIGHUP used to break: a supervisor process group that
+// becomes orphaned — the guardian's ordinary fate, since it deliberately
+// outlives the host and carries no Pdeathsig — is signalled SIGHUP by the kernel
+// and must survive it, keeping its descendants until its authenticated control
+// channel closes and the whole tree reaches ECHILD.
 //
-// Nothing here is skipped or tolerated. The kernel pairs the SIGHUP it sends to
-// a newly orphaned stopped group with a SIGCONT, and the test sends no SIGCONT
-// of its own, so the worker leaving the stopped state is positive proof the
-// hangup was delivered; an environment that cannot produce a genuine orphan
-// leaves the worker stopped and fails the test loudly.
+// Nothing here is skipped or tolerated. A `/bin/sh` witness stopped inside the
+// supervisor's group is the stopped job the kernel requires before it hangs up a
+// newly orphaned group, and the witness's own SIGHUP trap writes the receipt the
+// proof reads: the kernel's delivery is observed, never assumed, and the SIGCONT
+// that thawed the witness enough to run the trap is observed with it. An
+// environment that cannot produce a genuine orphan — a subreaper inside the
+// supervisor's own session — fails the test loudly instead of standing it down.
 func TestOrphanedSupervisorGroupSurvivesHangupUntilAuthenticatedQuiescence(t *testing.T) {
 	executable, err := os.Executable()
-	require.NoError(t, err)
-
-	topologyRead, topologyWrite, err := os.Pipe()
 	require.NoError(t, err)
 
 	reportRead, reportWrite, err := os.Pipe()
@@ -255,81 +232,104 @@ func TestOrphanedSupervisorGroupSurvivesHangupUntilAuthenticatedQuiescence(t *te
 	controlRead, controlWrite, err := os.Pipe()
 	require.NoError(t, err)
 
-	holdRead, holdWrite, err := os.Pipe()
-	require.NoError(t, err)
-
-	intermediate := exec.Command(executable)
-	intermediate.Env = orphanHangupEnvironment(orphanHangupRoleIntermediate)
-	intermediate.ExtraFiles = []*os.File{topologyWrite, reportWrite, controlRead, holdRead}
+	intermediate := exec.Command(
+		"/bin/sh", "-c", orphanHangupIntermediateScript, "sh", executable, orphanHangupSupervisorArg,
+	)
+	intermediate.ExtraFiles = []*os.File{reportWrite, controlRead}
+	intermediate.Stderr = os.Stderr
 	intermediate.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	require.NoError(t, intermediate.Start())
 
 	// The test must not retain the child ends, or no reader here ever sees the
 	// EOF that drives quiescence and completion.
-	for _, file := range []*os.File{topologyWrite, reportWrite, controlRead, holdRead} {
+	for _, file := range []*os.File{reportWrite, controlRead} {
 		require.NoError(t, file.Close())
 	}
 
-	workerPID, err := strconv.Atoi(readOrphanHangupLine(t, bufio.NewReader(topologyRead), "worker:"))
-	require.NoError(t, err)
-
 	reports := bufio.NewReader(reportRead)
 
-	descendantPID, err := strconv.Atoi(readOrphanHangupLine(t, reports, "ready:"))
+	readiness := readOrphanHangupReport(t, reportRead, reports)
+
+	pids, found := strings.CutPrefix(readiness, "ready:")
+	require.Truef(t, found, "supervisor report %q is not a readiness line", readiness)
+
+	supervisorText, witnessText, found := strings.Cut(pids, ":")
+	require.Truef(t, found, "supervisor readiness %q carries no witness pid", readiness)
+
+	supervisorPID, err := strconv.Atoi(supervisorText)
 	require.NoError(t, err)
 
+	witnessPID, err := strconv.Atoi(witnessText)
+	require.NoError(t, err)
+
+	// A failed proof must leave nothing behind holding this binary's standard
+	// error open, so the whole supervisor group goes, not just the pids the
+	// report named.
 	t.Cleanup(func() {
-		_ = holdWrite.Close()
 		_ = controlWrite.Close()
-
-		for _, pid := range []int{workerPID, descendantPID} {
-			_ = syscall.Kill(pid, syscall.SIGCONT)
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-		}
-
+		_ = syscall.Kill(-supervisorPID, syscall.SIGCONT)
+		_ = syscall.Kill(-supervisorPID, syscall.SIGKILL)
 		_ = intermediate.Process.Kill()
 		_ = intermediate.Wait()
+		_ = reportRead.Close()
 	})
 
-	require.NoError(t, syscall.Kill(workerPID, syscall.SIGSTOP))
-	awaitOrphanHangupState(t, workerPID, func(stat orphanHangupStat) bool { return stat.state == 'T' }, "stopped")
+	supervisor, err := readOrphanHangupStat(supervisorPID)
+	require.NoError(t, err)
+	require.Equal(t, supervisorPID, supervisor.group, "supervisor must lead its own process group")
+
+	witness, err := readOrphanHangupStat(witnessPID)
+	require.NoError(t, err)
+	require.Equal(t, supervisorPID, witness.group, "witness must share the supervisor's process group")
+
+	require.NoError(t, syscall.Kill(witnessPID, syscall.SIGSTOP))
+	awaitOrphanHangupState(t, witnessPID, func(stat orphanHangupStat) bool { return stat.state == 'T' }, "stopped")
 
 	require.NoError(t, intermediate.Process.Kill())
 	_, _ = intermediate.Process.Wait()
 
-	orphan, err := readOrphanHangupStat(workerPID)
+	orphan, err := readOrphanHangupStat(supervisorPID)
 	require.NoError(t, err)
-	require.Equal(t, workerPID, orphan.group, "worker must lead its own process group")
 
 	adopter, err := readOrphanHangupStat(orphan.parent)
 	require.NoError(t, err)
 
 	if adopter.session == orphan.session {
 		t.Fatalf(
-			"environment produced no genuine orphan: worker %d in session %d was adopted by %d in the same session",
-			workerPID, orphan.session, orphan.parent,
+			"environment produced no genuine orphan: supervisor %d in session %d was adopted by %d in the same session",
+			supervisorPID, orphan.session, orphan.parent,
 		)
 	}
 
-	resumed := awaitOrphanHangupState(
-		t, workerPID, func(stat orphanHangupStat) bool { return stat.state != 'T' }, "the kernel's orphan hangup",
-	)
-	require.NotEqual(t, byte('Z'), resumed.state, "orphaned supervisor was terminated by SIGHUP")
+	require.Equal(t, "hangup", readOrphanHangupReport(t, reportRead, reports),
+		"the kernel never hung up the orphaned supervisor group")
 
-	descendant, err := readOrphanHangupStat(descendantPID)
-	require.NoError(t, err)
-	require.NotEqual(t, byte('Z'), descendant.state, "supervised descendant did not survive the orphan hangup")
+	surviving, err := readOrphanHangupStat(supervisorPID)
+	require.NoErrorf(t, err, "orphaned supervisor %d did not survive the kernel hangup", supervisorPID)
+	require.NotEqualf(t, byte('Z'), surviving.state,
+		"orphaned supervisor %d was terminated by the kernel hangup", supervisorPID)
+
+	// Quiescence belongs to the control channel alone, so the report pipe must
+	// stay silent while the hangup is the only thing that has happened.
+	require.NoError(t, reportRead.SetReadDeadline(time.Now().Add(orphanHangupQuiet)))
+
+	premature, err := reports.ReadString('\n')
+	require.ErrorIsf(t, err, os.ErrDeadlineExceeded,
+		"supervisor reported %q on the kernel hangup instead of waiting for its control channel", premature)
+
+	held, err := readOrphanHangupStat(witnessPID)
+	require.NoError(t, err, "supervised descendant did not survive the orphan hangup")
+	require.NotEqual(t, byte('Z'), held.state, "supervised descendant did not survive the orphan hangup")
 
 	require.NoError(t, controlWrite.Close())
 
-	require.Equal(t, "", readOrphanHangupLine(t, reports, "complete"))
+	require.Equal(t, "complete", readOrphanHangupReport(t, reportRead, reports),
+		"supervisor never reported containment completion")
 
-	awaitOrphanHangupExit(t, descendantPID)
-	awaitOrphanHangupExit(t, workerPID)
+	_, err = readOrphanHangupStat(witnessPID)
+	require.ErrorIs(t, err, os.ErrNotExist, "completion was reported before the supervised tree was reaped")
 
-	require.NoError(t, topologyRead.Close())
-	require.NoError(t, reportRead.Close())
-	require.NoError(t, holdWrite.Close())
+	awaitOrphanHangupExit(t, supervisorPID)
 }
 
 // TestTurnSupervisorHangupGuardDrainsWithoutQuiescing proves the guard takes
