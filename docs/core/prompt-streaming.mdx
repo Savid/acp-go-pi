@@ -1,0 +1,176 @@
+---
+title: "Prompt Streaming"
+description: "How a pi turn becomes ACP updates, and how commands and failures resolve"
+---
+
+A prompt is one pi turn. The adapter sends the prompt as a pi RPC command and
+reads pi's JSONL event stream line by line, translating each event into an ACP
+session update, so the host sees assistant text, reasoning, and tool activity
+as it happens rather than after the turn finishes.
+
+## From RPC events to updates
+
+pi RPC events map to ACP session updates for assistant text, thoughts, tool
+calls, tool results, and usage counters. The full mapping table lives in
+[Updates](/docs/reference/updates). pi emits a single settle event exactly
+once per accepted prompt, which is the adapter's fence for finishing the turn
+and committing the store mirror.
+
+The wrapper bridge assigns each finalized assistant message a UUID before pi
+persists it. The adapter publishes that durable message identity immediately,
+returns it in terminal response metadata, and reuses it during history replay.
+This gives persistent hosts one native correlation across live delivery,
+mirror commit, process replacement, and `session/load`.
+
+Two interactive flows are layered on top of the stream:
+
+- **Permission requests** are surfaced as ACP permission prompts through the
+  adapter's own pi bridge extension — see
+  [Permissions](/docs/features/permissions).
+- **User-facing questions** raised by the wrapper-owned `question` tool or an
+  explicitly seeded extension dialog are forwarded through ACP elicitation,
+  but only when the initialized client advertised
+  elicitation support. Without it, the dialog is cancelled deterministically
+  and the turn proceeds — see [Elicitation](/docs/features/elicitation).
+
+Native image output is validated before it reaches the wire: the bytes must
+decode, must sniff as a raster, must not contradict a declared media type that
+names a different known raster, and must fit the per-image and per-tool-call
+decoded-byte limits. An image that fails any of those is **refused, not
+dropped, and does not end the turn**. A tool image fails that tool call and
+carries fixed guidance as the call's own content; an assistant image, which has
+no tool call to attribute to, is replaced by the same guidance as agent text.
+The guidance says what to do next and never quotes the size, media type, or
+bytes it refused. Only a stored artifact the bounded window can no longer
+reproduce (`stage: "image_output"`, `reason: "storage_failed"`) ends the turn.
+
+Raw pi RPC events are not sent by default. A host opts in per session with
+`_meta.pi.rawEvent.enabled`; see [Raw events](/docs/features/raw-events).
+
+## Prompt content validation
+
+Prompt content fails closed before the turn starts. An empty prompt (zero
+content blocks) and an unsupported block type (audio or an unknown block) are
+rejected with an invalid-params (`-32602`) error naming the offending field
+(`prompt`). Nothing is silently dropped and nothing is forwarded to pi.
+
+Image blocks are validated in request order, stopping on the first failure,
+and every rejection is an invalid-params (`-32602`) error carrying
+`{field:"prompt.image", error, index}` (plus `sizeBytes`/`maxBytes` on a limit
+failure). The declared media type must be one of `image/png`, `image/jpeg`,
+`image/gif`, or `image/webp`, static only: animated GIF, animated WebP, and
+APNG are rejected structurally without decoding pixels. The bytes are sniffed
+once, the sniffed format must agree with the declared type, and they must fit
+the configured per-image and per-prompt limits (`WithImageLimits`, 6 MiB each
+by default). A resource link is forwarded as text; an embedded resource whose
+declared type is a raster runs the same image validation, and every other
+embedded blob resource is refused rather than flattened or inlined.
+
+An image block's bytes arrive in one of two forms, chosen per block:
+
+- **Embedded** — non-empty base64 `data`. A `uri` alongside it is provenance
+  only and is never fetched, even when a handoff envelope is also present:
+  data always wins.
+- **Handoff** — empty `data` plus a `file://` uri and the
+  `acp-go.dev/handoff` envelope described in
+  [Metadata](/docs/reference/meta). Only available when
+  `WithInputHandoffRoot` is configured, which is also the condition under
+  which the handoff capability is advertised.
+
+A block with empty `data` and neither signal is `missing_data`, exactly as
+before; `invalid_handoff` never claims a plain empty-data block.
+
+Handoff blocks resolve and verify before any embedded-form gate runs, first
+failure winning:
+
+| `error` | Cause |
+| --- | --- |
+| `invalid_handoff` | The block is malformed as a block: no handoff root is configured, or the envelope or `file://` uri is absent, unparsable, non-local, non-absolute, wrongly versioned, missing a field, or carrying an unknown one. |
+| `path_not_allowed` | The path lies outside the handoff root, is reached through a symlink the root refuses (any absolute symlink, or one leading out of the root), or does not name a regular file. |
+| `missing_file` | A path inside the root that does not exist or cannot be opened or read. |
+| `handoff_digest_mismatch` | The file's byte count or sha256 does not match the envelope. Fail-closed: there is no fallback to the embedded form. |
+
+At most 64 handoff-form blocks are read per prompt; the block that crosses that
+count is rejected `too_large` reporting the count against 64. The bound is on
+the work rather than on the byte policy, so it holds even where
+`MaxInputBytesPerPrompt` is disabled, and it sits far above any conforming
+turn.
+
+The declaration is judged in full before the filesystem is consulted at all: the
+declared media type against the allowlist, then a declared `sizeBytes` above the
+effective per-image gate as `too_large`, both decided from the block with nothing
+opened. A refusal on the declaration therefore says nothing about whether the
+file it named exists.
+
+Containment comes next, and it is the kernel's rather than a path check's: the
+handoff root is opened once per prompt and every file is opened relative to that
+descriptor, so a name that leads out of the root is refused as part of the open
+itself and there is no window between deciding a path is inside the root and
+reading it. The opened descriptor is then required to be a regular file, because
+a root bounds where a name may lead and not what kind of object it names, so a
+directory, a FIFO, or a device under the root is rejected rather than read.
+
+The read is capped at the declared
+size plus one byte, so a file that returns more or fewer bytes than the envelope
+declared is rejected `handoff_digest_mismatch` rather than carried forward: no
+byte that could not be verified against the envelope leaves the read. The
+verified bytes then run the same gate chain as embedded data, minus the two
+gates that are meaningless without base64, and they count toward the per-prompt
+aggregate identically. Both forms over the same bytes
+produce identical native requests, and the handoff path never appears in the
+native request: pi's prompt images take base64 payloads, so nothing is
+materialized and nothing outlives the validation read. Handoff files stay owned
+by the host, which may remove them the moment `session/prompt` returns.
+
+Image support is also gated per model from pi's catalog input list: when the
+selected model authoritatively lists no image input the prompt is rejected
+before turn start with `unsupported_by_model`, reported on the member the
+prompt's first image arrived on; when the catalog is silent the prompt is
+forwarded and pi's provider stays authoritative.
+
+## Slash commands
+
+pi's RPC command inventory can describe extension commands, prompt templates,
+and skills, and the adapter projects any returned entries into ACP
+`available_commands` updates. A prompt whose first text block begins with
+`/name` runs that command as its turn; unrecognized `/text` stays ordinary
+prompt text.
+
+The launch disables ambient extension, skill, and prompt-template discovery.
+Explicit seeds under `extensions/`, `prompts/`, and `skills/**/SKILL.md` are
+loaded by exact path, so their commands remain reachable. The shipped wrapper
+extensions register no slash commands; a default session therefore advertises
+an empty command set. Nothing is fabricated from pi's terminal-only built-ins.
+
+## Turn resolution
+
+A turn resolves one of three ways:
+
+- **Success** — pi reports a terminal stop and the prompt returns an ACP
+  `StopReason`.
+- **Cancelled** — the host cancels; the adapter aborts the native turn and the
+  prompt resolves as a successful `cancelled` response, never an error. A user
+  cancel wins even if a turn timeout fires at the same instant. Abort
+  acknowledgement does not complete the selected containment boundary: the
+  adapter always drives that boundary before cancellation settles. Ordinary
+  mode portably waits for the direct child and does not claim descendant
+  absence. Explicit Linux isolation uses its embedded subreaper and reaps
+  session-detached descendants. The separate Darwin best-effort opt-in observes
+  only the captured original process group; it never establishes that escaped
+  descendants are absent. The
+  normal native abort ladder ends at `agent_settled`; after containment, the
+  adapter synchronously mirrors that durable aborted generation before the
+  cancelled response. If escalation stops the runtime before
+  `agent_settled`, no fresh generation is mirrored. The next prompt lazily
+  relaunches the same logical session from the resulting committed state.
+- **Failure** — a process exit, transport break, provider error, or
+  `WithTurnTimeout` expiry ends the prompt with a `pi_turn_failed` JSON-RPC
+  error. Timeout uses the same selected containment boundary before returning. Failures
+  are never reported as a stop reason. The
+  [ACP methods](/docs/reference/acp-methods) reference documents the error
+  code and cause vocabulary.
+
+Only turns that cross pi's native `agent_settled` durability fence are
+mirrored. Successes, settled provider errors, and settled explicit cancels are
+included. Timed-out, transport-failed, process-failed, or cancellation-
+escalated partial turns that never settle are not.

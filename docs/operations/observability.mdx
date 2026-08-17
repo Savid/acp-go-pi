@@ -1,0 +1,69 @@
+---
+title: "Observability"
+description: "Wire up telemetry and use it to diagnose turn failures and timeouts"
+---
+
+## Telemetry wiring
+
+Embedded hosts supply OpenTelemetry providers with `WithTracerProvider`,
+`WithMeterProvider`, and `WithTextMapPropagator`. The standalone binary
+includes OpenTelemetry exporter support and configures traces, metrics, and
+logs from standard `OTEL_*` environment variables. Providers a host passes
+stay owned by the host, including `ForceFlush` and `Shutdown`.
+
+Logs go to stderr so stdout stays reserved for ACP frames; enable debug
+logging with `-debug` (`WithLogger` for a custom logger). Telemetry records
+lifecycle timing, request outcomes, and counters, and by default avoids
+recording prompt text, tool inputs, tool outputs, and raw pi event bodies.
+
+## Containment signal
+
+`acp_go_pi.runtime.containment` is recorded as `1` with the exact
+`containment` attribute `authoritative`, `shared_identity`, `best_effort`, or
+`unavailable`.
+Embedded hosts receive the same value once through
+`RuntimeResourceHooks.ObserveContainment`; `Agent.ContainmentMode` exposes it
+directly.
+
+An agent with no explicit process-isolation policy reports
+`containment=shared_identity` on every supported platform. It runs as the
+current root or non-root identity and manages direct-process liveness, but it
+does not install identity authority, inventory descendants, or claim
+whole-tree quiescence. Consequently it emits no `provider_descendant`
+snapshot, including zero.
+
+Darwin opt-in logs a structured warning with `containment=best_effort`, and the
+standalone binary prints a plain warning even without `-debug`. Best-effort
+mode likewise emits no `provider_descendant` process snapshot, including zero, because
+the process group cannot inventory escaped descendants. Resource admissions
+still describe wrapper-managed native roots and scratch roots; they must not
+be interpreted as a bound on escaped provider work.
+
+## Diagnosing turn failures
+
+A failed prompt returns a `pi_turn_failed` error whose `cause` tells you where
+to look. The [failure contract](/docs/reference/acp-methods) defines the full
+shape; use the `cause` to route the investigation:
+
+| Cause | First thing to check |
+| --- | --- |
+| `process_exit` | The `message` carries the real exit status and the stderr line naming the cause; the whole retained stderr tail is in the adapter log. Confirm the `pi` CLI is installed and is version 0.80.6+. |
+| `transport` | A stream broke mid-turn; check for client disconnects or a pi process killed out from under the adapter. |
+| `provider` | pi reported a provider error — a missing or refused key, quota, or an upstream failure; check deliberate credential injection or the `_pi/auth/inventory` residence proof (ambient shell keys are scrubbed). |
+| `timeout` | A `WithTurnTimeout` deadline expired; raise the bound or investigate why the turn ran long. |
+
+<Note>
+A user cancel that coincides with a `WithTurnTimeout` expiry resolves as a
+successful `cancelled` response, not a `timeout` failure. If you expect
+timeouts but see cancellations, the client is cancelling first.
+</Note>
+
+## Reading the adapter log
+
+The wire surfaces are closed, so the adapter log is where the reasons live.
+At error level the logger records the whole retained stderr tail and exit
+status behind every `process_exit`, the driving error behind every `transport`
+failure and session-start failure, the reason an agent option was refused
+(the client is told only which option), and any adapter fault answered as a
+bare `-32603`. Install a logger with `WithLogger`; the standalone binary
+writes to stderr.

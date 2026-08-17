@@ -1,0 +1,98 @@
+---
+title: "Troubleshooting"
+description: "Route common failures to their cause: busy rejections, fork errors, blocked dialogs, and stale MCP tools"
+---
+
+Each symptom below names the behavior that produces it and the test in this
+repository that reproduces it. Tests named `TestFakePi*` run against a fake pi
+that speaks the exact RPC protocol observed from the real binary; the other
+integration tests launch the real `pi` CLI.
+
+## A concurrent prompt is rejected as busy
+
+A pi RPC process exposes exactly one active session at a time, and this
+adapter runs one RPC process per ACP session with a per-session turn capacity
+of one. A `session/prompt` that arrives while a turn is active is rejected
+with an invalid-request error carrying `"error": "backpressure"` and
+`"limit": "session_prompt"`; it is never queued. At the native surface pi
+refuses a second bare prompt while streaming and acknowledges a steer of the
+active turn only after queuing it. `TestFakePiBusyRejectionAndSteerAck`
+(`integration/fake_pi_protocol_test.go`) reproduces both native behaviors.
+Wait for the active turn to settle, or cancel it, before prompting again; the
+adapter does not expose pi's steering queue.
+
+## Forking a fresh session fails
+
+Forking runs through the `_pi/session/fork` extension method, and a fork of a
+session with no conversation yet fails with a structured error: pi's native
+clone of an empty session reports a missing session entry, and the adapter
+classifies that as an explicit rejection rather than a native crash. Complete
+at least one prompt turn before forking.
+`TestProviderTurnFailureAndEmptyCloneError` (`session_failure_test.go`) pins
+the classification; `TestPiACPLiveForkSession`
+(`integration/agent_live_test.go`, live tier) drives the real binary through
+the rejected empty fork and a successful fork after a seeded turn.
+
+## A cancel lands while a permission or elicitation dialog is open
+
+`session/cancel` marks the turn cancelled and resolves every pending
+dialog as cancelled, and a cancelled dialog fails closed: the adapter
+answers pi's native dialog — deny for a permission dialog, cancel for an
+elicitation/question dialog — so the blocked tool call or question resolves
+and the RPC process settles instead of waiting on an answer that never
+arrives. Both dialog kinds share the same registration mechanism, so the
+guarantee holds for either. A dialog that arrives after the cancel starts
+already cancelled and is resolved the same way. `TestRegisterDialogCancelledTurn`
+(`session_permissions_test.go`) pins that a dialog registered on a cancelled
+turn begins with an already-cancelled context and leaves no pending dialog
+behind.
+
+## Output stops but the turn stays active
+
+pi ends every accepted prompt with exactly one `agent_settled` event, emitted
+after the terminal `message_end` → `turn_end` → `agent_end` ladder and only
+once no automatic retry, compaction retry, or queued continuation remains.
+The adapter treats `agent_settled` as the turn-completion fence: the prompt
+response and the durable session mirror wait for it, and nothing observed
+after it belongs to the turn. A turn whose streamed output has stopped but
+which has not returned is a turn whose process has not settled yet.
+`TestFakePiPromptTurnLifecycle` (`integration/fake_pi_protocol_test.go`) pins
+the event order, the exactly-once settle, and the durable session file at the
+fence. A turn that never settles can be bounded with `WithTurnTimeout` — see
+[Observability](/docs/operations/observability) for the resulting failure.
+
+## The MCP tool set is stale after changing servers
+
+The pi RPC process fixes its MCP configuration at launch: the adapter writes
+a per-session MCP config into the session's isolated agent directory, and
+pi's extension-tool registry is established for that process. Changing a
+session's MCP servers therefore means closing the session's RPC process and
+relaunching it with the new declaration — there is no in-place mutation. The
+adapter refreshes the registry at the first user turn and after a resume, so
+a server that exposes only a provisional readiness surface until an operation
+is authorized does not leave the session stuck with the readiness stub as its
+tools (see [MCP](/docs/features/mcp)). `TestPiACPRuntimeMCPRefresh`
+(`integration/mcp_runtime_refresh_test.go`) drives the real pi binary,
+without provider credentials, through exactly this close-and-relaunch
+refresh: a session established against a readiness-only surface, the real
+tool surface on the first turn, and — after adapter shutdown — a resumed
+session that refreshes the registry again before continuing.
+
+## Splitting install problems from provider problems
+
+Every pi child launches with `PI_OFFLINE=1` and answers its state probes
+without provider credentials: `get_state`, `get_commands`, and
+`get_session_stats` succeed on a credential-less RPC process
+(`internal/pi/command.go`, `internal/pi/process.go`). That split routes the
+diagnosis:
+
+| Observation | Conclusion |
+| --- | --- |
+| Session creation or the state probes fail | pi install or wiring problem — confirm `pi` is on `PATH` and is version 0.80.6 or newer, and inspect the `process_exit` cause and the stderr tail in the adapter log. |
+| Session creation and probes succeed; prompts fail with cause `provider` | Credential problem — credentials were not injected for the session (ambient shell keys are scrubbed) or the provider refused them. |
+
+<Note>
+`pi --mode rpc` answers `get_state` and `get_commands` credential-free even
+outside this adapter, so a throwaway agent directory and the bare CLI
+reproduce the probe half of the table without any ACP host.
+</Note>

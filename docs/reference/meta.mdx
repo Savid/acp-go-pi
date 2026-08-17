@@ -1,0 +1,163 @@
+---
+title: "Metadata"
+description: "Every key the adapter reads and writes under the _meta.pi namespace"
+---
+
+All pi-specific public metadata lives under `_meta.pi`. Foreign metadata
+namespaces are preserved untouched for their owners. Inside the pi namespace,
+lifecycle requests are strict: a non-object `_meta.pi`, an unknown key, and a
+wrong-typed known value are all rejected with an invalid-params error naming
+the offending field.
+
+## Initialize capabilities
+
+Initialize advertises capability descriptors under `_meta.pi`:
+
+| Descriptor | Describes |
+| --- | --- |
+| `fork` | The `_pi/session/fork` extension method. |
+| `elicitation` | Session-scoped elicitation support. |
+| `rawEvent` | The raw-event opt-in (`enabledBy`, `maxBytes`, `defaultEnabled`). |
+| `sessionStore` | Store `format` (`pi-session-jsonl-v1`) and key shape. |
+
+Initialize also advertises the separate reserved capability
+`_meta["acp-go.dev/route"] = {"versions":[1]}`. Prompts and active-turn
+cancellations require exactly `{"version":1,"turnNonce":"..."}` under that
+key. A nonce is fresh and unguessable per turn, non-empty, and at most 4096
+bytes; missing, oversized, extra, unsupported, or stale route data is rejected.
+
+### Media envelope
+
+`_meta["acp-go.dev/mediaEnvelope"]` is advertised unconditionally and reports
+the prompt-media bounds this adapter enforces, so a host can reject an
+oversize or unsupported image before it sends one:
+
+```json
+{
+  "maxBytes": 6291456,
+  "maxPromptBytes": 6291456,
+  "maxDimension": 0,
+  "imageFormats": ["image/png", "image/jpeg", "image/gif", "image/webp"],
+  "documentFormats": []
+}
+```
+
+`maxBytes` is the effective per-image decoded-byte gate and `maxPromptBytes`
+the per-prompt aggregate gate, both derived from `WithImageLimits` rather than
+restated as literals. `maxDimension` is `0` because pi enforces no
+per-dimension pixel bound; `0` means "no bound", never "zero pixels".
+`imageFormats` is the inbound allowlist in advertisement order.
+`documentFormats` is an empty array because pi maps no MIME to a native
+document representation. The envelope covers only bounds the adapter itself
+enforces: whether the selected model accepts images is a prompt-time result,
+never envelope metadata.
+
+### Handoff
+
+`_meta["acp-go.dev/handoff"] = {"versions":[1]}` is advertised **only** when
+`WithInputHandoffRoot` is configured. Its absence is the actionable signal
+that no handoff root reached this adapter, so a host never has to guess
+whether its option took effect.
+
+The same key on an inbound prompt image block carries the handoff envelope:
+
+```json
+{
+  "type": "image",
+  "mimeType": "image/png",
+  "data": "",
+  "uri": "file:///<root>/<subpath>/<digest>.png",
+  "_meta": {
+    "acp-go.dev/handoff": {
+      "version": 1,
+      "digest": "<sha256-hex>",
+      "sizeBytes": 123456
+    }
+  }
+}
+```
+
+The envelope carries exactly `version`, `digest`, and `sizeBytes`; a missing
+field, an unknown field, an unsupported version, a digest that is not 64
+lowercase hex characters, and a non-integer or negative `sizeBytes` are all
+rejected. See [Prompt streaming](/docs/core/prompt-streaming) for the
+verdicts.
+
+Every live-turn `session/update` and `_pi/rawEvent` notification carries the
+same exact `{version, turnNonce}` object in its notification `_meta`; raw-event
+payloads also carry their structural `sessionId`. Lifecycle and load-history
+updates remain outside a turn epoch and omit the envelope.
+
+When an assistant message finalizes, the wrapper bridge stamps a UUID into the
+native pi transcript before persistence. The corresponding checkpoint update
+and terminal prompt response expose that durable identity as
+`_meta.pi.messageId`. `session/resume` publishes the final stored value on an
+identity-only notification without replaying content. `session/load` replays
+the same value on its notification envelope (and as the ACP `messageId` on
+replayed assistant text and thought chunks), so a host can compare the live
+terminal message with restored native history without inventing an identity.
+This field is output-only; lifecycle requests remain strict and reject it as an
+input option.
+
+Outbound form elicitation preserves native metadata and adds `version`,
+`sessionId`, `turnNonce`, and exactly one of `toolCallId` or `requestId` under
+the reserved key. A pre-existing reserved key is an error. Permission requests
+remain structurally correlated by ACP session and tool-call fields: the
+permission `toolCallId` is pi's exact native id and matches the corresponding
+tool-call session updates. Permission requests carry no route metadata.
+
+Structured output is not advertised: pi has no native structured-output
+surface, so no `structuredOutput` descriptor appears and an `outputSchema`
+option fails closed at session start.
+
+## Session options
+
+Session-lifecycle requests accept options and the raw-event opt-in:
+
+```json
+{
+  "_meta": {
+    "pi": {
+      "options": {
+        "model": "openai/gpt-4o",
+        "env": { "ANTHROPIC_API_KEY": "sk-ant-..." },
+        "extraPathDirs": ["/var/run/host/session-42/bin"],
+        "thinkingLevel": "medium",
+        "permission": "ask",
+        "autoRetry": true
+      },
+      "rawEvent": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `model` | Session model as `"provider/id"`; catalog-validated. |
+| `env` | Extra environment variables for this session's pi process. `PATH` is rejected: `extraPathDirs` is the only session `PATH` authority. |
+| `extraPathDirs` | Absolute directories prepended, in the order given, to this session's child `PATH`, ahead of the static base `PATH` from `WithEnv` and everything inherited. Order and duplicates are preserved. This launch-only field does not select the pi executable. Each entry must be absolute and free of the platform list separator. |
+| `thinkingLevel` | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; adapter-validated. |
+| `permission` | Permission mode: `ask` (default) or `allow`. |
+| `autoRetry` | Opt in to pi's native automatic retry of transient provider errors (5xx, timeouts). Default `false`: a native failure surfaces once, immediately, with the real cause. |
+| `outputSchema` | Accepted in the struct for API symmetry only; presence fails closed with the uniform unsupported error, including an empty `{}` schema. |
+
+## Update metadata
+
+Model select values carry an informational `_meta.pi` object containing the
+model id and any context-window and maximum-output-token facts pi reported. The
+adapter omits unknown facts rather than inventing them. Model input modalities
+are not published here; the catalog input list feeds only the internal
+image-prompt gate.
+
+Finalized live and replayed assistant messages carry the wrapper-persisted
+`_meta.pi.messageId` correlation described above. It is a UUID and remains
+stable across store mirroring, process replacement, `session/resume`, and
+`session/load`.
+
+pi has no native delegated-agent concept — there are no subagents to tag — so
+session updates carry no `parentToolUseId` annotation: every update is
+main-agent activity. Usage is authoritative only through the ACP
+`usage_update` notification; see [Updates](/docs/reference/updates).

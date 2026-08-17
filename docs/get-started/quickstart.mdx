@@ -1,0 +1,86 @@
+---
+title: "Quickstart"
+description: "Get a first successful ACP turn against pi in a few steps"
+---
+
+This tutorial takes you from nothing to a streamed assistant reply over ACP.
+
+## Prerequisites
+
+- A local pi CLI (`pi`) on `PATH`, **version 0.80.6 or newer**. The adapter
+  probes `pi --version` at startup and fails fast on anything older.
+- A way to authenticate one pi provider: explicitly inject an environment key
+  or `auth.json`, or configure the provider-auth broker and connect after ACP
+  initialization. Ambient provider keys are scrubbed — see
+  [Authentication](/docs/features/authentication).
+- A Go toolchain to build and run the example clients.
+
+## Steps
+
+<Steps>
+  <Step title="Clone the repository">
+    The example programs are repo-relative (`go run ./examples/...`), so start
+    from a checkout:
+
+    ```sh
+    git clone https://github.com/savid/acp-go-pi && cd acp-go-pi
+    ```
+  </Step>
+  <Step title="Run a single-prompt turn">
+    The minimal client starts the adapter, initializes, opens a session, sends
+    one prompt, and prints the streamed reply:
+
+    ```sh
+    go run ./examples/minimal-client \
+      -auth-file "$HOME/.pi/agent/auth.json" \
+      "Reply with a short hello from ACP."
+    ```
+  </Step>
+  <Step title="Try an interactive session">
+    The interactive client keeps a session open so you can send several prompts:
+
+    ```sh
+    go run ./examples/interactive-chat -auth-file "$HOME/.pi/agent/auth.json"
+    ```
+  </Step>
+</Steps>
+
+## Verify
+
+`-auth-file` names the credential file to copy into the isolated session; the
+example does not inherit ambient provider keys or read the normal pi home
+implicitly. The example prints the streamed assistant reply to stdout and
+exits `0`. A greeting line derived from your prompt confirms the full path worked: agent
+initialization, session creation, the prompt turn, and streamed output back
+through ACP.
+
+If you instead launch the raw command for an ACP host to drive, it blocks on
+stdin waiting for JSON-RPC frames and writes ACP frames only to stdout; add
+`-debug` to send diagnostics to stderr:
+
+```sh
+go run ./cmd/acp-go-pi \
+  -path "$(command -v pi)" \
+  -scratch-dir /tmp/pi-scratch \
+  -seed-file "auth.json=$HOME/.pi/agent/auth.json" \
+  -debug
+```
+
+For an ACP host that implements the `_pi/auth/*` extension legs, replace the
+seed with test- or service-owned durable paths:
+
+```sh
+go run ./cmd/acp-go-pi \
+  -path "$(command -v pi)" \
+  -home /var/lib/my-host/pi-home \
+  -provider-auth-root /var/lib/my-host/pi-auth
+```
+
+The broker is advertised even when that durable home does not yet contain a
+credential; that is how the host discovers and presents Connect.
+
+## Next steps
+
+- [Run modes](/docs/get-started/run-modes) — standalone binary versus embedded `Serve`.
+- [Examples](/docs/get-started/examples) — the interactive-chat and resume-from-file clients.
+- [Sessions](/docs/core/sessions) — the session lifecycle behind that first turn.

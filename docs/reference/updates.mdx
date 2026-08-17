@@ -1,0 +1,30 @@
+---
+title: "Updates"
+description: "The exact ACP session updates a pi turn emits and where each comes from"
+---
+
+## Update mapping
+
+During a prompt turn, pi RPC events are translated into ACP session updates:
+
+| Update | Source |
+| --- | --- |
+| assistant message chunks | pi assistant text deltas |
+| thought chunks | pi thinking deltas |
+| tool call | pi tool-call start and input |
+| tool call progress and result | pi tool execution events |
+| available commands | pi's discovered command set |
+| usage | per-message usage reported at message end |
+
+Usage `size` is the model's harness-reported context window; it is never
+fabricated, and `0` means unknown. `used` and the token breakdown come from
+pi's own per-message usage report.
+
+## Related channels
+
+- Raw pi events, when enabled, arrive separately on `_pi/rawEvent` and are
+  **not** session updates — see [Raw events](/docs/features/raw-events).
+- A turn *failure* is a JSON-RPC error on `session/prompt`, not an update —
+  see the failure contract in [ACP methods](/docs/reference/acp-methods).
+- There are no delegated-agent updates: pi has no subagent concept, so the
+  stream is always main-agent activity — see [Metadata](/docs/reference/meta).

@@ -1,0 +1,113 @@
+---
+title: "ACP Methods"
+description: "The implemented ACP methods, extensions, and the turn-failure error contract"
+---
+
+## Methods
+
+Core methods handled through the ACP SDK connection: initialize, session
+create/load/resume/list/delete, prompt, cancel, close, authenticate, logout,
+and the session configuration methods. Unsupported methods return a uniform
+JSON-RPC method-not-found error.
+
+## Extensions
+
+| Method | Direction |
+| --- | --- |
+| `_pi/session/fork` | client to agent |
+| `_pi/rawEvent` | agent to client |
+
+### `_pi/session/fork`
+
+Forks a session by duplicating the parent's active branch into a new pi
+session with a fresh session id; the parent linkage is recorded in the new
+session's header. Params and result reuse the SDK's fork payload shapes, built
+with `ForkSessionRequest` and called through `CallForkSession`. Stable
+`session/fork` is not routed — it returns method-not-found; the extension
+method is the only fork route. Forking a session that has no conversation
+entries yet is rejected with a structured invalid-params error, because pi
+cannot duplicate an empty branch.
+
+### No `_pi/rateLimits`
+
+pi is bring-your-own-key across many providers and exposes no
+subscription-usage source, so this adapter does not implement a
+`_pi/rateLimits` extension; a call returns the uniform JSON-RPC
+method-not-found error.
+
+## Turn-failure contract
+
+A native turn failure terminates `session/prompt` with a JSON-RPC error and no
+`PromptResponse`; it is never reported as an ACP stop reason. Every failure
+uses one uniform shape so a host can classify it without vendor parsing, and a
+native **session-start** failure carries that same shape: the causes are the
+same and there is no separate session-start error surface. The
+error is JSON-RPC code **`-32603`** with a `data` object:
+
+| Field | Value |
+| --- | --- |
+| `error` | `pi_turn_failed` |
+| `cause` | one of the causes below |
+| `message` | the real native cause text (never a placeholder) |
+
+The `cause` vocabulary:
+
+| Cause | Meaning |
+| --- | --- |
+| `process_exit` | The pi process died, or the version probe would not run; `message` carries the real exit status and the stderr line naming the cause. |
+| `transport` | pi's stdout closed or the event stream broke mid-turn. |
+| `provider` | pi reported a provider error for the turn (bad key, quota, upstream failure); `message` carries pi's error text. |
+| `timeout` | A `WithTurnTimeout` deadline expired; the native turn was aborted and reached its selected containment boundary before return. On Darwin best-effort this means direct-child reap plus original-group absence, not escaped-descendant absence. |
+
+`message` is bounded at 2048 bytes and carries the native cause, not a
+transcript: the whole retained stderr tail and the driving error are written to
+the adapter's `slog` logger at error level, where the operator reads them.
+
+A provider failure leaves the session addressable: the next `session/prompt`
+re-drives the turn. A single malformed native line is skipped and counted, not
+escalated into a dead session.
+
+## Caller-error contract
+
+An unsupported or unusable config field is rejected with JSON-RPC **`-32602`**
+whose `data` is exactly two keys,
+`{"error":"unsupported","field":"<json path>"}` — including
+`session/set_session_config_option`, which no longer echoes the caller's value
+or a native error string back.
+
+An option the embedding host handed `NewAgent` and this adapter refuses is
+answered with those same two keys naming the option, but under **`-32603`**:
+the caller's params were valid, and it is the constructed agent that cannot
+serve them. Both `initialize` and session establishment report it, because an
+embedded host can open a session and prompt without ever handshaking. Why the
+option was refused stays in the adapter log.
+
+The other `-32602` shapes are fixed by the wire contract and are unchanged:
+
+| Case | `data` |
+| --- | --- |
+| Unknown or unloaded session | `{"error":"unknown session","field":"sessionId"}` |
+| SSE or ACP MCP transport | `{"error":"unsupported","field":"mcpServers[N]","server":"<name>"}` |
+| MCP entry with no transport | `{"error":"no_transport","field":"mcpServers[<i>]"}` |
+| Empty or duplicate MCP name | `{"mcpServers[<i>].name":"required"}` / `"duplicate"` |
+| Undecodable or past-end list cursor | `{"cursor":"invalid cursor"}` / `{"cursor":"cursor is past end"}` |
+| `authenticate` with an unknown method id | `{"methodId":"<the id you sent>"}` |
+| Fork of an empty session | `{"error":"cannot fork an empty session","field":"sessionId"}` |
+
+Image rejections carry the structured image data documented in
+[Prompt streaming](/docs/core/prompt-streaming).
+
+A request the client cancels with `$/cancel_request` is answered **`-32800`**
+with no `data`, ahead of whatever error the in-flight handler returned. An
+adapter-internal deadline is never reported as a cancel. Any remaining
+adapter fault, the refused-option verdict above aside, is **`-32603`** with no
+`data`; its detail is in the adapter log.
+
+<Note>
+This adapter advertises no standard ACP `authenticate` method, so a provider
+failure during a prompt is a `provider` failure under `-32603`. When the
+optional Pi provider-auth broker is enabled, its `_pi/auth/*` extension legs
+can return `-32000` with the closed `pi_auth_failed` cause shape; they never
+return credential material. A user cancel that races a timeout resolves as a
+successful `cancelled` response, not a failure.
+</Note>

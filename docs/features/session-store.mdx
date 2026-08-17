@@ -1,0 +1,79 @@
+---
+title: "Session Store"
+description: "Wire a durable store so pi sessions survive beyond their isolated session directories"
+---
+
+By default a session's pi session file lives only in that session's isolated
+directory. Provide a `SessionStore` when the host needs sessions to resume
+from its own storage — for example a database or object store on a different
+machine.
+
+## Wiring a store
+
+Install a store with `WithSessionStore`; bound the reads used during resume
+with `WithSessionStoreLoadTimeout`. A ready-made in-memory implementation
+ships for tests and small hosts:
+
+```go
+store := piacp.NewInMemorySessionStore()
+
+err := piacp.Serve(ctx, input, output,
+	piacp.WithSessionStore(store),
+	piacp.WithSessionStoreLoadTimeout(5*time.Second),
+)
+```
+
+After each native `agent_settled` fence the adapter appends the session file's new JSONL rows
+to the store verbatim — the raw native bytes, header row first — backs
+`session/list` from the store, and hydrates stored rows back into an isolated
+session directory when the local file is missing. Because the ACP session id
+is pi's own session UUID (it lives in the header row), a restored session
+keeps its id and full history.
+
+The fence applies to natively settled success, provider-error, and explicit
+user-cancel turns: their durable state is mirrored before the ACP terminal
+result. For cancellation, pi's `agent_settled` must cross the response barrier
+before abort acknowledgement; after process-tree containment succeeds, the
+adapter appends the resulting aborted assistant row before returning
+`cancelled`. A timeout, transport/process failure, or escalated cancellation
+that never reaches `agent_settled` preserves the prior committed mirror and
+never publishes partial bytes.
+
+## The store contract
+
+The format constant and key type are stable public identifiers:
+
+```go
+const SessionStoreFormat = "pi-session-jsonl-v1"
+
+type SessionKey struct {
+	SessionID string
+	Subpath   string
+}
+```
+
+A store implements six methods:
+
+| Method | Role |
+| --- | --- |
+| `Append` | Append session JSONL rows for a key. |
+| `Load` | Read all rows for a key. |
+| `Replace` | Atomically replace a full generation of a session's files. |
+| `Delete` | Remove a key (and its subkeys for the main key). |
+| `ListSessions` | Enumerate sessions for `session/list`. |
+| `ListSubkeys` | Enumerate a session's non-main subpaths. |
+
+The main entry log uses the empty subpath (`SessionStoreMainSubpath`).
+`Replace` MUST include the main key exactly once. Session summaries report
+`UpdatedAtUnixMilli` in Unix milliseconds.
+
+Only conversation rows are durable. Credential and config files in the agent
+directory — `auth.json`, `settings.json`, trust state — are seeded, injected at
+hydrate time, written by pi itself, or reconciled to the operator baseline at
+launch, and are never mirrored into the store.
+
+<Note>
+`WithSessionStoreLoadTimeout` bounds load and list operations during resume.
+Set it when your store can hang (network round-trips), or a slow backend will
+stall `session/load` and `session/resume`.
+</Note>

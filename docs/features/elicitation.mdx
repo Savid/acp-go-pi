@@ -1,0 +1,41 @@
+---
+title: "Elicitation"
+description: "Forward pi's user-facing dialogs to clients that opt in during initialize"
+---
+
+The wrapper ships a `question` tool that a model can call to ask the user a
+free-form or multiple-choice question mid-turn. Its real pi extension UI
+dialog is forwarded to the host as an ACP elicitation request, and the answer
+returns to the same tool call. Explicitly seeded extensions can use pi's
+select, confirm, input, or editor dialogs through the same relay. Ambient
+extensions are never discovered.
+
+## Capability gating
+
+Elicitation is only used when the client explicitly advertised a non-null
+`form` mode during ACP initialize. An omitted or `null` top-level elicitation
+capability and an empty `elicitation: {}` object advertise no modes. The adapter
+checks the form mode before sending anything, so a client that never opted in
+is never handed an elicitation request it cannot render.
+
+| Client elicitation capability | Adapter behavior |
+| --- | --- |
+| Non-null `form` mode | The pi dialog is forwarded as an ACP elicitation request. |
+| Omitted, `null`, empty, or URL-only | No request is sent; the dialog is cancelled deterministically and the turn continues per pi's own logic. |
+
+<Note>
+Elicitation is not the permission channel. The wrapper's non-side-effecting
+`question` tool goes directly to elicitation and does not open a second tool
+permission prompt. All other tool-access approvals use
+[permission prompts](/docs/features/permissions).
+</Note>
+
+Because behavior depends on the client's advertised capability, test both
+paths: a client that supports elicitation and one that does not.
+
+## Route correlation
+
+The initialize response advertises route-envelope version 1. Every emitted
+form elicitation contains the owning session, current turn nonce, and exactly
+one callback correlation under `_meta["acp-go.dev/route"]`, while preserving
+other metadata. A pre-existing reserved key fails the callback closed.

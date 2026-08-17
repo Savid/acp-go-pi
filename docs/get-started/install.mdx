@@ -1,0 +1,65 @@
+---
+title: "Install"
+description: "Install the binary, add the library, or build from a checkout"
+---
+
+The adapter ships as both an installable CLI and an importable Go package.
+
+## Install the CLI
+
+Install the standalone ACP subprocess binary:
+
+```sh
+go install github.com/savid/acp-go-pi/cmd/acp-go-pi@latest
+```
+
+The `acp-go-pi` binary speaks ACP over stdin/stdout; an ACP host launches it as
+a subprocess rather than running it as a human-facing chat UI.
+
+## Add the library
+
+To embed the adapter in a Go host, add the module and call `piacp.Serve`:
+
+```sh
+go get github.com/savid/acp-go-pi
+```
+
+## Build from a checkout
+
+```sh
+go build ./cmd/acp-go-pi
+```
+
+## Locating the pi CLI
+
+The adapter launches `pi` from `PATH` unless a host provides `-path`
+(`WithExecutablePath`). Use `-scratch-dir` (`WithScratchDir`) to choose the
+parent directory under which the adapter creates ephemeral session state. By
+default each session receives a private Pi agent directory. Configure `-home`
+only when the instance needs a durable Pi-native credential residence, such as
+for the provider-auth broker; never point it at the operator's real `~/.pi`.
+The launched CLI must be pi **0.80.6 or newer**; the adapter probes
+`pi --version` at startup and fails fast on older builds. Install pi itself
+from npm:
+
+```sh
+npm install -g @earendil-works/pi-coding-agent
+```
+
+## Optional Linux hardening
+
+No privileged setup is needed for ordinary execution: omission runs as the
+current root or non-root identity. A deployment that explicitly selects the
+trusted-root Linux `ProcessIsolation` posture must persist the identity-lock
+root:
+
+```sh
+sudo install -d -o root -g root -m 0700 \
+  /var/lib/acp-go /var/lib/acp-go/agent-identities
+```
+
+Mount that exact local-lock volume into every service or container that can use
+the same numeric UID pool, with identical user-namespace UID/GID mappings and
+authoritative PID visibility. Otherwise use disjoint pools. Network, FUSE,
+pseudo, read-only, and unknown authority filesystems are rejected. Files named
+`<uid>.lock` are permanent and must never be unlinked, renamed, or replaced.

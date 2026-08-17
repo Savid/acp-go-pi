@@ -1,0 +1,80 @@
+---
+title: "MCP"
+description: "Declare MCP servers on a session and control how they reach pi"
+---
+
+pi deliberately ships no built-in MCP client — that too is left to extensions.
+The adapter supplies its own: a wrapper-owned, dependency-free pi extension
+(Node built-ins only, no package installs) that connects the session's
+declared servers, discovers their tools, and registers each one as a pi tool.
+A host attaches MCP servers to a session by including them in the ACP session
+request; the adapter validates the declarations before pi launches.
+
+## Supported transports
+
+| Transport | Support |
+| --- | --- |
+| stdio | Supported. |
+| HTTP (streamable) | Supported, including custom headers and session-id handling. |
+| SSE | Rejected at session start. |
+| ACP-transport | Rejected at session start. |
+
+Unsupported transports fail the session request with an explicit
+invalid-params error before pi is launched, so a bad declaration never reaches
+the CLI. Server names must be non-empty and unique within the request; they
+are forwarded verbatim, never rewritten.
+
+## Declaring servers
+
+Build declarations with the request helpers and pass them on the session
+request:
+
+```go
+servers := []acp.McpServer{
+	piacp.StdioMCPServer("tools", "node", []string{"server.js"}, nil),
+	piacp.HTTPMCPServer("remote", "https://example.test/mcp", nil),
+}
+```
+
+## How servers reach pi
+
+The adapter gives every session a private residence under its agent directory
+and writes that session's MCP config and wrapper extensions into it. Each file
+is published once and left read-only, and the residence is removed with the
+session. Because a configured `WithHome` makes every session share one agent
+directory, the residence is what keeps one session's server commands,
+arguments, environment, and credential-bearing headers unreadable and
+unreplaceable by another. The extension connects to every declared server
+during lifecycle establishment.
+Because some hosts deliberately expose only a side-effect-free readiness
+surface until an operation is authorized, the adapter rebuilds pi's fixed
+extension-tool registry once more at the first user turn. Every tool then
+available is registered under `mcp__<server>__<tool>`, so a provisional
+readiness list cannot replace the real session tools. The same refresh runs
+after `session/load`; a later native-process relaunch already occurs inside an
+authorized turn and discovers the active surface directly.
+
+Declared env vars are forwarded to stdio children and declared headers to HTTP
+servers. MCP tool calls run under the same
+[permission gate](/docs/features/permissions) as built-in tools, and an aborted
+turn cancels an in-flight MCP call promptly.
+
+A server that fails to connect at session start — an unreachable command, an
+HTTP 401 — fails the session request loudly with the real cause; the adapter
+never starts a session with a silently missing server.
+
+## Scope
+
+Forwarding is tools-only, with one fixed registry established for user turns:
+
+- MCP **resources** and **prompts** are not projected into the session.
+- **Server-initiated requests** (sampling, server-side elicitation, roots) are
+  not answered; a server that sends them will see them time out on its side.
+- **Tool-list change notifications** are ignored. After the first authorized
+  refresh, the tool set remains fixed for that native process.
+
+<Note>
+Plan around request/response-style MCP servers: the client answers only
+responses to its own requests. Servers that depend on server-initiated MCP
+traffic will not function correctly through this adapter.
+</Note>

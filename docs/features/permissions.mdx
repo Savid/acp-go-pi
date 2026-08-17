@@ -1,0 +1,54 @@
+---
+title: "Permissions"
+description: "Route pi tool approvals through ACP and choose the ask or allow mode"
+---
+
+pi deliberately ships no built-in permission system — approvals are left to
+extensions. The adapter supplies that extension itself: a wrapper-owned pi
+bridge extension intercepts every tool call and raises an ACP permission
+prompt, so the host stays in control of what pi may do. Because the adapter
+owns the whole permission path end to end, decisions are never silently
+granted by native defaults.
+
+## Permission modes
+
+The per-session mode is set with `_meta.pi.options.permission`
+(`WithPiPermission`):
+
+| Mode | Behavior |
+| --- | --- |
+| `ask` | Deny-by-default dialog: every gated tool call raises an ACP permission prompt (the default). |
+| `allow` | Auto-allow: tool calls run without prompting. |
+
+```go
+req := piacp.NewSessionRequest(cwd,
+	piacp.WithSessionPiOptions(piacp.NewPiOptions(
+		piacp.WithPiPermission("ask"),
+	)),
+)
+```
+
+## Answering a prompt
+
+Each permission prompt carries the tool request and a set of options; the host
+answers by selecting an option id. A denied call returns a blocked tool result
+to pi — the tool errors, and the turn continues rather than failing. A
+cancelled or unanswerable dialog fails closed as a deny.
+
+The prompt's ACP `toolCallId` is pi's exact native tool-call id. It is the same
+id used by the corresponding tool-call session updates; the tool name remains
+separate display and classification data.
+
+The gate covers every tool the session can run, including MCP tools supplied
+by the adapter's [MCP extension](/docs/features/mcp) — a denied MCP call is
+blocked before it reaches the server.
+
+<Note>
+Elicitation is a separate channel from permissions. Tool-access decisions
+always use permission prompts; free-form user questions use
+[elicitation](/docs/features/elicitation) and only when the client advertises
+support. Do not treat one as a substitute for the other.
+</Note>
+
+See [Security](/docs/operations/security) for why the permission path is
+load-bearing.

@@ -1,0 +1,111 @@
+---
+title: "Models And Config"
+description: "Select the model and thinking level per session, and seed pi settings safely"
+---
+
+pi is multi-provider: models are addressed as `"provider/id"` (for example
+`openai/gpt-4o`), and the adapter validates selections against
+pi's own model catalog rather than a static list.
+
+## Model and thinking-level options
+
+Session configuration uses typed select option categories:
+
+| Category | Option id | Values |
+| --- | --- | --- |
+| `model` | `model` | pi's model catalog, as `"provider/id"` |
+| `thought_level` | `thought_level` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+
+Use `session/set_config_option` with a selected option value id (the
+`SetModelRequest` helper builds the model form). Boolean payloads, unknown
+option ids, and unknown values are rejected with an invalid-params error
+naming the offending field. A model that pi's catalog does not know fails with
+pi's own error text.
+
+The adapter validates thinking levels itself against the enum above: pi
+natively accepts an invalid level and silently coerces it, so the adapter
+rejects unknown levels up front instead of letting them mutate silently.
+
+Each advertised model value includes harness-reported `_meta.pi` details:
+`modelId`, `contextWindow`, and `maxOutputTokens`. Missing values are omitted
+rather than filled with guessed zeroes. The catalog's per-model input list is
+consumed internally to gate image prompts (see
+[Prompt streaming](/docs/core/prompt-streaming)); it is not republished as
+`_meta` capability metadata.
+
+## Choosing defaults and per-session values
+
+Set a default model for new sessions with `-model` (`WithDefaultModel`), or
+per session through the typed options:
+
+```go
+req := piacp.NewSessionRequest(cwd,
+	piacp.WithSessionPiOptions(piacp.NewPiOptions(
+		piacp.WithPiModel("openai/gpt-4o"),
+		piacp.WithPiThinkingLevel("medium"),
+	)),
+)
+```
+
+The same values travel on the wire as `_meta.pi.options.model` and
+`_meta.pi.options.thinkingLevel`; see [Metadata](/docs/reference/meta).
+
+## Seeding pi settings
+
+`WithSeedFiles` (CLI: `-seed-file`) writes files into the pi agent directory a
+session launches against, before the pi process starts, so the CLI reads them
+as its own config. Without `WithHome` that directory is a fresh isolated one
+per session and seeds never touch a durable pi home. With `WithHome` it is the
+one durable directory every session launches against, and each launch writes
+the seeds there again, so the operator's files are what pi reads however a
+previous session left them.
+
+Every seed, `settings.json` included, is written verbatim. A seeded
+`settings.json` that is not valid JSON fails closed at session start, because
+pi would otherwise discard it in silence. Seeded resources under
+`extensions/*.ts` or `extensions/*.js`, `prompts/*.md`, and
+`skills/**/SKILL.md` are additionally passed to pi by exact path. This keeps
+ambient and project discovery disabled while making the operator's explicit
+resources reachable, including their slash commands. Paths are confined to
+the agent directory: absolute paths, `..` escapes, and empty keys fail closed
+at session start.
+
+```go
+err := piacp.Serve(ctx, input, output,
+	piacp.WithSeedFiles(map[string]string{
+		"settings.json": `{"defaultProvider":"anthropic"}`,
+	}),
+)
+```
+
+Keep secrets in `WithEnv` rather than in seeded files; see
+[Authentication](/docs/features/authentication) for the credential paths.
+
+## Startup state under a shared home
+
+pi reads `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` from
+`settings.json` once at process start to choose what a session begins on, and
+writes its own selection back into those same keys whenever a session changes
+model or thinking level. `WithHome` gives every session one shared agent
+directory, so those three keys are the one channel through which a session's
+runtime choice could reach another session's startup.
+
+The adapter never records a session's own model or thinking level there. Both
+travel to each pi process on its own RPC channel. Instead the adapter captures
+the operator baseline for those three keys on the first launch against the
+home — after any seeded `settings.json` has been applied — and restores that
+baseline before every later launch and relaunch. A session therefore starts on
+what the operator configured: one that requests no model gets the operator's
+default, or pi's own when the operator set none, never whatever another session
+last selected. Every other key in the file stays exactly as pi left it, a home
+that already matches its baseline is not written to at all, and the write takes
+pi's own `settings.json` lock so it cannot interleave with a concurrent
+session's native write.
+
+<Note>
+The baseline is restored immediately before the pi child spawns. A model or
+thinking-level change another session commits inside that child's startup
+window is the one value that can still reach it, because holding pi's settings
+lock across a child's startup would block every other session's settings write.
+A host that needs an exact model or thinking level for a session sends one.
+</Note>
