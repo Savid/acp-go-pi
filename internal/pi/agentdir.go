@@ -144,7 +144,7 @@ func (d AgentDir) Write() error {
 }
 
 // validateSettingsSeed rejects a seeded settings.json that pi would discard in
-// silence: pi records a load error for unparseable settings and then runs on
+// silence: pi records a load error for unparsable settings and then runs on
 // its own defaults, so an operator's malformed seed would take effect nowhere
 // and say so nowhere.
 func validateSettingsSeed(files map[string]string) error {
