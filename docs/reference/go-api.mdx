@@ -118,7 +118,7 @@ Request builders: `NewSessionRequest`, `LoadSessionRequest`,
 nonce per turn. `CancelRequest(sessionID, turnNonce)` must reuse the active
 turn's nonce. A route nonce must be non-empty and at most 4096 bytes. These
 builders fail closed for an invalid nonce by omitting route metadata, so the
-agent rejects the resulting prompt or active-turn cancellation.
+agent rejects the resulting prompt or cancellation.
 
 `RuntimeResourceHooks` exposes `AcquireNativeRoot`, `ReserveScratchRoot`,
 `ObserveProcess`, `ObserveProcessSnapshot`, `ObserveStartupStage`, and

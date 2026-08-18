@@ -21,10 +21,13 @@ Initialize advertises capability descriptors under `_meta.pi`:
 | `sessionStore` | Store `format` (`pi-session-jsonl-v1`) and key shape. |
 
 Initialize also advertises the separate reserved capability
-`_meta["acp-go.dev/route"] = {"versions":[1]}`. Prompts and active-turn
-cancellations require exactly `{"version":1,"turnNonce":"..."}` under that
-key. A nonce is fresh and unguessable per turn, non-empty, and at most 4096
-bytes; missing, oversized, extra, unsupported, or stale route data is rejected.
+`_meta["acp-go.dev/route"] = {"versions":[1]}`. Prompts and cancellations
+require exactly `{"version":1,"turnNonce":"..."}` under that key. A nonce is
+fresh and unguessable per turn, non-empty, and at most 4096 bytes; missing,
+oversized, extra, unsupported, or stale route data is rejected. A cancel is
+authorized against the session's current turn before any native interrupt, so
+one that names another turn, or arrives when the session has no current turn,
+is rejected and touches nothing native.
 
 ### Media envelope
 

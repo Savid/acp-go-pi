@@ -370,6 +370,104 @@ func TestSessionCancelContainsAcknowledgedAbortBeforeReturning(t *testing.T) {
 	require.Equal(t, 1, process.closeCalls)
 }
 
+// TestUnvalidatedCancelNeverTouchesNativeState pins cancel determinism at the
+// native boundary: the version-1 route nonce authorizes the cancel before any
+// native side effect, so a cancel that authorizes nothing — a missing
+// envelope, a stale nonce, or a session with no current turn to authorize
+// against — reaches neither the native interrupt nor a pending dialog.
+func TestUnvalidatedCancelNeverTouchesNativeState(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+
+	for _, test := range []struct {
+		name       string
+		activeTurn bool
+		meta       map[string]any
+	}{
+		{name: "missing envelope on the active turn", activeTurn: true},
+		{name: "stale nonce on the active turn", activeTurn: true, meta: turnRouteMeta("stale-turn")},
+		{name: "current nonce with no active turn", meta: turnRouteMeta("active-turn")},
+		{name: "missing envelope with no active turn"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var aborts atomic.Int64
+
+			client := newStubPiClient()
+			client.abortFunc = func(context.Context) error {
+				aborts.Add(1)
+
+				return nil
+			}
+
+			process := newStubProcess(false)
+			turnCtx, turnCancel := context.WithCancel(t.Context())
+			t.Cleanup(turnCancel)
+			dialogCtx, cancelDialog := context.WithCancel(t.Context())
+			t.Cleanup(cancelDialog)
+
+			session := &agentSession{
+				agent:          agent,
+				id:             "id",
+				client:         client,
+				proc:           process,
+				pendingDialogs: map[string]*dialogCancel{"dialog": {cancel: cancelDialog}},
+			}
+
+			if test.activeTurn {
+				session.cancel = turnCancel
+				session.turnNonce = "active-turn"
+			}
+
+			require.Error(t, session.cancelRouted(t.Context(), test.meta))
+			require.Zero(t, aborts.Load(), "an unvalidated cancel must not reach the native interrupt")
+			require.Zero(t, process.killCalls, "an unvalidated cancel must not contain the native process")
+			require.Zero(t, process.closeCalls)
+			require.Len(t, session.pendingDialogs, 1, "an unvalidated cancel must not resolve a pending dialog")
+			require.NoError(t, dialogCtx.Err())
+			require.NoError(t, turnCtx.Err())
+			require.False(t, session.wasTurnCancelled())
+		})
+	}
+}
+
+// TestValidatedCancelContainsTheActiveTurn is the other half of the rule: the
+// exact active turn's nonce authorizes the cancel, and that cancel does reach
+// the native interrupt, the containment boundary, and every pending dialog.
+func TestValidatedCancelContainsTheActiveTurn(t *testing.T) {
+	var aborts atomic.Int64
+
+	client := newStubPiClient()
+	client.abortFunc = func(context.Context) error {
+		aborts.Add(1)
+
+		return nil
+	}
+
+	process := newStubProcess(false)
+	turnCtx, turnCancel := context.WithCancel(t.Context())
+	t.Cleanup(turnCancel)
+	dialogCtx, cancelDialog := context.WithCancel(t.Context())
+	t.Cleanup(cancelDialog)
+
+	session := &agentSession{
+		agent:          NewAgent(WithLogger(slog.New(slog.DiscardHandler))),
+		id:             "id",
+		client:         client,
+		proc:           process,
+		cancel:         turnCancel,
+		turnNonce:      "active-turn",
+		pendingDialogs: map[string]*dialogCancel{"dialog": {cancel: cancelDialog}},
+	}
+
+	require.NoError(t, session.cancelRouted(t.Context(), turnRouteMeta("active-turn")))
+	require.Equal(t, int64(1), aborts.Load())
+	require.Equal(t, 1, process.killCalls)
+	require.Equal(t, 1, process.closeCalls)
+	require.Empty(t, session.pendingDialogs)
+	require.ErrorIs(t, dialogCtx.Err(), context.Canceled)
+	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
+	require.True(t, session.wasTurnCancelled())
+}
+
 // TestSessionCancelRecordsPumpObservedSettlementForTheCommitAfterContainment
 // pins the response-barrier race and the one commit point together: the outbox
 // records agent_settled at receipt even when cancellation prevents delivery, the

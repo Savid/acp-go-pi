@@ -594,33 +594,36 @@ func (s *agentSession) cancelForClose(ctx context.Context) error {
 	return s.cancelNativeLocked(ctx, false)
 }
 
-// cancelRouted validates the active turn and keeps its native abort fenced
-// from turn completion and admission of the next turn.
+// cancelRouted authenticates the cancel against the session's current turn and
+// keeps its native abort fenced from turn completion and admission of the next
+// turn. Authorization is unconditional: the route nonce is the anti-stale
+// admission and is validated first, so a cancel never reports two rejections,
+// and an envelope that is missing, malformed, or names anything other than the
+// current turn fails closed before native interrupt. A session with no current
+// turn has no nonce to authorize against, so it authorizes nothing and the
+// cancel fails closed there too — an unvalidated cancel never reaches a native
+// interrupt or a pending dialog.
 func (s *agentSession) cancelRouted(ctx context.Context, meta map[string]any) error {
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
+
+	route, err := parseInboundTurnRoute(meta)
+	if err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	activeNonce := s.turnNonce
 	active := s.cancel != nil && activeNonce != ""
 	s.mu.Unlock()
 
-	if active {
-		route, err := parseInboundTurnRoute(meta)
-		if err != nil {
-			return err
-		}
-
-		if route.turnNonce != activeNonce {
-			return routeInvalid()
-		}
+	if !active || route.turnNonce != activeNonce {
+		return routeInvalid()
 	}
 
-	// The route nonce is the anti-stale admission and is validated first, so a
-	// cancel never reports two rejections. The reserved family literal then
-	// fails the cancel closed before native interrupt: being a notification it
-	// carries no response frame, so the rejection is wire-silent and the cancel
-	// is never applied.
+	// The reserved family literal then fails the cancel closed before native
+	// interrupt: being a notification it carries no response frame, so the
+	// rejection is wire-silent and the cancel is never applied.
 	if refusal := refuseLifecycleMeta(meta); refusal != nil {
 		return refusal
 	}

@@ -66,7 +66,13 @@ func TestReservedLifecycleMetaRefusedOnEverySurface(t *testing.T) {
 	require.Error(t, err)
 	_, err = piOptionsFromMeta(reserved)
 	require.Error(t, err)
-	require.Error(t, (&agentSession{agent: agent}).cancelRouted(t.Context(), reserved))
+	// The cancel surface authorizes the route nonce before it reads anything
+	// else, so the reserved literal is refused on a cancel the current turn
+	// would otherwise have authorized.
+	routedReserved := turnRouteMeta("active-turn")
+	routedReserved[lifecycleMetaKey] = map[string]any{}
+	cancelSession := &agentSession{agent: agent, cancel: func() {}, turnNonce: "active-turn"}
+	require.Error(t, cancelSession.cancelRouted(t.Context(), routedReserved))
 }
 
 // TestProvenLifecycleFactsFollowTheContainmentBoundary pins that the
