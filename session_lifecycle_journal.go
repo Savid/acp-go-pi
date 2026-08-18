@@ -1,16 +1,26 @@
 package piacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
+
+	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
 
 // lifecycleBoundaryVersion is the version of the adapter-owned boundary record
 // written under SessionStoreLifecycleSubpath.
 const lifecycleBoundaryVersion = 1
+
+const lifecycleBoundaryFieldNativeRows = "nativeRows"
+
+const lifecycleBoundaryFieldNativeState = "nativeState"
+
+const lifecycleBoundaryFieldRecordedAt = "recordedAt"
 
 // Native-state dispositions a boundary record states. The durable format is a
 // raw mirror of pi's own session file, so a cycle whose frames pi never wrote
@@ -98,21 +108,122 @@ func (s *agentSession) commitLifecycleBoundary(ctx context.Context, record lifec
 	return nil
 }
 
-// lastLifecycleBoundary reads the boundary a restored session resumes from. A
-// session with no record resumes from no proven boundary, which is the truthful
-// answer for one that never reached one.
-func (a *Agent) lastLifecycleBoundary(ctx context.Context, sessionID string) lifecycleBoundaryRecord {
-	entries, err := a.sessionStore().Load(ctx, SessionKey{SessionID: sessionID, Subpath: SessionStoreLifecycleSubpath})
-	if err != nil || len(entries) == 0 {
-		return lifecycleBoundaryRecord{}
+// lastLifecycleBoundary validates the complete journal and returns the last
+// boundary a restored session may resume from. Corrupt adapter-owned state is
+// not equivalent to an absent proof: callers fail the restore rather than
+// opening from invented state.
+func (a *Agent) lastLifecycleBoundary(
+	ctx context.Context,
+	sessionID string,
+) (lifecycleBoundaryRecord, bool, error) {
+	entries, err := a.loadStoreEntries(ctx, a.sessionStore(), SessionKey{
+		SessionID: sessionID,
+		Subpath:   SessionStoreLifecycleSubpath,
+	})
+	if err != nil {
+		return lifecycleBoundaryRecord{}, false, fmt.Errorf("load lifecycle journal: %w", err)
 	}
+
+	var last lifecycleBoundaryRecord
+
+	for index, entry := range entries {
+		record, decodeErr := decodeLifecycleBoundaryRecord(entry)
+		if decodeErr != nil {
+			return lifecycleBoundaryRecord{}, false, fmt.Errorf("decode lifecycle journal row %d: %w", index, decodeErr)
+		}
+
+		if index > 0 && record.NativeRows < last.NativeRows {
+			return lifecycleBoundaryRecord{}, false, fmt.Errorf(
+				"decode lifecycle journal row %d: native row count regressed from %d to %d",
+				index, last.NativeRows, record.NativeRows,
+			)
+		}
+
+		last = record
+	}
+
+	return last, len(entries) > 0, nil
+}
+
+func decodeLifecycleBoundaryRecord(entry SessionStoreEntry) (lifecycleBoundaryRecord, error) {
+	decoder := json.NewDecoder(bytes.NewReader(entry))
+	decoder.DisallowUnknownFields()
 
 	var record lifecycleBoundaryRecord
-	if err := json.Unmarshal(entries[len(entries)-1], &record); err != nil || record.Version != lifecycleBoundaryVersion {
-		return lifecycleBoundaryRecord{}
+	if err := decoder.Decode(&record); err != nil {
+		return lifecycleBoundaryRecord{}, err
 	}
 
-	return record
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return lifecycleBoundaryRecord{}, errors.New("trailing JSON value")
+		}
+
+		return lifecycleBoundaryRecord{}, fmt.Errorf("decode trailing data: %w", err)
+	}
+
+	var fields map[string]json.RawMessage
+
+	_ = json.Unmarshal(entry, &fields) // the strict full decode above already proved valid JSON
+
+	for _, field := range []string{
+		lifecycleFieldVersion,
+		lifecycleFieldStreamID,
+		lifecycleBoundaryFieldNativeRows,
+		lifecycleBoundaryFieldNativeState,
+		lifecycleBoundaryFieldRecordedAt,
+	} {
+		raw, present := fields[field]
+		if !present || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return lifecycleBoundaryRecord{}, fmt.Errorf("%s is required", field)
+		}
+	}
+
+	for field, raw := range fields {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return lifecycleBoundaryRecord{}, fmt.Errorf("%s cannot be null", field)
+		}
+	}
+
+	if err := validateLifecycleBoundaryRecord(record); err != nil {
+		return lifecycleBoundaryRecord{}, err
+	}
+
+	return record, nil
+}
+
+func validateLifecycleBoundaryRecord(record lifecycleBoundaryRecord) error {
+	switch {
+	case record.Version != lifecycleBoundaryVersion:
+		return fmt.Errorf("unsupported version %d", record.Version)
+	case record.NativeRows < 0:
+		return fmt.Errorf("nativeRows cannot be negative")
+	case record.RecordedAtUnixMilli <= 0:
+		return fmt.Errorf("recordedAt must be positive")
+	case record.NativeState != nativeStateCommitted && record.NativeState != nativeStateRetained:
+		return fmt.Errorf("unsupported nativeState %q", record.NativeState)
+	case record.VacancyProven && record.NativeState != nativeStateCommitted:
+		return errors.New("vacancyProven requires committed native state")
+	case record.StreamID == "" && (record.TurnID != "" || record.CycleID != ""):
+		return errors.New("turnId and cycleId require streamId")
+	case record.CycleID != "" && record.TurnID == "":
+		return errors.New("cycleId requires turnId")
+	}
+
+	outcome := lifecycle.Outcome(record.Outcome)
+	switch {
+	case outcome == "" && record.StopReason != "":
+		return errors.New("stopReason requires outcome")
+	case outcome != "" && !outcome.Valid():
+		return fmt.Errorf("unsupported outcome %q", record.Outcome)
+	case outcome == lifecycle.OutcomeFailed && record.StopReason != "":
+		return errors.New("failed outcome forbids stopReason")
+	case outcome != "" && outcome != lifecycle.OutcomeFailed && !lifecycle.ValidStopReason(record.StopReason):
+		return fmt.Errorf("outcome %q requires a valid stopReason", record.Outcome)
+	}
+
+	return nil
 }
 
 // fencePersistence stops every later durable write for this session. It takes

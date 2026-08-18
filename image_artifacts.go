@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -21,30 +22,58 @@ var (
 	encodeStoreRow   = json.Marshal
 )
 
-// loadCurrentStoreEntries loads a session's mirrored rows for a restore and
-// enforces the bounded image-artifact window: expired output image bytes are
-// reclaimed from the store and the restore fails as storage_failed, as does
-// a restore that finds already-reclaimed artifacts.
-func (a *Agent) loadCurrentStoreEntries(ctx context.Context, sessionID string) ([]SessionStoreEntry, error) {
+// loadCurrentStoreEntries loads the native generation covered exactly by the
+// last validated lifecycle boundary. A main log may advance before its
+// boundary append does, but either direction of row-count mismatch is refused
+// before launch, so an unproven suffix is never hydrated or later appended to.
+//
+// The bounded image-artifact window is enforced only on the durable prefix:
+// expired output image bytes are reclaimed from the store and the restore
+// fails as storage_failed, as does a restore that finds already-reclaimed
+// artifacts.
+func (a *Agent) loadCurrentStoreEntries(
+	ctx context.Context,
+	sessionID string,
+) ([]SessionStoreEntry, lifecycleBoundaryRecord, error) {
 	entries, err := a.loadStoreEntries(ctx, a.sessionStore(), SessionKey{SessionID: sessionID})
 	if err != nil {
-		return nil, err
+		return nil, lifecycleBoundaryRecord{}, err
+	}
+
+	if len(entries) == 0 {
+		return nil, lifecycleBoundaryRecord{}, nil
+	}
+
+	boundary, found, err := a.lastLifecycleBoundary(ctx, sessionID)
+	if err != nil {
+		return nil, lifecycleBoundaryRecord{}, err
+	}
+
+	if !found {
+		return nil, lifecycleBoundaryRecord{}, errors.New("stored session has no lifecycle boundary")
+	}
+
+	if len(entries) != boundary.NativeRows {
+		return nil, lifecycleBoundaryRecord{}, fmt.Errorf(
+			"stored session has %d native rows but lifecycle boundary records %d",
+			len(entries), boundary.NativeRows,
+		)
 	}
 
 	swept, expired := scanImageArtifactRows(entries)
 	if expired > 0 {
 		if err := a.reclaimExpiredImageRows(ctx, sessionID, entries); err != nil {
-			return nil, storageFailure(fmt.Sprintf("reclaim expired image artifacts: %v", err))
+			return nil, lifecycleBoundaryRecord{}, storageFailure(fmt.Sprintf("reclaim expired image artifacts: %v", err))
 		}
 
-		return nil, storageFailure("stored image artifacts outlived the artifact window and were reclaimed")
+		return nil, lifecycleBoundaryRecord{}, storageFailure("stored image artifacts outlived the artifact window and were reclaimed")
 	}
 
 	if swept > 0 {
-		return nil, storageFailure("stored image artifact bytes are no longer available")
+		return nil, lifecycleBoundaryRecord{}, storageFailure("stored image artifact bytes are no longer available")
 	}
 
-	return entries, nil
+	return entries, boundary, nil
 }
 
 // scanImageArtifactRows counts output-provenance image artifacts that were

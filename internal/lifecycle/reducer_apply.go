@@ -440,12 +440,12 @@ func (r *Reducer) patchActivity(delivery Delivery, update ActivityUpdate) error 
 	index := r.activityIndex(update.ActivityID)
 
 	existing := r.state.Activities[index]
-	if detail := immutableActivityConflict(existing, update); detail != "" {
-		return r.fail(delivery, ViolationImmutableIdentityChange, detail)
+	if existing.State.Terminal() {
+		return r.fail(delivery, ViolationPostTerminalMutation, "activity "+existing.ActivityID+" is terminal")
 	}
 
-	if existing.State.Terminal() && update.State != existing.State {
-		return r.fail(delivery, ViolationPostTerminalMutation, "activity "+existing.ActivityID+" is terminal")
+	if detail := immutableActivityConflict(existing, update); detail != "" {
+		return r.fail(delivery, ViolationImmutableIdentityChange, detail)
 	}
 
 	if update.State.Terminal() {
@@ -602,6 +602,9 @@ func (r *Reducer) patchAction(delivery Delivery, update ActionUpdate) error {
 	index := r.actionIndex(update.ActionID)
 
 	existing := r.state.Actions[index]
+	if existing.State.Terminal() {
+		return r.fail(delivery, ViolationPostTerminalMutation, "action "+update.ActionID+" is terminal")
+	}
 
 	switch {
 	case update.Kind != "" && update.Kind != existing.Kind:
@@ -612,8 +615,6 @@ func (r *Reducer) patchAction(delivery Delivery, update ActionUpdate) error {
 		return r.fail(delivery, ViolationImmutableIdentityChange, "action "+update.ActionID+" changed ownership root")
 	case update.BlocksForeground != nil && *update.BlocksForeground != existing.BlocksForeground:
 		return r.fail(delivery, ViolationImmutableIdentityChange, "action "+update.ActionID+" changed what it blocks")
-	case existing.State.Terminal() && update.State != existing.State:
-		return r.fail(delivery, ViolationPostTerminalMutation, "action "+update.ActionID+" is terminal")
 	}
 
 	r.state.Actions[index].State = update.State

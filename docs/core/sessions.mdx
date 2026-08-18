@@ -60,6 +60,10 @@ type SessionKey struct {
 The main entry log uses the empty subpath (`SessionStoreMainSubpath`) and
 carries the raw pi session JSONL rows verbatim — the header row first, then
 the tree entries appended after each settled turn.
+The `SessionStoreLifecycleSubpath` log carries adapter-owned durable-boundary
+records. Load, resume, and fork hydrate only through the last strictly
+validated boundary's native-row count; corrupt or incomplete storage fails
+closed.
 
 ## Turn bounds and failures
 

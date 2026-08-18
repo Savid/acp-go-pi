@@ -1,6 +1,7 @@
 # Resume From File
 
-This example reads mirrored pi session JSONL rows into a `SessionStore`, loads
+This example reads mirrored pi session JSONL rows into a `SessionStore`, adds
+the adapter-owned durable boundary required by the current store format, loads
 the session through ACP so previous interactions are replayed, then sends one
 no-tools smoke-test prompt in-process.
 It denies tool permissions by default so a copied session cannot silently run

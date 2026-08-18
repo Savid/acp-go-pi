@@ -21,6 +21,19 @@ type dispatcherParams struct {
 	Value string `json:"value"`
 }
 
+type actionWriteFailureWriter struct {
+	err   error
+	short bool
+}
+
+func (w actionWriteFailureWriter) Write(data []byte) (int, error) {
+	if w.short {
+		return len(data) - 1, nil
+	}
+
+	return 0, w.err
+}
+
 func (p *dispatcherParams) Validate() error {
 	if p.Value == "" {
 		return errors.New("value is required")
@@ -40,17 +53,21 @@ func (c *dispatcherClient) Done() <-chan struct{} {
 }
 
 func (*dispatcherClient) CreateElicitation(
-	context.Context,
-	acp.UnstableCreateElicitationRequest,
-	elicitationScope,
+	ctx context.Context,
+	_ acp.UnstableCreateElicitationRequest,
+	_ elicitationScope,
 ) (acp.UnstableCreateElicitationResponse, error) {
+	acknowledgeActionRequestWrite(ctx, nil)
+
 	return acp.UnstableCreateElicitationResponse{}, nil
 }
 
 func (*dispatcherClient) RequestPermission(
-	context.Context,
-	acp.RequestPermissionRequest,
+	ctx context.Context,
+	_ acp.RequestPermissionRequest,
 ) (acp.RequestPermissionResponse, error) {
+	acknowledgeActionRequestWrite(ctx, nil)
+
 	return acp.RequestPermissionResponse{}, nil
 }
 
@@ -362,4 +379,106 @@ func TestLocalAgentConnectionClientCallErrors(t *testing.T) {
 
 	require.NoError(t, conn.NotifyExtension(t.Context(), "_pi/test", map[string]any{"ok": true}))
 	require.Contains(t, output.String(), `"method":"_pi/test"`)
+}
+
+func TestActionRequestWriteTracking(t *testing.T) {
+	meta := map[string]any{lifecycleMetaKey: map[string]any{
+		"action": map[string]any{"actionId": "action"},
+	}}
+	require.Equal(t, "action", lifecycleActionID(meta))
+	require.Empty(t, lifecycleActionID(nil))
+	require.Empty(t, lifecycleActionID(map[string]any{lifecycleMetaKey: func() {}}))
+	require.Empty(t, lifecycleActionIDFromRaw(json.RawMessage(`not-json`)))
+	require.Equal(t, meta, elicitationMeta(acp.UnstableCreateElicitationRequest{
+		Form: &acp.UnstableCreateElicitationForm{Meta: meta},
+	}))
+	require.Equal(t, meta, elicitationMeta(acp.UnstableCreateElicitationRequest{
+		Url: &acp.UnstableCreateElicitationUrl{Meta: meta},
+	}))
+	require.Nil(t, elicitationMeta(acp.UnstableCreateElicitationRequest{}))
+
+	requests := newActionRequestWrites()
+	ack := make(chan error, 1)
+	require.NoError(t, requests.register("action", func(err error) { ack <- err }))
+	require.Error(t, requests.register("action", func(error) {}))
+
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  acp.ClientMethodSessionRequestPermission,
+		"params":  map[string]any{"_meta": meta},
+	})
+	require.NoError(t, err)
+	writer := &actionRequestWriteWriter{
+		writer:   actionWriteFailureWriter{short: true},
+		requests: requests,
+	}
+	_, err = writer.Write(payload)
+	require.ErrorIs(t, err, io.ErrShortWrite)
+	require.ErrorIs(t, <-ack, io.ErrShortWrite)
+	requests.resolve("unknown", nil)
+
+	require.Empty(t, outboundLifecycleActionID(json.RawMessage(`not-json`)))
+	require.Empty(t, outboundLifecycleActionID(json.RawMessage(`{"id":1,"method":"other"}`)))
+}
+
+func TestLocalActionRequestsFailClosedAtTheWriteBarrier(t *testing.T) {
+	meta := map[string]any{lifecycleMetaKey: map[string]any{
+		"action": map[string]any{"actionId": "action"},
+	}}
+
+	t.Run("invalid registrations", func(t *testing.T) {
+		acked := make(chan error, 3)
+		ctx := context.WithValue(t.Context(), actionRequestWriteAckKey{}, func(err error) { acked <- err })
+
+		connection := &localAgentConnection{agent: NewAgent(), requestWrites: newActionRequestWrites()}
+		_, err := connection.RequestPermission(ctx, acp.RequestPermissionRequest{})
+		require.ErrorContains(t, err, "missing its lifecycle action id")
+		require.ErrorContains(t, <-acked, "missing its lifecycle action id")
+
+		require.NoError(t, connection.requestWrites.register("action", func(error) {}))
+		_, err = connection.RequestPermission(ctx, acp.RequestPermissionRequest{Meta: meta})
+		require.ErrorContains(t, err, "already awaits a write")
+		require.ErrorContains(t, <-acked, "already awaits a write")
+
+		_, err = connection.CreateElicitation(ctx, acp.UnstableCreateElicitationRequest{
+			Form: &acp.UnstableCreateElicitationForm{Meta: meta, Mode: elicitationModeForm},
+		}, elicitationScope{SessionID: "session", TurnNonce: "turn"})
+		require.ErrorContains(t, err, "already awaits a write")
+		require.ErrorContains(t, <-acked, "already awaits a write")
+	})
+
+	for name, call := range map[string]func(context.Context, *localAgentConnection) error{
+		"permission": func(ctx context.Context, connection *localAgentConnection) error {
+			_, err := connection.RequestPermission(ctx, acp.RequestPermissionRequest{Meta: meta})
+
+			return err
+		},
+		"elicitation": func(ctx context.Context, connection *localAgentConnection) error {
+			_, err := connection.CreateElicitation(ctx, acp.UnstableCreateElicitationRequest{
+				Form: &acp.UnstableCreateElicitationForm{Meta: meta, Mode: elicitationModeForm},
+			}, elicitationScope{SessionID: "session", TurnNonce: "turn", RequestID: "request"})
+
+			return err
+		},
+	} {
+		t.Run(name+" write failure", func(t *testing.T) {
+			input, peer := io.Pipe()
+			writeErr := errors.New("write failed")
+			connection := newLocalAgentConnection(NewAgent(), actionWriteFailureWriter{err: writeErr}, input)
+			t.Cleanup(func() {
+				require.NoError(t, peer.Close())
+				select {
+				case <-connection.Done():
+				case <-time.After(time.Second):
+					t.Fatal("connection did not stop")
+				}
+			})
+
+			acked := make(chan error, 1)
+			ctx := context.WithValue(t.Context(), actionRequestWriteAckKey{}, func(err error) { acked <- err })
+			require.Error(t, call(ctx, connection))
+			require.ErrorIs(t, <-acked, writeErr)
+		})
+	}
 }

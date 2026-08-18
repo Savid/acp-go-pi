@@ -63,6 +63,12 @@ func TestRunUsesInferredValuesAndLoadedSession(t *testing.T) {
 		entries, err := store.Load(context.Background(), piacp.SessionKey{SessionID: sessionID})
 		require.NoError(t, err)
 		require.Len(t, entries, 2)
+		boundaries, err := store.Load(context.Background(), piacp.SessionKey{
+			SessionID: sessionID,
+			Subpath:   piacp.SessionStoreLifecycleSubpath,
+		})
+		require.NoError(t, err)
+		require.Len(t, boundaries, 1)
 		fmt.Fprint(stdout, "loaded")
 
 		return nil

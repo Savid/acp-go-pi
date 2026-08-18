@@ -52,16 +52,12 @@ func (a *Agent) handleForkSession(
 		return acp.UnstableForkSessionResponse{}, unknownSessionError()
 	}
 
-	// An active parent's latest turns may not be committed yet; commit them
-	// so the fork hydrates the parent's current history.
-	parent, parentErr := a.session(params.SessionId)
-	if parentErr == nil {
-		if commitErr := parent.commitMirror(ctx); commitErr != nil {
-			return acp.UnstableForkSessionResponse{}, commitErr
-		}
-	}
+	// An active parent may have native rows beyond its last completed
+	// lifecycle boundary. A fork may clone only the durable prefix that
+	// boundary proves, never an in-flight transcript generation.
+	parent, _ := a.session(params.SessionId)
 
-	entries, err := a.loadCurrentStoreEntries(ctx, string(params.SessionId))
+	entries, _, err := a.loadCurrentStoreEntries(ctx, string(params.SessionId))
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}

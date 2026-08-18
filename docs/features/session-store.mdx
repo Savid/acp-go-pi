@@ -64,13 +64,19 @@ A store implements six methods:
 | `ListSubkeys` | Enumerate a session's non-main subpaths. |
 
 The main entry log uses the empty subpath (`SessionStoreMainSubpath`).
+The adapter-owned `SessionStoreLifecycleSubpath` log records each durable
+boundary and the exact native-row count it covers. Restore validates that
+journal strictly. Unknown fields, malformed or unsupported records, a missing
+journal, or any mismatch between the boundary and native row counts fails the
+request; native rows beyond the last valid boundary are not hydrated.
 `Replace` MUST include the main key exactly once. Session summaries report
 `UpdatedAtUnixMilli` in Unix milliseconds.
 
-Only conversation rows are durable. Credential and config files in the agent
-directory — `auth.json`, `settings.json`, trust state — are seeded, injected at
-hydrate time, written by pi itself, or reconciled to the operator baseline at
-launch, and are never mirrored into the store.
+Only conversation rows and adapter-owned lifecycle boundary records are
+durable. Credential and config files in the agent directory — `auth.json`,
+`settings.json`, trust state — are seeded, injected at hydrate time, written by
+pi itself, or reconciled to the operator baseline at launch, and are never
+mirrored into the store.
 
 <Note>
 `WithSessionStoreLoadTimeout` bounds load and list operations during resume.

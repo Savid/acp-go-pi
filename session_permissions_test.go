@@ -147,7 +147,7 @@ func requireExactTurnRoute(meta map[string]any, expectedNonce string) error {
 }
 
 func (c *strictPermissionClient) RequestPermission(
-	_ context.Context,
+	ctx context.Context,
 	request acp.RequestPermissionRequest,
 ) (acp.RequestPermissionResponse, error) {
 	c.mu.Lock()
@@ -162,6 +162,7 @@ func (c *strictPermissionClient) RequestPermission(
 	}
 
 	c.permissionRequests = append(c.permissionRequests, request)
+	acknowledgeActionRequestWrite(ctx, nil)
 
 	return acp.RequestPermissionResponse{
 		Outcome: acp.NewRequestPermissionOutcomeSelected(permissionOptionAllow),

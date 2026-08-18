@@ -127,6 +127,7 @@ func TestRestoreSessionAdditionalBranches(t *testing.T) {
 	newStore := func() SessionStore {
 		store := NewInMemorySessionStore()
 		require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: "resume-id"}, entries))
+		appendLifecycleBoundaryForRows(t, store, "resume-id", len(entries))
 
 		return store
 	}
@@ -162,6 +163,7 @@ func TestResumeSessionPublishesTerminalNativeIdentityWithoutHistory(t *testing.T
 	}
 	store := NewInMemorySessionStore()
 	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: "resume-id"}, entries))
+	appendLifecycleBoundaryForRows(t, store, "resume-id", len(entries))
 
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "resume-id"}
@@ -205,6 +207,7 @@ func TestLoadSessionRemovesStartedSessionOnReplayFailure(t *testing.T) {
 	}
 	store := NewInMemorySessionStore()
 	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: "resume-load"}, entries))
+	appendLifecycleBoundaryForRows(t, store, "resume-load", len(entries))
 
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "resume-load"}
@@ -823,6 +826,7 @@ func TestRestoreActiveAndCleanupBranches(t *testing.T) {
 		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`[{"type":"text","text":"history"}]`)}),
 	}
 	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: string(id)}, entries))
+	appendLifecycleBoundaryForRows(t, store, string(id), len(entries))
 	agent := NewAgent(WithSessionStore(store), WithLogger(slog.New(slog.DiscardHandler)))
 	start := sessionStart{Cwd: "/cwd", ResumeID: string(id)}
 	active := &agentSession{agent: agent, id: id, cwd: "/cwd", fingerprint: sessionStartFingerprint(start), turn: make(chan struct{}, 1)}
@@ -1158,12 +1162,29 @@ func TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel(t *testing.T) {
 	}
 }
 
-// TestDeleteSessionReportsAnInFlightSettlementFailure pins the delete order:
-// the tombstone serializes after the session's full settlement, and a
-// settlement that failed its order fails the delete rather than letting a
-// tombstone hide a boundary the store never recorded.
-func TestDeleteSessionReportsAnInFlightSettlementFailure(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+type settlementDeleteStore struct {
+	SessionStore
+	session *agentSession
+	deleted chan bool
+}
+
+func (s *settlementDeleteStore) Delete(ctx context.Context, key SessionKey) error {
+	s.session.commitMu.Lock()
+	fenced := s.session.persistFenced
+	s.session.commitMu.Unlock()
+	s.deleted <- fenced
+
+	return s.SessionStore.Delete(ctx, key)
+}
+
+// TestDeleteSessionWaitsForSettlementBeforeFencingAndDeleting pins the delete
+// interleaving without scheduler timing: delete first proves it entered the
+// settlement wait, remains outside the store until settlement is released,
+// then fences persistence before removing the durable generation.
+func TestDeleteSessionWaitsForSettlementBeforeFencingAndDeleting(t *testing.T) {
+	base := NewInMemorySessionStore()
+	store := &settlementDeleteStore{SessionStore: base, deleted: make(chan bool, 1)}
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
 	session := &agentSession{
 		agent:       agent,
 		id:          "id",
@@ -1172,14 +1193,31 @@ func TestDeleteSessionReportsAnInFlightSettlementFailure(t *testing.T) {
 	}
 	agent.sessions["id"] = session
 	session.openSettlement()
+	store.session = session
 
 	settleErr := errors.New("settlement commit failed")
+	type result struct {
+		err error
+	}
+	done := make(chan result, 1)
 	go func() {
-		time.Sleep(20 * time.Millisecond)
-		session.completeSettlement(settleErr)
+		_, err := agent.UnstableDeleteSession(t.Context(), acp.UnstableDeleteSessionRequest{SessionId: "id"})
+		done <- result{err: err}
 	}()
 
-	_, err := agent.UnstableDeleteSession(t.Context(), acp.UnstableDeleteSessionRequest{SessionId: "id"})
-	require.ErrorIs(t, err, settleErr)
+	session.mu.Lock()
+	settlement := session.settlement
+	session.mu.Unlock()
+	<-settlement.waiting
+
+	select {
+	case <-store.deleted:
+		t.Fatal("delete reached the store before settlement completed")
+	default:
+	}
+
+	session.completeSettlement(settleErr)
+	require.True(t, <-store.deleted, "persistence was not fenced before store deletion")
+	require.ErrorIs(t, (<-done).err, settleErr)
 	require.NotContains(t, agent.sessions, acp.SessionId("id"))
 }

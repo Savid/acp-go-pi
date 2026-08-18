@@ -446,10 +446,10 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 		mediaEnvelopeMetaKey: a.mediaEnvelope(),
 		piMetaKey: map[string]any{
 			metaCapabilityFork: map[string]any{
-				"unstable": true,
-				"method":   ForkSessionMethod,
-				"request":  "acp.UnstableForkSessionRequest JSON payload only",
-				"response": "acp.UnstableForkSessionResponse JSON payload only",
+				"unstable":      true,
+				jsonFieldMethod: ForkSessionMethod,
+				"request":       "acp.UnstableForkSessionRequest JSON payload only",
+				"response":      "acp.UnstableForkSessionResponse JSON payload only",
 			},
 			"elicitation": map[string]any{
 				"unstable": true,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,15 +25,20 @@ var sessionSettleTimeout = 60 * time.Second
 // lifecycle event, and any quiescence fact — never at the native settle marker,
 // because everything that makes the boundary durable happens after it.
 type turnSettlement struct {
-	done chan struct{}
-	err  error
+	done        chan struct{}
+	waiting     chan struct{}
+	waitingOnce sync.Once
+	err         error
 }
 
 // openSettlement arms the latch for a turn the native dispatcher has accepted.
 // A prompt that failed before acceptance settles nothing and arms nothing.
 func (s *agentSession) openSettlement() {
 	s.mu.Lock()
-	s.settlement = &turnSettlement{done: make(chan struct{})}
+	s.settlement = &turnSettlement{
+		done:    make(chan struct{}),
+		waiting: make(chan struct{}),
+	}
 	s.mu.Unlock()
 }
 
@@ -64,6 +70,7 @@ func (s *agentSession) awaitSettlement() error {
 		return nil
 	}
 
+	settlement.waitingOnce.Do(func() { close(settlement.waiting) })
 	<-settlement.done
 
 	return settlement.err

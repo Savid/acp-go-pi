@@ -105,7 +105,9 @@ func TestForkExtensionValidationAndConversionBranches(t *testing.T) {
 		sessionFilePath: sessionFile,
 	}
 	_, err = commitAgent.handleForkSession(t.Context(), forkRaw(t, forkParams(t)))
-	require.ErrorIs(t, err, errSessionMirrorAppend)
+	requireInvalidParams(t, err)
+	require.Zero(t, commitAgent.sessions[forkParentID].mirroredRows,
+		"fork adopted native rows beyond the last lifecycle boundary")
 }
 
 func TestForkExtensionStoreLimitAfterNativeClone(t *testing.T) {

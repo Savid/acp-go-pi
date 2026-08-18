@@ -1,9 +1,12 @@
 package piacp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
@@ -11,6 +14,47 @@ import (
 	"github.com/savid/acp-go-pi/internal/lifecycle"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
+
+type lifecycleActionWireWriter struct {
+	lines          chan []byte
+	blockMethod    string
+	requestWrite   chan struct{}
+	releaseRequest chan struct{}
+}
+
+func (w *lifecycleActionWireWriter) Write(data []byte) (int, error) {
+	w.lines <- append([]byte(nil), data...)
+
+	var message lifecycleActionWireMessage
+	if json.Unmarshal(data, &message) == nil && message.Method == w.blockMethod {
+		close(w.requestWrite)
+		<-w.releaseRequest
+	}
+
+	return len(data), nil
+}
+
+type lifecycleActionWireMessage struct {
+	ID     *json.RawMessage `json:"id"`
+	Method string           `json:"method"`
+	Params json.RawMessage  `json:"params"`
+}
+
+func nextLifecycleActionWireMessage(t *testing.T, lines <-chan []byte) lifecycleActionWireMessage {
+	t.Helper()
+
+	select {
+	case line := <-lines:
+		var message lifecycleActionWireMessage
+		require.NoError(t, json.Unmarshal(line, &message))
+
+		return message
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for outbound ACP message")
+
+		return lifecycleActionWireMessage{}
+	}
+}
 
 func stage4Session(t *testing.T, authoritative bool) (*agentSession, *directAgentClient) {
 	t.Helper()
@@ -147,7 +191,7 @@ func TestActionAnswerClassificationAndPlainRequest(t *testing.T) {
 
 	s := &agentSession{}
 	value, err := announcedActionRequest(t.Context(), s, lifecycle.ActionPermission,
-		func(meta map[string]any) (string, error) {
+		func(_ context.Context, meta map[string]any) (string, error) {
 			require.Nil(t, meta)
 
 			return "plain", nil
@@ -396,8 +440,9 @@ func TestAnnouncedActionRequestLifecycle(t *testing.T) {
 
 	var sentMeta map[string]any
 	value, err := announcedActionRequest(t.Context(), s, lifecycle.ActionPermission,
-		func(meta map[string]any) (string, error) {
+		func(ctx context.Context, meta map[string]any) (string, error) {
 			sentMeta = meta
+			acknowledgeActionRequestWrite(ctx, nil)
 
 			return "answer", nil
 		},
@@ -435,18 +480,25 @@ func TestAnnouncedActionRequestLifecycle(t *testing.T) {
 	require.True(t, resolved, "the resolved action names the request's identity")
 
 	sentErr := errors.New("send")
+	notificationsBeforeFailure := len(client.notifications)
 	_, err = announcedActionRequest(t.Context(), s, lifecycle.ActionElicitation,
-		func(map[string]any) (string, error) { return "", sentErr },
+		func(context.Context, map[string]any) (string, error) { return "", sentErr },
 		func(_ string, err error) lifecycle.ActionState {
 			require.ErrorIs(t, err, sentErr)
 
 			return lifecycle.ActionFailed
 		})
 	require.ErrorIs(t, err, sentErr)
+	require.Len(t, client.notifications, notificationsBeforeFailure,
+		"a request that did not cross the write barrier announced an action")
 
 	client.updateErr = errors.New("announce delivery")
 	_, err = announcedActionRequest(t.Context(), s, lifecycle.ActionPermission,
-		func(map[string]any) (string, error) { return "unpublished", nil },
+		func(ctx context.Context, _ map[string]any) (string, error) {
+			acknowledgeActionRequestWrite(ctx, nil)
+
+			return "unpublished", nil
+		},
 		func(string, error) lifecycle.ActionState { return lifecycle.ActionAccepted })
 	require.ErrorContains(t, err, "announce delivery")
 
@@ -457,15 +509,113 @@ func TestAnnouncedActionRequestLifecycle(t *testing.T) {
 	lifecycleRandRead = func([]byte) (int, error) { return 0, errors.New("entropy") }
 	t.Cleanup(func() { lifecycleRandRead = original })
 	_, err = announcedActionRequest(t.Context(), fenced, lifecycle.ActionPermission,
-		func(map[string]any) (string, error) { return "never sent", nil },
+		func(context.Context, map[string]any) (string, error) { return "never sent", nil },
 		func(string, error) lifecycle.ActionState { return lifecycle.ActionAccepted })
 	require.ErrorContains(t, err, "entropy")
 }
 
-// TestAnnouncedElicitationStampsActionMetaOnTheForm pins that the action
-// correlation rides the elicitation form's own _meta when a turn owns the
-// request.
-func TestAnnouncedElicitationStampsActionMetaOnTheForm(t *testing.T) {
+// TestAnnouncedPermissionCrossesTheRequestWriteBarrier pins the transport
+// boundary itself: the pending response is registered and the request write has
+// completed before the lifecycle notification can announce its action id.
+func TestAnnouncedPermissionCrossesTheRequestWriteBarrier(t *testing.T) {
+	input, respond := io.Pipe()
+	wire := &lifecycleActionWireWriter{
+		lines:          make(chan []byte, 16),
+		blockMethod:    acp.ClientMethodSessionRequestPermission,
+		requestWrite:   make(chan struct{}),
+		releaseRequest: make(chan struct{}),
+	}
+	agent := NewAgent(testContainmentOption())
+	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, ActivityKinds: []lifecycle.ActivityKind{}}
+	connection := newLocalAgentConnection(agent, wire, input)
+	agent.setConnection(connection)
+	t.Cleanup(func() {
+		select {
+		case <-wire.releaseRequest:
+		default:
+			close(wire.releaseRequest)
+		}
+		require.NoError(t, respond.Close())
+
+		select {
+		case <-connection.Done():
+		case <-time.After(time.Second):
+			t.Error("ACP connection did not stop")
+		}
+	})
+
+	session := &agentSession{agent: agent, id: "session"}
+	require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+	require.NoError(t, session.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{
+		SubmissionID: "submission", ClientNonce: "nonce",
+	}))
+
+	for range 3 {
+		nextLifecycleActionWireMessage(t, wire.lines)
+	}
+	session.lcMu.Lock()
+	sequenceBeforeRequest := session.lc.stream.Sequence()
+	session.lcMu.Unlock()
+
+	type result struct {
+		response acp.RequestPermissionResponse
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		response, err := session.requestAnnouncedPermission(t.Context(), connection, acp.RequestPermissionRequest{
+			SessionId: session.id,
+		})
+		done <- result{response: response, err: err}
+	}()
+
+	request := nextLifecycleActionWireMessage(t, wire.lines)
+	require.Equal(t, acp.ClientMethodSessionRequestPermission, request.Method)
+	require.NotNil(t, request.ID)
+	<-wire.requestWrite
+
+	session.lcMu.Lock()
+	require.Equal(t, sequenceBeforeRequest, session.lc.stream.Sequence(),
+		"action was claimed before the request write completed")
+	session.lcMu.Unlock()
+
+	// The SDK response registration precedes its transport write: route a
+	// response while that write is still blocked, then let the write complete.
+	encodedResult, err := json.Marshal(acp.RequestPermissionResponse{
+		Outcome: acp.NewRequestPermissionOutcomeSelected(permissionOptionAllow),
+	})
+	require.NoError(t, err)
+	response, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      *request.ID,
+		"result":  json.RawMessage(encodedResult),
+	})
+	require.NoError(t, err)
+	_, err = respond.Write(append(response, '\n'))
+	require.NoError(t, err)
+	close(wire.releaseRequest)
+
+	announcement := nextLifecycleActionWireMessage(t, wire.lines)
+	require.Equal(t, acp.ClientMethodSessionUpdate, announcement.Method)
+	var notification acp.SessionNotification
+	require.NoError(t, json.Unmarshal(announcement.Params, &notification))
+	envelope := anyMap(t, notification.Meta[lifecycleMetaKey])
+	event := anyMap(t, envelope["event"])
+	require.Equal(t, "action_update", event["type"])
+	require.Equal(t, "pending", anyMap(t, event["action"])["state"])
+
+	select {
+	case result := <-done:
+		require.NoError(t, result.err)
+		require.Equal(t, permissionOptionAllow, result.response.Outcome.Selected.OptionId)
+	case <-time.After(time.Second):
+		t.Fatal("permission response was not routed to the registered request")
+	}
+}
+
+// TestAnnouncedElicitationStampsActionMeta pins that the action correlation
+// rides either elicitation variant's own _meta when a turn owns the request.
+func TestAnnouncedElicitationStampsActionMeta(t *testing.T) {
 	s, _ := stage4Session(t, false)
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{SubmissionID: "s", ClientNonce: "n"}))
@@ -478,6 +628,18 @@ func TestAnnouncedElicitationStampsActionMetaOnTheForm(t *testing.T) {
 	require.True(t, accepted)
 	require.Len(t, dialog.elicitationRequests, 1)
 	require.Contains(t, dialog.elicitationRequests[0].Form.Meta, lifecycleMetaKey)
+
+	dialog.elicitationResponse = acp.UnstableCreateElicitationResponse{
+		Decline: &acp.UnstableCreateElicitationDecline{Action: "decline"},
+	}
+	_, err := s.requestAnnouncedElicitation(t.Context(), dialog, acp.UnstableCreateElicitationRequest{
+		Url: &acp.UnstableCreateElicitationUrl{
+			ElicitationId: "url", Message: "open", Mode: elicitationModeURL, Url: "https://example.test",
+		},
+	}, elicitationScope{})
+	require.NoError(t, err)
+	require.Len(t, dialog.elicitationRequests, 2)
+	require.Contains(t, dialog.elicitationRequests[1].Url.Meta, lifecycleMetaKey)
 }
 
 // vacantStubProcess is a contained process that can enumerate its own tree,
@@ -609,24 +771,106 @@ func TestLifecycleBoundaryCommitFailure(t *testing.T) {
 		"a session with no native identity has no key a boundary could record under")
 }
 
-// TestLastLifecycleBoundaryIgnoresUndecodableRecords pins that a restored
-// session resumes only from a boundary record of the current version: anything
-// else is no proven boundary.
-func TestLastLifecycleBoundaryIgnoresUndecodableRecords(t *testing.T) {
+// TestLifecycleBoundaryRestoreValidation pins the hard journal cut: malformed,
+// unknown, unsupported, and semantically incoherent records fail closed rather
+// than becoming an absent boundary or an unearned opening fact.
+func TestLifecycleBoundaryRestoreValidation(t *testing.T) {
+	t.Parallel()
+
+	valid := json.RawMessage(`{"version":1,"streamId":"current","nativeRows":2,"nativeState":"committed","recordedAt":1}`)
+	record, err := decodeLifecycleBoundaryRecord(valid)
+	require.NoError(t, err)
+	require.Equal(t, "current", record.StreamID)
+	require.Equal(t, 2, record.NativeRows)
+
+	invalid := map[string]json.RawMessage{
+		"malformed":                 json.RawMessage(`not-json`),
+		"trailing value":            json.RawMessage(string(valid) + ` {}`),
+		"malformed trailing data":   json.RawMessage(string(valid) + ` {`),
+		"unknown field":             json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":1,"legacy":true}`),
+		"missing required":          json.RawMessage(`{"version":1,"streamId":"","nativeState":"committed","recordedAt":1}`),
+		"null optional":             json.RawMessage(`{"version":1,"streamId":"","turnId":null,"nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+		"unsupported version":       json.RawMessage(`{"version":2,"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+		"negative rows":             json.RawMessage(`{"version":1,"streamId":"","nativeRows":-1,"nativeState":"committed","recordedAt":1}`),
+		"nonpositive timestamp":     json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":0}`),
+		"unsupported disposition":   json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"legacy","recordedAt":1}`),
+		"uncommitted vacancy":       json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"retained","vacancyProven":true,"recordedAt":1}`),
+		"identity without stream":   json.RawMessage(`{"version":1,"streamId":"","turnId":"turn","cycleId":"cycle","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+		"cycle without turn":        json.RawMessage(`{"version":1,"streamId":"stream","cycleId":"cycle","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+		"stop without outcome":      json.RawMessage(`{"version":1,"streamId":"","stopReason":"end_turn","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+		"unsupported outcome":       json.RawMessage(`{"version":1,"streamId":"","outcome":"unknown","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+		"failed with stop":          json.RawMessage(`{"version":1,"streamId":"","outcome":"failed","stopReason":"end_turn","nativeRows":0,"nativeState":"retained","recordedAt":1}`),
+		"nonfailure without stop":   json.RawMessage(`{"version":1,"streamId":"","outcome":"success","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+		"nonfailure invalid stop":   json.RawMessage(`{"version":1,"streamId":"","outcome":"success","stopReason":"stop","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+		"wrong required field type": json.RawMessage(`{"version":1,"streamId":"","nativeRows":"zero","nativeState":"committed","recordedAt":1}`),
+	}
+	for name, entry := range invalid {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, decodeErr := decodeLifecycleBoundaryRecord(entry)
+			require.Error(t, decodeErr)
+		})
+	}
+}
+
+func TestLastLifecycleBoundaryValidatesTheCompleteJournal(t *testing.T) {
 	store := NewInMemorySessionStore()
 	agent := NewAgent(testContainmentOption(), WithSessionStore(store))
-	key := SessionKey{SessionID: "id", Subpath: SessionStoreLifecycleSubpath}
 
-	require.Equal(t, lifecycleBoundaryRecord{}, agent.lastLifecycleBoundary(t.Context(), "id"))
-	require.NoError(t, store.Append(t.Context(), key, []SessionStoreEntry{json.RawMessage(`not-json`)}))
-	require.Equal(t, lifecycleBoundaryRecord{}, agent.lastLifecycleBoundary(t.Context(), "id"))
-	require.NoError(t, store.Append(t.Context(), key, []SessionStoreEntry{json.RawMessage(`{"version":0,"streamId":"old"}`)}))
-	require.Equal(t, lifecycleBoundaryRecord{}, agent.lastLifecycleBoundary(t.Context(), "id"))
-	require.NoError(t, store.Append(t.Context(), key, []SessionStoreEntry{json.RawMessage(`{"version":1,"streamId":"current","nativeState":"committed"}`)}))
+	record, found, err := agent.lastLifecycleBoundary(t.Context(), "id")
+	require.NoError(t, err)
+	require.False(t, found)
+	require.Equal(t, lifecycleBoundaryRecord{}, record)
 
-	record := agent.lastLifecycleBoundary(t.Context(), "id")
-	require.Equal(t, "current", record.StreamID)
-	require.Equal(t, nativeStateCommitted, record.NativeState)
+	appendLifecycleBoundaryForRows(t, store, "id", 2)
+	appendLifecycleBoundaryForRows(t, store, "id", 1)
+	_, _, err = agent.lastLifecycleBoundary(t.Context(), "id")
+	require.ErrorContains(t, err, "regressed")
+
+	loadErr := errors.New("journal unavailable")
+	agent.options.SessionStore = &lifecycleLoadFailingStore{SessionStore: store, err: loadErr}
+	_, _, err = agent.lastLifecycleBoundary(t.Context(), "id")
+	require.ErrorIs(t, err, loadErr)
+}
+
+func TestSessionRestoreMethodsRejectAnInvalidLifecycleJournal(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]func(*Agent) error{
+		"load": func(agent *Agent) error {
+			_, err := agent.LoadSession(t.Context(), LoadSessionRequest(validSessionUUID, "/cwd"))
+
+			return err
+		},
+		"resume": func(agent *Agent) error {
+			_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(validSessionUUID, "/cwd"))
+
+			return err
+		},
+		"fork": func(agent *Agent) error {
+			_, err := agent.handleForkSession(t.Context(), forkRaw(t, ForkSessionRequest(validSessionUUID, "/cwd")))
+
+			return err
+		},
+	}
+
+	for name, invoke := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			store := NewInMemorySessionStore()
+			require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: validSessionUUID}, []SessionStoreEntry{
+				json.RawMessage(`{"type":"session","id":"01234567-89ab-cdef-0123-456789abcdef","cwd":"/cwd"}`),
+			}))
+			require.NoError(t, store.Append(t.Context(), SessionKey{
+				SessionID: validSessionUUID,
+				Subpath:   SessionStoreLifecycleSubpath,
+			}, []SessionStoreEntry{json.RawMessage(`{"version":1,"vacancyProven":true}`)}))
+
+			agent := NewAgent(testContainmentOption(), WithSessionStore(store))
+			require.ErrorContains(t, invoke(agent), "decode lifecycle journal")
+		})
+	}
 }
 
 // TestPublishSessionOpen pins the establishing snapshot: it is emitted exactly

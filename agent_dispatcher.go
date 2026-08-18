@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,10 +19,64 @@ import (
 const postResponseHookIDParam = "_acp_go_pi_post_response_hook_id"
 
 type localAgentConnection struct {
-	agent       *Agent
-	conn        *acp.Connection
-	initialized atomic.Bool
-	hooks       *postResponseHooks
+	agent         *Agent
+	conn          *acp.Connection
+	initialized   atomic.Bool
+	hooks         *postResponseHooks
+	requestWrites *actionRequestWrites
+}
+
+type actionRequestWrites struct {
+	mu      sync.Mutex
+	pending map[string]func(error)
+}
+
+func newActionRequestWrites() *actionRequestWrites {
+	return &actionRequestWrites{pending: make(map[string]func(error))}
+}
+
+func (w *actionRequestWrites) register(actionID string, ack func(error)) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if _, exists := w.pending[actionID]; exists {
+		return fmt.Errorf("action request %s already awaits a write", actionID)
+	}
+
+	w.pending[actionID] = ack
+
+	return nil
+}
+
+func (w *actionRequestWrites) resolve(actionID string, err error) {
+	w.mu.Lock()
+	ack := w.pending[actionID]
+	delete(w.pending, actionID)
+	w.mu.Unlock()
+
+	if ack != nil {
+		ack(err)
+	}
+}
+
+type actionRequestWriteWriter struct {
+	writer   io.Writer
+	requests *actionRequestWrites
+}
+
+func (w *actionRequestWriteWriter) Write(data []byte) (int, error) {
+	actionID := outboundLifecycleActionID(data)
+
+	n, err := w.writer.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+
+	if actionID != "" {
+		w.requests.resolve(actionID, err)
+	}
+
+	return n, err
 }
 
 type localAgentHandler func(context.Context, *Agent, json.RawMessage) (any, *acp.RequestError)
@@ -52,9 +107,11 @@ var (
 
 func newLocalAgentConnection(agent *Agent, output io.Writer, input io.Reader) *localAgentConnection {
 	hooks := &postResponseHooks{log: agent.log}
-	conn := &localAgentConnection{agent: agent, hooks: hooks}
+	requestWrites := newActionRequestWrites()
+	conn := &localAgentConnection{agent: agent, hooks: hooks, requestWrites: requestWrites}
 	inputGate := newConnectionInputGate(newPostResponseHookRequestReader(input))
-	conn.conn = acp.NewConnection(conn.handle, hooks.wrap(output), inputGate)
+	trackedOutput := &actionRequestWriteWriter{writer: output, requests: requestWrites}
+	conn.conn = acp.NewConnection(conn.handle, hooks.wrap(trackedOutput), inputGate)
 	conn.conn.SetLogger(agent.log)
 	inputGate.open()
 
@@ -429,7 +486,17 @@ func (c *localAgentConnection) CreateElicitation(
 	}
 	defer release()
 
-	return acp.SendRequest[acp.UnstableCreateElicitationResponse](c.conn, ctx, acp.ClientMethodElicitationCreate, raw)
+	actionID := lifecycleActionID(elicitationMeta(params))
+	if registerErr := c.registerActionRequestWrite(ctx, actionID); registerErr != nil {
+		return acp.UnstableCreateElicitationResponse{}, registerErr
+	}
+
+	resp, err := acp.SendRequest[acp.UnstableCreateElicitationResponse](c.conn, ctx, acp.ClientMethodElicitationCreate, raw)
+	if err != nil {
+		c.failActionRequestWrite(actionID, err)
+	}
+
+	return resp, err
 }
 
 func (c *localAgentConnection) RequestPermission(
@@ -442,7 +509,104 @@ func (c *localAgentConnection) RequestPermission(
 	}
 	defer release()
 
-	return acp.SendRequest[acp.RequestPermissionResponse](c.conn, ctx, acp.ClientMethodSessionRequestPermission, params)
+	actionID := lifecycleActionID(params.Meta)
+	if registerErr := c.registerActionRequestWrite(ctx, actionID); registerErr != nil {
+		return acp.RequestPermissionResponse{}, registerErr
+	}
+
+	resp, err := acp.SendRequest[acp.RequestPermissionResponse](c.conn, ctx, acp.ClientMethodSessionRequestPermission, params)
+	if err != nil {
+		c.failActionRequestWrite(actionID, err)
+	}
+
+	return resp, err
+}
+
+func (c *localAgentConnection) registerActionRequestWrite(ctx context.Context, actionID string) error {
+	ack := actionRequestWriteAck(ctx)
+	if ack == nil {
+		return nil
+	}
+
+	if actionID == "" {
+		err := errors.New("announced action request is missing its lifecycle action id")
+		ack(err)
+
+		return err
+	}
+
+	if err := c.requestWrites.register(actionID, ack); err != nil {
+		ack(err)
+
+		return err
+	}
+
+	return nil
+}
+
+func (c *localAgentConnection) failActionRequestWrite(actionID string, err error) {
+	if actionID != "" {
+		c.requestWrites.resolve(actionID, err)
+	}
+}
+
+func elicitationMeta(params acp.UnstableCreateElicitationRequest) map[string]any {
+	if params.Form != nil {
+		return params.Form.Meta
+	}
+
+	if params.Url != nil {
+		return params.Url.Meta
+	}
+
+	return nil
+}
+
+func lifecycleActionID(meta map[string]any) string {
+	value, ok := meta[lifecycleMetaKey]
+	if !ok {
+		return ""
+	}
+
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+
+	return lifecycleActionIDFromRaw(raw)
+}
+
+func lifecycleActionIDFromRaw(raw json.RawMessage) string {
+	var value struct {
+		Action struct {
+			ActionID string `json:"actionId"`
+		} `json:"action"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+
+	return value.Action.ActionID
+}
+
+func outboundLifecycleActionID(data []byte) string {
+	var message struct {
+		ID     *json.RawMessage `json:"id"`
+		Method string           `json:"method"`
+		Params struct {
+			Meta map[string]json.RawMessage `json:"_meta"` //nolint:tagliatelle // ACP reserves the leading underscore.
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(data), &message); err != nil || message.ID == nil {
+		return ""
+	}
+
+	switch message.Method {
+	case acp.ClientMethodSessionRequestPermission, acp.ClientMethodElicitationCreate:
+		return lifecycleActionIDFromRaw(message.Params.Meta[lifecycleMetaKey])
+	default:
+		return ""
+	}
 }
 
 func (c *localAgentConnection) SessionUpdate(ctx context.Context, params acp.SessionNotification) error {

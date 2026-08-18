@@ -162,7 +162,7 @@ func (a *Agent) restoreSession(
 		return nil, nil, false, unknownSessionError()
 	}
 
-	entries, err := a.loadCurrentStoreEntries(ctx, string(sessionID))
+	entries, boundary, err := a.loadCurrentStoreEntries(ctx, string(sessionID))
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -180,7 +180,7 @@ func (a *Agent) restoreSession(
 	}
 
 	start.HydrateEntries = entries
-	start.PriorBoundary = a.lastLifecycleBoundary(ctx, string(sessionID))
+	start.PriorBoundary = boundary
 
 	session, err := a.startAndStoreSession(ctx, start)
 	if err != nil {

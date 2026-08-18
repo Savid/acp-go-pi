@@ -383,6 +383,78 @@ func TestActionRules(t *testing.T) {
 			actionEvent(ActionUpdate{ActionID: "req-1", State: ActionDeclined}))...)
 }
 
+// TestTerminalEntitiesRefuseEveryLaterSequence pins terminality rather than only
+// terminal state: once an activity or action resolves, a distinct later frame
+// cannot restate that state while changing progress or resolving it again.
+func TestTerminalEntitiesRefuseEveryLaterSequence(t *testing.T) {
+	t.Parallel()
+
+	accepted := Event{Type: EventPromptAccepted, PromptAccepted: &PromptAccepted{
+		SubmissionID: "sub-1", ClientNonce: "non-1", TurnID: "turn-1",
+	}}
+
+	t.Run("activity", func(t *testing.T) {
+		t.Parallel()
+
+		first := ActivityUpdate{
+			ActivityID: "act-1", Kind: ActivityTask, State: ActivityRunning,
+			Cause: CauseSubmission, OriginTurnID: "turn-1",
+		}
+		for name, later := range map[string]ActivityUpdate{
+			"identical":        {ActivityID: "act-1", State: ActivityCompleted},
+			"changed progress": {ActivityID: "act-1", State: ActivityCompleted, Progress: json.RawMessage(`{"done":true}`)},
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				reducer, refusal := reduceAll(t, richConfiguration(),
+					openSnapshot(), accepted, RunningEvent("cyc-1", "turn-1"),
+					activityEvent(first),
+					activityEvent(ActivityUpdate{ActivityID: "act-1", State: ActivityCompleted}),
+					activityEvent(later),
+				)
+				require.NotNil(t, refusal)
+				require.Equal(t, ViolationPostTerminalMutation, refusal.Kind)
+
+				activity, found := reducer.State().Activity("act-1")
+				require.True(t, found)
+				require.Equal(t, ActivityCompleted, activity.State)
+				require.Empty(t, activity.Progress)
+			})
+		}
+	})
+
+	t.Run("action", func(t *testing.T) {
+		t.Parallel()
+
+		pending := ActionUpdate{
+			ActionID: "req-1", Kind: ActionPermission, State: ActionPending,
+			Owner: Owner{Type: OwnerTurn, ID: "turn-1"}, BlocksForeground: stated(false),
+		}
+		for name, later := range map[string]ActionUpdate{
+			"identical":          {ActionID: "req-1", State: ActionAccepted},
+			"different terminal": {ActionID: "req-1", State: ActionDeclined},
+		} {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				reducer, refusal := reduceAll(t, richConfiguration(),
+					openSnapshot(), accepted, RunningEvent("cyc-1", "turn-1"),
+					actionEvent(pending),
+					actionEvent(ActionUpdate{ActionID: "req-1", State: ActionAccepted}),
+					actionEvent(later),
+				)
+				require.NotNil(t, refusal)
+				require.Equal(t, ViolationPostTerminalMutation, refusal.Kind)
+
+				action, found := reducer.State().Action("req-1")
+				require.True(t, found)
+				require.Equal(t, ActionAccepted, action.State)
+			})
+		}
+	})
+}
+
 // TestTerminalActionOnFirstSightNeverBlocks pins that an action already resolved
 // when a delta first sees it holds nothing: it is recorded, and the cycle it
 // would otherwise have blocked owes no transition.
@@ -486,6 +558,31 @@ func TestReducerRefusesADeltaFromAnUnseenStream(t *testing.T) {
 	foreign := Delivery{StreamID: "other", Sequence: 2, Carrier: CarrierSessionInfo, Event: RunningEvent("c", "t")}
 	require.Error(t, reducer.Reduce(foreign))
 	require.Equal(t, ViolationStaleStream, reducer.Failed().Kind)
+}
+
+// TestRefusedForeignSnapshotPreservesTheProvenProjection pins incarnation
+// replacement as an atomic operation: an invalid successor latches its refusal
+// without erasing the last whole state this reducer proved.
+func TestRefusedForeignSnapshotPreservesTheProvenProjection(t *testing.T) {
+	t.Parallel()
+
+	reducer := NewReducer(Options{Negotiated: richConfiguration()})
+	require.NoError(t, reducer.Reduce(deliver(1, openSnapshot())))
+	require.NoError(t, reducer.Reduce(deliver(2, Event{Type: EventPromptAccepted, PromptAccepted: &PromptAccepted{
+		SubmissionID: "sub-1", ClientNonce: "non-1", TurnID: "turn-1",
+	}})))
+	before := reducer.State()
+
+	foreign := Delivery{
+		StreamID: "strm-next",
+		Sequence: 1,
+		Carrier:  CarrierSessionInfo,
+		Event:    Event{Type: EventSnapshot, Snapshot: &Snapshot{}},
+	}
+	require.Error(t, reducer.Reduce(foreign))
+	require.Equal(t, ViolationMalformedEnvelope, reducer.Failed().Kind)
+	require.Equal(t, "strm-next", reducer.Failed().StreamID)
+	require.Equal(t, before, reducer.State())
 }
 
 // TestReducerRefusesAnUnopenedStreamsSnapshot pins that a snapshot this reducer

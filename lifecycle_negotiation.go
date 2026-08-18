@@ -14,6 +14,14 @@ import (
 // extension rides under on every surface that carries it.
 const lifecycleMetaKey = lifecycle.MetaKey
 
+const lifecycleFieldVersion = "version"
+
+const lifecycleFieldStreamID = "streamId"
+
+const lifecycleFieldAction = "action"
+
+const lifecycleFieldActionID = "actionId"
+
 const lifecycleOwnerIDKey = "id"
 
 const lifecycleOwnerKey = "owner"
@@ -158,11 +166,11 @@ func (a *Agent) lifecyclePromptCorrelation(meta map[string]any) (lifecycle.Submi
 // callback, which stays the reserved route envelope's job.
 func lifecycleActionMeta(streamID, actionID string, owner lifecycle.Owner) map[string]any {
 	return map[string]any{lifecycleMetaKey: map[string]any{
-		"version":  lifecycle.Version,
-		"streamId": streamID,
-		"action": map[string]any{
-			"actionId":        actionID,
-			lifecycleOwnerKey: map[string]any{jsonFieldType: string(owner.Type), lifecycleOwnerIDKey: owner.ID},
+		lifecycleFieldVersion:  lifecycle.Version,
+		lifecycleFieldStreamID: streamID,
+		lifecycleFieldAction: map[string]any{
+			lifecycleFieldActionID: actionID,
+			lifecycleOwnerKey:      map[string]any{jsonFieldType: string(owner.Type), lifecycleOwnerIDKey: owner.ID},
 		},
 	}}
 }

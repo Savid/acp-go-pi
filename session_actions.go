@@ -9,6 +9,20 @@ import (
 	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
 
+type actionRequestWriteAckKey struct{}
+
+func actionRequestWriteAck(ctx context.Context) func(error) {
+	ack, _ := ctx.Value(actionRequestWriteAckKey{}).(func(error))
+
+	return ack
+}
+
+func acknowledgeActionRequestWrite(ctx context.Context, err error) {
+	if ack := actionRequestWriteAck(ctx); ack != nil {
+		ack(err)
+	}
+}
+
 // announcedActionRequest sends one client request that holds native work until
 // it is answered, announces the ordered action that request answers, and
 // resolves that action exactly once.
@@ -22,7 +36,7 @@ func announcedActionRequest[T any](
 	ctx context.Context,
 	session *agentSession,
 	kind lifecycle.ActionKind,
-	send func(meta map[string]any) (T, error),
+	send func(context.Context, map[string]any) (T, error),
 	resolved func(T, error) lifecycle.ActionState,
 ) (T, error) {
 	action, announceable, prepareErr := session.prepareLifecycleAction()
@@ -33,7 +47,7 @@ func announcedActionRequest[T any](
 	}
 
 	if !announceable {
-		return send(nil)
+		return send(ctx, nil)
 	}
 
 	type answer struct {
@@ -42,11 +56,26 @@ func announcedActionRequest[T any](
 	}
 
 	answers := make(chan answer, 1)
+	written := make(chan error, 1)
+	requestCtx := context.WithValue(ctx, actionRequestWriteAckKey{}, func(err error) {
+		select {
+		case written <- err:
+		default:
+		}
+	})
 
 	go func() {
-		value, err := send(lifecycleActionMeta(action.streamID, action.actionID, action.owner))
+		value, err := send(requestCtx, lifecycleActionMeta(action.streamID, action.actionID, action.owner))
+		acknowledgeActionRequestWrite(requestCtx, err)
+
 		answers <- answer{value: value, err: err}
 	}()
+
+	if writeErr := <-written; writeErr != nil {
+		answered := <-answers
+
+		return answered.value, errors.Join(writeErr, answered.err)
+	}
 
 	announceErr := session.announceLifecycleAction(ctx, action, kind)
 	answered := <-answers
@@ -100,10 +129,10 @@ func (s *agentSession) requestAnnouncedPermission(
 	conn agentClient,
 	request acp.RequestPermissionRequest,
 ) (acp.RequestPermissionResponse, error) {
-	return announcedActionRequest(ctx, s, lifecycle.ActionPermission, func(meta map[string]any) (acp.RequestPermissionResponse, error) {
+	return announcedActionRequest(ctx, s, lifecycle.ActionPermission, func(requestCtx context.Context, meta map[string]any) (acp.RequestPermissionResponse, error) {
 		request.Meta = meta
 
-		return conn.RequestPermission(ctx, request)
+		return conn.RequestPermission(requestCtx, request)
 	}, permissionActionState)
 }
 
@@ -117,11 +146,16 @@ func (s *agentSession) requestAnnouncedElicitation(
 	request acp.UnstableCreateElicitationRequest,
 	scope elicitationScope,
 ) (acp.UnstableCreateElicitationResponse, error) {
-	return announcedActionRequest(ctx, s, lifecycle.ActionElicitation, func(meta map[string]any) (acp.UnstableCreateElicitationResponse, error) {
-		if meta != nil && request.Form != nil {
-			request.Form.Meta = meta
+	return announcedActionRequest(ctx, s, lifecycle.ActionElicitation, func(requestCtx context.Context, meta map[string]any) (acp.UnstableCreateElicitationResponse, error) {
+		if meta != nil {
+			switch {
+			case request.Form != nil:
+				request.Form.Meta = meta
+			case request.Url != nil:
+				request.Url.Meta = meta
+			}
 		}
 
-		return conn.CreateElicitation(ctx, request, scope)
+		return conn.CreateElicitation(requestCtx, request, scope)
 	}, elicitationActionState)
 }

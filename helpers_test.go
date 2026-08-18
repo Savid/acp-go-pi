@@ -114,24 +114,26 @@ func newDialogStubClient() *dialogStubClient {
 }
 
 func (c *dialogStubClient) CreateElicitation(
-	_ context.Context,
+	ctx context.Context,
 	request acp.UnstableCreateElicitationRequest,
 	_ elicitationScope,
 ) (acp.UnstableCreateElicitationResponse, error) {
 	c.dialogMu.Lock()
 	c.elicitationRequests = append(c.elicitationRequests, request)
 	c.dialogMu.Unlock()
+	acknowledgeActionRequestWrite(ctx, nil)
 
 	return c.elicitationResponse, c.elicitationErr
 }
 
 func (c *dialogStubClient) RequestPermission(
-	_ context.Context,
+	ctx context.Context,
 	request acp.RequestPermissionRequest,
 ) (acp.RequestPermissionResponse, error) {
 	c.dialogMu.Lock()
 	c.permissionRequests = append(c.permissionRequests, request)
 	c.dialogMu.Unlock()
+	acknowledgeActionRequestWrite(ctx, nil)
 
 	return c.permissionResponse, c.permissionErr
 }
@@ -215,6 +217,26 @@ func appendForkParentRows(t *testing.T, store *faultySessionStore, entries ...Se
 		SessionKey{SessionID: string(forkParentID)},
 		entries,
 	))
+	appendLifecycleBoundaryForRows(t, store.InMemorySessionStore, string(forkParentID), len(entries))
+}
+
+func appendLifecycleBoundaryForRows(t *testing.T, store SessionStore, sessionID string, rows int) json.RawMessage {
+	t.Helper()
+
+	encoded, err := json.Marshal(lifecycleBoundaryRecord{
+		Version:             lifecycleBoundaryVersion,
+		StreamID:            "stream",
+		NativeRows:          rows,
+		NativeState:         nativeStateCommitted,
+		RecordedAtUnixMilli: 1,
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.Append(t.Context(), SessionKey{
+		SessionID: sessionID,
+		Subpath:   SessionStoreLifecycleSubpath,
+	}, []SessionStoreEntry{encoded}))
+
+	return encoded
 }
 
 // fixtureBytes reads one raster fixture from testdata.
@@ -319,13 +341,17 @@ func newDirectAgentClient() *directAgentClient {
 
 func (c *directAgentClient) Done() <-chan struct{} { return c.done }
 func (*directAgentClient) CreateElicitation(
-	context.Context,
-	acp.UnstableCreateElicitationRequest,
-	elicitationScope,
+	ctx context.Context,
+	_ acp.UnstableCreateElicitationRequest,
+	_ elicitationScope,
 ) (acp.UnstableCreateElicitationResponse, error) {
+	acknowledgeActionRequestWrite(ctx, nil)
+
 	return acp.UnstableCreateElicitationResponse{}, nil
 }
-func (*directAgentClient) RequestPermission(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+func (*directAgentClient) RequestPermission(ctx context.Context, _ acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	acknowledgeActionRequestWrite(ctx, nil)
+
 	return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
 }
 func (c *directAgentClient) SessionUpdate(_ context.Context, notification acp.SessionNotification) error {
