@@ -100,6 +100,24 @@ func TestReducerRefusesAnIncompleteSnapshotForeground(t *testing.T) {
 	}
 }
 
+// TestReducerRefusesAMisshapenSnapshotForegroundTurn pins that the emit gate
+// holds a snapshot's foreground to the same turn shape the decoder enforces: an
+// idle foreground names no turn, origin travels exactly with the turn, and an
+// origin is one of the two causes.
+func TestReducerRefusesAMisshapenSnapshotForegroundTurn(t *testing.T) {
+	t.Parallel()
+
+	for _, foreground := range []Foreground{
+		{State: ForegroundIdle, CycleID: "cyc-0", TurnID: "turn-1"},
+		{State: ForegroundRunning, CycleID: "cyc-1", TurnID: "turn-1"},
+		{State: ForegroundRunning, CycleID: "cyc-1", Origin: CauseSubmission},
+		{State: ForegroundRunning, CycleID: "cyc-1", TurnID: "turn-1", Origin: "bogus"},
+	} {
+		requireReduceRefusal(t, richConfiguration(), ViolationMalformedEnvelope,
+			Event{Type: EventSnapshot, Snapshot: &Snapshot{Foreground: foreground}})
+	}
+}
+
 // TestSnapshotIntroducesEveryIdentityItNames pins that the state a snapshot
 // asserts predates the stream: its foreground turn, its activities' origin turns,
 // and its actions' owners are all introduced by the assertion itself.
@@ -219,7 +237,7 @@ func TestSnapshotForegroundTurnSettlesWithoutAcceptance(t *testing.T) {
 
 	reducer, refusal := reduceAll(t, richConfiguration(),
 		Event{Type: EventSnapshot, Snapshot: &Snapshot{
-			Foreground: Foreground{State: ForegroundRunning, CycleID: "cyc-1", TurnID: "turn-1"},
+			Foreground: Foreground{State: ForegroundRunning, CycleID: "cyc-1", TurnID: "turn-1", Origin: CauseSubmission},
 		}},
 		IdleEvent("cyc-1", "turn-1", StopReasonEndTurn, OutcomeSuccess),
 	)
@@ -573,6 +591,30 @@ func TestReducerRefusesASnapshotFromASupersededStream(t *testing.T) {
 	successor := deliver(1, openSnapshot())
 	successor.StreamID = "strm-next"
 	require.NoError(t, reducer.Reduce(successor))
+	before := reducer.State()
+
+	resurrection := deliver(2, openSnapshot())
+	require.Error(t, reducer.Reduce(resurrection))
+	require.Equal(t, ViolationStaleStream, reducer.Failed().Kind)
+	require.Equal(t, before, reducer.State())
+}
+
+// TestReducerCarriesRetirementAcrossGenerations pins that retirement is
+// transitive: after two supersessions, every earlier incarnation's identity
+// stays fenced, not just the immediately superseded one.
+func TestReducerCarriesRetirementAcrossGenerations(t *testing.T) {
+	t.Parallel()
+
+	reducer := NewReducer(Options{Negotiated: richConfiguration()})
+	require.NoError(t, reducer.Reduce(deliver(1, openSnapshot())))
+
+	second := deliver(1, openSnapshot())
+	second.StreamID = "strm-second"
+	require.NoError(t, reducer.Reduce(second))
+
+	third := deliver(1, openSnapshot())
+	third.StreamID = "strm-third"
+	require.NoError(t, reducer.Reduce(third))
 	before := reducer.State()
 
 	resurrection := deliver(2, openSnapshot())
