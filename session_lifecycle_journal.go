@@ -127,10 +127,3 @@ func (s *agentSession) fencePersistence() {
 
 	s.persistFenced = true
 }
-
-func (s *agentSession) persistenceFenced() bool {
-	s.commitMu.Lock()
-	defer s.commitMu.Unlock()
-
-	return s.persistFenced
-}

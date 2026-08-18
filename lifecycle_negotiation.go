@@ -14,6 +14,10 @@ import (
 // extension rides under on every surface that carries it.
 const lifecycleMetaKey = lifecycle.MetaKey
 
+const lifecycleOwnerIDKey = "id"
+
+const lifecycleOwnerKey = "owner"
+
 var lifecycleRandRead = rand.Read
 
 // provenLifecycleFacts resolves the answer for the active configuration from
@@ -64,7 +68,7 @@ func (a *Agent) negotiateLifecycle(meta map[string]any) (map[string]any, error) 
 	a.mu.Unlock()
 
 	if !common {
-		return nil, nil
+		return map[string]any{}, nil
 	}
 
 	return map[string]any{lifecycleMetaKey: answer.Advertisement()}, nil
@@ -98,11 +102,11 @@ func refuseLifecycleMeta(meta map[string]any) error {
 // validation or refusal runs.
 func refuseLifecycleRawMeta(params json.RawMessage) error {
 	var envelope struct {
-		Meta map[string]json.RawMessage `json:"_meta"`
+		Meta map[string]json.RawMessage `json:"_meta"` //nolint:tagliatelle // ACP reserves this wire spelling.
 	}
 
 	if err := json.Unmarshal(params, &envelope); err != nil {
-		return nil
+		return nil //nolint:nilerr // The route's decoder reports malformed JSON.
 	}
 
 	if _, present := envelope.Meta[lifecycleMetaKey]; !present {
@@ -157,8 +161,8 @@ func lifecycleActionMeta(streamID, actionID string, owner lifecycle.Owner) map[s
 		"version":  lifecycle.Version,
 		"streamId": streamID,
 		"action": map[string]any{
-			"actionId": actionID,
-			"owner":    map[string]any{"type": string(owner.Type), "id": owner.ID},
+			"actionId":        actionID,
+			lifecycleOwnerKey: map[string]any{jsonFieldType: string(owner.Type), lifecycleOwnerIDKey: owner.ID},
 		},
 	}}
 }

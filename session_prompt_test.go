@@ -156,8 +156,8 @@ func TestSettlementReportsAnIncompleteContainmentBoundary(t *testing.T) {
 	var timedOut atomic.Bool
 
 	for name, outcome := range map[string]promptOutcome{
-		"transport ended": {transportEnded: true},
-		"context ended":   {contextEnded: true},
+		"transport ended":  {transportEnded: true},
+		"context ended":    {contextEnded: true},
 		"natively settled": {settled: true},
 	} {
 		t.Run(name, func(t *testing.T) {

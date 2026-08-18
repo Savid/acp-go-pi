@@ -37,26 +37,6 @@ type lifecycleState struct {
 	vacancyProven bool
 }
 
-func (s *agentSession) lifecycleActive() bool {
-	s.lcMu.Lock()
-	defer s.lcMu.Unlock()
-
-	return s.lc.stream != nil && !s.lc.fenced
-}
-
-// lifecycleStreamID reports the incarnation the session currently speaks for,
-// or the empty string when it speaks for none.
-func (s *agentSession) lifecycleStreamID() string {
-	s.lcMu.Lock()
-	defer s.lcMu.Unlock()
-
-	if s.lc.stream == nil || s.lc.fenced {
-		return ""
-	}
-
-	return s.lc.stream.ID()
-}
-
 // openLifecycleStream mints a fresh incarnation for the current process
 // generation and states the whole truth it can: no turn, no activity, no
 // pending action, and the quiescence fact the last completed boundary actually
