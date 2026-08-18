@@ -75,6 +75,64 @@ func TestReservedLifecycleMetaRefusedOnEverySurface(t *testing.T) {
 	require.Error(t, cancelSession.cancelRouted(t.Context(), routedReserved))
 }
 
+// TestRouteValidationPrecedesTheReservedLifecycleRefusal pins the precedence on
+// every inbound surface that carries both the route envelope and the lifecycle
+// key: the authenticator runs before the placement rule, so a request that is
+// wrong in both ways reports the route verdict. One verdict, never an
+// implementation-defined choice between two.
+func TestRouteValidationPrecedesTheReservedLifecycleRefusal(t *testing.T) {
+	agent := NewAgent(testContainmentOption())
+	session := &agentSession{agent: agent, id: "route-precedence", cancel: func() {}, turnNonce: "active-turn"}
+
+	for name, meta := range map[string]map[string]any{
+		"absent route": {lifecycleMetaKey: map[string]any{}},
+		"malformed route": {
+			routeMetaKey:     map[string]any{routeFieldVer: 2, routeFieldTurn: "active-turn"},
+			lifecycleMetaKey: map[string]any{},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			requireRefusedField(t, routeMetaKey, session.cancelRouted(t.Context(), meta))
+
+			_, promptErr := session.Prompt(t.Context(), acp.PromptRequest{Meta: meta})
+			requireRefusedField(t, routeMetaKey, promptErr)
+		})
+	}
+
+	// A cancel additionally authenticates the nonce against the turn it names,
+	// and that authentication is still the route's verdict.
+	requireRefusedField(t, routeMetaKey,
+		session.cancelRouted(t.Context(), mergeRouteMeta(turnRouteMeta("stale-turn"), lifecycleMetaKey)))
+
+	// With the route valid the same request reports the lifecycle verdict, so
+	// the ordering above is precedence rather than the route swallowing the
+	// second defect.
+	requireRefusedField(t, lifecycle.MetaPath,
+		session.cancelRouted(t.Context(), mergeRouteMeta(turnRouteMeta("active-turn"), lifecycleMetaKey)))
+}
+
+// mergeRouteMeta adds the reserved lifecycle literal to a route envelope, which
+// is the combined case the precedence rule is about.
+func mergeRouteMeta(meta map[string]any, key string) map[string]any {
+	meta[key] = map[string]any{}
+
+	return meta
+}
+
+// requireRefusedField asserts which member a refusal named, which is the only
+// way a wire-silent surface can state which of two rules produced its verdict.
+func requireRefusedField(t *testing.T, field string, err error) {
+	t.Helper()
+
+	var requestError *acp.RequestError
+
+	require.ErrorAs(t, err, &requestError)
+
+	data, ok := requestError.Data.(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, field, data[jsonFieldField])
+}
+
 // TestProvenLifecycleFactsFollowTheContainmentBoundary pins that the
 // authoritative quiescence advertisement is resolved from the active
 // containment configuration, never asserted where the boundary cannot prove
