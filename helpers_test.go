@@ -16,6 +16,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
+	"github.com/savid/acp-go-pi/internal/lifecycle"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -539,4 +540,21 @@ func requireInvalidRequest(t *testing.T, err error) {
 	var requestError *acp.RequestError
 	require.ErrorAs(t, err, &requestError)
 	require.Equal(t, -32600, requestError.Code)
+}
+
+// lifecycleSession builds a session attached to a recording client with the
+// lifecycle extension negotiated, authoritative quiescence included only when
+// the test's containment boundary can prove whole-tree vacancy.
+func lifecycleSession(t *testing.T, authoritative bool) (*agentSession, *directAgentClient) {
+	t.Helper()
+	client := newDirectAgentClient()
+	agent := NewAgent(testContainmentOption())
+	agent.conn = client
+	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+	if authoritative {
+		agent.lifecycle.AuthoritativeQuiescence = true
+		agent.lifecycle.QuiescenceSource = lifecycle.ProofClassProcessContainment
+	}
+
+	return &agentSession{agent: agent, id: "lifecycle"}, client
 }

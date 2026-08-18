@@ -1,11 +1,7 @@
 package piacp
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
-
-	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
@@ -13,20 +9,6 @@ import (
 // lifecycleMetaKey is the family-reserved literal the session lifecycle
 // extension rides under on every surface that carries it.
 const lifecycleMetaKey = lifecycle.MetaKey
-
-const lifecycleFieldVersion = "version"
-
-const lifecycleFieldStreamID = "streamId"
-
-const lifecycleFieldAction = "action"
-
-const lifecycleFieldActionID = "actionId"
-
-const lifecycleOwnerIDKey = "id"
-
-const lifecycleOwnerKey = "owner"
-
-var lifecycleRandRead = rand.Read
 
 // provenLifecycleFacts resolves the answer for the active configuration from
 // the same code path that enforces containment, never from a compiled-in
@@ -158,45 +140,4 @@ func (a *Agent) lifecyclePromptCorrelation(meta map[string]any) (lifecycle.Submi
 	}
 
 	return submission, nil
-}
-
-// lifecycleActionMeta renders the action correlation value the agent stamps on
-// every permission and elicitation it emits while the extension is negotiated.
-// The action id is lifecycle identity only: it never routes or authorizes the
-// callback, which stays the reserved route envelope's job.
-func lifecycleActionMeta(streamID, actionID string, owner lifecycle.Owner) map[string]any {
-	return map[string]any{lifecycleMetaKey: map[string]any{
-		lifecycleFieldVersion:  lifecycle.Version,
-		lifecycleFieldStreamID: streamID,
-		lifecycleFieldAction: map[string]any{
-			lifecycleFieldActionID: actionID,
-			lifecycleOwnerKey:      map[string]any{jsonFieldType: string(owner.Type), lifecycleOwnerIDKey: owner.ID},
-		},
-	}}
-}
-
-// newLifecycleID mints one opaque lifecycle identifier. The identities this
-// adapter mints are adapter provenance: they name a stream, cycle, turn, or
-// action inside one incarnation and are never derived from a native id or from
-// the route nonce.
-func newLifecycleID(prefix string) (string, error) {
-	var data [16]byte
-	if _, err := lifecycleRandRead(data[:]); err != nil {
-		return "", err
-	}
-
-	return prefix + "-" + hex.EncodeToString(data[:]), nil
-}
-
-// lifecycleNotificationMeta is the envelope carrier's `_meta`. The envelope
-// rides the notification, never the update object's own per-entity metadata.
-func lifecycleNotificationMeta(envelope map[string]any) map[string]any {
-	return map[string]any{lifecycleMetaKey: envelope}
-}
-
-// lifecycleCarrier is the identity-only session_info_update every envelope
-// rides. It sets no title and no timestamp, so carrying an envelope mutates no
-// state a client reduces.
-func lifecycleCarrier() acp.SessionUpdate {
-	return acp.SessionUpdate{SessionInfoUpdate: &acp.SessionSessionInfoUpdate{}}
 }

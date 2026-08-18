@@ -83,6 +83,41 @@ lowercase hex characters, and a non-integer or negative `sizeBytes` are all
 rejected. See [Prompt streaming](/docs/core/prompt-streaming) for the
 verdicts.
 
+### Lifecycle
+
+`acp-go.dev/lifecycle` is the reserved `_meta` key for the session-lifecycle
+extension, alongside `acp-go.dev/route`, `acp-go.dev/mediaEnvelope`, and
+`acp-go.dev/handoff`. When a host offers `{"versions":[1]}` under
+`acp-go.dev/lifecycle` at initialize, the negotiated answer rides
+`InitializeResponse._meta` under the same key:
+
+```json
+{
+  "versions": [1],
+  "updatesOutsidePrompt": true,
+  "authoritativeQuiescence": false,
+  "activityKinds": []
+}
+```
+
+`updatesOutsidePrompt` is `true`: this adapter delivers `session/update`
+notifications whether or not a prompt is in flight. `authoritativeQuiescence`
+is `true` only under the Linux supervised containment boundary, where session
+close proves whole-tree vacancy; that answer adds `quiescenceSource:
+"process-containment"`, and every other boundary answers `false` and certifies
+no quiescence fact. `activityKinds` is empty because every native pi event is
+foreground work. An absent offer, or an offer with no common version, omits
+the key from the response and leaves the extension dormant.
+
+While negotiated, every lifecycle event rides a `session/update`
+notification's `_meta["acp-go.dev/lifecycle"]` on an identity-only
+`session_info_update` carrier, a prompt's submission identity rides the same
+key on `session/prompt`, and pending permission and elicitation requests carry
+their action correlation under it. On every surface that never carries the
+extension — session lifecycle requests included — the key is refused with an
+invalid-params error naming `_meta["acp-go.dev/lifecycle"]` rather than
+ignored.
+
 Every live-turn `session/update` and `_pi/rawEvent` notification carries the
 same exact `{version, turnNonce}` object in its notification `_meta`; raw-event
 payloads also carry their structural `sessionId`. Lifecycle and load-history

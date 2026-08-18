@@ -560,6 +560,27 @@ func TestReducerRefusesADeltaFromAnUnseenStream(t *testing.T) {
 	require.Equal(t, ViolationStaleStream, reducer.Failed().Kind)
 }
 
+// TestReducerRefusesASnapshotFromASupersededStream pins that supersession
+// fences an incarnation the same way close does: a snapshot bearing an identity
+// a later incarnation already superseded resurrects nothing, and the standing
+// projection is untouched.
+func TestReducerRefusesASnapshotFromASupersededStream(t *testing.T) {
+	t.Parallel()
+
+	reducer := NewReducer(Options{Negotiated: richConfiguration()})
+	require.NoError(t, reducer.Reduce(deliver(1, openSnapshot())))
+
+	successor := deliver(1, openSnapshot())
+	successor.StreamID = "strm-next"
+	require.NoError(t, reducer.Reduce(successor))
+	before := reducer.State()
+
+	resurrection := deliver(2, openSnapshot())
+	require.Error(t, reducer.Reduce(resurrection))
+	require.Equal(t, ViolationStaleStream, reducer.Failed().Kind)
+	require.Equal(t, before, reducer.State())
+}
+
 // TestRefusedForeignSnapshotPreservesTheProvenProjection pins incarnation
 // replacement as an atomic operation: an invalid successor latches its refusal
 // without erasing the last whole state this reducer proved.

@@ -19,7 +19,9 @@ type Options struct {
 //
 // One reducer follows one session across incarnations. A snapshot bearing a new
 // stream identity supersedes the previous incarnation and starts a fresh
-// projection; every other event on a foreign or fenced stream is stale.
+// projection; a snapshot bearing an identity a later incarnation already
+// superseded is a resurrection and is stale, as is every other event on a
+// foreign or fenced stream.
 //
 // The one advertised fact it cannot check is `updatesOutsidePrompt`: no fact on
 // the ordered stream expresses whether a prompt is in flight, so that obligation
@@ -54,6 +56,11 @@ type Reducer struct {
 	// a blocker blocks the cycle current at its first sight, and that cycle may
 	// not move again until the blocker terminalizes.
 	actionCycle map[string]string
+	// retired records every stream identity an incarnation of this session
+	// superseded. Retirement is permanent: a retired identity never opens again,
+	// so a snapshot bearing one is an event from a dead incarnation, not a fresh
+	// stream.
+	retired map[string]struct{}
 }
 
 // NewReducer builds a reducer for one session.
@@ -147,16 +154,29 @@ func (r *Reducer) Reduce(delivery Delivery) error {
 	return nil
 }
 
-// reduceForeign admits the next incarnation. Only its opening snapshot may arrive
-// on a stream identity this reducer has not seen; a projection is per incarnation
-// and adopts nothing from the one it supersedes. A closed session admits no
-// incarnation at all, which is why the fence is judged before this.
+// reduceForeign admits the next incarnation. Only its opening snapshot may
+// arrive on a stream identity this reducer has not seen; a projection is per
+// incarnation and adopts nothing from the one it supersedes. An identity an
+// earlier incarnation retired stays retired: supersession fenced it, so a
+// snapshot bearing it resurrects nothing and is stale like any other event
+// from a dead incarnation. A closed session admits no incarnation at all,
+// which is why the fence is judged before this.
 func (r *Reducer) reduceForeign(delivery Delivery) error {
+	if _, dead := r.retired[delivery.StreamID]; dead {
+		return r.fail(delivery, ViolationStaleStream, "stream "+delivery.StreamID+" was superseded")
+	}
+
 	if delivery.Event.Type != EventSnapshot {
 		return r.fail(delivery, ViolationStaleStream, "stream is "+r.state.StreamID)
 	}
 
 	next := NewReducer(Options{Negotiated: r.negotiated})
+	for streamID := range r.retired {
+		next.retired[streamID] = struct{}{}
+	}
+
+	next.retired[r.state.StreamID] = struct{}{}
+
 	if err := next.reduceFirst(delivery); err != nil {
 		r.failed = next.failed
 
@@ -179,6 +199,7 @@ func (r *Reducer) reset(streamID string) {
 	r.activitySeen = make(map[string]uint64)
 	r.blockedCycle = ""
 	r.actionCycle = make(map[string]string)
+	r.retired = make(map[string]struct{})
 }
 
 func (r *Reducer) reduceFirst(delivery Delivery) error {
