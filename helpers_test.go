@@ -342,6 +342,22 @@ func (c *directAgentClient) NotifyExtension(_ context.Context, _ string, value a
 	return c.notifyErr
 }
 
+// lifecycleFailingClient fails only the notifications that carry a lifecycle
+// envelope, so a test can break the lifecycle stream while every ordinary
+// update still lands.
+type lifecycleFailingClient struct {
+	*directAgentClient
+	err error
+}
+
+func (c *lifecycleFailingClient) SessionUpdate(ctx context.Context, notification acp.SessionNotification) error {
+	if _, carries := notification.Meta[lifecycleMetaKey]; carries {
+		return c.err
+	}
+
+	return c.directAgentClient.SessionUpdate(ctx, notification)
+}
+
 type appendControlledStore struct {
 	SessionStore
 	mu       sync.Mutex

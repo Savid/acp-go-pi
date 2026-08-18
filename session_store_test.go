@@ -128,3 +128,26 @@ func TestListSessionsFallsBackToSessionIDOrder(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "a", summaries[0].SessionID)
 }
+
+// TestReplaceAfterDeleteStaysTombstoned pins that a delete is final: a
+// replacement landing after it installs nothing, so no session the host was
+// told is gone can answer again.
+func TestReplaceAfterDeleteStaysTombstoned(t *testing.T) {
+	store := NewInMemorySessionStore()
+	main := SessionKey{SessionID: "one"}
+	sub := SessionKey{SessionID: "one", Subpath: SessionStoreLifecycleSubpath}
+
+	require.NoError(t, store.Append(t.Context(), main, []SessionStoreEntry{json.RawMessage(`{}`)}))
+	require.NoError(t, store.Delete(t.Context(), main))
+	require.NoError(t, store.Replace(t.Context(), main, []SessionStoreReplacement{
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"replacement":true}`)}},
+		{Key: sub, Entries: []SessionStoreEntry{json.RawMessage(`{}`)}},
+	}))
+
+	loaded, err := store.Load(t.Context(), main)
+	require.NoError(t, err)
+	require.Empty(t, loaded)
+	loaded, err = store.Load(t.Context(), sub)
+	require.NoError(t, err)
+	require.Empty(t, loaded)
+}

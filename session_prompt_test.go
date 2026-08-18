@@ -14,6 +14,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
+	"github.com/savid/acp-go-pi/internal/lifecycle"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -466,4 +467,90 @@ func TestPromptAndSettlementErrorBranches(t *testing.T) {
 	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
 	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675",
 		anyMap(t, response.Meta[piMetaKey])[jsonFieldMessageID])
+}
+
+// TestPromptRejectsMalformedLifecycleCorrelation pins the validation order:
+// the lifecycle submission identity is validated right after the route, so a
+// negotiated prompt carrying neither a valid version nor a valid submission
+// fails before admission and creates neither submission nor turn.
+func TestPromptRejectsMalformedLifecycleCorrelation(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+	session := &agentSession{agent: agent, id: "id", client: newStubPiClient(), proc: newStubProcess(false)}
+
+	missing := TextPromptRequest("id", "turn", "hi")
+	_, err := session.Prompt(t.Context(), missing)
+	require.Error(t, err, "a negotiated prompt without its correlation fails")
+
+	malformed := TextPromptRequest("id", "turn", "hi")
+	malformed.Meta[lifecycleMetaKey] = decodeMeta(t, `{"version":1.5}`)
+	_, err = session.Prompt(t.Context(), malformed)
+	require.Error(t, err, "a fractional version is no negotiated version")
+}
+
+// decodeMeta decodes a lifecycle correlation value the way the wire delivers
+// it, so numbers arrive as the float64 a real host's decoder produces.
+func decodeMeta(t *testing.T, raw string) map[string]any {
+	t.Helper()
+	var meta map[string]any
+	require.NoError(t, json.Unmarshal([]byte(raw), &meta))
+
+	return meta
+}
+
+// TestPromptAcceptanceDeliveryFailureFailsTheTurn pins that a prompt whose
+// prompt_accepted event cannot be delivered still runs the whole settlement
+// order and answers with the failure: the incarnation fences, the boundary
+// record commits, and no terminal idle is published.
+func TestPromptAcceptanceDeliveryFailureFailsTheTurn(t *testing.T) {
+	store := NewInMemorySessionStore()
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+	connection := newDirectAgentClient()
+	agent.setConnection(connection)
+	session := &agentSession{agent: agent, id: "id", client: newStubPiClient(), proc: newStubProcess(false)}
+	require.NoError(t, session.openLifecycleStream(t.Context(), 0))
+
+	connection.updateErr = errors.New("accept delivery")
+	request := TextPromptRequest("id", "turn", "hi")
+	request.Meta[lifecycleMetaKey] = decodeMeta(t, `{"version":1,"submission":{"submissionId":"submission","clientNonce":"nonce"}}`)
+	_, err := session.Prompt(t.Context(), request)
+	require.ErrorContains(t, err, "accept delivery")
+	require.True(t, session.lc.fenced, "an undeliverable acceptance fences the incarnation")
+
+	entries, loadErr := store.Load(t.Context(), SessionKey{SessionID: "id", Subpath: SessionStoreLifecycleSubpath})
+	require.NoError(t, loadErr)
+	require.Len(t, entries, 1, "the failed cycle still records how the incarnation ended")
+	require.Contains(t, string(entries[0]), `"outcome":"failed"`)
+}
+
+// TestAwaitSettlementWaitsForTheWholeOrder pins the latch semantics: close and
+// delete block until settlement has finished the whole order and then observe
+// its result, and a completed latch settles nothing twice.
+func TestAwaitSettlementWaitsForTheWholeOrder(t *testing.T) {
+	session := &agentSession{}
+	require.NoError(t, session.awaitSettlement(), "no armed settlement settles nothing")
+
+	session.openSettlement()
+	settleErr := errors.New("settlement commit failed")
+	done := make(chan error, 1)
+	go func() { done <- session.awaitSettlement() }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("awaitSettlement returned before the order completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	session.completeSettlement(settleErr)
+	require.ErrorIs(t, <-done, settleErr)
+	require.NoError(t, session.awaitSettlement(), "a completed latch is consumed")
+}
+
+func TestTurnOutcomeForStopReason(t *testing.T) {
+	require.Equal(t, lifecycle.OutcomeLimit, turnOutcomeForStopReason(acp.StopReasonMaxTokens))
+	require.Equal(t, lifecycle.OutcomeLimit, turnOutcomeForStopReason(acp.StopReasonMaxTurnRequests))
+	require.Equal(t, lifecycle.OutcomeCancelled, turnOutcomeForStopReason(acp.StopReasonCancelled))
+	require.Equal(t, lifecycle.OutcomeRefused, turnOutcomeForStopReason(acp.StopReasonRefusal))
+	require.Equal(t, lifecycle.OutcomeSuccess, turnOutcomeForStopReason(acp.StopReasonEndTurn))
 }

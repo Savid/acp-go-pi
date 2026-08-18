@@ -189,3 +189,16 @@ func TestClearCommandsAndPoisonEmitFailures(t *testing.T) {
 	require.Error(t, session.poison(t.Context(), "broken"))
 	require.Equal(t, "text", liveSessionTitleFromPrompt([]acp.ContentBlock{{}, acp.TextBlock("text")}))
 }
+
+// TestAvailableCommandsUpdateSilentBeforeAnyCatalog pins that without a force
+// the adapter says nothing before pi has advertised a first catalog: silence
+// there is not an answer a host may read as an empty catalog.
+func TestAvailableCommandsUpdateSilentBeforeAnyCatalog(t *testing.T) {
+	connection := newDirectAgentClient()
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	agent.setConnection(connection)
+	session := &agentSession{agent: agent, id: "id"}
+
+	require.NoError(t, session.emitAvailableCommandsUpdate(t.Context(), false))
+	require.Empty(t, connection.notifications)
+}

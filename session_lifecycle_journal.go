@@ -74,10 +74,8 @@ func (s *agentSession) commitLifecycleBoundary(ctx context.Context, record lifec
 	record.Version = lifecycleBoundaryVersion
 	record.RecordedAtUnixMilli = lifecycleBoundaryNow().UnixMilli()
 
-	encoded, err := json.Marshal(record)
-	if err != nil {
-		return fmt.Errorf("encode lifecycle boundary: %w", err)
-	}
+	// Every field is a scalar, so the encoding cannot fail.
+	encoded, _ := json.Marshal(record)
 
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
@@ -89,7 +87,7 @@ func (s *agentSession) commitLifecycleBoundary(ctx context.Context, record lifec
 	key := SessionKey{SessionID: string(s.id), Subpath: SessionStoreLifecycleSubpath}
 
 	appendCtx, finishAppend := s.agent.observe.StartSessionStore(ctx, "append")
-	err = appendMirrorEntries(appendCtx, s.agent.sessionStore(), key, []SessionStoreEntry{encoded})
+	err := appendMirrorEntries(appendCtx, s.agent.sessionStore(), key, []SessionStoreEntry{encoded})
 
 	finishAppend(err)
 

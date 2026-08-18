@@ -1157,3 +1157,29 @@ func TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel(t *testing.T) {
 			"session %s did not keep its own model", test.cwd)
 	}
 }
+
+// TestDeleteSessionReportsAnInFlightSettlementFailure pins the delete order:
+// the tombstone serializes after the session's full settlement, and a
+// settlement that failed its order fails the delete rather than letting a
+// tombstone hide a boundary the store never recorded.
+func TestDeleteSessionReportsAnInFlightSettlementFailure(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	session := &agentSession{
+		agent:       agent,
+		id:          "id",
+		proc:        newStubProcess(false),
+		sessionRoot: t.TempDir(),
+	}
+	agent.sessions["id"] = session
+	session.openSettlement()
+
+	settleErr := errors.New("settlement commit failed")
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		session.completeSettlement(settleErr)
+	}()
+
+	_, err := agent.UnstableDeleteSession(t.Context(), acp.UnstableDeleteSessionRequest{SessionId: "id"})
+	require.ErrorIs(t, err, settleErr)
+	require.NotContains(t, agent.sessions, acp.SessionId("id"))
+}

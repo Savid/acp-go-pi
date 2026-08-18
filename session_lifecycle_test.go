@@ -14,6 +14,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
+	"github.com/savid/acp-go-pi/internal/lifecycle"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -1042,4 +1043,76 @@ func TestRelaunchAdmissionFailureBranches(t *testing.T) {
 		prepareRelaunchFixture(t, session)
 		require.ErrorIs(t, session.relaunchProcess(t.Context()), wantErr)
 	})
+}
+
+// TestRelaunchPublicationFailureBranches pins the late relaunch failures:
+// once the replacement process is live, a catalog fetch, catalog publication,
+// or lifecycle stream that cannot complete retires the whole replacement
+// generation rather than adopting a session whose published state would
+// diverge from the live process.
+func TestRelaunchPublicationFailureBranches(t *testing.T) {
+	base := func(client *stubPiClient) (*agentSession, *Agent) {
+		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+		session := &agentSession{agent: agent, id: "id", proc: newStubProcess(true), client: newStubPiClient()}
+		prepareRelaunchFixture(t, session)
+		relaunched := newStubProcess(false)
+		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+			return relaunched, client, nil
+		}
+
+		return session, agent
+	}
+
+	t.Run("catalog fetch", func(t *testing.T) {
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "id"}
+		client.commandsErr = errors.New("commands")
+		session, _ := base(client)
+		require.ErrorContains(t, session.relaunchProcess(t.Context()), "commands")
+	})
+
+	t.Run("catalog publication", func(t *testing.T) {
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "id"}
+		session, agent := base(client)
+		connection := newDirectAgentClient()
+		connection.updateErr = errors.New("catalog delivery")
+		agent.setConnection(connection)
+		require.ErrorContains(t, session.relaunchProcess(t.Context()), "catalog delivery")
+	})
+
+	t.Run("lifecycle stream", func(t *testing.T) {
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "id"}
+		session, agent := base(client)
+		agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+		agent.setConnection(&lifecycleFailingClient{directAgentClient: newDirectAgentClient(), err: errors.New("stream delivery")})
+		require.ErrorContains(t, session.relaunchProcess(t.Context()), "stream delivery")
+	})
+}
+
+// TestRelaunchRecordsGenerationLossBeforeLaunch pins the ordering at the head
+// of a relaunch: the lost generation's boundary is recorded before the
+// replacement launches, and a store that cannot record it stops the relaunch
+// before any native root is admitted.
+func TestRelaunchRecordsGenerationLossBeforeLaunch(t *testing.T) {
+	store := newFaultySessionStore()
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+	agent.setConnection(newDirectAgentClient())
+	session := &agentSession{agent: agent, id: "id", proc: newStubProcess(true), client: newStubPiClient()}
+	prepareRelaunchFixture(t, session)
+	require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+
+	spawns := 0
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		spawns++
+
+		return newStubProcess(false), newStubPiClient(), nil
+	}
+	store.appendErr = errors.New("durability unavailable")
+
+	require.ErrorIs(t, session.relaunchProcess(t.Context()), errLifecycleBoundaryCommit)
+	require.True(t, session.lc.fenced, "the lost generation's stream ends even when its record cannot commit")
+	require.Zero(t, spawns, "an unrecorded generation loss admits no replacement")
 }
