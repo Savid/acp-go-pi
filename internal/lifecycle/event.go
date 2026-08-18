@@ -149,8 +149,10 @@ type ActivityUpdate struct {
 	OriginTurnID string
 	RunID        string
 	// Progress is the one member whose interior this contract does not fix: an
-	// opaque object a host renders and never reduces. It still takes part in the
-	// duplicate comparison, which the whole-frame fingerprint covers.
+	// opaque object a host renders and never reduces. It still takes part in
+	// both comparisons this extension makes — the whole-notification one a
+	// retransmission is judged under, and the member-wise one a terminal
+	// restatement is judged under — under lifecycle value equality.
 	Progress json.RawMessage
 }
 
@@ -203,9 +205,11 @@ type Delivery struct {
 	Carrier  CarrierClass
 	Event    Event
 	// Frame is the whole delivered notification as a decoded value — envelope and
-	// carrier together. Comparing decoded values is what distinguishes an exact
+	// carrier together, with numbers retained as their lexemes. Comparing decoded
+	// values under lifecycle value equality is what distinguishes an exact
 	// retransmission from a conflicting reuse of the same identity: key order and
-	// insignificant whitespace are never differences, and nothing has to retain
-	// raw bytes for the life of a session.
+	// insignificant whitespace are never differences, numbers compare as exact
+	// mathematical values, and nothing has to retain raw bytes for the life of a
+	// session.
 	Frame any
 }

@@ -401,10 +401,14 @@ func TestActionRules(t *testing.T) {
 			actionEvent(ActionUpdate{ActionID: "req-1", State: ActionDeclined}))...)
 }
 
-// TestTerminalEntitiesRefuseEveryLaterSequence pins terminality rather than only
-// terminal state: once an activity or action resolves, a distinct later frame
-// cannot restate that state while changing progress or resolving it again.
-func TestTerminalEntitiesRefuseEveryLaterSequence(t *testing.T) {
+// TestTerminalEntitiesRefuseEveryCarriedDifference pins terminality rather than
+// only terminal state: once an activity or action resolves, any member a later
+// frame carries that differs from the reduced terminal record is refused,
+// whether that member is the state, the opaque progress object, or an immutable
+// restated at other than its first-sight value. The immutable case is still
+// reported against the terminal entity, because a token naming a terminal
+// entity outranks one naming a live identity.
+func TestTerminalEntitiesRefuseEveryCarriedDifference(t *testing.T) {
 	t.Parallel()
 
 	accepted := Event{Type: EventPromptAccepted, PromptAccepted: &PromptAccepted{
@@ -419,8 +423,9 @@ func TestTerminalEntitiesRefuseEveryLaterSequence(t *testing.T) {
 			Cause: CauseSubmission, OriginTurnID: "turn-1",
 		}
 		for name, later := range map[string]ActivityUpdate{
-			"identical":        {ActivityID: "act-1", State: ActivityCompleted},
+			"changed state":    {ActivityID: "act-1", State: ActivityFailed},
 			"changed progress": {ActivityID: "act-1", State: ActivityCompleted, Progress: json.RawMessage(`{"done":true}`)},
+			"changed kind":     {ActivityID: "act-1", Kind: ActivitySubagent, State: ActivityCompleted},
 		} {
 			t.Run(name, func(t *testing.T) {
 				t.Parallel()
@@ -450,8 +455,9 @@ func TestTerminalEntitiesRefuseEveryLaterSequence(t *testing.T) {
 			Owner: Owner{Type: OwnerTurn, ID: "turn-1"}, BlocksForeground: stated(false),
 		}
 		for name, later := range map[string]ActionUpdate{
-			"identical":          {ActionID: "req-1", State: ActionAccepted},
 			"different terminal": {ActionID: "req-1", State: ActionDeclined},
+			"changed owner":      {ActionID: "req-1", State: ActionAccepted, Owner: Owner{Type: OwnerTurn, ID: "turn-9"}},
+			"changed blocking":   {ActionID: "req-1", State: ActionAccepted, BlocksForeground: stated(true)},
 		} {
 			t.Run(name, func(t *testing.T) {
 				t.Parallel()
@@ -471,6 +477,104 @@ func TestTerminalEntitiesRefuseEveryLaterSequence(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestTerminalEntitiesSuppressNoOpRestatement pins the other half of the
+// member-wise rule: a restatement that carries no difference from the reduced
+// terminal record consumes its sequence and changes nothing. It is not counted
+// as a retransmission — that member counts reused identities — and it begins no
+// work, so it neither raises the floor a quiescence proof must clear nor says
+// anything against a standing certification. Omission is not a difference: the
+// minimal patch that terminalized an activity is a no-op again at the next
+// sequence even though the record still holds every member it never mentions.
+func TestTerminalEntitiesSuppressNoOpRestatement(t *testing.T) {
+	t.Parallel()
+
+	accepted := Event{Type: EventPromptAccepted, PromptAccepted: &PromptAccepted{
+		SubmissionID: "sub-1", ClientNonce: "non-1", TurnID: "turn-1",
+	}}
+	first := ActivityUpdate{
+		ActivityID: "act-1", Kind: ActivityTask, State: ActivityRunning,
+		Cause: CauseSubmission, OriginTurnID: "turn-1", Progress: json.RawMessage(`{"stage":"scanning"}`),
+	}
+
+	for name, later := range map[string]ActivityUpdate{
+		"minimal patch":      {ActivityID: "act-1", State: ActivityCompleted},
+		"restated immutable": {ActivityID: "act-1", Kind: ActivityTask, State: ActivityCompleted, OriginTurnID: "turn-1"},
+		"identical progress": {ActivityID: "act-1", State: ActivityCompleted, Progress: json.RawMessage(`{"stage":"scanning"}`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			reducer, refusal := reduceAll(t, richConfiguration(),
+				openSnapshot(), accepted, RunningEvent("cyc-1", "turn-1"),
+				activityEvent(first),
+				activityEvent(ActivityUpdate{ActivityID: "act-1", State: ActivityCompleted}),
+				activityEvent(later),
+			)
+			require.Nil(t, refusal)
+
+			state := reducer.State()
+			require.Equal(t, uint64(6), state.ReducedThrough, "the suppressed restatement consumed its sequence")
+			require.Zero(t, state.SuppressedRetransmissions)
+
+			activity, found := state.Activity("act-1")
+			require.True(t, found)
+			require.Equal(t, ActivityCompleted, activity.State)
+			require.JSONEq(t, `{"stage":"scanning"}`, string(activity.Progress))
+		})
+	}
+
+	t.Run("action", func(t *testing.T) {
+		t.Parallel()
+
+		reducer, refusal := reduceAll(t, richConfiguration(),
+			openSnapshot(), accepted, RunningEvent("cyc-1", "turn-1"),
+			actionEvent(ActionUpdate{
+				ActionID: "req-1", Kind: ActionPermission, State: ActionPending,
+				Owner: Owner{Type: OwnerTurn, ID: "turn-1"}, BlocksForeground: stated(false),
+			}),
+			actionEvent(ActionUpdate{ActionID: "req-1", State: ActionAccepted}),
+			actionEvent(ActionUpdate{ActionID: "req-1", Kind: ActionPermission, State: ActionAccepted}),
+		)
+		require.Nil(t, refusal)
+		require.Zero(t, reducer.State().SuppressedRetransmissions)
+
+		action, found := reducer.State().Action("req-1")
+		require.True(t, found)
+		require.Equal(t, ActionAccepted, action.State)
+	})
+}
+
+// TestSuppressedRestatementLeavesTheQuiescenceFloorWhereItStood pins the
+// watermark consequence: a no-op restatement begins nothing, so a proof whose
+// watermark covers the terminal idle but stops below the restatement still
+// certifies the boundary rather than reporting false quiescence.
+func TestSuppressedRestatementLeavesTheQuiescenceFloorWhereItStood(t *testing.T) {
+	t.Parallel()
+
+	accepted := Event{Type: EventPromptAccepted, PromptAccepted: &PromptAccepted{
+		SubmissionID: "sub-1", ClientNonce: "non-1", TurnID: "turn-1",
+	}}
+
+	reducer, refusal := reduceAll(t, richConfiguration(),
+		openSnapshot(), accepted, RunningEvent("cyc-1", "turn-1"),
+		activityEvent(ActivityUpdate{
+			ActivityID: "act-1", Kind: ActivityTask, State: ActivityRunning,
+			Cause: CauseSubmission, OriginTurnID: "turn-1",
+		}),
+		activityEvent(ActivityUpdate{ActivityID: "act-1", State: ActivityCompleted}),
+		IdleEvent("cyc-1", "turn-1", StopReasonEndTurn, OutcomeSuccess),
+		activityEvent(ActivityUpdate{ActivityID: "act-1", State: ActivityCompleted}),
+		QuiescenceEvent(QuiescenceFact{
+			Quiescent: true, Source: ProofClassProcessContainment, Watermark: 6, Barrier: "contained-exit-1",
+		}),
+	)
+	require.Nil(t, refusal)
+
+	state := reducer.State()
+	require.True(t, state.Quiescence.Certified)
+	require.Equal(t, uint64(6), state.Quiescence.Watermark)
 }
 
 // TestTerminalActionOnFirstSightNeverBlocks pins that an action already resolved

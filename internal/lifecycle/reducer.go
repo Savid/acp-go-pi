@@ -3,7 +3,6 @@ package lifecycle
 import (
 	"encoding/json"
 	"errors"
-	"reflect"
 )
 
 // Options configures a reducer.
@@ -35,9 +34,11 @@ type Reducer struct {
 	base       uint64
 	started    bool
 	failed     *ViolationError
-	// frames holds every decoded notification this incarnation reduced. Wholesale
-	// idempotence has no window: an exact retransmission is suppressed however far
-	// back its identity was reduced, and the retention ends with the incarnation.
+	// frames holds every decoded notification this incarnation reduced, including
+	// the ones a suppressed no-op restatement consumed: a consumed sequence still
+	// establishes content identity for a later duplicate comparison. Wholesale
+	// idempotence has no window — an exact retransmission is suppressed however far
+	// back its identity was reduced — and the retention ends with the incarnation.
 	frames map[uint64]any
 	// lastTransition is the highest sequence carrying a transition a quiescence
 	// proof must cover before it can certify a boundary.
@@ -122,7 +123,8 @@ func (r *Reducer) nameStream(streamID string) {
 // it is judged before ordering: an envelope on a carrier a conformant client may
 // coalesce is no evidence the sequence it claims was ever delivered. An exact
 // retransmission of an already-reduced identity is suppressed wholesale and
-// returns nil without changing the projection.
+// returns nil without changing the projection; so is a no-op restatement of an
+// entity already terminal, which consumes a new sequence instead of reusing one.
 func (r *Reducer) Reduce(delivery Delivery) error {
 	switch {
 	case r.failed != nil:
@@ -224,7 +226,7 @@ func (r *Reducer) reduceFirst(delivery Delivery) error {
 }
 
 func (r *Reducer) reduceDuplicate(delivery Delivery) error {
-	if recorded, known := r.frames[delivery.Sequence]; known && reflect.DeepEqual(recorded, delivery.Frame) {
+	if recorded, known := r.frames[delivery.Sequence]; known && valueEqual(recorded, delivery.Frame) {
 		r.state.SuppressedRetransmissions++
 
 		return nil

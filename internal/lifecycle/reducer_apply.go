@@ -57,14 +57,24 @@ func (r *Reducer) checkSnapshot(delivery Delivery, snapshot Snapshot) error {
 
 // checkSnapshotActivities validates the asserted activity set. The set is the
 // complete nonterminal one, so an entry that is already terminal asserts as
-// current a state that is over.
+// current a state that is over, and an id listed twice asserts two current
+// states for one entity — malformed whether or not the two entries agree,
+// because a whole-state assertion is judged whole rather than deduplicated.
 func (r *Reducer) checkSnapshotActivities(delivery Delivery, snapshot Snapshot, introduced introductions) error {
+	listed := make(map[string]struct{}, len(snapshot.Activities))
+
 	for index := range snapshot.Activities {
 		activity := &snapshot.Activities[index]
 
 		if err := r.checkActivityIdentity(delivery, *activity); err != nil {
 			return err
 		}
+
+		if _, repeated := listed[activity.ActivityID]; repeated {
+			return r.fail(delivery, ViolationMalformedEnvelope, "activity "+activity.ActivityID+" is listed twice")
+		}
+
+		listed[activity.ActivityID] = struct{}{}
 
 		if activity.State.Terminal() {
 			return r.fail(delivery, ViolationMalformedEnvelope, "activity "+activity.ActivityID+" is terminal")
@@ -78,11 +88,23 @@ func (r *Reducer) checkSnapshotActivities(delivery Delivery, snapshot Snapshot, 
 	return nil
 }
 
+// checkSnapshotActions validates the asserted action set under the same rules.
+// Uniqueness is per set because activities and actions are distinct id spaces:
+// the same opaque string naming an activity in one set and an action in the
+// other is two entities, not a collision.
 func (r *Reducer) checkSnapshotActions(delivery Delivery, snapshot Snapshot, introduced introductions) error {
+	listed := make(map[string]struct{}, len(snapshot.Actions))
+
 	for _, action := range snapshot.Actions {
 		if err := r.checkActionIdentity(delivery, action); err != nil {
 			return err
 		}
+
+		if _, repeated := listed[action.ActionID]; repeated {
+			return r.fail(delivery, ViolationMalformedEnvelope, "action "+action.ActionID+" is listed twice")
+		}
+
+		listed[action.ActionID] = struct{}{}
 
 		if action.State.Terminal() {
 			return r.fail(delivery, ViolationMalformedEnvelope, "action "+action.ActionID+" is terminal")
@@ -342,11 +364,11 @@ func (r *Reducer) applyActivityUpdate(delivery Delivery) error {
 		return r.fail(delivery, ViolationMalformedEnvelope, "the activity payload is missing")
 	}
 
-	r.lastTransition = delivery.Sequence
-
 	if r.activityIndex(update.ActivityID) >= 0 {
 		return r.patchActivity(delivery, *update)
 	}
+
+	r.lastTransition = delivery.Sequence
 
 	if err := r.checkActivityIdentity(delivery, *update); err != nil {
 		return err
@@ -445,13 +467,27 @@ func (r *Reducer) checkActivityParent(delivery Delivery, activityID, parentID st
 // patchActivity applies a later update, which may change only state and progress.
 // A restated immutable field is permitted only with its first-sight value, and
 // changes nothing.
+//
+// An update naming an already-terminal activity is judged member-wise against
+// the reduced terminal record instead: every member it carries must equal that
+// record, and an omitted member is not a difference. A no-op restatement is
+// suppressed — it consumes its sequence and establishes content identity there
+// for a later duplicate comparison, but it begins no work, so it neither raises
+// the floor a quiescence proof must clear nor says anything against a standing
+// certification.
 func (r *Reducer) patchActivity(delivery Delivery, update ActivityUpdate) error {
 	index := r.activityIndex(update.ActivityID)
 
 	existing := r.state.Activities[index]
 	if existing.State.Terminal() {
-		return r.fail(delivery, ViolationPostTerminalMutation, "activity "+existing.ActivityID+" is terminal")
+		if detail := terminalActivityDifference(existing, update); detail != "" {
+			return r.fail(delivery, ViolationPostTerminalMutation, detail)
+		}
+
+		return nil
 	}
+
+	r.lastTransition = delivery.Sequence
 
 	if detail := immutableActivityConflict(existing, update); detail != "" {
 		return r.fail(delivery, ViolationImmutableIdentityChange, detail)
@@ -474,6 +510,26 @@ func (r *Reducer) patchActivity(delivery Delivery, update ActivityUpdate) error 
 	}
 
 	return nil
+}
+
+// terminalActivityDifference names the first member a delivery carries that
+// differs from the reduced terminal record, or the empty string when it carries
+// none. An immutable restated at other than its first-sight value is such a
+// difference, and it is still reported against the terminal entity: a token
+// naming a terminal entity always outranks one naming a live identity.
+func terminalActivityDifference(existing ActivityRecord, update ActivityUpdate) string {
+	if detail := immutableActivityConflict(existing, update); detail != "" {
+		return detail
+	}
+
+	switch {
+	case update.State != existing.State:
+		return "activity " + update.ActivityID + " is terminal and changed state"
+	case update.Progress != nil && !progressEqual(update.Progress, existing.Progress):
+		return "activity " + update.ActivityID + " is terminal and changed progress"
+	default:
+		return ""
+	}
 }
 
 // checkDescendantsTerminal refuses a parent that would terminalize while part of
@@ -519,11 +575,11 @@ func (r *Reducer) applyActionUpdate(delivery Delivery) error {
 		return r.fail(delivery, ViolationMalformedEnvelope, "the action payload is missing")
 	}
 
-	r.lastTransition = delivery.Sequence
-
 	if r.actionIndex(update.ActionID) >= 0 {
 		return r.patchAction(delivery, *update)
 	}
+
+	r.lastTransition = delivery.Sequence
 
 	if err := r.checkActionIdentity(delivery, *update); err != nil {
 		return err
@@ -607,23 +663,25 @@ func (r *Reducer) blockForeground(update ActionUpdate) {
 	}
 }
 
+// patchAction applies a later update to an action. A terminal action is judged
+// member-wise like a terminal activity: a no-op restatement is suppressed and
+// any carried difference is a post-terminal mutation.
 func (r *Reducer) patchAction(delivery Delivery, update ActionUpdate) error {
 	index := r.actionIndex(update.ActionID)
 
 	existing := r.state.Actions[index]
 	if existing.State.Terminal() {
-		return r.fail(delivery, ViolationPostTerminalMutation, "action "+update.ActionID+" is terminal")
+		if detail := terminalActionDifference(existing, update); detail != "" {
+			return r.fail(delivery, ViolationPostTerminalMutation, detail)
+		}
+
+		return nil
 	}
 
-	switch {
-	case update.Kind != "" && update.Kind != existing.Kind:
-		return r.fail(delivery, ViolationImmutableIdentityChange, "action "+update.ActionID+" changed kind")
-	case update.Owner.ID != "" && update.Owner != existing.Owner:
-		return r.fail(delivery, ViolationImmutableIdentityChange, "action "+update.ActionID+" changed owner")
-	case update.RunID != "" && update.RunID != existing.RunID:
-		return r.fail(delivery, ViolationImmutableIdentityChange, "action "+update.ActionID+" changed ownership root")
-	case update.BlocksForeground != nil && *update.BlocksForeground != existing.BlocksForeground:
-		return r.fail(delivery, ViolationImmutableIdentityChange, "action "+update.ActionID+" changed what it blocks")
+	r.lastTransition = delivery.Sequence
+
+	if detail := immutableActionConflict(existing, update); detail != "" {
+		return r.fail(delivery, ViolationImmutableIdentityChange, detail)
 	}
 
 	r.state.Actions[index].State = update.State
@@ -633,6 +691,36 @@ func (r *Reducer) patchAction(delivery Delivery, update ActionUpdate) error {
 	}
 
 	return nil
+}
+
+func immutableActionConflict(existing ActionRecord, update ActionUpdate) string {
+	switch {
+	case update.Kind != "" && update.Kind != existing.Kind:
+		return "action " + update.ActionID + " changed kind"
+	case update.Owner.ID != "" && update.Owner != existing.Owner:
+		return "action " + update.ActionID + " changed owner"
+	case update.RunID != "" && update.RunID != existing.RunID:
+		return "action " + update.ActionID + " changed ownership root"
+	case update.BlocksForeground != nil && *update.BlocksForeground != existing.BlocksForeground:
+		return "action " + update.ActionID + " changed what it blocks"
+	default:
+		return ""
+	}
+}
+
+// terminalActionDifference names the first member a delivery carries that
+// differs from the reduced terminal record, or the empty string when it carries
+// none.
+func terminalActionDifference(existing ActionRecord, update ActionUpdate) string {
+	if detail := immutableActionConflict(existing, update); detail != "" {
+		return detail
+	}
+
+	if update.State != existing.State {
+		return "action " + update.ActionID + " is terminal and changed state"
+	}
+
+	return ""
 }
 
 // applyQuiescence reduces a standalone quiescence fact. The event asserts the
