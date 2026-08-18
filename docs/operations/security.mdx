@@ -111,7 +111,7 @@ rebind, and every other owner or `ACTIVE` refuses. A changed boot carries every
 valid standalone owner+`ACTIVE` unchanged and excluded; ownerless
 `CLEAN_READY` may be carried. A provider never recovers ownerless `ACTIVE`: it
 performs no kill, path deletion, disposition rewrite, or CLEAN publish and
-fails with `Wagie recovery required`. Only the exact standalone owner may roll
+fails with `Host recovery required`. Only the exact standalone owner may roll
 retained `ACTIVE` after publication and two consecutive vacancy scans. Missing
 domain state plus any owner or disposition fails closed. Authorized cleanup
 requires the exact persisted state-root device and inode; device renumber or
