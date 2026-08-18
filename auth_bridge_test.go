@@ -473,8 +473,8 @@ func TestAuthPumpRoutesDialogsOutsideAnyTurn(t *testing.T) {
 
 	request := harness.dialogRequest(pi.AuthMessage{ID: "ex-1", Kind: pi.AuthKindProbe})
 
-	require.Nil(t, harness.session.activeTurnSink())
-	harness.session.dispatchUIRequest(t.Context(), request)
+	require.Nil(t, harness.session.activeTurnDelivery())
+	harness.session.routeUIRequest(t.Context(), harness.session.outbox, request)
 
 	require.Equal(t, pi.AuthAck, *harness.awaitAnswer(request.ID).Value)
 }
@@ -487,7 +487,7 @@ func TestAuthPumpLeavesForeignDialogsToTheTurn(t *testing.T) {
 
 	harness := newAuthHarness(t)
 
-	harness.session.dispatchUIRequest(t.Context(), pi.UIRequest{
+	harness.session.routeUIRequest(t.Context(), harness.session.outbox, pi.UIRequest{
 		ID:     "dialog-foreign",
 		Method: uiMethodSelect,
 		Title:  "an ordinary question",

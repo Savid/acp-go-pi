@@ -369,7 +369,12 @@ func TestSessionCancelContainsAcknowledgedAbortBeforeReturning(t *testing.T) {
 	require.Equal(t, 1, process.closeCalls)
 }
 
-func TestSessionCancelCommitsPumpObservedSettlementAfterContainment(t *testing.T) {
+// TestSessionCancelRecordsPumpObservedSettlementForTheCommitAfterContainment
+// pins the response-barrier race and the one commit point together: the outbox
+// records agent_settled at receipt even when cancellation prevents delivery, the
+// containment boundary commits nothing itself, and the settlement that follows
+// adopts the complete durable aborted generation after that boundary.
+func TestSessionCancelRecordsPumpObservedSettlementForTheCommitAfterContainment(t *testing.T) {
 	store := NewInMemorySessionStore()
 	agent := NewAgent(
 		WithLogger(slog.New(slog.DiscardHandler)),
@@ -389,22 +394,27 @@ func TestSessionCancelCommitsPumpObservedSettlementAfterContainment(t *testing.T
 	}
 
 	turnCtx, turnCancel := context.WithCancel(t.Context())
+	delivery := newTurnDelivery()
+	outbox := newSessionOutbox(1)
+	outbox.adopt(delivery)
 	session := &agentSession{
 		agent:           agent,
 		id:              "id",
 		client:          newStubPiClient(),
 		proc:            process,
 		cancel:          turnCancel,
-		turnSink:        newTurnSink(),
+		outbox:          outbox,
+		turnEvents:      delivery,
 		turnFenceDone:   make(chan struct{}),
 		sessionFilePath: path,
 	}
 
-	// Reproduce the response-barrier race: the pump has accepted
-	// agent_settled, but cancellation prevents delivery to the prompt sink.
-	dispatchCtx, stopDispatch := context.WithCancel(t.Context())
-	stopDispatch()
-	session.dispatchEvent(dispatchCtx, pi.AgentSettledEvent{})
+	// Reproduce the response-barrier race: the outbox has accepted
+	// agent_settled, but cancellation prevents delivery to the prompt loop.
+	routeCtx, stopRouting := context.WithCancel(t.Context())
+	stopRouting()
+	session.routeNativeEvent(routeCtx, outbox, pi.AgentSettledEvent{})
+	require.True(t, session.turnNativeSettled, "settlement is recorded at outbox receipt")
 
 	cancelDone := make(chan error, 1)
 	go func() { cancelDone <- session.Cancel(t.Context()) }()
@@ -417,9 +427,21 @@ func TestSessionCancelCommitsPumpObservedSettlementAfterContainment(t *testing.T
 	close(releaseClose)
 	require.NoError(t, <-cancelDone)
 	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
+
 	entries, err = store.Load(t.Context(), SessionKey{SessionID: "id"})
 	require.NoError(t, err)
-	require.Len(t, entries, 2)
+	require.Empty(t, entries, "the containment boundary is not a commit point")
+
+	var timedOut atomic.Bool
+	response, err := session.settlePrompt(
+		t.Context(), TextPromptRequest("id", "turn", "done"), &promptTurnState{}, promptOutcome{transportEnded: true}, &timedOut,
+	)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
+
+	entries, err = store.Load(t.Context(), SessionKey{SessionID: "id"})
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "the durable cancelled generation lands after the boundary that proved it")
 }
 
 func TestSessionCancelWithoutNativeSettlementPreservesMirror(t *testing.T) {
@@ -495,7 +517,11 @@ func TestSessionCloseAndTimeoutDoNotCommitSettledCancellation(t *testing.T) {
 	}
 }
 
-func TestSessionSettledCancelMirrorFailureFailsFence(t *testing.T) {
+// TestSettledCancelMirrorFailureFailsTheSettlement pins that a durability
+// failure on a cancelled cycle fails the prompt rather than reporting a
+// cancelled success, and that no terminal idle stands behind a store that does
+// not hold the prefix.
+func TestSettledCancelMirrorFailureFailsTheSettlement(t *testing.T) {
 	store := newFaultySessionStore()
 	store.appendErr = errors.New("durability unavailable")
 	agent := NewAgent(
@@ -516,9 +542,14 @@ func TestSessionSettledCancelMirrorFailureFailsFence(t *testing.T) {
 		sessionFilePath:   path,
 	}
 
-	err := session.Cancel(t.Context())
+	require.NoError(t, session.Cancel(t.Context()))
+
+	var timedOut atomic.Bool
+	_, err := session.settlePrompt(
+		t.Context(), TextPromptRequest("id", "turn", "done"), &promptTurnState{}, promptOutcome{transportEnded: true}, &timedOut,
+	)
+	require.ErrorIs(t, err, errSessionMirrorAppend)
 	require.ErrorContains(t, err, "durability unavailable")
-	require.ErrorIs(t, session.awaitTurnFence(), errSessionMirrorAppend)
 }
 
 func TestPromptTimeoutContainsProcessTreeBeforeReturning(t *testing.T) {

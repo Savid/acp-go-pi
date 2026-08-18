@@ -103,8 +103,25 @@ func (a *Agent) reclaimExpiredImageRows(ctx context.Context, sessionID string, e
 	}
 
 	main := SessionKey{SessionID: sessionID}
+	replacements := []SessionStoreReplacement{{Key: main, Entries: rewritten}}
 
-	return a.sessionStore().Replace(ctx, main, []SessionStoreReplacement{{Key: main, Entries: rewritten}})
+	// Replace installs the session's whole committed generation, so the
+	// adapter-owned lifecycle boundary log is carried through it. Dropping it
+	// would erase the record of how the last incarnation ended, which is what
+	// the next one opens its snapshot from.
+	boundaries, err := a.sessionStore().Load(ctx, SessionKey{SessionID: sessionID, Subpath: SessionStoreLifecycleSubpath})
+	if err != nil {
+		return err
+	}
+
+	if len(boundaries) > 0 {
+		replacements = append(replacements, SessionStoreReplacement{
+			Key:     SessionKey{SessionID: sessionID, Subpath: SessionStoreLifecycleSubpath},
+			Entries: boundaries,
+		})
+	}
+
+	return a.sessionStore().Replace(ctx, main, replacements)
 }
 
 // outputImageMessage decodes one stored row when it is an output-provenance

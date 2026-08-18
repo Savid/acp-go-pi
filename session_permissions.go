@@ -179,7 +179,7 @@ func (s *agentSession) requestPermissionAnswer(ctx context.Context, request pi.U
 		toolCall.RawInput = prompt.Input
 	}
 
-	resp, err := conn.RequestPermission(dialogCtx, acp.RequestPermissionRequest{
+	resp, err := s.requestAnnouncedPermission(dialogCtx, conn, acp.RequestPermissionRequest{
 		SessionId: s.id,
 		ToolCall:  toolCall,
 		Options: []acp.PermissionOption{

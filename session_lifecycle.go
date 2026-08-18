@@ -263,6 +263,17 @@ func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
 	if constructionErr := s.agent.beginNativeConstruction(); constructionErr != nil {
 		return constructionErr
 	}
+
+	// The generation that produced the old stream is gone, so the stream ends
+	// with it: its undelivered events are lost and the loss is recorded rather
+	// than inferred from an absent router. The next generation opens a fresh
+	// incarnation with its own identity, sequence space, and snapshot.
+	if fenceErr := s.recordGenerationLoss(ctx); fenceErr != nil {
+		s.agent.endNativeConstruction()
+
+		return fenceErr
+	}
+
 	defer func() {
 		s.recordNativeContainment(err)
 		s.agent.endNativeConstruction()
@@ -356,7 +367,7 @@ func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
 	s.mu.Unlock()
 	processRoot.observe(ctx, relaunched)
 
-	s.startPump(client)
+	generation := s.startPump(client)
 
 	if retryErr := client.SetAutoRetry(ctx, s.autoRetry); retryErr != nil {
 		return s.cleanupFailedRelaunch(relaunched, retryErr)
@@ -377,14 +388,32 @@ func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
 		)
 	}
 
+	commands, commandsErr := client.GetCommands(ctx)
+	if commandsErr != nil {
+		return s.cleanupFailedRelaunch(relaunched, commandsErr)
+	}
+
 	s.mu.Lock()
 	s.sessionFilePath = state.SessionFile
 	s.launch = spec
+	s.availableCommands = commands
 
 	if spec.SessionID != "" {
 		s.mirroredRows = 0
 	}
 	s.mu.Unlock()
+
+	// A relaunch re-runs the extension factories, so the catalog pi advertises
+	// now is the one this generation actually has. Re-emitting it — including
+	// the explicit empty snapshot — is what keeps a host from holding a
+	// catalog the live process no longer serves.
+	if emitErr := s.emitAvailableCommandsUpdate(ctx, true); emitErr != nil {
+		return s.cleanupFailedRelaunch(relaunched, emitErr)
+	}
+
+	if streamErr := s.openLifecycleStream(ctx, generation); streamErr != nil {
+		return s.cleanupFailedRelaunch(relaunched, streamErr)
+	}
 
 	keepGeneration = true
 
@@ -587,6 +616,15 @@ func (s *agentSession) cancelRouted(ctx context.Context, meta map[string]any) er
 		}
 	}
 
+	// The route nonce is the anti-stale admission and is validated first, so a
+	// cancel never reports two rejections. The reserved family literal then
+	// fails the cancel closed before native interrupt: being a notification it
+	// carries no response frame, so the rejection is wire-silent and the cancel
+	// is never applied.
+	if refusal := refuseLifecycleMeta(meta); refusal != nil {
+		return refusal
+	}
+
 	return s.cancelNativeLocked(ctx, true)
 }
 
@@ -700,24 +738,17 @@ func (s *agentSession) fenceActiveTurnLocked(ctx context.Context) (err error) {
 	}
 
 	// Stop transport delivery before closing its pipes. Prompt settlement may
-	// observe the closed turn sink, but awaitTurnFence keeps it behind this
+	// observe the ended generation, but joinTurnBoundary keeps it behind this
 	// selected containment boundary.
 	s.stopPump()
 	err = s.terminateCancelledTurn(context.WithoutCancel(ctx), proc, turnCancel, abortErr)
 
-	// Pi's abort response follows its native terminal ladder. The pump records
-	// agent_settled before forwarding it to the prompt goroutine, so even when
-	// stopPump wins that delivery race we can still publish the complete
-	// durable aborted generation. Never adopt a forced-kill partial turn: both
-	// successful containment and the native settle marker are required.
-	s.mu.Lock()
-	commitCancelled := err == nil && s.turnCommitOnCancel && s.turnNativeSettled
-	s.mu.Unlock()
-
-	if commitCancelled {
-		err = s.commitMirror(context.WithoutCancel(ctx))
-	}
-
+	// The durable commit is not made here. Pi's abort response follows its
+	// native terminal ladder and the pump records agent_settled before
+	// forwarding it, so the prompt's one settlement point can still adopt the
+	// complete durable aborted generation after this boundary completes —
+	// which is also what keeps a cancelled cycle's terminal idle ordered
+	// after the commit it stands behind.
 	s.mu.Lock()
 	s.turnFenceErr = err
 
@@ -868,9 +899,13 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 
 	// An in-flight turn owns the native generation, up to and including a
 	// relaunch that installs a fresh process, so which process this close must
-	// contain is only knowable once that turn has released the session's turn
-	// admission. The wait is bounded: a turn that never releases surrenders its
-	// claim rather than blocking teardown forever.
+	// contain is only knowable once that turn's settlement has finished. Close
+	// waits for the whole settlement result — the durable commit, the terminal
+	// idle, and any quiescence fact — rather than racing the roots that
+	// settlement is still writing through. The settlement's own bounded context
+	// is what makes the wait terminate.
+	err = errors.Join(err, s.awaitSettlement())
+
 	waitCtx, stopWaiting := context.WithTimeout(context.WithoutCancel(ctx), sessionCloseTurnWait)
 	defer stopWaiting()
 
@@ -905,6 +940,9 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 	}
 
 	err = errors.Join(err, s.nativeContainmentError())
+
+	err = errors.Join(err, s.settleCloseBoundary(context.WithoutCancel(ctx), proc, err))
+	s.closeLifecycleSession()
 
 	// Every admission is taken out of the session before it is finalized, so a
 	// coincident turn fence releasing the same native root cannot release it

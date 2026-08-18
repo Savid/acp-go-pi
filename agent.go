@@ -12,6 +12,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 
+	"github.com/savid/acp-go-pi/internal/lifecycle"
 	"github.com/savid/acp-go-pi/internal/observer"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
@@ -80,15 +81,18 @@ type Agent struct {
 
 	// Lock order: acquire mu before any session lock. Do not call session
 	// close methods while holding mu.
-	mu                   sync.Mutex
-	closed               bool
-	conn                 agentClient
-	sessions             map[acp.SessionId]*agentSession
-	store                SessionStore
-	deleted              map[acp.SessionId]struct{}
-	clientCalls          chan struct{}
-	clientCapabilities   acp.ClientCapabilities
-	positionEncoding     acp.PositionEncodingKind
+	mu                 sync.Mutex
+	closed             bool
+	conn               agentClient
+	sessions           map[acp.SessionId]*agentSession
+	store              SessionStore
+	deleted            map[acp.SessionId]struct{}
+	clientCalls        chan struct{}
+	clientCapabilities acp.ClientCapabilities
+	positionEncoding   acp.PositionEncodingKind
+	// lifecycle is the answer this connection gave at initialize. An absent
+	// answer leaves the extension dormant for every session on it.
+	lifecycle            lifecycle.Negotiated
 	optionErr            error
 	processes            *providerProcessTracker
 	nativeContainmentErr error
@@ -424,6 +428,14 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 	title := a.options.AgentTitle
 	positionEncoding := selectPositionEncoding(params.ClientCapabilities.PositionEncodings)
 
+	// The lifecycle answer is the one family literal this adapter validates on
+	// initialize itself, and the only one whose answer is resolved from the
+	// active configuration rather than from a compiled-in constant.
+	lifecycleAnswer, err := a.negotiateLifecycle(params.Meta)
+	if err != nil {
+		return acp.InitializeResponse{}, err
+	}
+
 	a.mu.Lock()
 	a.clientCapabilities = params.ClientCapabilities
 	a.positionEncoding = positionEncoding
@@ -470,6 +482,10 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 	}
 
 	resp = acp.InitializeResponse{
+		// The lifecycle answer rides the response's own _meta, never
+		// agentCapabilities._meta: later protocol work relocates capability
+		// objects and initialize _meta survives that move unchanged.
+		Meta:            lifecycleAnswer,
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentInfo: &acp.Implementation{
 			Name:    a.options.AgentName,
@@ -506,11 +522,22 @@ func (a *Agent) Authenticate(ctx context.Context, params acp.AuthenticateRequest
 	_, finish := a.observe.StartACP(ctx, params.Meta, "authenticate")
 	defer func() { finish(observer.ACPResult{Err: err}) }()
 
+	// The reserved family literal is inspected before this method's own
+	// refusal, so a request carrying it is answered about the key rather than
+	// about the auth method it also named.
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.AuthenticateResponse{}, refusal
+	}
+
 	return acp.AuthenticateResponse{}, acp.NewInvalidParams(map[string]any{"methodId": params.MethodId})
 }
 
 // Logout clears auth state owned by this adapter.
-func (a *Agent) Logout(_ context.Context, _ acp.LogoutRequest) (acp.LogoutResponse, error) {
+func (a *Agent) Logout(_ context.Context, params acp.LogoutRequest) (acp.LogoutResponse, error) {
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.LogoutResponse{}, refusal
+	}
+
 	return acp.LogoutResponse{}, nil
 }
 
@@ -520,6 +547,13 @@ func (a *Agent) Logout(_ context.Context, _ acp.LogoutRequest) (acp.LogoutRespon
 func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	if err := a.ensureOpen(); err != nil {
 		return nil, err
+	}
+
+	// Every request-bearing extension leg inspects the reserved family literal
+	// before its own validation or refusal, whether or not the leg it names is
+	// configured on this agent.
+	if refusal := refuseLifecycleExtensionMeta(method, params); refusal != nil {
+		return nil, refusal
 	}
 
 	if result, handled, err := a.handleAuthExtensionMethod(ctx, method, params); handled {
@@ -614,4 +648,9 @@ type sessionStart struct {
 	ForkSession           bool
 	MetaOptions           PiOptions
 	RawMessages           rawMessageConfig
+	// PriorBoundary is the durable lifecycle boundary a restored session
+	// resumes from. It is what lets the opening snapshot state the quiescence
+	// the last incarnation actually proved instead of the class this
+	// configuration advertises.
+	PriorBoundary lifecycleBoundaryRecord
 }

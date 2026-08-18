@@ -3,7 +3,6 @@ package piacp
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"strings"
 	"sync/atomic"
@@ -174,8 +173,16 @@ func xmlEscape(text string) string {
 }
 
 // Prompt sends one turn to pi and streams updates until the run settles.
+// Route validation runs first, then the lifecycle submission identity: a
+// prompt never reports two rejections, and the order of two failures is never
+// implementation-defined.
 func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
 	route, err := parseInboundTurnRoute(params.Meta)
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	submission, err := s.agent.lifecyclePromptCorrelation(params.Meta)
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
@@ -213,14 +220,14 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	turnCtx, cancel := context.WithCancel(ctx)
 	turnCtx = withTurnRoute(turnCtx, route.turnNonce)
 
-	sink := newTurnSink()
+	delivery := newTurnDelivery()
 
 	s.cancelMu.Lock()
 	s.mu.Lock()
 	s.cancel = cancel
 	s.turnCancelled = false
 	s.turnNonce = route.turnNonce
-	s.turnSink = sink
+	s.turnEvents = delivery
 	s.turnNativeSettled = false
 	s.turnFenceStarted = false
 	s.turnFenceDone = make(chan struct{})
@@ -228,11 +235,15 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	s.turnSettling = false
 	s.turnCommitOnCancel = false
 	s.turnImagesEmitted = false
+	outbox := s.outbox
 	s.mu.Unlock()
 	s.cancelMu.Unlock()
 
+	outbox.adopt(delivery)
+
 	defer func() {
 		cancel()
+		outbox.release(delivery)
 
 		s.cancelMu.Lock()
 		defer s.cancelMu.Unlock()
@@ -245,12 +256,12 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		s.turnNativeSettled = false
 		s.turnCommitOnCancel = false
 
-		if s.turnSink == sink {
-			s.turnSink = nil
+		if s.turnEvents == delivery {
+			s.turnEvents = nil
 		}
 		s.mu.Unlock()
 
-		close(sink.done)
+		close(delivery.done)
 		s.resetTurnTools()
 	}()
 
@@ -265,53 +276,72 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 
 	client := s.currentClient()
 	if promptErr := client.Prompt(turnCtx, mapped.Message, mapped.Images); promptErr != nil {
+		// The native dispatcher never took the frame, so this creates neither
+		// submission nor turn and settles nothing.
 		fenceErr := s.fenceTurnAfterFailure(context.WithoutCancel(ctx))
 
 		return acp.PromptResponse{}, errors.Join(s.nativeTurnFailure(ctx, promptErr), fenceErr)
 	}
 
-	state := &promptTurnState{}
+	s.openSettlement()
 
+	if acceptErr := s.lifecycleAcceptTurn(turnCtx, submission); acceptErr != nil {
+		return s.settlePrompt(turnCtx, params, &promptTurnState{}, promptOutcome{failure: acceptErr}, &timedOut)
+	}
+
+	state := &promptTurnState{}
+	outcomeOfTurn := s.runPromptTurn(turnCtx, delivery, state)
+
+	return s.settlePrompt(turnCtx, params, state, outcomeOfTurn, &timedOut)
+}
+
+// promptOutcome is how the streaming loop ended. Every accepted exit returns
+// one rather than returning a response directly, so exactly one settlement
+// point covers them all.
+type promptOutcome struct {
+	// settled reports that native pi crossed agent_settled for this turn.
+	settled bool
+	// transportEnded reports that this generation's event stream ended before
+	// the run settled.
+	transportEnded bool
+	// contextEnded reports that the turn context ended before the run settled.
+	contextEnded bool
+	// failure is an update-emission or lifecycle-emission failure the loop
+	// stopped on.
+	failure error
+}
+
+// runPromptTurn streams the accepted turn until it ends, and reports how it
+// ended instead of writing a response of its own.
+func (s *agentSession) runPromptTurn(ctx context.Context, delivery *turnDelivery, state *promptTurnState) promptOutcome {
 	for {
 		select {
-		case event, ok := <-sink.events:
+		case event, ok := <-delivery.events:
 			if !ok {
-				if fenceErr := s.fenceTurnAfterFailure(context.WithoutCancel(ctx)); fenceErr != nil {
-					return acp.PromptResponse{}, fenceErr
-				}
-
-				return s.transportEndedTurn(ctx, params.MessageId, &timedOut)
+				return promptOutcome{transportEnded: true}
 			}
 
-			s.emitRawPiEvent(turnCtx, event.RawJSON())
-
-			settled, err := s.handleTurnEvent(turnCtx, event, state)
+			settled, err := s.handleTurnEvent(ctx, event, state)
 			if err != nil {
-				return acp.PromptResponse{}, s.abortAfterEmitError(ctx, err)
+				return promptOutcome{failure: err}
 			}
 
 			if settled {
-				return s.finishTurn(ctx, turnCtx, params, state, &timedOut)
+				return promptOutcome{settled: true}
 			}
-		case request := <-sink.uiRequests:
-			s.emitRawPiEvent(turnCtx, request.RawJSON())
-
+		case request := <-delivery.uiRequests:
 			if request.IsDialog() {
 				s.dialogWG.Add(1)
 
 				go func() {
 					defer s.dialogWG.Done()
-					defer recoverAgentGoroutine(context.WithoutCancel(turnCtx), agentLogger(s.agent), "UI dialog handler")
+					defer recoverAgentGoroutine(context.WithoutCancel(ctx), agentLogger(s.agent), "UI dialog handler")
 
-					s.handleUIDialog(turnCtx, request)
+					s.handleUIDialog(ctx, request)
 				}()
 			}
-		case <-turnCtx.Done():
-			if fenceErr := s.fenceTurnAfterContext(context.WithoutCancel(ctx)); fenceErr != nil {
-				return acp.PromptResponse{}, fenceErr
-			}
-
-			return s.contextEndedTurn(params.MessageId, &timedOut)
+		case <-ctx.Done():
+			return promptOutcome{contextEnded: true}
 		}
 	}
 }
@@ -361,6 +391,13 @@ func (s *agentSession) handleTurnEvent(ctx context.Context, event pi.Event, stat
 
 		return false, s.publishNativeToolTerminal(ctx, typed.ToolCallID, status, typed.Result)
 	default:
+		// The remaining decoded types are foreground machinery inside
+		// agent_settled's own scope — the agent and turn brackets, the queue
+		// update, the compaction and auto-retry pairs, the extension error,
+		// and a type this package does not model. None carries an entity ACP
+		// or the lifecycle extension can name, so none projects an update.
+		// They still reached the session outbox, which is what keeps them off
+		// the raw-event stream's gap detector.
 		return false, nil
 	}
 }
@@ -531,78 +568,6 @@ func mergeTurnUsage(total *acp.Usage, next *pi.Usage) *acp.Usage {
 	return total
 }
 
-// finishTurn runs the settle fence: usage query, usage update, session info,
-// the awaited mirror commit, then the cancel guard and failure mapping.
-func (s *agentSession) finishTurn(
-	ctx context.Context,
-	turnCtx context.Context,
-	params acp.PromptRequest,
-	state *promptTurnState,
-	timedOut *atomic.Bool,
-) (acp.PromptResponse, error) {
-	if fenceErr := s.claimTurnSettlement(); fenceErr != nil {
-		return acp.PromptResponse{}, fenceErr
-	}
-
-	// A routed user cancellation can win the settlement race after pi has
-	// already emitted agent_settled. In that case the native session file is a
-	// complete durable generation (including pi's aborted assistant row), so
-	// publish it before the cancelled response. The cancel fence handles the
-	// opposite race, where the pump observes agent_settled but stopPump wins
-	// before the prompt goroutine receives it. Paths that never reach
-	// agent_settled deliberately preserve the prior mirror instead.
-	if s.wasTurnCancelled() {
-		s.mu.Lock()
-		commitCancelled := s.turnCommitOnCancel
-		s.mu.Unlock()
-
-		if !commitCancelled {
-			return cancelledResponse(params.MessageId), nil
-		}
-
-		if err := s.commitMirror(context.WithoutCancel(ctx)); err != nil {
-			return acp.PromptResponse{}, s.imageAwareMirrorFailure(err)
-		}
-
-		return cancelledResponse(params.MessageId), nil
-	}
-
-	if timedOut.Load() {
-		return acp.PromptResponse{}, turnFailureError(failureCauseTimeout, fmt.Sprintf("pi turn exceeded %s", s.agent.turnTimeout()))
-	}
-
-	stats := s.settledSessionStats(turnCtx)
-
-	// A native session id change mid-session breaks the wrapper's identity
-	// invariant (for example an operator-seeded extension switching
-	// sessions); the session is poisoned rather than mirrored under the
-	// wrong key.
-	if stats != nil && stats.SessionID != "" && stats.SessionID != string(s.id) {
-		return acp.PromptResponse{}, s.poison(turnCtx, fmt.Sprintf("native session id drift: expected %s, got %s", s.id, stats.SessionID))
-	}
-
-	s.emitTurnUsageUpdate(turnCtx, state, stats)
-
-	if err := s.emitLiveSessionInfoUpdate(turnCtx, params.Prompt); err != nil {
-		return acp.PromptResponse{}, s.abortAfterEmitError(ctx, err)
-	}
-
-	if err := s.commitMirror(context.WithoutCancel(ctx)); err != nil {
-		return acp.PromptResponse{}, s.imageAwareMirrorFailure(err)
-	}
-
-	if err := providerTurnFailure(state); err != nil {
-		return acp.PromptResponse{}, err
-	}
-
-	return acp.PromptResponse{
-		Meta:          nativeMessageResponseMeta(state.nativeMessageID),
-		StopReason:    acpStopReason(s, state),
-		Usage:         state.usage,
-		UserMessageId: params.MessageId,
-	}, nil
-}
-
 func acpStopReason(s *agentSession, state *promptTurnState) acp.StopReason {
 	switch state.stopReason {
 	case stopReasonLength, stopReasonMaxTokens:
@@ -674,70 +639,4 @@ func (s *agentSession) currentModelContextWindow() int64 {
 	defer s.mu.Unlock()
 
 	return s.contextWindowSize
-}
-
-// transportEndedTurn maps a mid-turn native transport end. The cancel guard
-// runs first; otherwise the real cause is recovered from the child exit
-// status and stderr tail before falling back to a transport classification.
-func (s *agentSession) transportEndedTurn(ctx context.Context, messageID *string, timedOut *atomic.Bool) (acp.PromptResponse, error) {
-	if fenceErr := s.awaitTurnFence(); fenceErr != nil {
-		return acp.PromptResponse{}, fenceErr
-	}
-
-	if s.wasTurnCancelled() {
-		return cancelledResponse(messageID), nil
-	}
-
-	if timedOut.Load() {
-		return acp.PromptResponse{}, turnFailureError(failureCauseTimeout, fmt.Sprintf("pi turn exceeded %s", s.agent.turnTimeout()))
-	}
-
-	if exitMessage, exited := s.processExitCause(ctx, "pi process exited"); exited {
-		s.agent.observe.RecordPiProcessExit(context.Background(), "unexpected", nil)
-
-		return acp.PromptResponse{}, turnFailureError(failureCauseProcessExit, exitMessage)
-	}
-
-	message := "pi event stream closed mid-turn"
-
-	if client := s.currentClient(); client != nil {
-		if err := client.Err(); err != nil {
-			message = err.Error()
-			s.agent.log.ErrorContext(ctx, "pi turn transport failed", slog.Any("error", err))
-		}
-	}
-
-	return acp.PromptResponse{}, turnFailureError(failureCauseTransport, message)
-}
-
-// contextEndedTurn maps a turn context that ended before the run settled:
-// a user cancel whose drain window elapsed, a timeout whose abort never
-// settled, or a cancelled host request context.
-func (s *agentSession) contextEndedTurn(messageID *string, timedOut *atomic.Bool) (acp.PromptResponse, error) {
-	if fenceErr := s.awaitTurnFence(); fenceErr != nil {
-		return acp.PromptResponse{}, fenceErr
-	}
-
-	if s.wasTurnCancelled() {
-		return cancelledResponse(messageID), nil
-	}
-
-	if timedOut.Load() {
-		return acp.PromptResponse{}, turnFailureError(failureCauseTimeout, fmt.Sprintf("pi turn exceeded %s", s.agent.turnTimeout()))
-	}
-
-	return cancelledResponse(messageID), nil
-}
-
-func cancelledResponse(messageID *string) acp.PromptResponse {
-	return acp.PromptResponse{
-		StopReason:    acp.StopReasonCancelled,
-		UserMessageId: messageID,
-	}
-}
-
-// abortAfterEmitError aborts the native turn under a bounded background
-// context after an update-emission failure, then surfaces the original error.
-func (s *agentSession) abortAfterEmitError(ctx context.Context, err error) error {
-	return errors.Join(err, s.fenceTurnAfterFailure(context.WithoutCancel(ctx)))
 }

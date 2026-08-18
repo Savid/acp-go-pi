@@ -132,12 +132,12 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 	return result, reqErr
 }
 
-// enqueueLifecycleCommandHook schedules the first available_commands_update
-// for a session lifecycle method to run only after the lifecycle response has
-// been written to the ACP transport.
+// enqueueLifecycleCommandHook schedules the session's establishing snapshot —
+// the explicit command catalog and the opening lifecycle stream — to run only
+// after the session lifecycle response has been written to the ACP transport.
 func (c *localAgentConnection) enqueueLifecycleCommandHook(ctx context.Context, method string, params json.RawMessage, result any) {
 	sessionID, ok := lifecycleCommandSessionID(method, params, result)
-	if !ok || c.hooks == nil {
+	if !ok {
 		return
 	}
 
@@ -151,7 +151,7 @@ func (c *localAgentConnection) enqueueLifecycleCommandHook(ctx context.Context, 
 
 		session, err := c.agent.session(sessionID)
 		if err != nil {
-			c.agent.log.ErrorContext(hookCtx, "post-response command update session lookup failed",
+			c.agent.log.ErrorContext(hookCtx, "post-response session open lookup failed",
 				slog.String(jsonFieldMethod, method),
 				slog.String(acpFieldSessionID, string(sessionID)),
 				slog.String(jsonFieldError, err.Error()),
@@ -160,13 +160,7 @@ func (c *localAgentConnection) enqueueLifecycleCommandHook(ctx context.Context, 
 			return
 		}
 
-		if err := session.emitAvailableCommandsUpdate(hookCtx, true); err != nil {
-			c.agent.log.ErrorContext(hookCtx, "post-response command update failed",
-				slog.String(jsonFieldMethod, method),
-				slog.String(acpFieldSessionID, string(sessionID)),
-				slog.String(jsonFieldError, err.Error()),
-			)
-		}
+		session.publishSessionOpen(hookCtx)
 	})
 }
 

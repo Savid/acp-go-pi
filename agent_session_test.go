@@ -172,10 +172,15 @@ func TestResumeSessionPublishesTerminalNativeIdentityWithoutHistory(t *testing.T
 
 	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest("resume-id", "/cwd"))
 	require.NoError(t, err)
-	require.Len(t, connection.notifications, 1)
+	require.Len(t, connection.notifications, 2)
 	require.NotNil(t, connection.notifications[0].Update.SessionInfoUpdate)
 	require.Equal(t, messageID,
 		anyMap(t, connection.notifications[0].Meta[piMetaKey])[jsonFieldMessageID])
+
+	// The establishing snapshot is an answer rather than a silence: a session
+	// whose harness discovered no commands says so explicitly.
+	require.NotNil(t, connection.notifications[1].Update.AvailableCommandsUpdate)
+	require.Empty(t, connection.notifications[1].Update.AvailableCommandsUpdate.AvailableCommands)
 
 	connection.updateErr = errors.New("identity")
 	_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("resume-id", "/cwd"))

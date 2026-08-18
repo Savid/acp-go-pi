@@ -62,6 +62,8 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 		ConfigOptions: sessionConfigOptions(session),
 	}
 
+	a.publishSessionOpenInline(ctx, session)
+
 	return resp, nil
 }
 
@@ -94,6 +96,8 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 	resp = acp.ResumeSessionResponse{
 		ConfigOptions: sessionConfigOptions(session),
 	}
+
+	a.publishSessionOpenInline(ctx, session)
 
 	return resp, nil
 }
@@ -128,6 +132,8 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 	resp = acp.LoadSessionResponse{
 		ConfigOptions: sessionConfigOptions(session),
 	}
+
+	a.publishSessionOpenInline(ctx, session)
 
 	return resp, nil
 }
@@ -174,6 +180,7 @@ func (a *Agent) restoreSession(
 	}
 
 	start.HydrateEntries = entries
+	start.PriorBoundary = a.lastLifecycleBoundary(ctx, string(sessionID))
 
 	session, err := a.startAndStoreSession(ctx, start)
 	if err != nil {
@@ -187,6 +194,10 @@ func (a *Agent) restoreSession(
 func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (resp acp.ListSessionsResponse, err error) {
 	ctx, finish := a.observe.StartACP(ctx, params.Meta, "session/list")
 	defer func() { finish(observer.ACPResult{Err: err}) }()
+
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.ListSessionsResponse{}, refusal
+	}
 
 	if validationErr := validateOptionalAbsolutePath(jsonFieldCwd, params.Cwd); validationErr != nil {
 		return acp.ListSessionsResponse{}, validationErr
@@ -279,11 +290,30 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) (err 
 	return err
 }
 
+// deleteSessionSettlement serializes a delete after the settlement that could
+// still be writing, then fences every later durable write. A tombstone written
+// while a commit was in flight would be recreated by that commit; fencing after
+// the settlement completes is what makes the delete final.
+func (a *Agent) deleteSessionSettlement(session *agentSession) error {
+	if session == nil {
+		return nil
+	}
+
+	settleErr := session.awaitSettlement()
+	session.fencePersistence()
+
+	return settleErr
+}
+
 // CloseSession closes a pi session process and removes it from the active
 // map.
 func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (resp acp.CloseSessionResponse, err error) {
 	ctx, finish := a.observe.StartACP(ctx, params.Meta, "session/close")
 	defer func() { finish(observer.ACPResult{Err: err}) }()
+
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.CloseSessionResponse{}, refusal
+	}
 
 	session, err := a.session(params.SessionId)
 	if err != nil {
@@ -306,27 +336,41 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 	return acp.CloseSessionResponse{}, nil
 }
 
-// UnstableDeleteSession implements ACP session/delete: durable tombstone
-// first, then close and clean up the active session and its native state.
+// UnstableDeleteSession implements ACP session/delete. The delete serializes
+// after the addressed session's full settlement and fences its persistence
+// before the tombstone lands, so no write that was still in flight can recreate
+// the row the tombstone removed. The tombstone is durable before the native
+// state and the active session are torn down, and the session is hidden from
+// list, load, and resume from that moment on.
 func (a *Agent) UnstableDeleteSession(
 	ctx context.Context,
 	params acp.UnstableDeleteSessionRequest,
 ) (acp.UnstableDeleteSessionResponse, error) {
-	if err := a.sessionStore().Delete(ctx, SessionKey{SessionID: string(params.SessionId)}); err != nil {
-		return acp.UnstableDeleteSessionResponse{}, err
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.UnstableDeleteSessionResponse{}, refusal
 	}
 
 	a.mu.Lock()
 	session := a.sessions[params.SessionId]
+	a.mu.Unlock()
 
-	if session != nil {
+	var cleanupErr error
+
+	if settleErr := a.deleteSessionSettlement(session); settleErr != nil {
+		cleanupErr = errors.Join(cleanupErr, settleErr)
+	}
+
+	if err := a.sessionStore().Delete(ctx, SessionKey{SessionID: string(params.SessionId)}); err != nil {
+		return acp.UnstableDeleteSessionResponse{}, errors.Join(cleanupErr, err)
+	}
+
+	a.mu.Lock()
+	if a.sessions[params.SessionId] == session && session != nil {
 		delete(a.sessions, params.SessionId)
 	}
 
 	a.deleted[params.SessionId] = struct{}{}
 	a.mu.Unlock()
-
-	var cleanupErr error
 
 	if session != nil {
 		_ = session.cancelForClose(ctx)
@@ -909,6 +953,10 @@ func (a *Agent) setUpNativeSession(
 	}
 
 	session.id = acp.SessionId(state.SessionID)
+
+	session.lcMu.Lock()
+	session.lc.vacancyProven = start.PriorBoundary.VacancyProven
+	session.lcMu.Unlock()
 
 	session.mu.Lock()
 	session.sessionFilePath = state.SessionFile

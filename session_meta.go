@@ -107,6 +107,12 @@ func (options PiOptions) Meta() map[string]any {
 func piOptionsFromMeta(meta map[string]any) (PiOptions, error) {
 	options := PiOptions{}
 
+	// The session lifecycle extension rides no session lifecycle request: the
+	// family literal is never a foreign namespace here and never a no-op.
+	if refusal := refuseLifecycleMeta(meta); refusal != nil {
+		return PiOptions{}, refusal
+	}
+
 	piMeta, ok := meta[piMetaKey].(map[string]any)
 	if !ok {
 		if _, exists := meta[piMetaKey]; exists {

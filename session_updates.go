@@ -148,7 +148,10 @@ func (s *agentSession) emitAvailableCommandsUpdate(ctx context.Context, force bo
 		emit = []acp.SessionUpdate{{
 			AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{AvailableCommands: cloneAvailableCommands(current)},
 		}}
-	case len(previous) > 0:
+	case len(previous) > 0, force:
+		// A host cannot tell "no catalog yet" from "no commands" without being
+		// told, and it may not substitute a timer or an optimistic fallback for
+		// the answer. The explicit empty snapshot is that answer.
 		emit = emptyAvailableCommandsUpdate()
 	default:
 		return nil

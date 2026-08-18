@@ -14,7 +14,7 @@ func TestSessionCoreDefaults(t *testing.T) {
 	}
 
 	var session agentSession
-	if session.turnTools != nil || session.pendingDialogs != nil || session.turnSink != nil {
+	if session.turnTools != nil || session.pendingDialogs != nil || session.turnEvents != nil || session.outbox != nil {
 		t.Fatal("zero-value session contains live turn state")
 	}
 }

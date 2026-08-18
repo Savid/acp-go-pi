@@ -53,7 +53,7 @@ func (s *agentSession) createDialogElicitation(
 	dialogCtx, finishDialog := s.registerDialog(ctx, request.ID)
 	defer finishDialog()
 
-	resp, err := conn.CreateElicitation(dialogCtx, acp.UnstableCreateElicitationRequest{
+	resp, err := s.requestAnnouncedElicitation(dialogCtx, conn, acp.UnstableCreateElicitationRequest{
 		Form: &acp.UnstableCreateElicitationForm{
 			Message:         elicitationMessage(request),
 			Mode:            elicitationModeForm,

@@ -17,9 +17,11 @@ var sessionMirrorAppendTimeout = defaultSessionMirrorAppendTimeout
 var errSessionMirrorAppend = errors.New("append session mirror entries")
 
 // commitMirror appends the native session file's new raw JSONL rows to the
-// store. It is awaited on the prompt path before the prompt response returns;
-// a failed commit fails the prompt. The native file is durable at
-// agent_settled, so reading it after the settle fence captures the full turn.
+// store. It is awaited on the settlement path before the terminal lifecycle
+// event and the prompt response; a failed commit fails the prompt. The native
+// file is durable at agent_settled, so reading it after the settle fence
+// captures the full cycle. A session whose delete fenced persistence writes
+// nothing, so no late commit can recreate a row the delete removed.
 func (s *agentSession) commitMirror(ctx context.Context) error {
 	s.mu.Lock()
 	path := s.sessionFilePath
@@ -56,10 +58,19 @@ func (s *agentSession) commitMirror(ctx context.Context) error {
 		newRows = append(newRows, SessionStoreEntry(row))
 	}
 
+	s.commitMu.Lock()
+
+	if s.persistFenced {
+		s.commitMu.Unlock()
+
+		return nil
+	}
+
 	appendCtx, finishAppend := s.agent.observe.StartSessionStore(ctx, "append")
 	err = appendMirrorEntries(appendCtx, s.agent.sessionStore(), SessionKey{SessionID: string(s.id)}, newRows)
 
 	finishAppend(err)
+	s.commitMu.Unlock()
 
 	if err != nil {
 		return fmt.Errorf("%w: %w", errSessionMirrorAppend, err)

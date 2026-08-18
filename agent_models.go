@@ -19,6 +19,10 @@ func (a *Agent) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.
 
 // SetSessionConfigOption handles supported configuration changes.
 func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
+	if refusal := refuseLifecycleMeta(setSessionConfigOptionMeta(params)); refusal != nil {
+		return acp.SetSessionConfigOptionResponse{}, refusal
+	}
+
 	switch {
 	case params.ValueId != nil:
 		return a.setSessionConfigValue(ctx, params.ValueId)
@@ -33,6 +37,20 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 		// it does not recognise fails to decode before reaching here. Only an
 		// in-process caller reaches this arm, and it left out "value".
 		return acp.SetSessionConfigOptionResponse{}, unsupportedField(acpFieldValue)
+	}
+}
+
+// setSessionConfigOptionMeta reads whichever variant of the union carries the
+// request `_meta`, so the reserved family literal is refused on the mode, model,
+// and config surfaces alike.
+func setSessionConfigOptionMeta(params acp.SetSessionConfigOptionRequest) map[string]any {
+	switch {
+	case params.ValueId != nil:
+		return params.ValueId.Meta
+	case params.Boolean != nil:
+		return params.Boolean.Meta
+	default:
+		return nil
 	}
 }
 

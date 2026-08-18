@@ -119,7 +119,7 @@ func TestPromptParentCancellationContainsProcessTree(t *testing.T) {
 		}{response: response, err: err}
 	}()
 
-	require.Eventually(t, func() bool { return session.activeTurnSink() != nil }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return session.activeTurnDelivery() != nil }, time.Second, time.Millisecond)
 	cancel()
 	result := <-promptDone
 	require.NoError(t, result.err)
@@ -143,30 +143,39 @@ func TestPromptParentCancellationReturnsContainmentFailure(t *testing.T) {
 		promptDone <- err
 	}()
 
-	require.Eventually(t, func() bool { return session.activeTurnSink() != nil }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return session.activeTurnDelivery() != nil }, time.Second, time.Millisecond)
 	cancel()
 	require.ErrorIs(t, <-promptDone, pi.ErrProcessContainmentIncomplete)
 }
 
-func TestTurnTerminalPathsReturnContainmentProofFailure(t *testing.T) {
+// TestSettlementReportsAnIncompleteContainmentBoundary pins that a boundary
+// which did not complete outranks the terminal event it precedes: every accepted
+// exit reports the containment failure and none of them commits or settles.
+func TestSettlementReportsAnIncompleteContainmentBoundary(t *testing.T) {
 	fenceErr := pi.ErrProcessContainmentIncomplete
-	done := make(chan struct{})
-	close(done)
-	session := &agentSession{
-		agent:            NewAgent(WithLogger(slog.New(slog.DiscardHandler))),
-		turnFenceStarted: true,
-		turnFenceDone:    done,
-		turnFenceErr:     fenceErr,
-	}
 	var timedOut atomic.Bool
-	messageID := "message"
 
-	_, err := session.transportEndedTurn(t.Context(), &messageID, &timedOut)
-	require.ErrorIs(t, err, fenceErr)
-	_, err = session.contextEndedTurn(&messageID, &timedOut)
-	require.ErrorIs(t, err, fenceErr)
-	_, err = session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "turn", "done"), &promptTurnState{}, &timedOut)
-	require.ErrorIs(t, err, fenceErr)
+	for name, outcome := range map[string]promptOutcome{
+		"transport ended": {transportEnded: true},
+		"context ended":   {contextEnded: true},
+		"natively settled": {settled: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			done := make(chan struct{})
+			close(done)
+			session := &agentSession{
+				agent:            NewAgent(WithLogger(slog.New(slog.DiscardHandler))),
+				turnFenceStarted: true,
+				turnFenceDone:    done,
+				turnFenceErr:     fenceErr,
+			}
+
+			_, err := session.settlePrompt(
+				t.Context(), TextPromptRequest("id", "turn", "done"), &promptTurnState{}, outcome, &timedOut,
+			)
+			require.ErrorIs(t, err, fenceErr)
+		})
+	}
 }
 
 func TestPromptTransportEndReturnsContainmentProofFailure(t *testing.T) {
@@ -181,7 +190,7 @@ func TestPromptTransportEndReturnsContainmentProofFailure(t *testing.T) {
 
 	go func() {
 		deadline := time.Now().Add(time.Second)
-		for session.activeTurnSink() == nil && time.Now().Before(deadline) {
+		for session.activeTurnDelivery() == nil && time.Now().Before(deadline) {
 			time.Sleep(time.Millisecond)
 		}
 
@@ -205,7 +214,7 @@ func TestPromptHandleTurnEventEmitFailure(t *testing.T) {
 
 	go func() {
 		deadline := time.Now().Add(2 * time.Second)
-		for session.activeTurnSink() == nil {
+		for session.activeTurnDelivery() == nil {
 			if time.Now().After(deadline) {
 				return
 			}
@@ -236,7 +245,7 @@ func TestMessageEndIdentityEmitFailure(t *testing.T) {
 	require.ErrorContains(t, err, "emit identity")
 }
 
-func TestFinishTurnCommitMirrorFailure(t *testing.T) {
+func TestSettlementCommitMirrorFailure(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithTurnTimeout(time.Second))
 	connection := newDirectAgentClient()
 	agent.setConnection(connection)
@@ -245,16 +254,18 @@ func TestFinishTurnCommitMirrorFailure(t *testing.T) {
 	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false), sessionFilePath: t.TempDir()}
 
 	var timedOut atomic.Bool
-	_, err := session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, &timedOut)
+	settled := promptOutcome{settled: true}
+	_, err := session.settlePrompt(t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, settled, &timedOut)
 	require.Error(t, err)
 
 	session.turnCancelled = true
 	session.turnCommitOnCancel = true
-	_, err = session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, &timedOut)
+	session.turnNativeSettled = true
+	_, err = session.settlePrompt(t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, settled, &timedOut)
 	require.Error(t, err, "a settled cancellation must not hide its mirror failure")
 }
 
-func TestFinishTurnSettledCancelCommitsMirror(t *testing.T) {
+func TestSettledCancelCommitsMirrorBeforeItsTerminalIdle(t *testing.T) {
 	store := NewInMemorySessionStore()
 	agent := NewAgent(
 		WithLogger(slog.New(slog.DiscardHandler)),
@@ -268,12 +279,13 @@ func TestFinishTurnSettledCancelCommitsMirror(t *testing.T) {
 		sessionFilePath:    path,
 		turnCancelled:      true,
 		turnCommitOnCancel: true,
+		turnNativeSettled:  true,
 	}
 
 	var timedOut atomic.Bool
 	timedOut.Store(true)
-	response, err := session.finishTurn(
-		t.Context(), t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, &timedOut,
+	response, err := session.settlePrompt(
+		t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, promptOutcome{settled: true}, &timedOut,
 	)
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonCancelled, response.StopReason,
@@ -358,45 +370,48 @@ func TestTurnTerminationBranches(t *testing.T) {
 	client := newStubPiClient()
 	session := &agentSession{agent: agent, client: client, proc: newStubProcess(false)}
 	var timedOut atomic.Bool
-	messageID := "message"
 
-	response, err := session.transportEndedTurn(t.Context(), &messageID, &timedOut)
+	request := TextPromptRequest("id", "turn", "done")
+	settle := func(outcome promptOutcome) (acp.PromptResponse, error) {
+		return session.settlePrompt(t.Context(), request, &promptTurnState{}, outcome, &timedOut)
+	}
+
+	response, err := settle(promptOutcome{transportEnded: true})
 	requirePiTurnFailure(t, err, failureCauseTransport)
 	require.Empty(t, response.StopReason)
 	client.err = errors.New("native stream")
-	_, err = session.transportEndedTurn(t.Context(), &messageID, &timedOut)
+	_, err = settle(promptOutcome{transportEnded: true})
 	requirePiTurnFailure(t, err, failureCauseTransport)
 
 	timedOut.Store(true)
-	_, err = session.transportEndedTurn(t.Context(), &messageID, &timedOut)
+	_, err = settle(promptOutcome{transportEnded: true})
 	requirePiTurnFailure(t, err, failureCauseTimeout)
-	_, err = session.contextEndedTurn(&messageID, &timedOut)
+	_, err = settle(promptOutcome{contextEnded: true})
 	requirePiTurnFailure(t, err, failureCauseTimeout)
 	timedOut.Store(false)
-	response, err = session.contextEndedTurn(&messageID, &timedOut)
+	response, err = settle(promptOutcome{contextEnded: true})
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
 
 	session.turnCancelled = true
-	response, err = session.transportEndedTurn(t.Context(), &messageID, &timedOut)
+	response, err = settle(promptOutcome{transportEnded: true})
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
-	response, err = session.contextEndedTurn(&messageID, &timedOut)
+	response, err = settle(promptOutcome{contextEnded: true})
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
 
 	session.turnCancelled = false
 	session.proc = newStubProcess(true)
-	_, err = session.transportEndedTurn(t.Context(), &messageID, &timedOut)
+	_, err = settle(promptOutcome{transportEnded: true})
 	requirePiTurnFailure(t, err, failureCauseProcessExit)
 
-	original := errors.New("emit")
-	require.ErrorIs(t, session.abortAfterEmitError(t.Context(), original), original)
+	session.proc = newStubProcess(false)
 	session.client = nil
-	require.ErrorIs(t, session.abortAfterEmitError(t.Context(), original), original)
+	requirePiTurnFailure(t, session.transportFailure(t.Context()), failureCauseTransport)
 }
 
-func TestPromptAndFinishTurnErrorBranches(t *testing.T) {
+func TestPromptAndSettlementErrorBranches(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithTurnTimeout(time.Second))
 	connection := newDirectAgentClient()
 	agent.setConnection(connection)
@@ -423,7 +438,7 @@ func TestPromptAndFinishTurnErrorBranches(t *testing.T) {
 		var timeout atomic.Bool
 		timeout.Store(timedOut)
 
-		return session.finishTurn(t.Context(), t.Context(), TextPromptRequest("id", "test-turn", "title"), state, &timeout)
+		return session.settlePrompt(t.Context(), TextPromptRequest("id", "test-turn", "title"), state, promptOutcome{settled: true}, &timeout)
 	}
 	session.proc = newStubProcess(false)
 	client.stats = pi.SessionStats{SessionID: "other"}
