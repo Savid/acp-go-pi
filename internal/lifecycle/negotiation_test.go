@@ -41,6 +41,8 @@ func TestDecodeOfferStrictness(t *testing.T) {
 		{"empty versions", offerMeta([]any{}), MetaPath + ".versions"},
 		{"non-array versions", offerMeta(1.0), MetaPath + ".versions"},
 		{"fractional version", offerMeta([]any{1.5}), MetaPath + ".versions"},
+		{"unrepresentable version", offerMeta([]any{1e300}), MetaPath + ".versions"},
+		{"unrepresentable negative version", offerMeta([]any{-1e300}), MetaPath + ".versions"},
 		{"string version", offerMeta([]any{"1"}), MetaPath + ".versions"},
 		{"unparsable number", offerMeta([]any{json.Number("one")}), MetaPath + ".versions"},
 	} {
@@ -130,6 +132,7 @@ func TestDecodePromptCorrelationStrictness(t *testing.T) {
 		{"unknown member", map[string]any{"version": 1.0, "submission": submission, "streamId": "x"}, MetaPath + ".streamId"},
 		{"missing version", map[string]any{"submission": submission}, MetaPath + ".version"},
 		{"fractional version", map[string]any{"version": 1.5, "submission": submission}, MetaPath + ".version"},
+		{"unrepresentable version", map[string]any{"version": 1e300, "submission": submission}, MetaPath + ".version"},
 		{"unsupported version", map[string]any{"version": 2.0, "submission": submission}, MetaPath + ".version"},
 		{"missing submission", map[string]any{"version": 1.0}, MetaPath + ".submission"},
 		{"unknown submission member", map[string]any{"version": 1.0, "submission": map[string]any{

@@ -170,10 +170,19 @@ func checkCorrelationVersion(fields map[string]any, negotiated Negotiated) *Para
 // integerValue reads one JSON integer. A decoded wire value arrives as a float64
 // and an embedding Go host writes an int, so both are the same integer; a
 // fractional value is neither.
+//
+// Integrality alone does not make a float64 an integer here. A magnitude past
+// the int range is integral under Trunc and still names no int at all, so `1e300`
+// is refused rather than silently converted to whatever that platform's
+// out-of-range conversion happens to produce.
 func integerValue(raw any) (int, bool) {
 	switch value := raw.(type) {
 	case float64:
-		return int(value), value == math.Trunc(value)
+		if value != math.Trunc(value) || value < math.MinInt64 || value >= math.MaxInt64+1 {
+			return 0, false
+		}
+
+		return int(value), true
 	case int:
 		return value, true
 	case json.Number:
