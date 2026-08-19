@@ -73,7 +73,7 @@ func TestSettleCloseBoundary(t *testing.T) {
 	t.Run("terminalization failure stops the order", func(t *testing.T) {
 		s, client := lifecycleSession(t, true)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 		client.updateErr = errors.New("delivery")
 		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
 		require.ErrorContains(t, s.settleCloseBoundary(t.Context(), proc, nil), "delivery")
@@ -112,7 +112,7 @@ func TestCloseSettlesOnAFencedOrNeverOpenedIncarnation(t *testing.T) {
 	t.Run("fenced by a cancel", func(t *testing.T) {
 		s, client := lifecycleSession(t, true)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 		s.fenceLifecycleStream()
 
 		emitted := len(client.notifications)
@@ -184,7 +184,7 @@ func TestCloseCertifiesNothingAfterPersistenceIsFenced(t *testing.T) {
 	require.NoError(t, os.WriteFile(s.sessionFilePath, []byte("{\"one\":1}\n"), 0o600))
 
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 
 	// The delete path: persistence is fenced before the close runs its boundary.
 	s.fencePersistence()
@@ -210,7 +210,7 @@ func TestCloseCertifiesNothingAfterPersistenceIsFenced(t *testing.T) {
 func TestCloseNeverRewritesALossTerminalizedFailure(t *testing.T) {
 	s, _ := lifecycleSession(t, true)
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 
 	_, lostTurn, _ := s.lifecycleIdentity()
 	require.NotEmpty(t, lostTurn)
@@ -263,7 +263,7 @@ func TestRecordGenerationLoss(t *testing.T) {
 	require.NoError(t, s.recordGenerationLoss(t.Context()), "no stream means no loss to record")
 
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 	require.NoError(t, s.recordGenerationLoss(t.Context()))
 	require.True(t, s.lc.fenced)
 	require.Empty(t, s.lc.turnID)

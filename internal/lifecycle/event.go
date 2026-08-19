@@ -70,6 +70,40 @@ type Event struct {
 	Quiescence     *QuiescenceFact
 }
 
+// knownEventType reports membership of the closed six.
+func knownEventType(eventType EventType) bool {
+	switch eventType {
+	case EventSnapshot, EventPromptAccepted, EventStateUpdate,
+		EventActivityUpdate, EventActionUpdate, EventQuiescenceUpdate:
+		return true
+	default:
+		return false
+	}
+}
+
+// payloadMatchesType reports whether the event carries exactly the payload its
+// type names. The encoder reads the payload the discriminant selects, so an
+// in-process caller that named one and supplied another is judged here rather
+// than dereferenced there.
+func (e Event) payloadMatchesType() bool {
+	switch e.Type {
+	case EventSnapshot:
+		return e.Snapshot != nil
+	case EventPromptAccepted:
+		return e.PromptAccepted != nil
+	case EventStateUpdate:
+		return e.State != nil
+	case EventActivityUpdate:
+		return e.Activity != nil
+	case EventActionUpdate:
+		return e.Action != nil
+	case EventQuiescenceUpdate:
+		return e.Quiescence != nil
+	default:
+		return false
+	}
+}
+
 // Snapshot opens a stream with the whole truth it can state: the foreground state
 // and cycle, the complete nonterminal activity and action sets, and the current
 // quiescence fact with its proof source.

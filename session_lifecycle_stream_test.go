@@ -48,7 +48,7 @@ func TestLifecycleStreamFinalityActionsAndIncarnationLoss(t *testing.T) {
 
 func TestLifecycleStreamFailureBranchesAndRequiredActionMembers(t *testing.T) {
 	s, client := lifecycleSession(t, false)
-	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 	_, ok, err := s.prepareLifecycleAction()
 	require.NoError(t, err)
 	require.False(t, ok)
@@ -67,7 +67,7 @@ func TestLifecycleStreamFailureBranchesAndRequiredActionMembers(t *testing.T) {
 	s.agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, ActivityKinds: []lifecycle.ActivityKind{}}
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 	lifecycleRandRead = func([]byte) (int, error) { return 0, errors.New("entropy") }
-	require.ErrorContains(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}), "entropy")
+	require.ErrorContains(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()), "entropy")
 	lifecycleRandRead = original
 	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{SubmissionID: "s", ClientNonce: "n"}))
 	action, ok, err := s.prepareLifecycleAction()
@@ -118,7 +118,7 @@ func TestLifecycleStreamMintFailureBranches(t *testing.T) {
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 
 	failOnCall(2)
-	require.ErrorContains(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}), "entropy")
+	require.ErrorContains(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()), "entropy")
 
 	lifecycleRandRead = original
 	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{SubmissionID: "s", ClientNonce: "n"}))
@@ -138,14 +138,14 @@ func TestLifecycleStreamEmissionFailureBranches(t *testing.T) {
 		s, client := lifecycleSession(t, false)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 		client.updateErr = delivery
-		require.ErrorIs(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}), delivery)
+		require.ErrorIs(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()), delivery)
 		require.True(t, s.lc.fenced)
 	})
 
 	t.Run("settle terminalizes blockers", func(t *testing.T) {
 		s, client := lifecycleSession(t, false)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 		action, ok, err := s.prepareLifecycleAction()
 		require.NoError(t, err)
 		require.True(t, ok)
@@ -158,7 +158,7 @@ func TestLifecycleStreamEmissionFailureBranches(t *testing.T) {
 	t.Run("resolve", func(t *testing.T) {
 		s, client := lifecycleSession(t, false)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 		action, ok, err := s.prepareLifecycleAction()
 		require.NoError(t, err)
 		require.True(t, ok)
@@ -170,7 +170,7 @@ func TestLifecycleStreamEmissionFailureBranches(t *testing.T) {
 	t.Run("terminalize owned", func(t *testing.T) {
 		s, client := lifecycleSession(t, false)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 		action, ok, err := s.prepareLifecycleAction()
 		require.NoError(t, err)
 		require.True(t, ok)
@@ -186,7 +186,7 @@ func TestLifecycleStreamEmissionFailureBranches(t *testing.T) {
 func TestLifecycleSettleCancelsUnresolvedBlockers(t *testing.T) {
 	s, client := lifecycleSession(t, false)
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 	action, ok, err := s.prepareLifecycleAction()
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -204,7 +204,7 @@ func TestLifecycleSettleCancelsUnresolvedBlockers(t *testing.T) {
 func TestLifecycleAnnounceAfterTurnEndIsANoOp(t *testing.T) {
 	s, client := lifecycleSession(t, false)
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 	action, ok, err := s.prepareLifecycleAction()
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -220,7 +220,7 @@ func TestLifecycleAnnounceAfterTurnEndIsANoOp(t *testing.T) {
 func TestLifecycleTerminalizeOwned(t *testing.T) {
 	s, client := lifecycleSession(t, false)
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 	require.NoError(t, s.lifecycleTerminalizeOwned(t.Context()))
 	require.Empty(t, s.lc.turnID)
 

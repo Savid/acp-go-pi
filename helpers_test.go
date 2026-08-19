@@ -558,3 +558,11 @@ func lifecycleSession(t *testing.T, authoritative bool) (*agentSession, *directA
 
 	return &agentSession{agent: agent, id: "lifecycle"}, client
 }
+
+// testSubmission is the correlation identity a negotiated prompt always carries.
+// The emitter validates the notification it renders, so an acceptance stating no
+// submission is refused in its own bytes exactly as a consumer would refuse it —
+// which is why no fixture may stand one in for a real prompt's correlation.
+func testSubmission() lifecycle.Submission {
+	return lifecycle.Submission{SubmissionID: "submission", ClientNonce: "nonce"}
+}

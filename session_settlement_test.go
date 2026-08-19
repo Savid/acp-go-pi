@@ -4,8 +4,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
 
 // TestLifecycleIdentityNamesTheIncarnation pins the boundary-record identity:
@@ -19,7 +17,7 @@ func TestLifecycleIdentityNamesTheIncarnation(t *testing.T) {
 	require.Empty(t, cycleID)
 
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 	streamID, turnID, cycleID = s.lifecycleIdentity()
 	require.NotEmpty(t, streamID)
 	require.NotEmpty(t, turnID)

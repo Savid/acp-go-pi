@@ -361,3 +361,100 @@ func TestEmittedMidTurnSnapshotReducesToTheEmitterOwnProjection(t *testing.T) {
 	require.Equal(t, emitted.Quiescence, reduced.Quiescence)
 	require.Equal(t, emitted, reduced)
 }
+
+// TestEmitValidatesTheRenderedBytesNotTheStruct pins the emitter's self-check as
+// a claim about bytes. Both events below reduce cleanly as in-process structs —
+// the reducer never reads an activity's opaque progress — and both are illegal
+// once rendered. Reducing the struct would have published them; reducing the
+// rendered notification refuses them at emit, which is the only place an encoder
+// defect is still the emitter's to catch.
+func TestEmitValidatesTheRenderedBytesNotTheStruct(t *testing.T) {
+	t.Parallel()
+
+	live := ActivityUpdate{
+		ActivityID: "act-1", Kind: ActivityTask, State: ActivityRunning,
+		Cause: CauseSession, OriginTurnID: "turn-1",
+	}
+
+	// The same event with a renderable progress object survives the round trip,
+	// so the refusals below name the rendered defect rather than the event kind.
+	sound := NewStream("strm-1", observingConfiguration())
+	emitAll(t, sound,
+		SnapshotEvent("cyc-0", QuiescenceFact{}),
+		AcceptedEvent(Submission{SubmissionID: "sub-1", ClientNonce: "non-1"}, "turn-1"))
+
+	renderable := live
+	renderable.Progress = json.RawMessage(`{"done":1}`)
+
+	envelope, err := sound.Emit(activityEvent(renderable))
+	require.NoError(t, err)
+
+	rendered, ok := envelope[fieldEvent].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, string(EventActivityUpdate), rendered[fieldType])
+
+	activity, ok := sound.State().Activity("act-1")
+	require.True(t, ok)
+	require.Equal(t, ActivityRunning, activity.State)
+
+	for _, test := range []struct {
+		name     string
+		progress json.RawMessage
+	}{
+		{name: "a progress object that renders to nothing at all", progress: json.RawMessage("{")},
+		{name: "a progress value that renders as a non-object", progress: json.RawMessage("123")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			opening := SnapshotEvent("cyc-0", QuiescenceFact{})
+			accepted := AcceptedEvent(Submission{SubmissionID: "sub-1", ClientNonce: "non-1"}, "turn-1")
+
+			stream := NewStream("strm-1", observingConfiguration())
+			emitAll(t, stream, opening, accepted)
+
+			update := live
+			update.Progress = test.progress
+
+			// The reducer accepts the struct: progress is rendered and never
+			// reduced, so nothing about it is judged in memory.
+			memory := NewReducer(Options{Negotiated: observingConfiguration()})
+			require.NoError(t, memory.Reduce(deliver(1, opening)))
+			require.NoError(t, memory.Reduce(deliver(2, accepted)))
+			require.NoError(t, memory.Reduce(deliver(3, activityEvent(update))))
+
+			// The rendered bytes are refused, and the sequence stays consumed.
+			_, err := stream.Emit(activityEvent(update))
+
+			var refusal *ViolationError
+
+			require.ErrorAs(t, err, &refusal)
+			require.Equal(t, ViolationMalformedEnvelope, refusal.Kind)
+			require.Equal(t, uint64(3), stream.Sequence())
+		})
+	}
+}
+
+// TestEmitRefusesADiscriminantWithoutItsPayload pins the pre-render guard: the
+// encoder reads the payload the discriminant selects, so an event that names one
+// and carries another is judged before the sequence is claimed rather than
+// dereferenced inside the encoder.
+func TestEmitRefusesADiscriminantWithoutItsPayload(t *testing.T) {
+	t.Parallel()
+
+	stream := NewStream("strm-1", containedConfiguration())
+
+	_, err := stream.Emit(Event{Type: EventSnapshot})
+	require.Equal(t, violation(ViolationMalformedEnvelope, "strm-1", 1,
+		"event payload does not match type "+string(EventSnapshot)), err)
+	require.Zero(t, stream.Sequence(), "a caller defect burns no sequence")
+
+	_, err = stream.Emit(Event{Type: EventType("invented")})
+	require.Equal(t, violation(ViolationUnknownEventType, "strm-1", 1, "event type invented"), err)
+	require.Zero(t, stream.Sequence())
+
+	// A real event still opens the stream at sequence one afterwards.
+	_, err = stream.Emit(SnapshotEvent("cyc-0", QuiescenceFact{}))
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), stream.Sequence())
+}

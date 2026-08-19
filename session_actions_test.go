@@ -154,7 +154,7 @@ func TestAnnouncedActionRequestLifecycle(t *testing.T) {
 
 	fenced, _ := lifecycleSession(t, false)
 	require.NoError(t, fenced.openLifecycleStream(t.Context(), 1))
-	require.NoError(t, fenced.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+	require.NoError(t, fenced.lifecycleAcceptTurn(t.Context(), testSubmission()))
 	original := lifecycleRandRead
 	lifecycleRandRead = func([]byte) (int, error) { return 0, errors.New("entropy") }
 	t.Cleanup(func() { lifecycleRandRead = original })

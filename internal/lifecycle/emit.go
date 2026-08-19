@@ -1,10 +1,13 @@
 package lifecycle
 
+import "encoding/json"
+
 // Stream is one incarnation's ordered emitter. It claims a sequence before
 // delivery is attempted, so a lost or refused event leaves a detectable gap
-// rather than a silently contiguous stream, and it reduces every event through
-// the same reducer the fixture battery drives, so a stream this adapter could not
-// support fails at the point of emission instead of at its consumers.
+// rather than a silently contiguous stream, and it renders every event as the
+// notification it will ride and reads it back through DecodeSessionUpdate before
+// reducing it, so a stream this adapter could not support fails at the point of
+// emission instead of at its consumers.
 //
 // A Stream is not safe for concurrent use; the session that owns the incarnation
 // serializes emission.
@@ -30,28 +33,59 @@ func (s *Stream) State() State { return s.reducer.State() }
 // Sequence reports the highest sequence claimed so far.
 func (s *Stream) Sequence() uint64 { return s.sequence }
 
-// Emit claims the next sequence, reduces the event, and renders the envelope for
-// the notification's `_meta`. A refused event is never rendered and its sequence
-// stays consumed, which is exactly the detectable gap the ordering rule wants.
+// Emit claims the next sequence, renders the envelope for the notification's
+// `_meta`, and validates the rendered bytes before returning them. A refused
+// event is never returned and its sequence stays consumed, which is exactly the
+// detectable gap the ordering rule wants.
+//
+// "Emitted envelopes are well formed" is a claim about bytes, so the claim is
+// tested on bytes: the notification is rendered, marshalled, decoded, and
+// reduced through the exact path a consumer takes. Reducing the in-process
+// struct instead would leave every encoder defect — a dropped member, a member
+// rendered under the wrong name — invisible to the emitter that produced it,
+// because the struct the reducer judged was never the thing that went out.
 func (s *Stream) Emit(event Event) (map[string]any, error) {
-	s.sequence++
+	// The payload is judged before the sequence claim, so a caller defect
+	// neither burns a sequence nor dereferences a payload that is not there.
+	// The verdicts mirror the decoder's: an unknown discriminant is the
+	// discriminant's violation, a known one without its payload is shape.
+	if !event.payloadMatchesType() {
+		if !knownEventType(event.Type) {
+			return nil, violation(ViolationUnknownEventType, s.id, s.sequence+1,
+				"event type "+string(event.Type))
+		}
 
-	err := s.reducer.Reduce(Delivery{
-		StreamID: s.id,
-		Sequence: s.sequence,
-		Carrier:  CarrierSessionInfo,
-		Event:    event,
-	})
-	if err != nil {
-		return nil, err
+		return nil, violation(ViolationMalformedEnvelope, s.id, s.sequence+1,
+			"event payload does not match type "+string(event.Type))
 	}
 
-	return map[string]any{
+	s.sequence++
+
+	envelope := map[string]any{
 		fieldVersion:  Version,
 		fieldStreamID: s.id,
 		fieldSequence: s.sequence,
 		fieldEvent:    encodeEvent(event),
-	}, nil
+	}
+
+	// A rendered envelope holds only JSON-safe values, and a payload this step
+	// could not produce fails the decode below as a malformed envelope rather
+	// than escaping as an untyped error.
+	params, _ := json.Marshal(map[string]any{
+		metaField:   map[string]any{MetaKey: envelope},
+		updateField: map[string]any{sessionUpdateField: string(CarrierSessionInfo)},
+	})
+
+	delivery, err := DecodeSessionUpdate(params, s.reducer.Negotiated())
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.reducer.Reduce(delivery); err != nil {
+		return nil, err
+	}
+
+	return envelope, nil
 }
 
 // SnapshotEvent opens a stream from the whole state this adapter can state
@@ -137,14 +171,17 @@ func QuiescenceEvent(fact QuiescenceFact) Event {
 	return Event{Type: EventQuiescenceUpdate, Quiescence: &fact}
 }
 
-// encodeEvent renders the events this adapter emits. This configuration proves no
-// activity kind, so `activity_update` has no emitter here; the reducer still
-// reduces all six, because it is also the validator for streams this adapter
-// reads, and a snapshot's sets are rendered whole for the same reason.
+// encodeEvent renders the events this adapter emits. This adapter's own
+// configuration proves no activity kind, so it never emits an `activity_update`
+// of its own; the encoder still renders all six, because Emit reads the rendered
+// bytes back through the decoder and a discriminant the encoder could not render
+// would be a hole in that self-check rather than an event nobody produces.
 func encodeEvent(event Event) map[string]any {
 	switch event.Type {
 	case EventSnapshot:
 		return encodeSnapshot(*event.Snapshot)
+	case EventActivityUpdate:
+		return map[string]any{fieldType: string(EventActivityUpdate), fieldActivity: encodeActivity(*event.Activity)}
 	case EventPromptAccepted:
 		return withOptional(map[string]any{
 			fieldType:         string(EventPromptAccepted),
