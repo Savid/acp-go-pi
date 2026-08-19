@@ -207,7 +207,7 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 
 	activeSessions := make(map[acp.SessionId]*agentSession, len(a.sessions))
 	for id, session := range a.sessions {
-		if params.Cwd != nil && *params.Cwd != session.cwd {
+		if params.Cwd != nil && *params.Cwd != "" && *params.Cwd != session.cwd {
 			continue
 		}
 

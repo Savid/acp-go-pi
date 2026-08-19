@@ -673,6 +673,10 @@ func TestConformanceStoreResumeLoadAndPagination(t *testing.T) {
 	list, err := resumeConn.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd(cwd)))
 	require.NoError(t, err)
 	require.NotEmpty(t, list.Sessions)
+	// An empty cwd is an absent filter, never a filter that matches nothing.
+	list, err = resumeConn.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd("")))
+	require.NoError(t, err)
+	require.NotEmpty(t, list.Sessions)
 	list, err = resumeConn.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor("bad")))
 	requireInvalidParams(t, err)
 }
