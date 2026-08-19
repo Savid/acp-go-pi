@@ -211,6 +211,13 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 			continue
 		}
 
+		// A tombstoned id is hidden from list even while something still holds
+		// it in the active map: the store half already filters, and the active
+		// half answers on the same terms.
+		if _, deleted := a.deleted[id]; deleted {
+			continue
+		}
+
 		activeSessions[id] = session
 	}
 	a.mu.Unlock()
@@ -290,21 +297,6 @@ func (a *Agent) Cancel(ctx context.Context, params acp.CancelNotification) (err 
 	return err
 }
 
-// deleteSessionSettlement serializes a delete after the settlement that could
-// still be writing, then fences every later durable write. A tombstone written
-// while a commit was in flight would be recreated by that commit; fencing after
-// the settlement completes is what makes the delete final.
-func (a *Agent) deleteSessionSettlement(session *agentSession) error {
-	if session == nil {
-		return nil
-	}
-
-	settleErr := session.awaitSettlement()
-	session.fencePersistence()
-
-	return settleErr
-}
-
 // CloseSession closes a pi session process and removes it from the active
 // map.
 func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (resp acp.CloseSessionResponse, err error) {
@@ -326,6 +318,10 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 		a.observe.AddActiveSession(ctx, -1)
 	}
 
+	// Ladder steps 2-4 before the native interrupt: a parked provider-auth
+	// login is answered while the process that parked it is still there.
+	session.settleBoundaryInteractions(ctx)
+
 	_ = session.cancelForClose(ctx)
 
 	closeErr := session.Close(ctx)
@@ -336,16 +332,32 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 	return acp.CloseSessionResponse{}, nil
 }
 
-// UnstableDeleteSession implements ACP session/delete. The delete serializes
-// after the addressed session's full settlement and fences its persistence
-// before the tombstone lands, so no write that was still in flight can recreate
-// the row the tombstone removed. The tombstone is durable before the native
-// state and the active session are torn down, and the session is hidden from
-// list, load, and resume from that moment on.
+// UnstableDeleteSession implements ACP session/delete in the order
+// 05-behavior.md fixes: the durable tombstone first, then close-and-cancel of
+// any active session with the same id, then the native state and store entries,
+// and the id is hidden from list, load, and resume from the moment the tombstone
+// lands.
+//
+// The tombstone is written before anything is torn down and before the session's
+// persistence is fenced. It does not need to wait for a settlement that is still
+// committing, because the store itself refuses an Append or a Replace over a
+// tombstone that write did not create: a commit racing the delete either landed
+// before it or lands nowhere. Waiting instead would wedge the delete behind a
+// live prompt nothing has cancelled yet — the cancel is the rung *after* the
+// tombstone — and with no turn deadline configured, nothing inside the wrapper
+// bounds that wait.
+//
+// A delete that did not tombstone changes nothing: the session stays the host's,
+// stays listed, stays promptable, and keeps its persistence unfenced. Fencing a
+// session the host still owns would silently drop every later commit it makes
+// while reporting success on each one.
 func (a *Agent) UnstableDeleteSession(
 	ctx context.Context,
 	params acp.UnstableDeleteSessionRequest,
-) (acp.UnstableDeleteSessionResponse, error) {
+) (resp acp.UnstableDeleteSessionResponse, err error) {
+	ctx, finish := a.observe.StartACP(ctx, params.Meta, "session/delete")
+	defer func() { finish(observer.ACPResult{Err: err}) }()
+
 	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
 		return acp.UnstableDeleteSessionResponse{}, refusal
 	}
@@ -354,33 +366,41 @@ func (a *Agent) UnstableDeleteSession(
 	session := a.sessions[params.SessionId]
 	a.mu.Unlock()
 
-	var cleanupErr error
-
-	if settleErr := a.deleteSessionSettlement(session); settleErr != nil {
-		cleanupErr = errors.Join(cleanupErr, settleErr)
-	}
-
-	if err := a.sessionStore().Delete(ctx, SessionKey{SessionID: string(params.SessionId)}); err != nil {
-		return acp.UnstableDeleteSessionResponse{}, errors.Join(cleanupErr, err)
+	if deleteErr := a.sessionStore().Delete(ctx, SessionKey{SessionID: string(params.SessionId)}); deleteErr != nil {
+		return acp.UnstableDeleteSessionResponse{}, deleteErr
 	}
 
 	a.mu.Lock()
-	if a.sessions[params.SessionId] == session && session != nil {
+	if session != nil && a.sessions[params.SessionId] == session {
 		delete(a.sessions, params.SessionId)
 	}
 
 	a.deleted[params.SessionId] = struct{}{}
 	a.mu.Unlock()
 
-	if session != nil {
-		_ = session.cancelForClose(ctx)
-		if err := session.Close(ctx); err != nil {
-			cleanupErr = errors.Join(cleanupErr, err)
-		}
-
-		a.observe.AddActiveSession(ctx, -1)
+	if session == nil {
+		return acp.UnstableDeleteSessionResponse{}, nil
 	}
 
+	// The tombstone is durable, so the incarnation ends with it: the close
+	// boundary that follows terminalizes nothing, certifies nothing, and commits
+	// nothing behind a session the host was told is gone.
+	session.fencePersistence()
+
+	session.settleBoundaryInteractions(ctx)
+
+	var cleanupErr error
+
+	_ = session.cancelForClose(ctx)
+
+	if closeErr := session.Close(ctx); closeErr != nil {
+		cleanupErr = errors.Join(cleanupErr, closeErr)
+	}
+
+	a.observe.AddActiveSession(ctx, -1)
+
+	// Partial cleanup is reported only now, with the tombstone already durable
+	// and the id already hidden.
 	if cleanupErr != nil {
 		return acp.UnstableDeleteSessionResponse{}, cleanupErr
 	}
@@ -388,9 +408,17 @@ func (a *Agent) UnstableDeleteSession(
 	return acp.UnstableDeleteSessionResponse{}, nil
 }
 
+// session resolves an addressed id to its live session. The tombstone is
+// consulted in the same critical section as the map, so a deleted id is
+// wire-indistinguishable from one that never existed on every session-scoped
+// method — whatever an install racing the delete managed to leave behind.
 func (a *Agent) session(sessionID acp.SessionId) (*agentSession, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if _, deleted := a.deleted[sessionID]; deleted {
+		return nil, unknownSessionError()
+	}
 
 	session := a.sessions[sessionID]
 	if session == nil {
@@ -485,6 +513,13 @@ func (a *Agent) ensureOpen() error {
 	return nil
 }
 
+// storeStartedSession installs a freshly prepared session under its id. The
+// deletion tombstone is re-checked here, under the same lock that installs, and
+// never cleared as a side effect of installing: a delete that completed while
+// this session was being prepared wins however far the preparation got, so the
+// prepared replacement is torn down and the id answers unknown-session. A load
+// or resume that passed its entry check is not licensed to resurrect an id the
+// host was told is gone.
 func (a *Agent) storeStartedSession(ctx context.Context, session *agentSession) error {
 	a.mu.Lock()
 	if a.closed {
@@ -495,6 +530,16 @@ func (a *Agent) storeStartedSession(ctx context.Context, session *agentSession) 
 		}
 
 		return errAgentClosed
+	}
+
+	if _, deleted := a.deleted[session.id]; deleted {
+		a.mu.Unlock()
+
+		if err := session.Close(ctx); err != nil {
+			a.log.DebugContext(ctx, "close tombstoned pi session failed", slog.String(jsonFieldError, err.Error()))
+		}
+
+		return unknownSessionError()
 	}
 
 	previous := a.sessions[session.id]
@@ -575,6 +620,10 @@ func (a *Agent) activeSessionForStart(id acp.SessionId, start sessionStart) *age
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	if _, deleted := a.deleted[id]; deleted {
+		return nil
+	}
 
 	session := a.sessions[id]
 	if session == nil || session.fingerprint != fingerprint {

@@ -458,10 +458,17 @@ func (p *providerAuth) answerParked(ctx context.Context, session *agentSession, 
 // user code would stay approvable, and an approval landing after the flow ended
 // would write a credential into pi's durable agent directory under a ledger
 // entry no leg will ever confirm.
+//
+// The session is the one the flow was published under, not one resolved from the
+// agent's active map: ladder step 4 runs while the boundary is tearing that
+// session down, and close, delete, and Agent.Close all take the id out of the
+// map first. Resolving by id there would silently skip the native cancel on
+// exactly the three paths that owe it.
 func (p *providerAuth) releaseNativeLogin(ctx context.Context, flow *authFlow) {
 	p.mu.Lock()
 	parked := flow.parkedDialog
 	abort := flow.abortDialog
+	session := flow.session
 	flow.parkedDialog = ""
 	flow.abortDialog = ""
 	p.mu.Unlock()
@@ -470,8 +477,7 @@ func (p *providerAuth) releaseNativeLogin(ctx context.Context, flow *authFlow) {
 		return
 	}
 
-	session, err := p.agent.session(flow.sessionID)
-	if err != nil {
+	if session == nil {
 		return
 	}
 

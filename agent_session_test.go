@@ -15,6 +15,8 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/savid/acp-go-pi/internal/pi"
 )
@@ -1177,11 +1179,14 @@ func (s *settlementDeleteStore) Delete(ctx context.Context, key SessionKey) erro
 	return s.SessionStore.Delete(ctx, key)
 }
 
-// TestDeleteSessionWaitsForSettlementBeforeFencingAndDeleting pins the delete
-// interleaving without scheduler timing: delete first proves it entered the
-// settlement wait, remains outside the store until settlement is released,
-// then fences persistence before removing the durable generation.
-func TestDeleteSessionWaitsForSettlementBeforeFencingAndDeleting(t *testing.T) {
+// TestDeleteTombstonesBeforeItFencesOrWaitsForSettlement pins the delete order
+// 05-behavior.md fixes. The tombstone is the first rung: it reaches the store
+// while a settlement is still running and while the session's persistence is
+// still unfenced, because store tombstone finality — not a wait — is what stops
+// a commit in flight from recreating the row. Only then is the incarnation
+// fenced, and the settlement's own failure is reported after the tombstone is
+// durable and the id already hidden.
+func TestDeleteTombstonesBeforeItFencesOrWaitsForSettlement(t *testing.T) {
 	base := NewInMemorySessionStore()
 	store := &settlementDeleteStore{SessionStore: base, deleted: make(chan bool, 1)}
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
@@ -1196,28 +1201,349 @@ func TestDeleteSessionWaitsForSettlementBeforeFencingAndDeleting(t *testing.T) {
 	store.session = session
 
 	settleErr := errors.New("settlement commit failed")
-	type result struct {
-		err error
-	}
-	done := make(chan result, 1)
+	done := make(chan error, 1)
+
 	go func() {
-		_, err := agent.UnstableDeleteSession(t.Context(), acp.UnstableDeleteSessionRequest{SessionId: "id"})
-		done <- result{err: err}
+		_, err := agent.UnstableDeleteSession(context.Background(), acp.UnstableDeleteSessionRequest{SessionId: "id"})
+		done <- err
 	}()
+
+	// The tombstone lands with the settlement still open and the session still
+	// unfenced: nothing about the delete waits on the turn it is deleting.
+	require.False(t, <-store.deleted, "the tombstone is written before the fence, not after it")
 
 	session.mu.Lock()
 	settlement := session.settlement
 	session.mu.Unlock()
 	<-settlement.waiting
 
-	select {
-	case <-store.deleted:
-		t.Fatal("delete reached the store before settlement completed")
-	default:
-	}
+	require.True(t, agent.isDeleted("id"), "the id is hidden from the moment the tombstone lands")
+
+	session.commitMu.Lock()
+	fenced := session.persistFenced
+	session.commitMu.Unlock()
+	require.True(t, fenced, "the durable tombstone ends the incarnation with it")
 
 	session.completeSettlement(settleErr)
-	require.True(t, <-store.deleted, "persistence was not fenced before store deletion")
-	require.ErrorIs(t, (<-done).err, settleErr)
+
+	require.ErrorIs(t, <-done, settleErr, "partial cleanup is reported after the tombstone is durable")
 	require.NotContains(t, agent.sessions, acp.SessionId("id"))
+}
+
+// TestDeleteNeverWedgesBehindALivePrompt pins the reason the tombstone comes
+// first. The close-and-cancel rung is what ends a live turn, and it runs after
+// the tombstone: a delete issued during a live prompt cancels that prompt rather
+// than waiting for it. With TurnTimeout defaulting to zero, a delete that waited
+// first would have nothing inside the wrapper to bound it.
+func TestDeleteNeverWedgesBehindALivePrompt(t *testing.T) {
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: "wedge-id"}
+	agent := newStubClientAgent(t, client)
+	agent.setConnection(newDirectAgentClient())
+
+	response, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+	require.NoError(t, err)
+
+	session, err := agent.session(response.SessionId)
+	require.NoError(t, err)
+
+	promptDone := make(chan struct{})
+
+	go func() {
+		defer close(promptDone)
+
+		_, _ = agent.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: response.SessionId,
+			Prompt:    []acp.ContentBlock{acp.TextBlock("hi")},
+			Meta:      map[string]any{routeMetaKey: map[string]any{routeFieldVer: 1, routeFieldTurn: "n1"}},
+		})
+	}()
+
+	require.Eventually(t, func() bool {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+
+		return session.settlement != nil
+	}, 5*time.Second, time.Millisecond, "the turn armed its settlement latch")
+
+	deleted := make(chan error, 1)
+
+	go func() {
+		_, delErr := agent.UnstableDeleteSession(context.Background(),
+			acp.UnstableDeleteSessionRequest{SessionId: response.SessionId})
+		deleted <- delErr
+	}()
+
+	select {
+	case <-deleted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("delete wedged behind the live prompt it never cancelled")
+	}
+
+	<-promptDone
+
+	require.True(t, agent.isDeleted(response.SessionId))
+	require.NotContains(t, agent.sessions, response.SessionId)
+}
+
+// refusingDeleteStore refuses the tombstone write and serves every other
+// operation from the store it wraps.
+type refusingDeleteStore struct {
+	SessionStore
+	deleteErr error
+}
+
+func (s *refusingDeleteStore) Delete(ctx context.Context, key SessionKey) error {
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+
+	return s.SessionStore.Delete(ctx, key)
+}
+
+// TestRefusedDeleteLeavesTheSessionTheHostsAndUnfenced pins the delete that did
+// not tombstone: it changes nothing. The session stays in the active map, stays
+// listed, stays promptable, and — the part that is not merely cosmetic — keeps
+// its persistence unfenced, so every later commit it makes is durable rather
+// than silently dropped behind a success the wrapper reported anyway. A caller
+// that cancels its own delete request is the same case: the tombstone write is
+// caller-context-bound, so it is refused, and refusing changes nothing.
+func TestRefusedDeleteLeavesTheSessionTheHostsAndUnfenced(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		request func(*Agent, *refusingDeleteStore) error
+	}{
+		{
+			name: "the store refuses the tombstone",
+			request: func(agent *Agent, store *refusingDeleteStore) error {
+				store.deleteErr = errors.New("store refused the tombstone")
+
+				_, err := agent.UnstableDeleteSession(context.Background(),
+					acp.UnstableDeleteSessionRequest{SessionId: "id"})
+
+				return err
+			},
+		},
+		{
+			name: "the caller cancels its own delete",
+			request: func(agent *Agent, _ *refusingDeleteStore) error {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+
+				_, err := agent.UnstableDeleteSession(ctx,
+					acp.UnstableDeleteSessionRequest{SessionId: "id"})
+
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := NewInMemorySessionStore()
+			store := &refusingDeleteStore{SessionStore: base}
+			agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+
+			root := t.TempDir()
+			sessionFile := filepath.Join(root, "session.jsonl")
+			require.NoError(t, os.WriteFile(sessionFile, []byte("{\"row\":1}\n"), 0o600))
+
+			session := &agentSession{
+				agent:           agent,
+				id:              "id",
+				proc:            newStubProcess(false),
+				sessionRoot:     root,
+				sessionFilePath: sessionFile,
+			}
+			agent.sessions["id"] = session
+
+			require.Error(t, test.request(agent, store), "a refused tombstone fails the delete")
+
+			// The session is still the host's.
+			require.Contains(t, agent.sessions, acp.SessionId("id"))
+			require.False(t, agent.isDeleted("id"))
+
+			resolved, sessErr := agent.session("id")
+			require.NoError(t, sessErr)
+			require.Same(t, session, resolved)
+
+			listed, listErr := agent.ListSessions(context.Background(), acp.ListSessionsRequest{})
+			require.NoError(t, listErr)
+			require.Condition(t, func() bool {
+				for _, info := range listed.Sessions {
+					if info.SessionId == "id" {
+						return true
+					}
+				}
+
+				return false
+			}, "the refused delete leaves the id visible to list")
+
+			// And its persistence still works: a later commit is durable.
+			session.commitMu.Lock()
+			fenced := session.persistFenced
+			session.commitMu.Unlock()
+			require.False(t, fenced, "a delete that did not tombstone fences nothing")
+
+			require.NoError(t, session.commitMirror(context.Background()))
+			require.NoError(t, session.commitLifecycleBoundary(context.Background(), lifecycleBoundaryRecord{
+				StreamID:    "s",
+				NativeRows:  1,
+				NativeState: nativeStateCommitted,
+			}))
+
+			rows, loadErr := base.Load(context.Background(), SessionKey{SessionID: "id"})
+			require.NoError(t, loadErr)
+			require.NotEmpty(t, rows, "the live session's native rows are still committed")
+
+			journal, journalErr := base.Load(context.Background(),
+				SessionKey{SessionID: "id", Subpath: SessionStoreLifecycleSubpath})
+			require.NoError(t, journalErr)
+			require.NotEmpty(t, journal, "the live session's boundary records are still committed")
+		})
+	}
+}
+
+// gatedLoadStore blocks the first lifecycle-subpath Load after the underlying
+// read returns, which parks a restore inside its own preparation window.
+type gatedLoadStore struct {
+	SessionStore
+	gate    chan struct{}
+	release chan struct{}
+	armed   bool
+	mu      sync.Mutex
+}
+
+func (s *gatedLoadStore) Load(ctx context.Context, key SessionKey) ([]SessionStoreEntry, error) {
+	entries, err := s.SessionStore.Load(ctx, key)
+
+	s.mu.Lock()
+	armed := s.armed && key.Subpath == SessionStoreLifecycleSubpath
+	if armed {
+		s.armed = false
+	}
+	s.mu.Unlock()
+
+	if armed {
+		close(s.gate)
+		<-s.release
+	}
+
+	return entries, err
+}
+
+// TestResumeRacingDeleteResurrectsNothing pins the install re-check. A resume
+// that passed its entry check and prepared a whole replacement still loses to a
+// delete that completed while it was preparing: the tombstone is re-read under
+// the same lock that installs, the prepared replacement is torn down, the resume
+// answers unknown-session, and nothing — the active map, session/list,
+// session-scoped resolution, or a durable row — reports the id as alive again.
+func TestResumeRacingDeleteResurrectsNothing(t *testing.T) {
+	entries := []SessionStoreEntry{
+		json.RawMessage(`{"type":"session","id":"resume-id","cwd":"/cwd"}`),
+		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`[{"type":"text","text":"hi"}]`)}),
+	}
+	base := NewInMemorySessionStore()
+	require.NoError(t, base.Append(t.Context(), SessionKey{SessionID: "resume-id"}, entries))
+	appendLifecycleBoundaryForRows(t, base, "resume-id", len(entries))
+
+	store := &gatedLoadStore{
+		SessionStore: base,
+		gate:         make(chan struct{}),
+		release:      make(chan struct{}),
+		armed:        true,
+	}
+
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: "resume-id"}
+	agent := newStubClientAgent(t, client, WithSessionStore(store))
+	agent.setConnection(newDirectAgentClient())
+
+	resumed := make(chan error, 1)
+
+	go func() {
+		_, err := agent.ResumeSession(context.Background(), ResumeSessionRequest("resume-id", "/cwd"))
+		resumed <- err
+	}()
+
+	<-store.gate
+
+	_, delErr := agent.UnstableDeleteSession(context.Background(),
+		acp.UnstableDeleteSessionRequest{SessionId: "resume-id"})
+	require.NoError(t, delErr, "the delete completes while the resume is mid-flight")
+	require.True(t, agent.isDeleted("resume-id"))
+
+	close(store.release)
+
+	requireUnknownSession(t, <-resumed)
+
+	agent.mu.Lock()
+	installed := agent.sessions["resume-id"]
+	agent.mu.Unlock()
+	require.Nil(t, installed, "no live session is installed under a tombstoned id")
+
+	_, sessErr := agent.session("resume-id")
+	requireUnknownSession(t, sessErr)
+
+	listed, listErr := agent.ListSessions(context.Background(), acp.ListSessionsRequest{})
+	require.NoError(t, listErr)
+
+	for _, info := range listed.Sessions {
+		require.NotEqual(t, acp.SessionId("resume-id"), info.SessionId, "a deleted id is invisible to list")
+	}
+
+	rows, loadErr := base.Load(context.Background(), SessionKey{SessionID: "resume-id"})
+	require.NoError(t, loadErr)
+	require.Empty(t, rows, "no durable row survives under the deleted key")
+}
+
+// TestInstallUnderATombstoneTearsDownThePreparedReplacement pins the
+// install-lock verdict directly, without the timing the race above needs: a
+// fully prepared session offered for an id a delete already tombstoned is closed
+// rather than installed, and the deletion marker is not cleared by the attempt.
+func TestInstallUnderATombstoneTearsDownThePreparedReplacement(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+
+	agent.mu.Lock()
+	agent.deleted["gone"] = struct{}{}
+	agent.mu.Unlock()
+
+	proc := newStubProcess(false)
+	prepared := &agentSession{agent: agent, id: "gone", proc: proc, sessionRoot: t.TempDir()}
+
+	requireUnknownSession(t, agent.storeStartedSession(t.Context(), prepared))
+
+	agent.mu.Lock()
+	_, installed := agent.sessions["gone"]
+	_, stillDeleted := agent.deleted["gone"]
+	agent.mu.Unlock()
+
+	require.False(t, installed, "the prepared replacement is never installed")
+	require.True(t, stillDeleted, "installing never clears the deletion marker")
+	require.Positive(t, proc.closeCalls, "the prepared replacement is torn down")
+}
+
+// TestDeleteBoundaryIsObserved pins the observer span every other boundary
+// handler opens. session/delete is a boundary like close: a host tracing its
+// lifecycle must see the delete it issued, with its own outcome, rather than a
+// hole between the last update and the id disappearing.
+func TestDeleteBoundaryIsObserved(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	agent := NewAgent(
+		WithLogger(slog.New(slog.DiscardHandler)),
+		WithTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))),
+	)
+
+	_, err := agent.UnstableDeleteSession(t.Context(), acp.UnstableDeleteSessionRequest{SessionId: "missing"})
+	require.NoError(t, err, "deleting an unknown session silently succeeds")
+
+	methods := make([]string, 0, len(recorder.Ended()))
+
+	for _, span := range recorder.Ended() {
+		for _, attr := range span.Attributes() {
+			if attr.Key == "acp.method" {
+				methods = append(methods, attr.Value.AsString())
+			}
+		}
+	}
+
+	require.Contains(t, methods, "session/delete")
 }

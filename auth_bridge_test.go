@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
 	"github.com/savid/acp-go-pi/internal/pi"
@@ -565,4 +566,166 @@ func TestParkAdoptsPromptTextWhenNoneWasSupplied(t *testing.T) {
 	require.Equal(t, "Paste the authorization code here", flow.presentMessage)
 	require.True(t, flow.presentMessageNative)
 	require.Equal(t, authInteractionCallback, flow.presentInteraction)
+}
+
+// armPendingAuthFlow installs one pending provider-auth flow whose native login
+// is still parked on a pi dialog, with the abort dialog the bridge holds open
+// for the life of that login.
+func armPendingAuthFlow(h *authHarness) *authFlow {
+	flow := &authFlow{
+		id:           "flow-1",
+		session:      h.session,
+		sessionID:    h.session.id,
+		providerID:   "prov",
+		state:        authStatePending,
+		parkedDialog: "dialog-parked",
+		abortDialog:  "dialog-abort",
+		disarm:       make(chan struct{}),
+		decidable:    make(chan struct{}),
+		ready:        make(chan struct{}),
+		result:       make(chan pi.AuthMessage, 1),
+	}
+
+	h.broker.mu.Lock()
+	h.broker.flows[authFlowKey{sessionID: h.session.id, providerID: "prov"}] = flow
+	h.broker.byID[flow.id] = flow
+	h.broker.mu.Unlock()
+
+	return flow
+}
+
+// dialogAnswers reports every native dialog the wrapper answered.
+func dialogAnswers(h *authHarness) []string {
+	h.client.mu.Lock()
+	defer h.client.mu.Unlock()
+
+	ids := make([]string, 0, len(h.client.responses))
+	for _, response := range h.client.responses {
+		ids = append(ids, response.ID)
+	}
+
+	return ids
+}
+
+// TestShutdownLadderStepFourReachesTheNativeCancelOnEveryTeardown pins step 4's
+// "invoke native cancel where one exists" on all three boundaries the ladder
+// applies to. The native cancel answers dialogs through the flow's own session
+// rather than one resolved from the agent's active map: close, delete, and
+// Agent.Close all take the id out of that map before step 4 runs, so a lookup
+// would leave every parked login unanswered on exactly the paths that owe an
+// answer.
+func TestShutdownLadderStepFourReachesTheNativeCancelOnEveryTeardown(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		boundary func(*authHarness) error
+	}{
+		{
+			name: "the broker called directly",
+			boundary: func(h *authHarness) error {
+				h.broker.closeSession(context.Background(), h.session)
+
+				return nil
+			},
+		},
+		{
+			name: "session/close",
+			boundary: func(h *authHarness) error {
+				_, err := h.agent.CloseSession(context.Background(),
+					acp.CloseSessionRequest{SessionId: h.session.id})
+
+				return err
+			},
+		},
+		{
+			name: "session/delete",
+			boundary: func(h *authHarness) error {
+				_, err := h.agent.UnstableDeleteSession(context.Background(),
+					acp.UnstableDeleteSessionRequest{SessionId: h.session.id})
+
+				return err
+			},
+		},
+		{
+			name:     "Agent.Close",
+			boundary: func(h *authHarness) error { return h.agent.Close() },
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newAuthHarness(t)
+			flow := armPendingAuthFlow(h)
+
+			require.NoError(t, test.boundary(h))
+
+			h.broker.mu.Lock()
+			state := flow.state
+			reason := flow.reason
+			h.broker.mu.Unlock()
+
+			require.Equal(t, authStateCancelled, state, "the record terminalizes")
+			require.Equal(t, authReasonSessionClosed, reason)
+			require.Subset(t, dialogAnswers(h), []string{"dialog-parked", "dialog-abort"},
+				"the parked native login and its abort dialog are both answered")
+		})
+	}
+}
+
+// TestShutdownLadderStepFourPrecedesTheNativeInterrupt pins step 4's fixed
+// position. It runs after pending interactions are resolved and before the
+// native interrupt on every boundary, so a flow is never abandoned to a process
+// already being torn down. The abort observed here is the interrupt itself, and
+// the session's auth admission is already closed when it arrives.
+//
+// Agent.Close is absent because it sends no native interrupt at all: embedded
+// shutdown takes the graceful process exit directly, so there is no interrupt
+// for step 4 to precede there. That it still reaches the native cancel is
+// pinned above.
+func TestShutdownLadderStepFourPrecedesTheNativeInterrupt(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		boundary func(*authHarness) error
+	}{
+		{
+			name: "session/close",
+			boundary: func(h *authHarness) error {
+				_, err := h.agent.CloseSession(context.Background(),
+					acp.CloseSessionRequest{SessionId: h.session.id})
+
+				return err
+			},
+		},
+		{
+			name: "session/delete",
+			boundary: func(h *authHarness) error {
+				_, err := h.agent.UnstableDeleteSession(context.Background(),
+					acp.UnstableDeleteSessionRequest{SessionId: h.session.id})
+
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newAuthHarness(t)
+			armPendingAuthFlow(h)
+
+			var (
+				aborted       bool
+				closedAtAbort bool
+			)
+
+			h.client.abortFunc = func(context.Context) error {
+				aborted = true
+
+				h.broker.mu.Lock()
+				closedAtAbort = h.session.authClosed
+				h.broker.mu.Unlock()
+
+				return nil
+			}
+
+			require.NoError(t, test.boundary(h))
+			require.True(t, aborted, "the boundary reaches the native interrupt")
+			require.True(t, closedAtAbort,
+				"provider-auth flows are cancelled before the native interrupt")
+		})
+	}
 }

@@ -322,6 +322,15 @@ func (a *Agent) close() error {
 	var closeErrs []error
 
 	for _, session := range sessions {
+		// Embedded shutdown detaches the connection above, so no incarnation
+		// survives this call to carry an event: the stream is fenced here and
+		// the boundary that follows emits nothing on it. The rungs that are not
+		// emissions still run unconditionally — the containment proof, both
+		// durable commits, and failing closed when a commit is refused — so
+		// Agent.Close makes exactly the durable commit a wire close would have
+		// made rather than dropping the state with the wrapper.
+		session.fenceLifecycleStream()
+
 		if err := session.Close(context.Background()); err != nil {
 			closeErrs = append(closeErrs, err)
 		}

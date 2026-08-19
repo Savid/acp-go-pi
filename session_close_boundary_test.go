@@ -1,12 +1,15 @@
 package piacp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
 	"github.com/savid/acp-go-pi/internal/lifecycle"
@@ -279,4 +282,104 @@ func TestRecordGenerationLoss(t *testing.T) {
 	require.NotEmpty(t, record.StreamID)
 	require.NotEmpty(t, record.TurnID)
 	require.NotZero(t, record.RecordedAtUnixMilli)
+}
+
+// TestAgentCloseOwesTheSameDurableRungAsAWireClose pins the ladder's durable
+// rung on the embedded shutdown path. Agent.Close applies the ladder identically
+// to a wire session/close, and that includes the commit the boundary owes:
+// embedded shutdown must not drop state a wire close would have committed just
+// because the host tore the whole agent down instead of one session.
+func TestAgentCloseOwesTheSameDurableRungAsAWireClose(t *testing.T) {
+	newBoundary := func(t *testing.T) (*Agent, *InMemorySessionStore, *directAgentClient) {
+		t.Helper()
+
+		store := NewInMemorySessionStore()
+		client := newDirectAgentClient()
+		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+		agent.conn = client
+		agent.lifecycle = lifecycle.Negotiated{
+			Versions:                []int{1},
+			UpdatesOutsidePrompt:    true,
+			ActivityKinds:           []lifecycle.ActivityKind{},
+			AuthoritativeQuiescence: true,
+			QuiescenceSource:        lifecycle.ProofClassProcessContainment,
+		}
+
+		root := t.TempDir()
+		sessionFile := filepath.Join(root, "session.jsonl")
+		require.NoError(t, os.WriteFile(sessionFile, []byte("{\"row\":1}\n"), 0o600))
+
+		session := &agentSession{
+			agent:           agent,
+			id:              "embedded",
+			proc:            &vacantStubProcess{stubProcess: newStubProcess(true), available: true},
+			sessionRoot:     root,
+			sessionFilePath: sessionFile,
+		}
+		agent.sessions["embedded"] = session
+		require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+
+		return agent, store, client
+	}
+
+	requireDurableRungs := func(t *testing.T, store *InMemorySessionStore) {
+		t.Helper()
+
+		rows, err := store.Load(context.Background(), SessionKey{SessionID: "embedded"})
+		require.NoError(t, err)
+		require.Len(t, rows, 1, "the mirror commit ran")
+
+		journal, err := store.Load(context.Background(),
+			SessionKey{SessionID: "embedded", Subpath: SessionStoreLifecycleSubpath})
+		require.NoError(t, err)
+		require.Len(t, journal, 1, "the boundary record commit ran")
+	}
+
+	quiescenceEmitted := func(t *testing.T, client *directAgentClient) bool {
+		t.Helper()
+
+		for _, notification := range client.notifications {
+			envelope := anyMap(t, notification.Meta[lifecycleMetaKey])
+			if anyMap(t, envelope["event"])["type"] == "quiescence_update" {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	// Embedded shutdown detaches the connection, so no incarnation survives to
+	// carry an event. The emission rungs are skipped on the fenced stream and
+	// the durable rungs still run, with the chain of preconditions intact
+	// across the skipped ones.
+	t.Run("Agent.Close", func(t *testing.T) {
+		agent, store, client := newBoundary(t)
+		require.NoError(t, agent.Close())
+		requireDurableRungs(t, store)
+		require.False(t, quiescenceEmitted(t, client),
+			"a fenced incarnation carries no quiescence fact")
+	})
+
+	t.Run("session/close", func(t *testing.T) {
+		agent, store, client := newBoundary(t)
+		t.Cleanup(func() { _ = agent.Close() })
+
+		_, err := agent.CloseSession(context.Background(), acp.CloseSessionRequest{SessionId: "embedded"})
+		require.NoError(t, err)
+		requireDurableRungs(t, store)
+		require.True(t, quiescenceEmitted(t, client), "a live incarnation certifies its barrier")
+	})
+
+	// A store that refuses the owed commit fails the embedded shutdown rather
+	// than letting it drop the state silently.
+	t.Run("Agent.Close fails closed on a refused commit", func(t *testing.T) {
+		agent, _, _ := newBoundary(t)
+		refused := errors.New("durability unavailable")
+		faulty := newFaultySessionStore()
+		faulty.appendErr = refused
+		agent.options.SessionStore = faulty
+
+		require.ErrorIs(t, agent.Close(), refused,
+			"embedded shutdown reports the store's refusal rather than dropping the state")
+	})
 }

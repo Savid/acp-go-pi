@@ -859,6 +859,24 @@ func (s *agentSession) cancelPendingInteractions() {
 	}
 }
 
+// settleBoundaryInteractions runs the settle phase of the shutdown ladder:
+// pending permission and elicitation requests are resolved, and then every
+// pending provider-auth flow is cancelled — disarmed, terminalized as
+// cancelled/session_closed, and its native login dismissed.
+//
+// Step 4 has a fixed position rather than a floating obligation: it runs after
+// the pending interactions are resolved and *before* the native interrupt, so no
+// flow is ever abandoned to a process already being torn down. Close, delete,
+// and Agent.Close all reach it through here, and it is idempotent — a boundary
+// that already ran it finds nothing pending and nothing nonterminal left.
+func (s *agentSession) settleBoundaryInteractions(ctx context.Context) {
+	s.cancelPendingInteractions()
+
+	if s.agent != nil && s.agent.providerAuth != nil {
+		s.agent.providerAuth.closeSession(ctx, s)
+	}
+}
+
 func (s *agentSession) wasTurnCancelled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -884,13 +902,10 @@ func (s *agentSession) Close(ctx context.Context) (err error) {
 		defer func() { finish(err) }()
 	}
 
-	s.cancelPendingInteractions()
-
-	// Terminalize provider-auth flows before interrupting the Pi child so no
-	// login is abandoned to a process already being torn down.
-	if s.agent != nil && s.agent.providerAuth != nil {
-		s.agent.providerAuth.closeSession(ctx, s)
-	}
+	// Ladder steps 2-4. A boundary that already ran them before its native
+	// interrupt finds nothing left to resolve; a direct Close is where they run
+	// for the first time.
+	s.settleBoundaryInteractions(ctx)
 
 	s.mu.Lock()
 	cancel := s.cancel
