@@ -3,6 +3,8 @@ package piacp
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -167,6 +169,38 @@ func TestCloseSettlesOnAFencedOrNeverOpenedIncarnation(t *testing.T) {
 			"a fenced stream skips the emissions, never the durability")
 		require.False(t, s.lc.vacancyProven)
 	})
+}
+
+// TestCloseCertifiesNothingAfterPersistenceIsFenced pins the third state of the
+// close-fenced order, the one a delete-then-close reaches: both commits are
+// reached and both silently no-op, because the delete already fenced this
+// session's persistence. A quiescence fact asserts the store holds everything a
+// later session/load or session/resume needs, so a boundary that wrote no rows
+// may state nothing at all. The delete's fence ends the incarnation too, so the
+// close settles in silence and still succeeds.
+func TestCloseCertifiesNothingAfterPersistenceIsFenced(t *testing.T) {
+	s, client := lifecycleSession(t, true)
+	s.sessionFilePath = filepath.Join(t.TempDir(), "session.jsonl")
+	require.NoError(t, os.WriteFile(s.sessionFilePath, []byte("{\"one\":1}\n"), 0o600))
+
+	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
+	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{}))
+
+	// The delete path: persistence is fenced before the close runs its boundary.
+	s.fencePersistence()
+
+	emitted := len(client.notifications)
+	proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+	require.NoError(t, s.settleCloseBoundary(t.Context(), proc, nil))
+
+	require.Len(t, client.notifications, emitted,
+		"a boundary whose commits can write nothing terminalizes nothing and certifies nothing")
+
+	requireLifecycleJournalLen(t, s, 0, "no boundary record stands behind the close")
+
+	mirrored, err := s.agent.sessionStore().Load(t.Context(), SessionKey{SessionID: string(s.id)})
+	require.NoError(t, err)
+	require.Empty(t, mirrored, "no native row is recreated after the tombstone")
 }
 
 // TestCloseNeverRewritesALossTerminalizedFailure pins the durable branch's

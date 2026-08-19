@@ -226,11 +226,21 @@ func validateLifecycleBoundaryRecord(record lifecycleBoundaryRecord) error {
 	return nil
 }
 
-// fencePersistence stops every later durable write for this session. It takes
-// the same lock a commit holds, so a commit already in flight either completed
-// before the fence or writes nothing after it — which is what makes a delete
-// unrecoverable by a settlement that was still running when it landed.
+// fencePersistence stops every later durable write for this session and ends
+// its lifecycle incarnation with them. It takes the same lock a commit holds, so
+// a commit already in flight either completed before the fence or writes nothing
+// after it — which is what makes a delete unrecoverable by a settlement that was
+// still running when it landed.
+//
+// The stream is fenced first, and never after: every fact this extension states
+// is a claim about durable state a later incarnation can act on, so once no
+// write can land, the close boundary that follows must terminalize nothing and
+// certify nothing. Its commits silently no-op, and a quiescence fact behind zero
+// durable rows would promise a resumable snapshot the delete has already taken
+// away.
 func (s *agentSession) fencePersistence() {
+	s.fenceLifecycleStream()
+
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
 
