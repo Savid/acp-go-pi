@@ -434,7 +434,7 @@ func ordinaryPiHarness(t *testing.T, scenario unitFakeScenario) (string, string)
 	script := fmt.Sprintf(
 		"#!/bin/sh\n"+
 			"printf '{\"uid\":\"%%s\",\"gid\":\"%%s\",\"canary\":\"%%s\",\"args\":\"%%s\"}\\n' "+
-			"\"$(id -u)\" \"$(id -g)\" \"${ACP_GO_PI_TEST_CANARY:-}\" \"$*\" >> %q\n"+
+			"\"$(id -u)\" \"$(id -g)\" \"${ACP_GO_PI_TEST_ACTUAL_AMBIENT:-}\" \"$*\" >> %q\n"+
 			"exec %q \"$@\"\n",
 		record, inner,
 	)
@@ -489,7 +489,7 @@ func TestAgentSessionDefaultsToOrdinaryExecution(t *testing.T) {
 	agentRuntimePlatform = runtime.GOOS
 
 	t.Setenv("ANTHROPIC_API_KEY", "ambient-provider-key")
-	t.Setenv("ACP_GO_PI_TEST_CANARY", "ambient-canary")
+	t.Setenv("ACP_GO_PI_TEST_ACTUAL_AMBIENT", "ambient-canary")
 
 	harness, record := ordinaryPiHarness(t, successfulUnitScenario())
 
