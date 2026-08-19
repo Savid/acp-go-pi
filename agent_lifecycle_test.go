@@ -27,8 +27,6 @@ func TestLifecycleNegotiationPrecisionAndReservedRouting(t *testing.T) {
 	require.NoError(t, refuseLifecycleRawMeta(json.RawMessage(`{`)))
 	require.NoError(t, refuseLifecycleRawMeta(json.RawMessage(`{"_meta":{}}`)))
 	require.Error(t, refuseLifecycleRawMeta(json.RawMessage(`{"_meta":{"acp-go.dev/lifecycle":{}}}`)))
-	require.NoError(t, refuseLifecycleExtensionMeta("unknown/method", json.RawMessage(`{"_meta":{"acp-go.dev/lifecycle":{}}}`)))
-	require.Error(t, refuseLifecycleExtensionMeta(ForkSessionMethod, json.RawMessage(`{"_meta":{"acp-go.dev/lifecycle":{}}}`)))
 
 	_, err = agent.lifecyclePromptCorrelation(map[string]any{lifecycleMetaKey: map[string]any{"version": 1.0}})
 	require.Error(t, err)
@@ -54,6 +52,7 @@ func TestReservedLifecycleMetaRefusedOnEverySurface(t *testing.T) {
 	require.Error(t, err)
 	_, err = agent.HandleExtensionMethod(t.Context(), ForkSessionMethod, json.RawMessage(`{"_meta":{"acp-go.dev/lifecycle":{}}}`))
 	require.Error(t, err)
+	requireRefusedField(t, lifecycle.MetaPath, err)
 	_, err = agent.SetSessionConfigOption(t.Context(), acp.SetSessionConfigOptionRequest{
 		ValueId: &acp.SetSessionConfigOptionValueId{Meta: reserved},
 	})
@@ -78,6 +77,39 @@ func TestReservedLifecycleMetaRefusedOnEverySurface(t *testing.T) {
 	routedReserved[lifecycleMetaKey] = map[string]any{}
 	cancelSession := &agentSession{agent: agent, cancel: func() {}, turnNonce: "active-turn"}
 	require.Error(t, cancelSession.cancelRouted(t.Context(), routedReserved))
+}
+
+// TestReservedLifecycleMetaPrecedesMethodResolution pins the order on the
+// extension surface: a closed agent is refused first, then the reserved family
+// literal, then the unknown method. A method this adapter defines nowhere is no
+// licence to ignore the key — the literal is the family's, not the method's, so
+// the request is answered about the key it misplaced. Without the key the same
+// unknown method keeps its method-not-found verdict.
+func TestReservedLifecycleMetaPrecedesMethodResolution(t *testing.T) {
+	agent := NewAgent(testContainmentOption())
+	reserved := json.RawMessage(`{"_meta":{"acp-go.dev/lifecycle":{}}}`)
+
+	for _, method := range []string{"_x/nonexistent", "_pi/unknown", ForkSessionMethod} {
+		_, err := agent.HandleExtensionMethod(t.Context(), method, reserved)
+
+		var requestError *acp.RequestError
+
+		require.ErrorAs(t, err, &requestError, method)
+		require.Equal(t, -32602, requestError.Code, method)
+		requireRefusedField(t, lifecycle.MetaPath, err)
+	}
+
+	_, err := agent.HandleExtensionMethod(t.Context(), "_x/nonexistent", json.RawMessage(`{}`))
+
+	var requestError *acp.RequestError
+
+	require.ErrorAs(t, err, &requestError)
+	require.Equal(t, -32601, requestError.Code, "an unknown method carrying no reserved key is still method-not-found")
+
+	// The closed agent's refusal outranks both.
+	require.NoError(t, agent.Close())
+	_, err = agent.HandleExtensionMethod(t.Context(), "_x/nonexistent", reserved)
+	require.ErrorIs(t, err, errAgentClosed)
 }
 
 // TestRouteValidationPrecedesTheReservedLifecycleRefusal pins the precedence on

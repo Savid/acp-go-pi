@@ -576,10 +576,12 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 		return nil, err
 	}
 
-	// Every request-bearing extension leg inspects the reserved family literal
-	// before its own validation or refusal, whether or not the leg it names is
-	// configured on this agent.
-	if refusal := refuseLifecycleExtensionMeta(method, params); refusal != nil {
+	// The reserved family literal is inspected before the method is resolved,
+	// so every extension call answers about the key it misplaced: the legs this
+	// adapter defines whether or not they are configured, and equally a method
+	// it defines nowhere, which is answered about the key rather than about the
+	// name that carried it.
+	if refusal := refuseLifecycleRawMeta(params); refusal != nil {
 		return nil, refusal
 	}
 

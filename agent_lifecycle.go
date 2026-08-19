@@ -87,9 +87,12 @@ func refuseLifecycleMeta(meta map[string]any) error {
 	return unsupportedField(lifecycle.MetaPath)
 }
 
-// refuseLifecycleRawMeta applies the same rule to an extension leg whose
-// parameters are still undecoded, so the key is refused before the leg's own
-// validation or refusal runs.
+// refuseLifecycleRawMeta applies the same rule to an extension call whose
+// parameters are still undecoded, so the key is refused before the method is
+// resolved and before any leg's own validation or refusal runs. The refusal
+// does not depend on which method carried the key: a family literal is never a
+// foreign namespace, and a method this adapter does not define is not licence
+// to ignore one.
 func refuseLifecycleRawMeta(params json.RawMessage) error {
 	var envelope struct {
 		Meta map[string]json.RawMessage `json:"_meta"` //nolint:tagliatelle // ACP reserves this wire spelling.
@@ -104,30 +107,6 @@ func refuseLifecycleRawMeta(params json.RawMessage) error {
 	}
 
 	return unsupportedField(lifecycle.MetaPath)
-}
-
-// lifecycleGuardedExtensionMethods are the extension legs this adapter defines.
-// A method it does not define stays a method-not-found rather than becoming an
-// invalid-params answer about a key no route was ever going to read.
-var lifecycleGuardedExtensionMethods = map[string]struct{}{
-	ForkSessionMethod:    {},
-	AuthMethodsMethod:    {},
-	AuthAuthorizeMethod:  {},
-	AuthCallbackMethod:   {},
-	AuthStatusMethod:     {},
-	AuthCancelMethod:     {},
-	AuthInventoryMethod:  {},
-	AuthDisconnectMethod: {},
-}
-
-// refuseLifecycleExtensionMeta rejects the family literal on one of this
-// adapter's extension legs, configured or not.
-func refuseLifecycleExtensionMeta(method string, params json.RawMessage) error {
-	if _, guarded := lifecycleGuardedExtensionMethods[method]; !guarded {
-		return nil
-	}
-
-	return refuseLifecycleRawMeta(params)
 }
 
 // lifecyclePromptCorrelation reads the submission identity a prompt carries.
