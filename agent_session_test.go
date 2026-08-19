@@ -1519,6 +1519,42 @@ func TestInstallUnderATombstoneTearsDownThePreparedReplacement(t *testing.T) {
 	require.False(t, installed, "the prepared replacement is never installed")
 	require.True(t, stillDeleted, "installing never clears the deletion marker")
 	require.Positive(t, proc.closeCalls, "the prepared replacement is torn down")
+
+	// A teardown that itself fails is logged and still refuses the install:
+	// the verdict about the id is the tombstone's, not the teardown's.
+	failing := &agentSession{
+		agent: agent, id: "gone", proc: newFailingCloseProcess(), sessionRoot: t.TempDir(),
+		turn: make(chan struct{}, sessionTurnCapacity),
+	}
+	requireUnknownSession(t, agent.storeStartedSession(t.Context(), failing))
+}
+
+// TestListHidesATombstonedIDStillHeldInTheActiveMap pins the active half of the
+// hiding rule. The store half filters tombstoned keys on its own; the active
+// half must answer on the same terms, so an id something still holds in the map
+// after a delete is invisible to session/list rather than listed as live.
+func TestListHidesATombstonedIDStillHeldInTheActiveMap(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	t.Cleanup(func() { _ = agent.Close() })
+
+	held := &agentSession{agent: agent, id: "held", cwd: "/cwd"}
+	live := &agentSession{agent: agent, id: "live", cwd: "/cwd"}
+
+	agent.mu.Lock()
+	agent.sessions["held"] = held
+	agent.sessions["live"] = live
+	agent.deleted["held"] = struct{}{}
+	agent.mu.Unlock()
+
+	listed, err := agent.ListSessions(t.Context(), acp.ListSessionsRequest{})
+	require.NoError(t, err)
+
+	ids := make([]acp.SessionId, 0, len(listed.Sessions))
+	for _, info := range listed.Sessions {
+		ids = append(ids, info.SessionId)
+	}
+
+	require.Equal(t, []acp.SessionId{"live"}, ids)
 }
 
 // TestDeleteBoundaryIsObserved pins the observer span every other boundary
