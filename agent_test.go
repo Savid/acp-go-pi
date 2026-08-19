@@ -577,7 +577,11 @@ func TestAgentCapturesOrdinaryEnvironmentOnce(t *testing.T) {
 }
 
 // TestExplicitProcessIsolationPreservesPolicy pins that a supplied policy is
-// never reinterpreted as ordinary execution or a Darwin fallback.
+// never reinterpreted as ordinary execution or a Darwin fallback: a valid
+// Linux policy selects the hardened boundary, and every other platform reports
+// the boundary unavailable and refuses the policy rather than degrading it.
+// That the refusal also stops the spawn is proven beside it, in
+// TestExplicitProcessIsolationRefusesWithoutASecondSpawnAttempt.
 func TestExplicitProcessIsolationPreservesPolicy(t *testing.T) {
 	restoreContainmentPlatformSeam(t)
 	policy := &ProcessIsolation{UID: 1001, GID: 1001, BaseEnvironment: map[string]string{}}
@@ -598,55 +602,86 @@ func TestExplicitProcessIsolationPreservesPolicy(t *testing.T) {
 }
 
 // TestExplicitProcessIsolationRefusesWithoutASecondSpawnAttempt is the other
-// half of the policy rule: an explicit policy this platform cannot honour
-// refuses the launch outright. It never falls back to ordinary execution or to
+// half of the policy rule: an explicit policy this agent cannot honour refuses
+// the launch outright. It never falls back to ordinary execution or to
 // best-effort containment to make the session start — a downgrade would run the
 // child under a boundary the host did not choose — and the proof is that the
 // refusal spawned nothing at all, counted at the executable itself.
+//
+// Both ways a policy goes unhonoured are driven. An unavailable one is a
+// platform verdict, so it can only be reached where no hardened boundary
+// exists; an invalid one is a verdict on the policy's own contents and is
+// reachable everywhere, which keeps the gate lit on Linux too.
 func TestExplicitProcessIsolationRefusesWithoutASecondSpawnAttempt(t *testing.T) {
-	restoreContainmentPlatformSeam(t)
+	for name, testCase := range map[string]struct {
+		option              Option
+		refusedByOnlyLinux  bool
+		wantUnavailableMode bool
+	}{
+		// Every non-Linux platform is a configuration whose explicit policy
+		// cannot be honoured, whatever its contents.
+		"the platform has no hardened boundary": {
+			option:              testProcessIsolationOption(),
+			refusedByOnlyLinux:  true,
+			wantUnavailableMode: true,
+		},
+		// A zero UID/GID names no privilege boundary to cross. On Linux the
+		// selected mode still reads as the hardened one, which is the point:
+		// the refusal comes from validating the policy, not from picking a
+		// weaker boundary to run under.
+		"the policy names no identity to drop to": {
+			option: WithProcessIsolation(ProcessIsolation{UID: 0, GID: 0}),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			restoreContainmentPlatformSeam(t)
 
-	// Every non-Linux platform is a configuration whose explicit policy cannot
-	// be honoured, so this is the unavailable-policy case whatever runs it.
-	if runtime.GOOS == linuxPlatform {
-		t.Skip("the unavailable-policy case needs a platform with no hardened boundary")
+			if testCase.refusedByOnlyLinux && runtime.GOOS == linuxPlatform {
+				t.Skip("the unavailable-policy case needs a platform with no hardened boundary")
+			}
+
+			agentRuntimePlatform = runtime.GOOS
+
+			wantMode := containmentMode(Options{ProcessIsolation: policyForContainmentModeTest()})
+			if testCase.wantUnavailableMode {
+				wantMode = RuntimeContainmentUnavailable
+			}
+
+			harness, record := ordinaryPiHarness(t, successfulUnitScenario())
+
+			// The harness is drained once here so the recorder is armed and the
+			// scenario binary is already built: anything the refusal below
+			// records is the refusal's own doing.
+			require.Empty(t, ordinaryLaunches(t, record))
+
+			agent := NewAgent(
+				testCase.option,
+				WithExecutablePath(harness),
+				WithScratchDir(t.TempDir()),
+				WithLogger(slog.New(slog.DiscardHandler)),
+			)
+			t.Cleanup(func() { _ = agent.Close() })
+			agent.setConnection(newDirectAgentClient())
+
+			require.Equal(t, wantMode, agent.ContainmentMode())
+
+			_, err := agent.NewSession(t.Context(), NewSessionRequest(t.TempDir()))
+			require.Error(t, err, "an unhonoured explicit policy refuses the session")
+
+			require.Empty(t, ordinaryLaunches(t, record),
+				"the refusal spawned a native process anyway")
+
+			agent.mu.Lock()
+			active := len(agent.sessions)
+			agent.mu.Unlock()
+			require.Zero(t, active, "a refused launch installs no session")
+
+			// And the policy is still the one the host supplied: nothing rewrote
+			// it into ordinary execution on the way to the refusal.
+			require.NotNil(t, agent.options.ProcessIsolation)
+			require.False(t, agent.options.DarwinBestEffortContainment)
+		})
 	}
-
-	agentRuntimePlatform = runtime.GOOS
-
-	harness, record := ordinaryPiHarness(t, successfulUnitScenario())
-
-	// The harness is drained once here so the recorder is armed and the
-	// scenario binary is already built: anything the refusal below records is
-	// the refusal's own doing.
-	require.Empty(t, ordinaryLaunches(t, record))
-
-	agent := NewAgent(
-		testProcessIsolationOption(),
-		WithExecutablePath(harness),
-		WithScratchDir(t.TempDir()),
-		WithLogger(slog.New(slog.DiscardHandler)),
-	)
-	t.Cleanup(func() { _ = agent.Close() })
-	agent.setConnection(newDirectAgentClient())
-
-	require.Equal(t, RuntimeContainmentUnavailable, agent.ContainmentMode())
-
-	_, err := agent.NewSession(t.Context(), NewSessionRequest(t.TempDir()))
-	require.Error(t, err, "an unavailable explicit policy refuses the session")
-
-	require.Empty(t, ordinaryLaunches(t, record),
-		"the refusal spawned a native process anyway")
-
-	agent.mu.Lock()
-	active := len(agent.sessions)
-	agent.mu.Unlock()
-	require.Zero(t, active, "a refused launch installs no session")
-
-	// And the policy is still the one the host supplied: nothing rewrote it
-	// into ordinary execution on the way to the refusal.
-	require.NotNil(t, agent.options.ProcessIsolation)
-	require.False(t, agent.options.DarwinBestEffortContainment)
 }
 
 func TestEnsureVersionRefusesExplicitIsolationBestEffortCombination(t *testing.T) {
