@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strconv"
 
 	"github.com/coder/acp-go-sdk"
 )
@@ -113,15 +114,15 @@ func WithSessionAdditionalDirectories(paths ...string) SessionRequestOption {
 
 // WithSessionMeta merges host metadata into a session lifecycle request.
 //
-// A key matching a family-global reserved literal is rejected rather than
-// merged or overwritten: those namespaces are the family's, versioned and
-// fixed, and a caller value under one of them would either forge a fact the
-// wrapper alone may state or displace one the wrapper is about to stamp. These
-// builders answer with the request they built rather than an error, so
-// rejection is exclusion — the request goes out without the reserved key, and
-// the agent refuses one that arrives on the wire anyway.
+// A key matching a family-global reserved literal fails rather than merging or
+// overwriting: those namespaces are the family's, versioned and fixed, and a
+// caller value under one of them would either forge a fact the wrapper alone
+// may state or displace one the wrapper is about to stamp. Everything the host
+// actually owns still rides.
 func WithSessionMeta(meta map[string]any) SessionRequestOption {
-	cloned := withoutReservedLiterals(cloneAnyMap(meta))
+	rejectReservedMeta("WithSessionMeta", meta)
+
+	cloned := cloneAnyMap(meta)
 
 	return func(config *sessionRequestConfig) {
 		config.meta = mergeAnyMap(config.meta, cloned)
@@ -294,10 +295,13 @@ func WithListSessionsCursor(cursor string) ListSessionsRequestOption {
 	}
 }
 
-// WithListSessionsMeta sets host metadata on a session/list request. It rejects
-// a family-global reserved literal on the same terms as WithSessionMeta.
+// WithListSessionsMeta sets host metadata on a session/list request. A caller
+// map naming a family-global reserved literal fails on the same terms as
+// WithSessionMeta.
 func WithListSessionsMeta(meta map[string]any) ListSessionsRequestOption {
-	cloned := withoutReservedLiterals(cloneAnyMap(meta))
+	rejectReservedMeta("WithListSessionsMeta", meta)
+
+	cloned := cloneAnyMap(meta)
 
 	return func(req *acp.ListSessionsRequest) {
 		req.Meta = mergeAnyMap(req.Meta, cloned)
@@ -306,7 +310,10 @@ func WithListSessionsMeta(meta map[string]any) ListSessionsRequestOption {
 
 // reservedMetaLiterals is the closed family-global set. Every one of them is a
 // namespace this family owns end to end: a host reads them and never writes
-// them into a request an exported builder assembles.
+// them into a request an exported builder assembles. Adding a fifth is a
+// contract amendment, so the set is written out rather than matched by prefix:
+// a prefix test would also reject a literal this family has not defined and
+// report it as though the contract already did.
 var reservedMetaLiterals = []string{
 	routeMetaKey,
 	lifecycleMetaKey,
@@ -314,19 +321,18 @@ var reservedMetaLiterals = []string{
 	mediaEnvelopeMetaKey,
 }
 
-// withoutReservedLiterals drops every reserved literal a caller supplied. It is
-// the only refusal an error-free builder can make, and it is the refusal the
-// rule asks for: the value is neither merged nor allowed to overwrite.
-func withoutReservedLiterals(meta map[string]any) map[string]any {
-	if meta == nil {
-		return nil
-	}
-
+// rejectReservedMeta refuses a caller `_meta` map that names a family literal.
+// The builders return values rather than errors, so the refusal is a panic: the
+// only alternatives inside the signature the family fixes are merging the key
+// or dropping it, and both would let a host's guess about a reserved envelope
+// stand in for the one this adapter stamps — silently, on a request the host
+// believes it authored.
+func rejectReservedMeta(builder string, meta map[string]any) {
 	for _, literal := range reservedMetaLiterals {
-		delete(meta, literal)
+		if _, present := meta[literal]; present {
+			panic(builder + ": caller metadata used the family-reserved key " + strconv.Quote(literal))
+		}
 	}
-
-	return meta
 }
 
 // PiOption configures PiOptions values.

@@ -113,6 +113,14 @@ Request builders: `NewSessionRequest`, `LoadSessionRequest`,
 `WithListSessionsCwd`, `WithListSessionsCursor`, `WithListSessionsMeta`,
 `StdioMCPServer`, `HTTPMCPServer`.
 
+`WithSessionMeta` and `WithListSessionsMeta` take host-supplied metadata. A
+caller key naming a reserved `acp-go.dev/*` literal — `route`, `lifecycle`,
+`handoff`, or `mediaEnvelope` — is refused rather than merged or overwritten:
+those values are minted by the adapter on the surfaces that carry them, so a
+collision is a defect in the calling code and the builder panics rather than
+putting an unvalidated reserved value on the wire. Everything outside the
+closed set is ordinary host metadata and rides untouched.
+
 `PromptRequest(sessionID, turnNonce, blocks...)` and
 `TextPromptRequest(sessionID, turnNonce, text)` require a fresh, unguessable
 nonce per turn. `CancelRequest(sessionID, turnNonce)` must reuse the active
