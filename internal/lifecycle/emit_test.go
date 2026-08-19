@@ -20,6 +20,31 @@ func containedConfiguration() Negotiated {
 	}
 }
 
+// observingConfiguration is the answer for a source that does prove an activity
+// kind. The reducer is also the validator for streams this adapter reads, so the
+// encoder is held to the whole shape rather than to the subset this adapter's own
+// configuration happens to produce.
+func observingConfiguration() Negotiated {
+	negotiated := containedConfiguration()
+	negotiated.ActivityKinds = []ActivityKind{ActivityTask}
+
+	return negotiated
+}
+
+// delivered wraps one envelope in the single carrier the extension permits.
+func delivered(t *testing.T, envelope map[string]any) json.RawMessage {
+	t.Helper()
+
+	params, err := json.Marshal(map[string]any{
+		"sessionId": "sess-1",
+		"update":    map[string]any{sessionUpdateField: string(CarrierSessionInfo)},
+		metaField:   map[string]any{MetaKey: envelope},
+	})
+	require.NoError(t, err)
+
+	return params
+}
+
 // reduceEnvelopes decodes each emitted envelope from a session/update
 // notification and reduces it, which is the only measure of wire legality that
 // counts.
@@ -29,13 +54,7 @@ func reduceEnvelopes(t *testing.T, negotiated Negotiated, envelopes []map[string
 	reducer := NewReducer(Options{Negotiated: negotiated})
 
 	for index, envelope := range envelopes {
-		params, err := json.Marshal(map[string]any{
-			"sessionId": "sess-1",
-			"update":    map[string]any{sessionUpdateField: string(CarrierSessionInfo)},
-			metaField:   map[string]any{MetaKey: envelope},
-		})
-		require.NoError(t, err)
-		require.NoError(t, reducer.ReduceSessionUpdate(params), "envelope %d", index)
+		require.NoError(t, reducer.ReduceSessionUpdate(delivered(t, envelope)), "envelope %d", index)
 	}
 
 	return reducer.State()
@@ -224,4 +243,121 @@ func TestResolvedActionRestatesNoImmutableMember(t *testing.T) {
 
 	encoded := encodeAction(*ActionResolvedEvent("act-1", ActionDeclined).Action)
 	require.Equal(t, map[string]any{fieldActionID: "act-1", fieldState: string(ActionDeclined)}, encoded)
+}
+
+// TestMisshapenSnapshotForegroundIsRefusedAtEmitAndInItsOwnBytes drives every
+// shape the foreground rule forbids through both halves of this package. Emit
+// refuses each one, because the reducer that gates emission is the same rule the
+// decoder applies — and the bytes the encoder renders for the same assertion
+// carry the identical defect, so the refusal an emitter states is the refusal its
+// consumer would state. An encoder that dropped the turn or its origin would
+// render a legal-looking envelope for an assertion this adapter just refused.
+func TestMisshapenSnapshotForegroundIsRefusedAtEmitAndInItsOwnBytes(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name       string
+		foreground Foreground
+		refusal    string
+	}{
+		{
+			name:       "an idle foreground naming a turn",
+			foreground: Foreground{State: ForegroundIdle, CycleID: "cyc-1", TurnID: "turn-1", Origin: CauseSubmission},
+			refusal:    "an idle foreground reports no turn",
+		},
+		{
+			name:       "a turn without its origin",
+			foreground: Foreground{State: ForegroundRunning, CycleID: "cyc-1", TurnID: "turn-1"},
+			refusal:    "foreground origin is present exactly while a turn is",
+		},
+		{
+			name:       "an origin without its turn",
+			foreground: Foreground{State: ForegroundRunning, CycleID: "cyc-1", Origin: CauseSubmission},
+			refusal:    "foreground origin is present exactly while a turn is",
+		},
+		{
+			name:       "an origin outside the cause vocabulary",
+			foreground: Foreground{State: ForegroundRunning, CycleID: "cyc-1", TurnID: "turn-1", Origin: "bogus"},
+			refusal:    "foreground origin bogus",
+		},
+		{
+			name:       "a cause no turn is ever opened by",
+			foreground: Foreground{State: ForegroundRunning, CycleID: "cyc-1", TurnID: "turn-1", Origin: CauseSession},
+			refusal:    "foreground origin session",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			negotiated := containedConfiguration()
+			event := Event{Type: EventSnapshot, Snapshot: &Snapshot{Foreground: test.foreground}}
+			refusal := violation(ViolationMalformedEnvelope, "strm-1", 1, test.refusal)
+
+			_, err := NewStream("strm-1", negotiated).Emit(event)
+			require.Equal(t, refusal, err)
+
+			_, err = DecodeSessionUpdate(delivered(t, map[string]any{
+				fieldVersion:  Version,
+				fieldStreamID: "strm-1",
+				fieldSequence: 1,
+				fieldEvent:    encodeEvent(event),
+			}), negotiated)
+			require.Equal(t, refusal, err)
+		})
+	}
+}
+
+// TestEmittedMidTurnSnapshotReducesToTheEmitterOwnProjection proves the emitter
+// and a consumer agree about a resumed stream. The emitter reduces the assertion
+// in memory and the consumer reduces the bytes rendered for it, so any member the
+// encoder dropped would leave the two holding different states for one stream:
+// the turn the foreground names, its origin, the live activity with its opaque
+// progress, and the pending action with its stated blocking claim all have to
+// survive the round trip.
+func TestEmittedMidTurnSnapshotReducesToTheEmitterOwnProjection(t *testing.T) {
+	t.Parallel()
+
+	negotiated := observingConfiguration()
+	blocks := true
+	stream := NewStream("strm-1", negotiated)
+
+	envelope, err := stream.Emit(Event{Type: EventSnapshot, Snapshot: &Snapshot{
+		Foreground: Foreground{State: ForegroundRunning, CycleID: "cyc-1", TurnID: "turn-1", Origin: CauseSubmission},
+		Activities: []ActivityUpdate{{
+			ActivityID:   "acty-1",
+			Kind:         ActivityTask,
+			State:        ActivityRunning,
+			ToolCallID:   "tool-1",
+			Cause:        CauseSubmission,
+			OriginTurnID: "turn-1",
+			RunID:        "run-1",
+			Progress:     json.RawMessage(`{"phase":"scanning"}`),
+		}},
+		Actions: []ActionUpdate{{
+			ActionID:         "act-1",
+			Kind:             ActionPermission,
+			State:            ActionPending,
+			Owner:            Owner{Type: OwnerTurn, ID: "turn-1"},
+			RunID:            "run-1",
+			BlocksForeground: &blocks,
+		}},
+		Quiescence: QuiescenceFact{},
+	}})
+	require.NoError(t, err)
+
+	delivery, err := DecodeSessionUpdate(delivered(t, envelope), negotiated)
+	require.NoError(t, err)
+
+	consumer := NewReducer(Options{Negotiated: negotiated})
+	require.NoError(t, consumer.Reduce(delivery))
+
+	emitted, reduced := stream.State(), consumer.State()
+	require.Equal(t, emitted.StreamID, reduced.StreamID)
+	require.Equal(t, emitted.ReducedThrough, reduced.ReducedThrough)
+	require.Equal(t, emitted.Foreground, reduced.Foreground)
+	require.Equal(t, emitted.Turns, reduced.Turns)
+	require.Equal(t, emitted.Activities, reduced.Activities)
+	require.Equal(t, emitted.Actions, reduced.Actions)
+	require.Equal(t, emitted.Quiescence, reduced.Quiescence)
+	require.Equal(t, emitted, reduced)
 }

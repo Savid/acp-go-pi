@@ -140,20 +140,11 @@ func QuiescenceEvent(fact QuiescenceFact) Event {
 // encodeEvent renders the events this adapter emits. This configuration proves no
 // activity kind, so `activity_update` has no emitter here; the reducer still
 // reduces all six, because it is also the validator for streams this adapter
-// reads.
+// reads, and a snapshot's sets are rendered whole for the same reason.
 func encodeEvent(event Event) map[string]any {
 	switch event.Type {
 	case EventSnapshot:
-		return map[string]any{
-			fieldType: string(EventSnapshot),
-			fieldForeground: map[string]any{
-				fieldState:   string(event.Snapshot.Foreground.State),
-				fieldCycleID: event.Snapshot.Foreground.CycleID,
-			},
-			fieldActivities: []any{},
-			fieldActions:    []any{},
-			fieldQuiescence: encodeQuiescence(event.Snapshot.Quiescence),
-		}
+		return encodeSnapshot(*event.Snapshot)
 	case EventPromptAccepted:
 		return withOptional(map[string]any{
 			fieldType:         string(EventPromptAccepted),
@@ -171,6 +162,61 @@ func encodeEvent(event Event) map[string]any {
 	default:
 		return encodeTransition(*event.State)
 	}
+}
+
+// encodeSnapshot renders the whole-state assertion. The foreground names its turn
+// and that turn's origin exactly while one is open, and the two sets are rendered
+// member for member with the same encoding the delta events use: the reducer that
+// gates emission reduces the assertion in memory, so an encoder that dropped a
+// member would render a different assertion than the one this adapter proved, and
+// emitter and consumer would disagree about the state of the same stream.
+func encodeSnapshot(snapshot Snapshot) map[string]any {
+	foreground := map[string]any{
+		fieldState:   string(snapshot.Foreground.State),
+		fieldCycleID: snapshot.Foreground.CycleID,
+	}
+	withOptional(foreground, fieldTurnID, snapshot.Foreground.TurnID)
+	withOptional(foreground, fieldOrigin, string(snapshot.Foreground.Origin))
+
+	activities := make([]any, 0, len(snapshot.Activities))
+	for index := range snapshot.Activities {
+		activities = append(activities, encodeActivity(snapshot.Activities[index]))
+	}
+
+	actions := make([]any, 0, len(snapshot.Actions))
+	for index := range snapshot.Actions {
+		actions = append(actions, encodeAction(snapshot.Actions[index]))
+	}
+
+	return map[string]any{
+		fieldType:       string(EventSnapshot),
+		fieldForeground: foreground,
+		fieldActivities: activities,
+		fieldActions:    actions,
+		fieldQuiescence: encodeQuiescence(snapshot.Quiescence),
+	}
+}
+
+// encodeActivity renders one activity's members. A snapshot's set is the complete
+// nonterminal one, so every member that fixes what an activity is rides it,
+// including the opaque progress object this contract renders and never reduces.
+func encodeActivity(activity ActivityUpdate) map[string]any {
+	encoded := map[string]any{
+		fieldActivityID: activity.ActivityID,
+		fieldState:      string(activity.State),
+	}
+	withOptional(encoded, fieldKind, string(activity.Kind))
+	withOptional(encoded, fieldParentID, activity.ParentID)
+	withOptional(encoded, fieldToolCallID, activity.ToolCallID)
+	withOptional(encoded, fieldCause, string(activity.Cause))
+	withOptional(encoded, fieldOriginTurnID, activity.OriginTurnID)
+	withOptional(encoded, fieldRunID, activity.RunID)
+
+	if activity.Progress != nil {
+		encoded[fieldProgress] = activity.Progress
+	}
+
+	return encoded
 }
 
 func encodeTransition(transition StateTransition) map[string]any {
