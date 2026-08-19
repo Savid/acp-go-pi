@@ -46,6 +46,16 @@ never releases surrenders its claim and the wait is reported in the close
 error. Close is idempotent: repeated or concurrent calls run teardown once and
 observe the same result.
 
+`session/delete` writes its durable tombstone first, before it tears anything
+down. From that moment the id is hidden from list, load, and resume, and the
+session store refuses any write that would make its rows readable again — so a
+commit a turn was still making cannot recreate what the tombstone removed. The
+delete then cancels and closes the session, which means a delete issued during a
+live prompt ends that prompt rather than waiting for it. A delete whose
+tombstone the store refuses changes nothing: the session stays yours, stays
+listed, stays promptable, and keeps committing durably. Deleting an unknown or
+already-deleted session succeeds silently.
+
 ## Store keys and subpaths
 
 Durable storage is keyed by session id plus a subpath:
