@@ -171,6 +171,25 @@ func endingIdleDefect(transition StateTransition) string {
 	}
 }
 
+// liveForegroundDefect reports why an assertion of a live foreground state is
+// structurally incomplete, or the empty string when it is not. A running
+// foreground is a turn running and a blocked one is owned work blocked, so
+// neither an update nor a snapshot may assert one with no turn to own it.
+//
+// The defect is structural, so it outranks every rule that reads what the event
+// says: an event carrying no name has nothing for entity resolution to report
+// unknown, and an event omitting a member its state requires says nothing about
+// a cycle for the blocked-cycle rule to judge. Both the decoder and the reducer
+// consult it, on a transition and on a snapshot's foreground alike, so an event
+// this adapter emits is held to the same rule as one it reads.
+func liveForegroundDefect(state ForegroundState, turnID string) string {
+	if state == ForegroundIdle || turnID != "" {
+		return ""
+	}
+
+	return "a " + string(state) + " foreground names the turn that owns it"
+}
+
 // ActivityUpdate reports one activity. A first sight carries every immutable
 // identity field; a later update carries state and progress only.
 type ActivityUpdate struct {

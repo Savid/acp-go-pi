@@ -230,6 +230,40 @@ func TestForegroundTransitionsResolveTheirTurn(t *testing.T) {
 	require.Equal(t, &Foreground{State: ForegroundIdle, CycleID: "cyc-1"}, reducer.State().Foreground)
 }
 
+// TestLiveForegroundNamesItsTurn pins the structural rule on the emitter's own
+// path: a running foreground is a turn running and a blocked one is owned work
+// blocked, so neither a transition nor a snapshot may assert one with no turn to
+// own it. The refusal is structural, so it outranks both rules that would
+// otherwise answer — the event carries no name for entity resolution to report
+// unknown, and the cycle it names is never consulted, whether that cycle is
+// unblocked or properly blocked.
+func TestLiveForegroundNamesItsTurn(t *testing.T) {
+	t.Parallel()
+
+	for _, state := range []ForegroundState{ForegroundRunning, ForegroundRequiresAction} {
+		requireReduceRefusal(t, richConfiguration(), ViolationMalformedEnvelope, openSnapshot(),
+			Event{Type: EventStateUpdate, State: &StateTransition{State: state, CycleID: "cyc-1", Cause: CauseSession}})
+
+		requireReduceRefusal(t, richConfiguration(), ViolationMalformedEnvelope,
+			Event{Type: EventSnapshot, Snapshot: &Snapshot{Foreground: Foreground{State: state, CycleID: "cyc-1"}}})
+	}
+
+	accepted := Event{Type: EventPromptAccepted, PromptAccepted: &PromptAccepted{
+		SubmissionID: "sub-1", ClientNonce: "non-1", TurnID: "turn-1",
+	}}
+	blocking := actionEvent(ActionUpdate{
+		ActionID: "req-1", Kind: ActionPermission, State: ActionPending,
+		Owner: Owner{Type: OwnerTurn, ID: "turn-1"}, BlocksForeground: stated(true),
+	})
+
+	requireReduceRefusal(t, richConfiguration(), ViolationMalformedEnvelope,
+		openSnapshot(), accepted, RunningEvent("cyc-1", "turn-1"), blocking,
+		RequiresActionEvent("cyc-1", "turn-1"),
+		Event{Type: EventStateUpdate, State: &StateTransition{
+			State: ForegroundRequiresAction, CycleID: "cyc-1", Cause: CauseSession,
+		}})
+}
+
 // TestSnapshotForegroundTurnSettlesWithoutAcceptance pins that a turn the
 // snapshot introduced can end even though no acceptance opened it here.
 func TestSnapshotForegroundTurnSettlesWithoutAcceptance(t *testing.T) {

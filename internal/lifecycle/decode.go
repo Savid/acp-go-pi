@@ -231,9 +231,11 @@ func (d *decoder) snapshot(fields map[string]json.RawMessage) Event {
 }
 
 // foreground reads the snapshot's foreground object. Presence is a rule rather
-// than a preference: a turn is named exactly while one is open, and its origin
-// is named exactly with it, so a resumed turn always carries recorded
-// provenance.
+// than a preference, and it binds in both directions: a turn is named exactly
+// while one is open, and its origin is named exactly with it, so a resumed turn
+// always carries recorded provenance — while a live foreground carrying neither
+// asserts a running or blocked cycle no turn owns, which is a state no stream
+// may reach and a resumed projection could never repair.
 func (d *decoder) foreground(raw json.RawMessage) Foreground {
 	fields, ok := jsonObject(raw)
 	if !ok {
@@ -260,6 +262,10 @@ func (d *decoder) foreground(raw json.RawMessage) Foreground {
 		d.fail(ViolationMalformedEnvelope, "foreground origin is present exactly while a turn is")
 	case foreground.Origin != "" && foreground.Origin != CauseSubmission && foreground.Origin != CauseActivity:
 		d.fail(ViolationMalformedEnvelope, "foreground origin "+string(foreground.Origin))
+	default:
+		if detail := liveForegroundDefect(foreground.State, foreground.TurnID); detail != "" {
+			d.fail(ViolationMalformedEnvelope, detail)
+		}
 	}
 
 	return foreground
@@ -289,6 +295,8 @@ func (d *decoder) stateUpdate(fields map[string]json.RawMessage) Event {
 		Outcome:    Outcome(d.identifier(fields, fieldOutcome, false)),
 	}
 
+	turnless := liveForegroundDefect(transition.State, transition.TurnID)
+
 	switch {
 	case !transition.State.Valid():
 		d.fail(ViolationMalformedEnvelope, "transition state "+string(transition.State))
@@ -296,6 +304,8 @@ func (d *decoder) stateUpdate(fields map[string]json.RawMessage) Event {
 		d.fail(ViolationMalformedEnvelope, "transition cause "+string(transition.Cause))
 	case transition.TurnID == "" && transition.Cause != CauseSession:
 		d.fail(ViolationMalformedEnvelope, "a "+string(transition.Cause)+"-caused transition names its turn")
+	case turnless != "":
+		d.fail(ViolationMalformedEnvelope, turnless)
 	case transition.State != ForegroundIdle && (transition.StopReason != "" || transition.Outcome != ""):
 		d.fail(ViolationMalformedEnvelope, "only an ending transition carries a stop reason and an outcome")
 	case transition.StopReason != "" && !ValidStopReason(transition.StopReason):

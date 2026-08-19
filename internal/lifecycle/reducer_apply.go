@@ -25,6 +25,7 @@ func (r *Reducer) applySnapshot(delivery Delivery) error {
 // that set: an action owner is a reference rather than an introduction.
 func (r *Reducer) checkSnapshot(delivery Delivery, snapshot Snapshot) error {
 	foreground := snapshot.Foreground
+	turnless := liveForegroundDefect(foreground.State, foreground.TurnID)
 
 	switch {
 	case !foreground.State.Valid() || foreground.CycleID == "":
@@ -35,6 +36,8 @@ func (r *Reducer) checkSnapshot(delivery Delivery, snapshot Snapshot) error {
 		return r.fail(delivery, ViolationMalformedEnvelope, "foreground origin is present exactly while a turn is")
 	case foreground.Origin != "" && foreground.Origin != CauseSubmission && foreground.Origin != CauseActivity:
 		return r.fail(delivery, ViolationMalformedEnvelope, "foreground origin "+string(foreground.Origin))
+	case turnless != "":
+		return r.fail(delivery, ViolationMalformedEnvelope, turnless)
 	}
 
 	introduced := snapshot.introduces()
@@ -243,6 +246,10 @@ func (r *Reducer) applyStateUpdate(delivery Delivery) error {
 		return r.fail(delivery, ViolationMalformedEnvelope, "the transition payload is missing")
 	}
 
+	if detail := liveForegroundDefect(transition.State, transition.TurnID); detail != "" {
+		return r.fail(delivery, ViolationMalformedEnvelope, detail)
+	}
+
 	if detail := endingIdleDefect(*transition); detail != "" {
 		return r.fail(delivery, ViolationMalformedEnvelope, detail)
 	}
@@ -271,6 +278,11 @@ func (r *Reducer) applyStateUpdate(delivery Delivery) error {
 // action blocking it is still nonterminal. The resolution is the reason the
 // foreground may move, so it is always ordered first, and a cycle returns to
 // running when the last blocker resolves rather than the first.
+//
+// Both halves are judged on a structurally valid transition: one omitting the
+// turn a live foreground requires was refused before the cycle was consulted at
+// all, so a properly blocked cycle never converts a structural defect into a
+// consistency verdict.
 func (r *Reducer) checkBlockedCycle(delivery Delivery, transition StateTransition) error {
 	if transition.State == ForegroundRequiresAction {
 		if !r.blocked(transition.CycleID) {

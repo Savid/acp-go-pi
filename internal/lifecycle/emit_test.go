@@ -308,6 +308,16 @@ func TestMisshapenSnapshotForegroundIsRefusedAtEmitAndInItsOwnBytes(t *testing.T
 			foreground: Foreground{State: ForegroundRunning, CycleID: "cyc-1", TurnID: "turn-1", Origin: CauseSession},
 			refusal:    "foreground origin session",
 		},
+		{
+			name:       "a running foreground owned by no turn at all",
+			foreground: Foreground{State: ForegroundRunning, CycleID: "cyc-1"},
+			refusal:    "a running foreground names the turn that owns it",
+		},
+		{
+			name:       "a blocked foreground owned by no turn at all",
+			foreground: Foreground{State: ForegroundRequiresAction, CycleID: "cyc-1"},
+			refusal:    "a requires_action foreground names the turn that owns it",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
