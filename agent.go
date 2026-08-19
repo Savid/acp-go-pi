@@ -81,12 +81,17 @@ type Agent struct {
 
 	// Lock order: acquire mu before any session lock. Do not call session
 	// close methods while holding mu.
-	mu                 sync.Mutex
-	closed             bool
-	conn               agentClient
-	sessions           map[acp.SessionId]*agentSession
-	store              SessionStore
-	deleted            map[acp.SessionId]struct{}
+	mu       sync.Mutex
+	closed   bool
+	conn     agentClient
+	sessions map[acp.SessionId]*agentSession
+	store    SessionStore
+	deleted  map[acp.SessionId]struct{}
+	// pendingCleanups holds the sessions whose tombstone is durable and whose
+	// teardown is not. Hiding an id never orphans the work it was running: the
+	// retained session is what a later delete retries and what Agent.Close
+	// sweeps before this process exits.
+	pendingCleanups    map[acp.SessionId]*agentSession
 	clientCalls        chan struct{}
 	clientCapabilities acp.ClientCapabilities
 	positionEncoding   acp.PositionEncodingKind
@@ -154,6 +159,7 @@ func NewAgent(opts ...Option) *Agent {
 		sessions:            make(map[acp.SessionId]*agentSession),
 		store:               NewInMemorySessionStore(),
 		deleted:             make(map[acp.SessionId]struct{}),
+		pendingCleanups:     make(map[acp.SessionId]*agentSession),
 		positionEncoding:    acp.PositionEncodingKindUtf16,
 		optionErr: errors.Join(
 			optionFailure(log, optionFieldEnv, validateEnvironment(options.Env, optionFieldEnv, blockedAgentEnvKey)),
@@ -310,7 +316,13 @@ func (a *Agent) close() error {
 		sessions = append(sessions, session)
 	}
 
+	pending := make([]*agentSession, 0, len(a.pendingCleanups))
+	for _, session := range a.pendingCleanups {
+		pending = append(pending, session)
+	}
+
 	a.sessions = make(map[acp.SessionId]*agentSession)
+	a.pendingCleanups = make(map[acp.SessionId]*agentSession)
 	a.deleted = make(map[acp.SessionId]struct{})
 	a.conn = nil
 	a.mu.Unlock()
@@ -318,6 +330,12 @@ func (a *Agent) close() error {
 	if len(sessions) > 0 {
 		a.observe.AddActiveSession(context.Background(), -int64(len(sessions)))
 	}
+
+	// A session whose delete tombstoned it but whose teardown did not finish
+	// left the active map when its id was hidden, so it is counted nowhere and
+	// swept here: the agent still owns its native scope, and this is the last
+	// moment anything can contain it.
+	sessions = append(sessions, pending...)
 
 	var closeErrs []error
 

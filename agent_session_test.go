@@ -1210,6 +1210,94 @@ func TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel(t *testing.T) {
 	}
 }
 
+// newPartialDeleteAgent stages a session whose first teardown fails, so a
+// delete tombstones and hides the id and then leaves its cleanup unfinished.
+func newPartialDeleteAgent(t *testing.T, refused error) (*Agent, *stubProcess, acp.SessionId) {
+	t.Helper()
+
+	store := NewInMemorySessionStore()
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+	agent.conn = newDirectAgentClient()
+
+	id := acp.SessionId(validSessionUUID)
+	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: string(id)},
+		[]SessionStoreEntry{json.RawMessage(`{"type":"session","cwd":"/cwd"}`)}))
+
+	process := newStubProcess(false)
+	process.closeFunc = func() error {
+		if process.closeCalls == 1 {
+			return refused
+		}
+
+		return nil
+	}
+
+	agent.sessions[id] = &agentSession{
+		agent:       agent,
+		id:          id,
+		proc:        process,
+		sessionRoot: t.TempDir(),
+		turn:        make(chan struct{}, sessionTurnCapacity),
+	}
+
+	return agent, process, id
+}
+
+// TestFailedDeleteTeardownIsRetriedByTheNextDelete pins step 5 against the
+// wire posture of step 6. A delete whose teardown failed keeps everything the
+// host was told: the tombstone is durable and the id is hidden from list, load,
+// and resume. What it does not do is drop the obligation with the wrapper — the
+// agent still owns the native scope that teardown did not contain, so the next
+// delete on the same id retries it and completes it.
+func TestFailedDeleteTeardownIsRetriedByTheNextDelete(t *testing.T) {
+	refused := errors.New("close the contained tree")
+	agent, process, id := newPartialDeleteAgent(t, refused)
+
+	t.Cleanup(func() { _ = agent.Close() })
+
+	_, err := agent.UnstableDeleteSession(t.Context(), DeleteSessionRequest(id))
+	require.ErrorIs(t, err, refused)
+	require.Equal(t, 1, process.closeCalls)
+
+	_, err = agent.LoadSession(t.Context(), LoadSessionRequest(id, "/cwd"))
+	requireInvalidParams(t, err)
+
+	listed, err := agent.ListSessions(t.Context(), ListSessionsRequest())
+	require.NoError(t, err)
+	require.Empty(t, listed.Sessions, "a tombstoned id stayed visible after its teardown failed")
+
+	_, err = agent.UnstableDeleteSession(t.Context(), DeleteSessionRequest(id))
+	require.NoError(t, err)
+	require.Equal(t, 2, process.closeCalls,
+		"the retried delete did not re-run the teardown the first one left unfinished")
+
+	agent.mu.Lock()
+	require.NotContains(t, agent.pendingCleanups, id, "a completed cleanup stayed on the retry registry")
+	agent.mu.Unlock()
+}
+
+// TestAgentCloseSweepsAPartiallyDeletedSession pins the other retry path of the
+// same obligation. A hidden session whose teardown failed is reachable through
+// no map the shutdown sweep used to read, so shutdown would have exited leaving
+// its native scope running; the retained cleanup is swept with the live
+// sessions instead.
+func TestAgentCloseSweepsAPartiallyDeletedSession(t *testing.T) {
+	refused := errors.New("close the contained tree")
+	agent, process, id := newPartialDeleteAgent(t, refused)
+
+	_, err := agent.UnstableDeleteSession(t.Context(), DeleteSessionRequest(id))
+	require.ErrorIs(t, err, refused)
+
+	agent.mu.Lock()
+	require.Contains(t, agent.pendingCleanups, id)
+	require.NotContains(t, agent.sessions, id)
+	agent.mu.Unlock()
+
+	require.NoError(t, agent.Close())
+	require.Equal(t, 2, process.closeCalls,
+		"shutdown exited leaving a hidden session's native scope uncontained")
+}
+
 type settlementDeleteStore struct {
 	SessionStore
 	session *agentSession
@@ -1225,8 +1313,8 @@ func (s *settlementDeleteStore) Delete(ctx context.Context, key SessionKey) erro
 	return s.SessionStore.Delete(ctx, key)
 }
 
-// TestDeleteTombstonesBeforeItFencesOrWaitsForSettlement pins the delete order
-// 05-behavior.md fixes. The tombstone is the first rung: it reaches the store
+// TestDeleteTombstonesBeforeItFencesOrWaitsForSettlement pins the fixed delete
+// order. The tombstone is the first rung: it reaches the store
 // while a settlement is still running and while the session's persistence is
 // still unfenced, because store tombstone finality — not a wait — is what stops
 // a commit in flight from recreating the row. Only then is the incarnation

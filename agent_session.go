@@ -337,11 +337,10 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 	return acp.CloseSessionResponse{}, nil
 }
 
-// UnstableDeleteSession implements ACP session/delete in the order
-// 05-behavior.md fixes: the durable tombstone first, then close-and-cancel of
-// any active session with the same id, then the native state and store entries,
-// and the id is hidden from list, load, and resume from the moment the tombstone
-// lands.
+// UnstableDeleteSession implements ACP session/delete in a fixed order: the
+// durable tombstone first, then close-and-cancel of any active session with the
+// same id, then the native state and store entries, and the id is hidden from
+// list, load, and resume from the moment the tombstone lands.
 //
 // The tombstone is written before anything is torn down and before the session's
 // persistence is fenced. It does not need to wait for a settlement that is still
@@ -356,6 +355,12 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 // stays listed, stays promptable, and keeps its persistence unfenced. Fencing a
 // session the host still owns would silently drop every later commit it makes
 // while reporting success on each one.
+//
+// A delete that tombstoned and then failed partway through teardown keeps that
+// wire posture — the tombstone is durable and the id stays hidden — and retains
+// the cleanup it did not finish. Hiding is a wire fact rather than a bookkeeping
+// one, so this agent still owns the native scope behind a hidden id: a later
+// delete on the same id retries the teardown, and Agent.Close sweeps it.
 func (a *Agent) UnstableDeleteSession(
 	ctx context.Context,
 	params acp.UnstableDeleteSessionRequest,
@@ -376,12 +381,28 @@ func (a *Agent) UnstableDeleteSession(
 	}
 
 	a.mu.Lock()
-	if session != nil && a.sessions[params.SessionId] == session {
+	detached := session != nil && a.sessions[params.SessionId] == session
+	if detached {
 		delete(a.sessions, params.SessionId)
 	}
 
 	a.deleted[params.SessionId] = struct{}{}
+
+	// A delete addressed at an id whose earlier delete tombstoned it and then
+	// failed partway through teardown is that teardown's retry: the session it
+	// left unfinished is taken back out of the cleanup registry and torn down
+	// here, so step 5's obligation is discharged on the very path the host
+	// retried.
+	if pending := a.pendingCleanups[params.SessionId]; session == nil {
+		session = pending
+	}
+
+	delete(a.pendingCleanups, params.SessionId)
 	a.mu.Unlock()
+
+	if detached {
+		a.observe.AddActiveSession(ctx, -1)
+	}
 
 	if session == nil {
 		return acp.UnstableDeleteSessionResponse{}, nil
@@ -394,23 +415,29 @@ func (a *Agent) UnstableDeleteSession(
 
 	session.settleBoundaryInteractions(ctx)
 
-	var cleanupErr error
-
 	_ = session.cancelForClose(ctx)
 
-	if closeErr := session.Close(ctx); closeErr != nil {
-		cleanupErr = errors.Join(cleanupErr, closeErr)
-	}
-
-	a.observe.AddActiveSession(ctx, -1)
-
 	// Partial cleanup is reported only now, with the tombstone already durable
-	// and the id already hidden.
-	if cleanupErr != nil {
+	// and the id already hidden. Hiding is a wire fact and not a bookkeeping
+	// one: the session whose teardown did not finish is retained, because this
+	// agent still owns the native scope and the store entries that teardown
+	// owed, and dropping it with the response would leave both to nobody.
+	if cleanupErr := session.Close(ctx); cleanupErr != nil {
+		a.retainPendingCleanup(params.SessionId, session)
+
 		return acp.UnstableDeleteSessionResponse{}, cleanupErr
 	}
 
 	return acp.UnstableDeleteSessionResponse{}, nil
+}
+
+// retainPendingCleanup records a tombstoned session whose teardown failed, so a
+// later delete on the same id retries it and Agent.Close sweeps it.
+func (a *Agent) retainPendingCleanup(sessionID acp.SessionId, session *agentSession) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.pendingCleanups[sessionID] = session
 }
 
 // session resolves an addressed id to its live session. The tombstone is

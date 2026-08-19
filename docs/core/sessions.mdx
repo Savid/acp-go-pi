@@ -36,14 +36,16 @@ right after `session/new` therefore reflects the store, not a native file.
 
 ## Closing
 
-`session/close` and `session/delete` are terminal. Closing first removes the id
-from the active map and marks the session closing, so a concurrent prompt is
-answered with the uniform unknown-session error rather than lazily relaunching
-the process being torn down. Close then waits, up to a bounded interval, for an
-in-flight turn to release the session's single turn admission before it
-contains the native process and removes the session's directories; a turn that
-never releases surrenders its claim and the wait is reported in the close
-error. Close is idempotent: repeated or concurrent calls run teardown once and
+`session/close` and `session/delete` are terminal. Closing first marks the
+session closing, so a concurrent prompt is answered with the uniform
+unknown-session error rather than lazily relaunching the process being torn
+down. Close then waits, up to a bounded interval, for an in-flight turn to
+release the session's single turn admission before it contains the native
+process and removes the session's directories; a turn that never releases
+surrenders its claim and the wait is reported in the close error. Only a
+completed close removes the id from the active map. A close that failed still
+owes the boundary it did not reach, so its id stays addressable and a later
+`session/close` retries the teardown; concurrent calls run one teardown and
 observe the same result.
 
 `session/delete` writes its durable tombstone first, before it tears anything
@@ -55,6 +57,11 @@ live prompt ends that prompt rather than waiting for it. A delete whose
 tombstone the store refuses changes nothing: the session stays yours, stays
 listed, stays promptable, and keeps committing durably. Deleting an unknown or
 already-deleted session succeeds silently.
+
+Hiding an id never orphans the work it was running. A delete that tombstoned
+and hid the id but failed partway through teardown reports that failure and
+keeps the unfinished cleanup: a later `session/delete` on the same id retries
+it, and `Agent.Close` sweeps it before the process exits.
 
 ## Store keys and subpaths
 
