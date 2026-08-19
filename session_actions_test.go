@@ -291,3 +291,79 @@ func TestAnnouncedElicitationStampsActionMeta(t *testing.T) {
 	require.Len(t, dialog.elicitationRequests, 2)
 	require.Contains(t, dialog.elicitationRequests[1].Url.Meta, lifecycleMetaKey)
 }
+
+// TestUnownedLifecycleActionIsRefusedRatherThanSentBare pins the three states
+// prepareLifecycleAction distinguishes. While version 1 is negotiated every
+// permission and elicitation carries the correlation, so there is no shape for
+// one with no owner to name: a live incarnation with no open turn refuses the
+// request instead of putting a correlation-less one on the wire, and the caller
+// answers pi with a native cancel. The absence of an incarnation is a different
+// thing entirely and still sends plainly.
+func TestUnownedLifecycleActionIsRefusedRatherThanSentBare(t *testing.T) {
+	t.Run("no incarnation sends plainly", func(t *testing.T) {
+		s, _ := lifecycleSession(t, false)
+
+		action, announceable, err := s.prepareLifecycleAction()
+		require.NoError(t, err)
+		require.False(t, announceable)
+		require.Zero(t, action)
+	})
+
+	t.Run("a fenced incarnation sends plainly", func(t *testing.T) {
+		s, _ := lifecycleSession(t, false)
+		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
+		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
+		s.fenceLifecycleStream()
+
+		_, announceable, err := s.prepareLifecycleAction()
+		require.NoError(t, err)
+		require.False(t, announceable)
+	})
+
+	t.Run("a live incarnation with no open turn refuses", func(t *testing.T) {
+		s, _ := lifecycleSession(t, false)
+		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
+
+		_, announceable, err := s.prepareLifecycleAction()
+		require.ErrorIs(t, err, errLifecycleActionUnowned)
+		require.False(t, announceable)
+
+		// A turn that has already settled is the same state: the dialog
+		// handler outlived the turn it was spawned for.
+		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
+		require.NoError(t, s.lifecycleSettleTurn(t.Context(),
+			lifecycle.StopReasonEndTurn, lifecycle.OutcomeSuccess))
+
+		_, _, err = s.prepareLifecycleAction()
+		require.ErrorIs(t, err, errLifecycleActionUnowned)
+	})
+
+	t.Run("an open turn always owns its action", func(t *testing.T) {
+		s, _ := lifecycleSession(t, false)
+		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
+		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
+
+		action, announceable, err := s.prepareLifecycleAction()
+		require.NoError(t, err)
+		require.True(t, announceable)
+		require.NotEmpty(t, action.actionID)
+		require.Equal(t, s.lc.stream.ID(), action.streamID)
+		require.Equal(t, lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: s.lc.turnID}, action.owner)
+	})
+
+	// The refusal reaches the caller as a failed request, which both dialog
+	// legs already answer with a deterministic native cancel.
+	t.Run("the announced request refuses with it", func(t *testing.T) {
+		s, _ := lifecycleSession(t, false)
+		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
+
+		_, err := announcedActionRequest(t.Context(), s, lifecycle.ActionPermission,
+			func(context.Context, map[string]any) (int, error) {
+				t.Fatal("an unowned action never reaches the wire")
+
+				return 0, nil
+			},
+			func(int, error) lifecycle.ActionState { return lifecycle.ActionFailed })
+		require.ErrorIs(t, err, errLifecycleActionUnowned)
+	})
+}

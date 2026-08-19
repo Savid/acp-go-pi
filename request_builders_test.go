@@ -141,3 +141,63 @@ func TestForkCallRejectsMalformedResponse(t *testing.T) {
 	_, err := CallForkSession(t.Context(), conn, forkParams(t))
 	require.Error(t, err)
 }
+
+// TestMetaBuildersRejectEveryReservedLiteral pins the family-literal guard on
+// the two builders that take a host-supplied _meta map. Each `acp-go.dev/*`
+// namespace is the family's: the wrapper stamps the route envelope and the
+// lifecycle correlation, the host writes handoff and media-envelope values only
+// where this contract says so, and none of them may arrive through a caller map
+// that the builder would otherwise merge or let overwrite. Everything the host
+// actually owns still rides.
+func TestMetaBuildersRejectEveryReservedLiteral(t *testing.T) {
+	t.Parallel()
+
+	require.Len(t, reservedMetaLiterals, 4, "the reserved set is closed at four")
+
+	caller := map[string]any{"host": map[string]any{"trace": "keep-me"}}
+	for _, literal := range reservedMetaLiterals {
+		caller[literal] = map[string]any{"forged": true}
+	}
+
+	t.Run("WithSessionMeta", func(t *testing.T) {
+		t.Parallel()
+
+		for name, meta := range map[string]map[string]any{
+			"session/new":    NewSessionRequest("/cwd", WithSessionMeta(caller)).Meta,
+			"session/load":   LoadSessionRequest("id", "/cwd", WithSessionMeta(caller)).Meta,
+			"session/resume": ResumeSessionRequest("id", "/cwd", WithSessionMeta(caller)).Meta,
+			"session/fork":   ForkSessionRequest("id", "/cwd", WithSessionMeta(caller)).Meta,
+		} {
+			for _, literal := range reservedMetaLiterals {
+				require.NotContains(t, meta, literal, name)
+			}
+
+			require.Equal(t, map[string]any{"trace": "keep-me"}, meta["host"], name)
+		}
+	})
+
+	t.Run("WithListSessionsMeta", func(t *testing.T) {
+		t.Parallel()
+
+		meta := ListSessionsRequest(WithListSessionsMeta(caller)).Meta
+		for _, literal := range reservedMetaLiterals {
+			require.NotContains(t, meta, literal)
+		}
+
+		require.Equal(t, map[string]any{"trace": "keep-me"}, meta["host"])
+	})
+
+	t.Run("the caller's own map is never mutated", func(t *testing.T) {
+		t.Parallel()
+
+		supplied := map[string]any{lifecycleMetaKey: map[string]any{"v": 1}}
+		_ = NewSessionRequest("/cwd", WithSessionMeta(supplied))
+		require.Contains(t, supplied, lifecycleMetaKey)
+	})
+
+	t.Run("a nil map carries nothing", func(t *testing.T) {
+		t.Parallel()
+
+		require.Empty(t, ListSessionsRequest(WithListSessionsMeta(nil)).Meta)
+	})
+}

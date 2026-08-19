@@ -60,6 +60,11 @@ func TestReservedLifecycleMetaRefusedOnEverySurface(t *testing.T) {
 	require.Error(t, err)
 	_, err = agent.ListSessions(t.Context(), acp.ListSessionsRequest{Meta: reserved})
 	require.Error(t, err)
+	// Unreachable from the wire, reachable from an embedding Go host: the
+	// literal is refused before the method-not-found verdict.
+	_, err = agent.SetSessionMode(t.Context(), acp.SetSessionModeRequest{Meta: reserved})
+	require.Error(t, err)
+	requireRefusedField(t, lifecycle.MetaPath, err)
 	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{Meta: reserved})
 	require.Error(t, err)
 	_, err = agent.UnstableDeleteSession(t.Context(), acp.UnstableDeleteSessionRequest{Meta: reserved})

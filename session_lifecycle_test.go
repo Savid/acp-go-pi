@@ -244,7 +244,7 @@ func TestRuntimeRelaunchRefusesDurableHomeWithExplicitIsolation(t *testing.T) {
 	session := &agentSession{agent: agent, sessionRoot: sessionRoot}
 
 	_, err := session.nextRuntimeLaunch(pi.LaunchSpec{}, "")
-	require.ErrorContains(t, err, "durable pi agent directory is unavailable with explicit process isolation")
+	requireRefusedField(t, optionFieldHome, err)
 }
 
 func TestSessionRetainsIncompleteNativeContainment(t *testing.T) {

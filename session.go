@@ -31,6 +31,7 @@ const (
 	optionFieldContainment       = "containment"
 	optionFieldDefaultModel      = "defaultModel"
 	optionFieldEnv               = "env"
+	optionFieldHome              = "home"
 	optionFieldImageLimits       = "imageLimits"
 	optionFieldInputHandoffRoot  = "inputHandoffRoot"
 	optionFieldProviderAuthRoot  = "providerAuthRoot"

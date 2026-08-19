@@ -13,7 +13,17 @@ import (
 // SetSessionMode exists only because github.com/coder/acp-go-sdk's generated
 // Agent interface still requires it. Remove this when the upstream SDK drops
 // session/set_mode; the local ACP dispatcher intentionally does not route it.
-func (a *Agent) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+//
+// The reserved family literal is refused before the method-not-found verdict.
+// This surface is unreachable from the wire but reachable from an embedding Go
+// host, and the placement rule is about where the literal may appear rather than
+// about which methods this adapter answers: a surface that never carries the
+// extension refuses the key rather than ignoring it.
+func (a *Agent) SetSessionMode(_ context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.SetSessionModeResponse{}, refusal
+	}
+
 	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
 }
 

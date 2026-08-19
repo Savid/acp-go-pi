@@ -14,12 +14,15 @@ import (
 // Option configures the pi ACP agent.
 type Option func(*Options)
 
-// ProcessIsolation is an explicit hardened Linux identity policy. Omitting
-// WithProcessIsolation selects ordinary execution as the current identity.
+// ProcessIdentityLockCapability is a duplicable descriptor a trusted supervisor
+// hands the adapter for the host-global UID lock or the authority domain. The
+// descriptor is validated and never exposed to the native pi process.
 type ProcessIdentityLockCapability interface {
 	Duplicate() (*os.File, error)
 }
 
+// ProcessIsolation is an explicit hardened Linux identity policy. Omitting
+// WithProcessIsolation selects ordinary execution as the current identity.
 type ProcessIsolation struct {
 	UID             uint32
 	GID             uint32
@@ -149,10 +152,12 @@ type Options struct {
 	RuntimeResourceHooks RuntimeResourceHooks
 	// ConcurrencyLimits controls process-local backpressure.
 	ConcurrencyLimits ConcurrencyLimits
-	// SeedFiles maps paths relative to each session's isolated pi agent
-	// directory to file contents written there before the pi process launches,
-	// so the launched CLI reads them as its own config (e.g. settings.json,
-	// which is deep-merged under the adapter's managed keys).
+	// SeedFiles maps paths relative to the pi agent directory a session
+	// launches against to file contents written there before the pi process
+	// starts, so the launched CLI reads them as its own config. Every file is
+	// written verbatim, settings.json included; that directory is the durable
+	// Home when one is configured, and a per-session ephemeral directory
+	// otherwise. Set via WithSeedFiles.
 	SeedFiles map[string]string
 	// ImageLimits bounds decoded image bytes on prompt input and emitted
 	// output. Set via WithImageLimits; every field defaults to 6 MiB when the
@@ -385,11 +390,22 @@ func WithConcurrencyLimits(limits ConcurrencyLimits) Option {
 	}
 }
 
-// WithSeedFiles registers files written into each session's isolated pi agent
-// directory before the pi process launches. Keys are paths relative to that
-// directory and values are the file contents. settings.json is deep-merged
-// under the adapter's managed keys; other files are written verbatim. Paths
-// are confined to the agent directory: absolute paths, ".." escapes, and
+// WithSeedFiles registers files written into the pi agent directory a session
+// launches against, before the pi process starts. Keys are paths relative to
+// that directory and values are the file contents.
+//
+// Every file, settings.json included, is written verbatim: the adapter authors
+// no settings.json of its own and merges nothing into a seeded one. The only
+// special handling for settings.json is a parse check that fails the seed
+// closed, because pi records a load error for unparsable settings and then
+// silently runs its own defaults.
+//
+// The directory written to is per session only when no durable Home is
+// configured. With WithHome, every session launches against that one shared
+// directory and the seed is written there, so a seeded file is agent-scoped
+// operator configuration rather than per-session state.
+//
+// Paths are confined to the agent directory: absolute paths, ".." escapes, and
 // empty keys fail closed at session start.
 func WithSeedFiles(files map[string]string) Option {
 	return func(options *Options) {

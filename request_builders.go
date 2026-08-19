@@ -111,9 +111,17 @@ func WithSessionAdditionalDirectories(paths ...string) SessionRequestOption {
 	}
 }
 
-// WithSessionMeta merges metadata into a session lifecycle request.
+// WithSessionMeta merges host metadata into a session lifecycle request.
+//
+// A key matching a family-global reserved literal is rejected rather than
+// merged or overwritten: those namespaces are the family's, versioned and
+// fixed, and a caller value under one of them would either forge a fact the
+// wrapper alone may state or displace one the wrapper is about to stamp. These
+// builders answer with the request they built rather than an error, so
+// rejection is exclusion — the request goes out without the reserved key, and
+// the agent refuses one that arrives on the wire anyway.
 func WithSessionMeta(meta map[string]any) SessionRequestOption {
-	cloned := cloneAnyMap(meta)
+	cloned := withoutReservedLiterals(cloneAnyMap(meta))
 
 	return func(config *sessionRequestConfig) {
 		config.meta = mergeAnyMap(config.meta, cloned)
@@ -286,13 +294,39 @@ func WithListSessionsCursor(cursor string) ListSessionsRequestOption {
 	}
 }
 
-// WithListSessionsMeta sets metadata on a session/list request.
+// WithListSessionsMeta sets host metadata on a session/list request. It rejects
+// a family-global reserved literal on the same terms as WithSessionMeta.
 func WithListSessionsMeta(meta map[string]any) ListSessionsRequestOption {
-	cloned := cloneAnyMap(meta)
+	cloned := withoutReservedLiterals(cloneAnyMap(meta))
 
 	return func(req *acp.ListSessionsRequest) {
 		req.Meta = mergeAnyMap(req.Meta, cloned)
 	}
+}
+
+// reservedMetaLiterals is the closed family-global set. Every one of them is a
+// namespace this family owns end to end: a host reads them and never writes
+// them into a request an exported builder assembles.
+var reservedMetaLiterals = []string{
+	routeMetaKey,
+	lifecycleMetaKey,
+	handoffMetaKey,
+	mediaEnvelopeMetaKey,
+}
+
+// withoutReservedLiterals drops every reserved literal a caller supplied. It is
+// the only refusal an error-free builder can make, and it is the refusal the
+// rule asks for: the value is neither merged nor allowed to overwrite.
+func withoutReservedLiterals(meta map[string]any) map[string]any {
+	if meta == nil {
+		return nil
+	}
+
+	for _, literal := range reservedMetaLiterals {
+		delete(meta, literal)
+	}
+
+	return meta
 }
 
 // PiOption configures PiOptions values.

@@ -580,6 +580,10 @@ func TestAuthHarnessUsesGeneratedAgentDir(t *testing.T) {
 	require.NotEqual(t, harness.session.launch.AgentDir, spec.AgentDir)
 }
 
+// TestDurableHomeIsRefusedWithProcessIsolation pins both halves of the refusal:
+// explicit isolation never gets the durable home, and the verdict it gives is
+// the uniform option shape naming the option the host set — not a raw Go error
+// a host has to read prose out of.
 func TestDurableHomeIsRefusedWithProcessIsolation(t *testing.T) {
 	originalPlatform := agentRuntimePlatform
 	agentRuntimePlatform = linuxPlatform
@@ -593,7 +597,7 @@ func TestDurableHomeIsRefusedWithProcessIsolation(t *testing.T) {
 	agent.versionChecked = true
 
 	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-	require.ErrorContains(t, err, "durable pi agent directory is unavailable with explicit process isolation")
+	requireRefusedField(t, optionFieldHome, err)
 }
 
 func TestGeneratedAgentDirRelaunchIgnoresLedgerIdentity(t *testing.T) {

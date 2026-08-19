@@ -29,6 +29,11 @@ var lifecycleRandRead = rand.Read
 // ended. Its events are gone with it and are never reconstructed.
 var errLifecycleStreamFenced = errors.New("lifecycle stream is fenced")
 
+// errLifecycleActionUnowned refuses a permission or elicitation a live
+// incarnation has no turn to attribute. The correlation names an owner or the
+// request does not go out.
+var errLifecycleActionUnowned = errors.New("no open turn owns this lifecycle action")
+
 // lifecycleState is the session's ordered lifecycle emitter for exactly one pi
 // process generation. The stream survives ordinary prompts, because the process
 // does; it ends when the generation ends, and the session's close fences the
@@ -190,12 +195,31 @@ type pendingAction struct {
 // prepareLifecycleAction mints the identity for one permission or elicitation
 // without publishing anything. Nothing is announced yet: the request that
 // answers the action goes on the wire first.
+//
+// There are three states here and only two of them are the same. With no
+// incarnation — the extension is not negotiated — or with the incarnation
+// already fenced, there is no stream to correlate against and the request goes
+// out plainly: that is the absence of the extension, not a hole in it.
+//
+// A live incarnation with no open turn is neither. While version 1 is
+// negotiated the correlation is stamped on *every* permission and elicitation,
+// so there is no shape for one without an owner to name. A dialog only reaches
+// this path from an open foreground delivery — a dialog with no foreground
+// cycle to block is already cancelled at the pump — so this state is a dialog
+// handler that outlived the turn that spawned it, and the request it would send
+// asks for an answer to a turn that is over. It is refused on the same terms
+// the pump refuses an unattributable dialog: the caller answers pi with a
+// native cancel rather than putting a correlation-less request on the wire.
 func (s *agentSession) prepareLifecycleAction() (pendingAction, bool, error) {
 	s.lcMu.Lock()
 	defer s.lcMu.Unlock()
 
-	if s.lc.stream == nil || s.lc.fenced || s.lc.turnID == "" {
+	if s.lc.stream == nil || s.lc.fenced {
 		return pendingAction{}, false, nil
+	}
+
+	if s.lc.turnID == "" {
+		return pendingAction{}, false, errLifecycleActionUnowned
 	}
 
 	actionID, err := newLifecycleID("action")
