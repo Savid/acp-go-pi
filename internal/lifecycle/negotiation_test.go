@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 
@@ -89,6 +90,73 @@ func TestDecodeOfferReadsEveryIntegerSpelling(t *testing.T) {
 		require.True(t, offered)
 		require.Equal(t, []int{1}, offer.Versions)
 	}
+}
+
+// TestIntegerValueBoundsTheTypeItReadsInto pins the boundary of every integer
+// spelling against the range the value is read into rather than against int64.
+// A build whose int is narrower is the case the rule exists for: a value that
+// fits an int64 and not the target names no value of that type, so it is
+// refused instead of being narrowed to a different number.
+func TestIntegerValueBoundsTheTypeItReadsInto(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  any
+		low  int64
+		high int64
+		want int64
+		ok   bool
+	}{
+		{"float at the ceiling", float64(math.MaxInt32), math.MinInt32, math.MaxInt32, math.MaxInt32, true},
+		{"float one past the ceiling", float64(math.MaxInt32) + 1, math.MinInt32, math.MaxInt32, 0, false},
+		{"float at the floor", float64(math.MinInt32), math.MinInt32, math.MaxInt32, math.MinInt32, true},
+		{"float one past the floor", float64(math.MinInt32) - 1, math.MinInt32, math.MaxInt32, 0, false},
+		{"float past a narrower ceiling than int64", float64(1 << 40), math.MinInt32, math.MaxInt32, 0, false},
+		{"float past every ceiling", 1e300, math.MinInt64, math.MaxInt64, 0, false},
+		{"float past every floor", -1e300, math.MinInt64, math.MaxInt64, 0, false},
+		{"fractional float", 1.5, math.MinInt64, math.MaxInt64, 0, false},
+		{"largest float64 an int64 holds", float64(math.MaxInt64 - 1023), math.MinInt64, math.MaxInt64, math.MaxInt64 - 1023, true},
+		{"host int at the ceiling", 10, -10, 10, 10, true},
+		{"host int past the ceiling", 11, -10, 10, 0, false},
+		{"host int past the floor", -11, -10, 10, 0, false},
+		{"number at the ceiling", json.Number("2147483647"), math.MinInt32, math.MaxInt32, math.MaxInt32, true},
+		{"number past the ceiling", json.Number("2147483648"), math.MinInt32, math.MaxInt32, 0, false},
+		{"number past the floor", json.Number("-2147483649"), math.MinInt32, math.MaxInt32, 0, false},
+		{"number past every ceiling", json.Number("9223372036854775808"), math.MinInt64, math.MaxInt64, 0, false},
+		{"unparsable number", json.Number("one"), math.MinInt64, math.MaxInt64, 0, false},
+		{"not a number at all", "1", math.MinInt64, math.MaxInt64, 0, false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			value, ok := integerInRange(test.raw, test.low, test.high)
+			require.Equal(t, test.ok, ok)
+			require.Equal(t, test.want, value)
+		})
+	}
+
+	// The platform's own bounds are the ones integerValue reads into, so an
+	// accepted value survives the narrowing unchanged.
+	platform := []struct {
+		raw  any
+		want int
+	}{
+		{float64(math.MaxInt32), math.MaxInt32},
+		{math.MaxInt, math.MaxInt},
+		{json.Number("2147483647"), math.MaxInt32},
+	}
+
+	for _, test := range platform {
+		value, ok := integerValue(test.raw)
+		require.True(t, ok)
+		require.Equal(t, test.want, value)
+	}
+
+	_, ok := integerValue(float64(math.MaxInt) + 1)
+	require.False(t, ok, "a float past the platform ceiling was narrowed instead of refused")
 }
 
 func correlationMeta(value any) map[string]any {

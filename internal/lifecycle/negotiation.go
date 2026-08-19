@@ -171,24 +171,41 @@ func checkCorrelationVersion(fields map[string]any, negotiated Negotiated) *Para
 // and an embedding Go host writes an int, so both are the same integer; a
 // fractional value is neither.
 //
-// Integrality alone does not make a float64 an integer here. A magnitude past
-// the int range is integral under Trunc and still names no int at all, so `1e300`
-// is refused rather than silently converted to whatever that platform's
-// out-of-range conversion happens to produce.
+// Integrality alone does not make a float64 an integer here, and neither does
+// fitting in an int64. The bounds are the bounds of the type the value is read
+// into, so a magnitude past them is refused rather than narrowed to whatever
+// that build's out-of-range conversion happens to produce — which is why the
+// range is passed in rather than assumed, and why `1e300` is refused on every
+// build and `1e10` on one whose int is 32 bits.
 func integerValue(raw any) (int, bool) {
+	value, ok := integerInRange(raw, math.MinInt, math.MaxInt)
+
+	return int(value), ok
+}
+
+// integerInRange reads one JSON integer and refuses every value outside the
+// inclusive bounds it is given.
+func integerInRange(raw any, low int64, high int64) (int64, bool) {
 	switch value := raw.(type) {
 	case float64:
-		if value != math.Trunc(value) || value < math.MinInt64 || value >= math.MaxInt64+1 {
+		if value != math.Trunc(value) || value < float64(low) || value >= float64(high)+1 {
 			return 0, false
 		}
 
-		return int(value), true
+		return int64(value), true
 	case int:
-		return value, true
+		if int64(value) < low || int64(value) > high {
+			return 0, false
+		}
+
+		return int64(value), true
 	case json.Number:
 		number, err := value.Int64()
+		if err != nil || number < low || number > high {
+			return 0, false
+		}
 
-		return int(number), err == nil
+		return number, true
 	default:
 		return 0, false
 	}
