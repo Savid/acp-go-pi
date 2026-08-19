@@ -201,6 +201,29 @@ func TestEmitClaimsTheSequenceBeforeDelivery(t *testing.T) {
 	require.Equal(t, uint64(1), stream.Sequence())
 }
 
+// TestClosedSessionRefusesEveryLaterEmission proves the session's close reaches
+// the emitter's own validator. The close is stronger than an incarnation fence:
+// a fenced stream is over, but a closed session admits no incarnation at all, so
+// even an opening snapshot — the one event that legitimately starts a stream
+// from nothing — fails closed as stale, and the sequence it burned stays burned.
+func TestClosedSessionRefusesEveryLaterEmission(t *testing.T) {
+	t.Parallel()
+
+	stream := NewStream("strm-1", containedConfiguration())
+	_, err := stream.Emit(SnapshotEvent("cyc-0", QuiescenceFact{}))
+	require.NoError(t, err)
+
+	stream.Close()
+	require.True(t, stream.State().Closed)
+
+	_, err = stream.Emit(RunningEvent("cyc-0", "turn-1"))
+	require.ErrorIs(t, err, &ViolationError{Kind: ViolationStaleStream})
+
+	_, err = stream.Emit(SnapshotEvent("cyc-1", QuiescenceFact{}))
+	require.ErrorIs(t, err, &ViolationError{Kind: ViolationStaleStream})
+	require.Equal(t, uint64(3), stream.Sequence())
+}
+
 // TestSnapshotStatesAnUnprovenBoundaryAsNotQuiescent proves a configuration with
 // no proof class emits a negative fact rather than a `none` sentinel or a
 // present-and-empty source.

@@ -122,6 +122,12 @@ func (s *agentSession) fenceLifecycleStream() {
 
 // closeLifecycleSession fences the session itself. Once close containment has
 // completed, the session admits no further incarnation of itself.
+//
+// The emitter learns the same fact the session just recorded. Its own validator
+// is the last thing an envelope passes before it becomes bytes, so telling it
+// the session is over means a post-close event fails closed where it is minted
+// rather than relying on this struct's flag being consulted first on every path
+// that ever reaches emission.
 func (s *agentSession) closeLifecycleSession() {
 	s.lcMu.Lock()
 	defer s.lcMu.Unlock()
@@ -130,6 +136,10 @@ func (s *agentSession) closeLifecycleSession() {
 	s.lc.fenced = true
 	s.lc.turnID = ""
 	s.lc.blockers = nil
+
+	if s.lc.stream != nil {
+		s.lc.stream.Close()
+	}
 }
 
 // lifecycleAcceptTurn records that the native dispatcher took durable ownership

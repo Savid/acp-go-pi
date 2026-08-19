@@ -41,7 +41,11 @@ func TestLifecycleStreamFinalityActionsAndIncarnationLoss(t *testing.T) {
 	require.NoError(t, s.openLifecycleStream(t.Context(), 2))
 	require.Equal(t, uint64(2), s.lc.generation)
 	require.Empty(t, s.lc.turnID)
+	// Closing the session is the stronger end: the emitter's own validator holds
+	// it too, so a post-close envelope fails where it is minted and not only
+	// where this struct's flag is consulted.
 	s.closeLifecycleSession()
+	require.True(t, s.lc.stream.State().Closed)
 	require.NoError(t, s.openLifecycleStream(t.Context(), 3))
 	require.Equal(t, uint64(2), s.lc.generation)
 }

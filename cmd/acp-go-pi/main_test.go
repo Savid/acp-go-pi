@@ -159,21 +159,19 @@ func TestRunOptionsCancellationAndSignal(t *testing.T) {
 	require.Zero(t, run(ctx, isolatedArgs(), bytes.NewReader(nil), io.Discard, io.Discard))
 }
 
-func TestRunRemovedDarwinFlagAndContainmentSubcommand(t *testing.T) {
+func TestRunDispatchesContainmentSubcommand(t *testing.T) {
 	disableTelemetry(t)
 	restoreMainSeams(t)
 	restoreContainmentCommandSeams(t)
 
-	var stderr bytes.Buffer
-	require.Equal(t, 2, run(t.Context(), []string{"-darwin-best-effort-containment"}, bytes.NewReader(nil), io.Discard, &stderr))
-	require.Contains(t, stderr.String(), "flag provided but not defined")
-
 	containmentDiagnoseCommand = func(string) (containmentDiagnoseOutput, error) {
 		return containmentDiagnoseOutput{Records: []containmentDiagnoseRecord{}}, nil
 	}
-	var stdout bytes.Buffer
+
+	var stdout, stderr bytes.Buffer
 	require.Zero(t, run(t.Context(), []string{"containment", "diagnose", "-scratch-dir", "/scratch"}, bytes.NewReader(nil), &stdout, &stderr))
 	require.Contains(t, stdout.String(), `"records":[]`)
+	require.Empty(t, stderr.String())
 }
 
 type namedSignal string

@@ -30,6 +30,13 @@ func (s *Stream) ID() string { return s.id }
 // State returns the projection the emitted stream proves.
 func (s *Stream) State() State { return s.reducer.State() }
 
+// Close records that the addressed session's close containment completed. It is
+// the stronger of the two ends a stream can reach: fencing an incarnation stops
+// this stream, while closing the session stops the session, so a later event on
+// it — an opening snapshot for a would-be new incarnation included — fails
+// closed as stale at the emitter rather than reaching a consumer.
+func (s *Stream) Close() { s.reducer.Close() }
+
 // Sequence reports the highest sequence claimed so far.
 func (s *Stream) Sequence() uint64 { return s.sequence }
 
