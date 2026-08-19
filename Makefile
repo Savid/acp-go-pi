@@ -5,6 +5,10 @@
 GOLANGCI_LINT_VERSION ?= v2.12.2
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
+# Removed public surfaces and forbidden hard-cutover terms. Hex-escaped so the
+# term list never contains a literal forbidden term. Expanded with `printf %b`.
+REMOVED_PUBLIC_TERMS = --cl\x69|pi\x20acp|pro\x78y|compatibilit\x79|deprecat\x65d|legac\x79|migratio\x6e|session/imp\x6frt|sdkMessag\x65|emitRawSDKMessag\x65s|setGoa\x6c|goa\x6cs|\x4e\x45\x53|SSE\x20MCP|mcpCapabilities\\.ac\x70|\\bExportSessio\x6e\\b|\\bImportSessio\x6e\\b|\\bDeleteSessio\x6e\\b|\\bParseConfi\x67\\b
+
 .PHONY: build lint fmt-check fmt test coverage-check test-cross-compile test-integration-smoke test-integration-live test-integration-cover test-integration-attended test-integration-keystore test-integration-native-browser docs-audit clean tidy vuln modernize-check audit test/cover help
 
 ## build: compile all packages
@@ -171,7 +175,7 @@ docs-audit:
 	@missing=0; for file in README.md doc.go docs.json example_test.go AGENTS.md docs/overview.mdx docs/core/sessions.mdx docs/core/prompt-streaming.mdx docs/features/authentication.mdx docs/features/elicitation.mdx docs/features/mcp.mdx docs/features/models-config.mdx docs/features/permissions.mdx docs/features/raw-events.mdx docs/features/session-store.mdx docs/get-started/examples.mdx docs/get-started/install.mdx docs/get-started/quickstart.mdx docs/get-started/run-modes.mdx docs/operations/observability.mdx docs/operations/security.mdx docs/operations/troubleshooting.mdx docs/reference/acp-methods.mdx docs/reference/cli.mdx docs/reference/go-api.mdx docs/reference/meta.mdx docs/reference/updates.mdx examples/minimal-client/main.go examples/resume-from-file/main.go examples/interactive-chat/main.go; do if [ ! -f "$$file" ]; then echo "missing required docs file: $$file"; missing=1; fi; done; exit $$missing
 	@for flag in -path -home -scratch-dir -provider-auth-root -process-isolation-config -model -seed-file -debug -version; do rg -q -- "$$flag" docs/reference/cli.mdx || { echo "missing CLI flag in docs/reference/cli.mdx: $$flag"; exit 1; }; done
 	@for flag in path home scratch-dir provider-auth-root process-isolation-config model seed-file debug version; do rg -q -- "\"$$flag\"" cmd/acp-go-pi/*.go || { echo "missing CLI flag registration in command code: $$flag"; exit 1; }; done
-	@! rg -n -- '--cli|proxy|compatibility|deprecated|legacy|migration|session/import|sdkMessage|setGoal|goals|NES|SSE MCP|mcpCapabilities\.acp' README.md doc.go docs.json docs examples cmd/acp-go-pi/*.go AGENTS.md
+	@pattern=$$(printf '%b' '$(REMOVED_PUBLIC_TERMS)'); ! rg -n -- "$$pattern" README.md doc.go docs.json docs examples cmd/acp-go-pi/*.go AGENTS.md
 	@rg -q 'SupervisorGuardianSIGKILL' Makefile
 	@rg -q 'SupervisorLivenessSIGKILL' Makefile
 	@rg -q 'BorrowedIdentityAdoption' Makefile
