@@ -121,8 +121,9 @@ extension — session lifecycle requests included — the key is refused with an
 invalid-params error naming `_meta["acp-go.dev/lifecycle"]` rather than
 ignored. On the extension surface that refusal precedes method resolution: an
 extension call carrying the key is answered about the key even when it names a
-method this adapter implements nowhere, because the key is the family's rather
-than the method's. Without it, an unknown method is still method-not-found.
+method this adapter implements nowhere, because the key is reserved on every
+inbound surface rather than owned by any one method. Without it, an unknown
+method is still method-not-found.
 
 Every live-turn `session/update` and `_pi/rawEvent` notification carries the
 same exact `{version, turnNonce}` object in its notification `_meta`; raw-event
