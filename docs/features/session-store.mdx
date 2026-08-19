@@ -69,7 +69,10 @@ boundary and the exact native-row count it covers. Restore validates that
 journal strictly. Unknown fields, malformed or unsupported records, a missing
 journal, or any mismatch between the boundary and native row counts fails the
 request; native rows beyond the last valid boundary are not hydrated.
-`Replace` MUST include the main key exactly once. Session summaries report
+`Replace` MUST include the main key exactly once, and MUST refuse a call whose
+replacements name one key twice — two generations of one key with nothing to
+say which was meant, so the whole call fails before any key is written rather
+than resolving the collision by last-write-wins. Session summaries report
 `UpdatedAtUnixMilli` in Unix milliseconds.
 
 Only conversation rows and adapter-owned lifecycle boundary records are

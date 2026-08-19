@@ -129,6 +129,37 @@ func TestListSessionsFallsBackToSessionIDOrder(t *testing.T) {
 	require.Equal(t, "a", summaries[0].SessionID)
 }
 
+// TestReplaceRefusesDuplicateReplacementKeys pins that two replacements naming
+// one key are refused rather than silently resolved. Each names a whole
+// generation of that key and nothing in the call says which one the caller
+// meant, so the refusal lands before any key of the call is written.
+func TestReplaceRefusesDuplicateReplacementKeys(t *testing.T) {
+	store := NewInMemorySessionStore()
+	main := SessionKey{SessionID: "one"}
+	sub := SessionKey{SessionID: "one", Subpath: "branch"}
+
+	require.NoError(t, store.Append(t.Context(), sub, []SessionStoreEntry{json.RawMessage(`{"row":"original"}`)}))
+
+	require.EqualError(t, store.Replace(t.Context(), main, []SessionStoreReplacement{
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"main"}`)}},
+		{Key: sub, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"first"}`)}},
+		{Key: sub, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"last"}`)}},
+	}), `duplicate replacement key "one" subpath "branch"`)
+
+	loaded, err := store.Load(t.Context(), sub)
+	require.NoError(t, err)
+	require.Len(t, loaded, 1)
+	require.JSONEq(t, `{"row":"original"}`, string(loaded[0]), "a refused replacement installed a generation anyway")
+
+	loaded, err = store.Load(t.Context(), main)
+	require.NoError(t, err)
+	require.Empty(t, loaded, "a refused replacement wrote the main key")
+
+	require.EqualError(t, store.Replace(t.Context(), main, []SessionStoreReplacement{
+		{Key: main}, {Key: main},
+	}), `duplicate replacement key "one" subpath ""`)
+}
+
 // TestReplaceAfterDeleteStaysTombstoned pins that a delete is final: a
 // replacement landing after it installs nothing, so no session the host was
 // told is gone can answer again.
