@@ -60,21 +60,27 @@ func (r *Reducer) checkSnapshot(delivery Delivery, snapshot Snapshot) error {
 // current a state that is over, and an id listed twice asserts two current
 // states for one entity — malformed whether or not the two entries agree,
 // because a whole-state assertion is judged whole rather than deduplicated.
+//
+// Set membership is judged before the entry itself: an id that repeats has
+// already broken the assertion as a whole, so nothing about that entry's own
+// first sight can be decided any more, and an entry that both repeats an id and
+// fails its own check is malformed_envelope rather than whatever its members
+// would have been judged as on first sight.
 func (r *Reducer) checkSnapshotActivities(delivery Delivery, snapshot Snapshot, introduced introductions) error {
 	listed := make(map[string]struct{}, len(snapshot.Activities))
 
 	for index := range snapshot.Activities {
 		activity := &snapshot.Activities[index]
 
-		if err := r.checkActivityIdentity(delivery, *activity); err != nil {
-			return err
-		}
-
 		if _, repeated := listed[activity.ActivityID]; repeated {
 			return r.fail(delivery, ViolationMalformedEnvelope, "activity "+activity.ActivityID+" is listed twice")
 		}
 
 		listed[activity.ActivityID] = struct{}{}
+
+		if err := r.checkActivityIdentity(delivery, *activity); err != nil {
+			return err
+		}
 
 		if activity.State.Terminal() {
 			return r.fail(delivery, ViolationMalformedEnvelope, "activity "+activity.ActivityID+" is terminal")
@@ -88,23 +94,23 @@ func (r *Reducer) checkSnapshotActivities(delivery Delivery, snapshot Snapshot, 
 	return nil
 }
 
-// checkSnapshotActions validates the asserted action set under the same rules.
-// Uniqueness is per set because activities and actions are distinct id spaces:
-// the same opaque string naming an activity in one set and an action in the
-// other is two entities, not a collision.
+// checkSnapshotActions validates the asserted action set under the same rules,
+// membership before entry included. Uniqueness is per set because activities and
+// actions are distinct id spaces: the same opaque string naming an activity in
+// one set and an action in the other is two entities, not a collision.
 func (r *Reducer) checkSnapshotActions(delivery Delivery, snapshot Snapshot, introduced introductions) error {
 	listed := make(map[string]struct{}, len(snapshot.Actions))
 
 	for _, action := range snapshot.Actions {
-		if err := r.checkActionIdentity(delivery, action); err != nil {
-			return err
-		}
-
 		if _, repeated := listed[action.ActionID]; repeated {
 			return r.fail(delivery, ViolationMalformedEnvelope, "action "+action.ActionID+" is listed twice")
 		}
 
 		listed[action.ActionID] = struct{}{}
+
+		if err := r.checkActionIdentity(delivery, action); err != nil {
+			return err
+		}
 
 		if action.State.Terminal() {
 			return r.fail(delivery, ViolationMalformedEnvelope, "action "+action.ActionID+" is terminal")

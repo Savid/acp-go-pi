@@ -1067,3 +1067,60 @@ func TestActionRestatementKeepsItPending(t *testing.T) {
 	require.Equal(t, ActionPending, action.State)
 	require.False(t, reducer.State().Quiescence.Certified)
 }
+
+// TestSnapshotSetMembershipPrecedesEntryJudgment pins that the per-set
+// uniqueness test runs before any per-entry first-sight validation. A whole-state
+// assertion is judged whole: once an id repeats, the assertion has already broken
+// as a set, so an entry that both repeats an id and fails its own first-sight
+// check is malformed_envelope rather than the verdict that entry alone would have
+// drawn.
+func TestSnapshotSetMembershipPrecedesEntryJudgment(t *testing.T) {
+	t.Parallel()
+
+	complete := ActivityUpdate{
+		ActivityID: "act-1", Kind: ActivityTask, State: ActivityRunning,
+		Cause: CauseSession, OriginTurnID: "turn-1",
+	}
+
+	// The repeat is missing every immutable member, which alone is an
+	// immutable-identity refusal.
+	requireReduceRefusal(t, richConfiguration(), ViolationMalformedEnvelope,
+		Event{Type: EventSnapshot, Snapshot: &Snapshot{
+			Foreground: Foreground{State: ForegroundIdle, CycleID: "cyc-0"},
+			Activities: []ActivityUpdate{complete, {ActivityID: "act-1", State: ActivityRunning}},
+		}})
+
+	// The repeat names a kind the answer never proved, which alone is an
+	// unnegotiated-fact refusal.
+	requireReduceRefusal(t, richConfiguration(), ViolationMalformedEnvelope,
+		Event{Type: EventSnapshot, Snapshot: &Snapshot{
+			Foreground: Foreground{State: ForegroundIdle, CycleID: "cyc-0"},
+			Activities: []ActivityUpdate{complete, {
+				ActivityID: "act-1", Kind: ActivityKind("mystery"), State: ActivityRunning,
+				Cause: CauseSession, OriginTurnID: "turn-1",
+			}},
+		}})
+
+	// The action set is judged on the same terms: the repeat states an
+	// incomplete first sight, and the duplicate verdict is still what answers.
+	completeAction := ActionUpdate{
+		ActionID: "req-1", Kind: ActionPermission, State: ActionPending,
+		Owner: Owner{Type: OwnerTurn, ID: "turn-1"}, BlocksForeground: stated(false),
+	}
+
+	requireReduceRefusal(t, richConfiguration(), ViolationMalformedEnvelope,
+		Event{Type: EventSnapshot, Snapshot: &Snapshot{
+			Foreground: Foreground{State: ForegroundRunning, CycleID: "cyc-1", TurnID: "turn-1", Origin: CauseSubmission},
+			Actions:    []ActionUpdate{completeAction, {ActionID: "req-1", State: ActionPending}},
+		}})
+
+	// The detail names the set rule that answered, so the ordering is pinned as
+	// precedence rather than two rules that happen to share a kind.
+	_, refusal := reduceAll(t, richConfiguration(),
+		Event{Type: EventSnapshot, Snapshot: &Snapshot{
+			Foreground: Foreground{State: ForegroundIdle, CycleID: "cyc-0"},
+			Activities: []ActivityUpdate{complete, {ActivityID: "act-1", State: ActivityRunning}},
+		}})
+	require.NotNil(t, refusal)
+	require.Contains(t, refusal.Error(), "is listed twice")
+}
