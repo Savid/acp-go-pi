@@ -381,6 +381,7 @@ func (a *Agent) UnstableDeleteSession(
 	}
 
 	a.mu.Lock()
+
 	detached := session != nil && a.sessions[params.SessionId] == session
 	if detached {
 		delete(a.sessions, params.SessionId)
@@ -390,8 +391,8 @@ func (a *Agent) UnstableDeleteSession(
 
 	// A delete addressed at an id whose earlier delete tombstoned it and then
 	// failed partway through teardown is that teardown's retry: the session it
-	// left unfinished is taken back out of the cleanup registry and torn down
-	// here, so step 5's obligation is discharged on the very path the host
+	// left unfinished comes back out of the cleanup registry and is torn down
+	// here, so the retained obligation is discharged on the very path the host
 	// retried.
 	if pending := a.pendingCleanups[params.SessionId]; session == nil {
 		session = pending
