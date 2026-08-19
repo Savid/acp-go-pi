@@ -93,6 +93,52 @@ func TestSameSessionIDKeepsOneLinearizedOwner(t *testing.T) {
 	require.Empty(t, replacement.turn, "close left the replacement's turn admission unbalanced")
 }
 
+// TestFailedCloseRetainsTheSessionItDidNotFinish pins the rule that a close
+// which failed still owes the boundary it did not reach. The id stays
+// addressable so a later close can retry that boundary, admission is fenced on
+// the session rather than by unmapping the id so no prompt slips in behind the
+// close, and only the completed boundary detaches the id.
+func TestFailedCloseRetainsTheSessionItDidNotFinish(t *testing.T) {
+	refused := errors.New("durability unavailable")
+	// The commit exhausts its own retries before the close reports the refusal.
+	store := &appendControlledStore{SessionStore: NewInMemorySessionStore(), failures: len(mirrorAppendDelays), err: refused}
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+	agent.conn = newDirectAgentClient()
+
+	session := &agentSession{
+		agent:       agent,
+		id:          "retained",
+		proc:        newStubProcess(false),
+		sessionRoot: t.TempDir(),
+		turn:        make(chan struct{}, sessionTurnCapacity),
+	}
+	agent.sessions[session.id] = session
+
+	t.Cleanup(func() { _ = agent.Close() })
+
+	_, err := agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: session.id})
+	require.ErrorIs(t, err, refused)
+
+	resolved, err := agent.session(session.id)
+	require.NoError(t, err, "a failed close orphaned the id whose boundary it still owes")
+	require.Same(t, session, resolved)
+
+	_, err = agent.Prompt(t.Context(), acp.PromptRequest{SessionId: session.id})
+	requireInvalidParams(t, err)
+	require.Equal(t, len(mirrorAppendDelays), store.calls, "a prompt slipped in behind the close and drove the session")
+
+	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: session.id})
+	require.NoError(t, err, "the retried close did not re-run the boundary the first one refused")
+
+	journal, err := store.Load(t.Context(), SessionKey{SessionID: string(session.id), Subpath: SessionStoreLifecycleSubpath})
+	require.NoError(t, err)
+	require.Len(t, journal, 1, "the retry committed the boundary record the failed close owed")
+
+	agent.mu.Lock()
+	require.NotContains(t, agent.sessions, session.id, "a completed close left the id addressable")
+	agent.mu.Unlock()
+}
+
 func TestNewSessionBackpressure(t *testing.T) {
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "fresh"}
@@ -852,7 +898,7 @@ func TestRestoreActiveAndCleanupBranches(t *testing.T) {
 	active.proc = process
 	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: id})
 	require.Error(t, err)
-	require.NotContains(t, agent.sessions, id)
+	require.Contains(t, agent.sessions, id, "a failed close orphaned the session it did not finish")
 
 	cleanup := &agentSession{agent: agent, id: id, proc: process, turn: make(chan struct{}, 1)}
 	agent.sessions[id] = cleanup

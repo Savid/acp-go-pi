@@ -221,7 +221,8 @@ func TestAgentRetainsContainmentFailureAfterSessionRemoval(t *testing.T) {
 
 	_, err := agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: "id"})
 	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
-	require.NotContains(t, agent.sessions, acp.SessionId("id"))
+	require.Contains(t, agent.sessions, acp.SessionId("id"),
+		"a close that could not contain the tree dropped the session that still owns it")
 	require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
 }
 

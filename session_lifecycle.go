@@ -115,38 +115,57 @@ func (s *agentSession) turnQueueLocked() chan struct{} {
 	return s.turn
 }
 
-// beginClose claims the session's terminal state. The first caller owns
-// teardown and reports its result through closeDone; every later caller waits
-// for that result instead of tearing the same resources down again.
-func (s *agentSession) beginClose() (chan struct{}, bool) {
+// fenceAdmission refuses every later turn admission on this session. A close
+// ladder fences the session it is tearing down instead of unmapping the id,
+// which keeps a prompt from slipping in behind the close while leaving the id
+// addressable for the retry a failed boundary still owes.
+func (s *agentSession) fenceAdmission() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closing {
-		return s.closeDone, false
-	}
-
 	s.closing = true
-	s.closeDone = make(chan struct{})
-
-	return s.closeDone, true
-}
-
-func (s *agentSession) finishClose(done chan struct{}, err error) {
-	s.mu.Lock()
-	s.closeErr = err
-
-	close(done)
 	s.mu.Unlock()
 }
 
-func (s *agentSession) awaitClose(done chan struct{}) error {
-	<-done
-
+// beginClose fences admission and claims the teardown ladder. The first caller
+// of an attempt owns it and publishes that attempt's result; a caller arriving
+// while it runs waits for the same result instead of tearing the same resources
+// down beside it.
+//
+// The fence is permanent and the claim is not. A teardown that failed leaves
+// the session still owning the native scope and the durable rows it did not
+// finish, so the claim is released with the failure and the next Close runs the
+// ladder again; replaying the recorded failure would leave that scope owned by
+// nobody.
+func (s *agentSession) beginClose() (*sessionCloseAttempt, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.closeErr
+	s.closing = true
+
+	if s.closeAttempt != nil {
+		return s.closeAttempt, false
+	}
+
+	s.closeAttempt = &sessionCloseAttempt{done: make(chan struct{})}
+
+	return s.closeAttempt, true
+}
+
+func (s *agentSession) finishClose(attempt *sessionCloseAttempt, err error) {
+	s.mu.Lock()
+	if err != nil {
+		s.closeAttempt = nil
+	}
+	s.mu.Unlock()
+
+	attempt.err = err
+
+	close(attempt.done)
+}
+
+func (s *agentSession) awaitClose(attempt *sessionCloseAttempt) error {
+	<-attempt.done
+
+	return attempt.err
 }
 
 func (s *agentSession) currentClient() piClient {
@@ -884,16 +903,18 @@ func (s *agentSession) wasTurnCancelled() bool {
 	return s.turnCancelled
 }
 
-// Close shuts the pi process down and releases the session's resources. It is
-// terminal and idempotent: the first caller performs teardown exactly once and
-// every later caller waits for it and reports the same result.
+// Close shuts the pi process down and releases the session's resources. One
+// teardown runs at a time and a caller arriving while it runs reports its
+// result; a teardown that succeeded is final, and a teardown that failed is
+// retried by the next Close, because every rung of the ladder is idempotent and
+// the session still owns whatever the failed attempt left behind.
 func (s *agentSession) Close(ctx context.Context) (err error) {
-	done, owner := s.beginClose()
+	attempt, owner := s.beginClose()
 	if !owner {
-		return s.awaitClose(done)
+		return s.awaitClose(attempt)
 	}
 
-	defer func() { s.finishClose(done, err) }()
+	defer func() { s.finishClose(attempt, err) }()
 
 	if s.agent != nil {
 		var finish func(error)

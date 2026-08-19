@@ -85,10 +85,14 @@ func (s *agentSession) commitMirror(ctx context.Context) error {
 	return nil
 }
 
+// mirrorAppendDelays is the wait before each attempt at one durable append. A
+// store that refuses every attempt has refused the commit.
+var mirrorAppendDelays = []time.Duration{0, 200 * time.Millisecond, 800 * time.Millisecond}
+
 func appendMirrorEntries(ctx context.Context, store SessionStore, key SessionKey, entries []SessionStoreEntry) error {
 	var lastErr error
 
-	for _, delay := range []time.Duration{0, 200 * time.Millisecond, 800 * time.Millisecond} {
+	for _, delay := range mirrorAppendDelays {
 		if delay > 0 {
 			select {
 			case <-time.After(delay):

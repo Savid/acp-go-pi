@@ -144,13 +144,23 @@ type agentSession struct {
 	residence            *pi.SessionResidence
 	authClosed           bool
 
-	// closing is the session's terminal state: once the first Close claims it
-	// the session admits no prompt, relaunch, or MCP-tool refresh ever again,
-	// and every later Close waits on closeDone and reports closeErr rather than
-	// tearing the same resources down a second time.
-	closing   bool
-	closeDone chan struct{}
-	closeErr  error
+	// closing is the session's admission fence: from the moment a close is
+	// requested the session admits no prompt, relaunch, or MCP-tool refresh
+	// ever again, whether or not the teardown that requested it succeeded.
+	closing bool
+	// closeAttempt is the teardown ladder in flight. A concurrent Close waits
+	// on it and reports its result rather than tearing the same resources down
+	// beside it; an attempt that failed clears the field, because the session
+	// still owns everything that teardown did not finish.
+	closeAttempt *sessionCloseAttempt
+}
+
+// sessionCloseAttempt is one run of the session teardown ladder. Its result is
+// published by closing done, so a waiter always reads the result of the attempt
+// it actually waited on and never a later one's.
+type sessionCloseAttempt struct {
+	done chan struct{}
+	err  error
 }
 
 // turnToolCall is the exact-ID lifecycle published for one native tool call.

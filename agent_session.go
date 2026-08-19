@@ -312,11 +312,12 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 		return acp.CloseSessionResponse{}, err
 	}
 
-	// Detaching before teardown closes the window where a prompt could still
-	// resolve this id and relaunch the process being closed.
-	if a.detachSession(params.SessionId, session) {
-		a.observe.AddActiveSession(ctx, -1)
-	}
+	// The window where a prompt could still resolve this id and relaunch the
+	// process being closed is shut by fencing admission on the session itself,
+	// not by unmapping the id. A close that fails still owes the boundary it did
+	// not finish, and an id that no longer resolves can never be told to retry
+	// it: the id is detached only once the boundary has completed.
+	session.fenceAdmission()
 
 	// Ladder steps 2-4 before the native interrupt: a parked provider-auth
 	// login is answered while the process that parked it is still there.
@@ -327,6 +328,10 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 	closeErr := session.Close(ctx)
 	if closeErr != nil {
 		return acp.CloseSessionResponse{}, closeErr
+	}
+
+	if a.detachSession(params.SessionId, session) {
+		a.observe.AddActiveSession(ctx, -1)
 	}
 
 	return acp.CloseSessionResponse{}, nil
