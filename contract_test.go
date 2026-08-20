@@ -18,6 +18,8 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
+
+	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
 
 type unitFakeModel struct {
@@ -679,6 +681,94 @@ func TestConformanceStoreResumeLoadAndPagination(t *testing.T) {
 	require.NotEmpty(t, list.Sessions)
 	list, err = resumeConn.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor("bad")))
 	requireInvalidParams(t, err)
+}
+
+// lifecycleInitializeRequest offers the session lifecycle extension, which is
+// what makes the sessions on that connection open a real incarnation. The
+// default handshake offers nothing, so a session under it mints no stream, no
+// cycle, and commits its boundaries with an empty identity — which is why a
+// resume across the extension has to be exercised through its own handshake.
+func lifecycleInitializeRequest() acp.InitializeRequest {
+	return acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+		Meta: map[string]any{lifecycleMetaKey: map[string]any{
+			"versions": []any{lifecycle.Version},
+		}},
+	}
+}
+
+// lifecyclePromptRequest carries the submission correlation a negotiated prompt
+// owes alongside the route nonce every prompt carries.
+func lifecyclePromptRequest(sessionID acp.SessionId, turnNonce, text string) acp.PromptRequest {
+	request := TextPromptRequest(sessionID, turnNonce, text)
+	request.Meta[lifecycleMetaKey] = map[string]any{
+		"version": lifecycle.Version,
+		"submission": map[string]any{
+			"submissionId": turnNonce + "-submission",
+			"clientNonce":  turnNonce + "-nonce",
+		},
+	}
+
+	return request
+}
+
+// TestConformanceLifecycleSessionResumesAfterItsCloseBoundary pins the durable
+// half of the lifecycle extension across a real rotation, over the wire and
+// through a fresh connection.
+//
+// A negotiated session opens its incarnation on the establishing response, so
+// every boundary it commits names the cycle that stream minted. The turn that
+// ran under it is finished by the time the close boundary is written — the
+// terminal idle already cleared the turn, and turn identity is present only
+// while a turn is open — so the close records a cycle and no turn. The next
+// incarnation must read that boundary back and resume from it. A reader that
+// refused the shape its own writer produces would strand every session on its
+// first rotation, which is the whole session rather than an edge of it.
+func TestConformanceLifecycleSessionResumesAfterItsCloseBoundary(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	store := NewInMemorySessionStore()
+	scenario := successfulUnitScenario()
+	cwd := t.TempDir()
+
+	conn := connectConformanceAgent(
+		t, ctx, &conformanceClient{}, lifecycleInitializeRequest(), scenario, WithSessionStore(store))
+	session, err := conn.NewSession(ctx, NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	_, err = conn.Prompt(ctx, lifecyclePromptRequest(session.SessionId, "first-turn", "history"))
+	require.NoError(t, err)
+	_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+
+	journal, err := store.Load(ctx, SessionKey{
+		SessionID: string(session.SessionId), Subpath: SessionStoreLifecycleSubpath,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, journal, "a negotiated close commits the boundary its resume stands on")
+
+	var boundary lifecycleBoundaryRecord
+
+	require.NoError(t, json.Unmarshal(journal[len(journal)-1], &boundary))
+	require.NotEmpty(t, boundary.StreamID)
+	require.NotEmpty(t, boundary.CycleID, "the incarnation names the cycle its stream minted")
+	require.Empty(t, boundary.TurnID, "the settled turn is over before the close boundary is written")
+
+	// The rotation: a fresh connection resumes the same id from that boundary.
+	loadClient := &conformanceClient{}
+	loadConn := connectConformanceAgent(
+		t, ctx, loadClient, lifecycleInitializeRequest(), scenario, WithSessionStore(store))
+	_, err = loadConn.LoadSession(ctx, LoadSessionRequest(session.SessionId, cwd))
+	require.NoError(t, err)
+	require.Contains(t, loadClient.text(), "FAKE_PI_REPLY", "the resumed session replayed its history")
+
+	// A resumed session is a working one, not merely a load that returned: it
+	// takes a second turn and closes on a boundary of its own.
+	_, err = loadConn.Prompt(ctx, lifecyclePromptRequest(session.SessionId, "second-turn", "again"))
+	require.NoError(t, err)
+	_, err = loadConn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
 }
 
 func TestConformanceDeleteForkAndUnknownSession(t *testing.T) {

@@ -205,10 +205,13 @@ func validateLifecycleBoundaryRecord(record lifecycleBoundaryRecord) error {
 		return fmt.Errorf("unsupported nativeState %q", record.NativeState)
 	case record.VacancyProven && record.NativeState != nativeStateCommitted:
 		return errors.New("vacancyProven requires committed native state")
+	// A cycle outlives the turn it carried: the terminal transition clears the
+	// turn and leaves the foreground idle, so a boundary recorded there names a
+	// cycle and no turn. Turn identity is present only while a turn is open —
+	// an idle foreground carrying one is malformed — which makes the turnless
+	// cycle the correct shape here rather than a defect to refuse.
 	case record.StreamID == "" && (record.TurnID != "" || record.CycleID != ""):
 		return errors.New("turnId and cycleId require streamId")
-	case record.CycleID != "" && record.TurnID == "":
-		return errors.New("cycleId requires turnId")
 	}
 
 	outcome := lifecycle.Outcome(record.Outcome)

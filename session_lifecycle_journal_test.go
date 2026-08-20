@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
 
 // TestLifecycleBoundaryCommitFailure pins that a store the boundary record
@@ -49,7 +51,6 @@ func TestLifecycleBoundaryRestoreValidation(t *testing.T) {
 		"unsupported disposition":   json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"legacy","recordedAt":1}`),
 		"uncommitted vacancy":       json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"retained","vacancyProven":true,"recordedAt":1}`),
 		"identity without stream":   json.RawMessage(`{"version":1,"streamId":"","turnId":"turn","cycleId":"cycle","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
-		"cycle without turn":        json.RawMessage(`{"version":1,"streamId":"stream","cycleId":"cycle","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
 		"stop without outcome":      json.RawMessage(`{"version":1,"streamId":"","stopReason":"end_turn","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
 		"unsupported outcome":       json.RawMessage(`{"version":1,"streamId":"","outcome":"unknown","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
 		"failed with stop":          json.RawMessage(`{"version":1,"streamId":"","outcome":"failed","stopReason":"end_turn","nativeRows":0,"nativeState":"retained","recordedAt":1}`),
@@ -64,6 +65,35 @@ func TestLifecycleBoundaryRestoreValidation(t *testing.T) {
 			require.Error(t, decodeErr)
 		})
 	}
+}
+
+// TestCloseBoundaryOnAnIdleForegroundReadsBack pins the journal reader against
+// the shape its own writer produces. A settled turn leaves the foreground idle:
+// the terminal transition clears the turn and the cycle outlives it, so the
+// close boundary records a cycle with no turn. That is the only shape an idle
+// foreground may carry — a turnId there is a malformed envelope, present only
+// while a turn is open — so the journal a resume stands behind reads it back
+// instead of refusing it. A reader that refused it would strand every session
+// on its first rotation.
+func TestCloseBoundaryOnAnIdleForegroundReadsBack(t *testing.T) {
+	s, _ := lifecycleSession(t, true)
+	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
+	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
+	require.NoError(t, s.lifecycleSettleTurn(t.Context(), lifecycle.StopReasonEndTurn, lifecycle.OutcomeSuccess))
+
+	streamID, turnID, cycleID := s.lifecycleIdentity()
+	require.NotEmpty(t, streamID)
+	require.Empty(t, turnID, "the terminal idle clears the turn")
+	require.NotEmpty(t, cycleID, "the cycle outlives the turn it carried")
+
+	require.NoError(t, s.commitCloseBoundary(t.Context(), true))
+
+	record, found, err := s.agent.lastLifecycleBoundary(t.Context(), string(s.id))
+	require.NoError(t, err, "the close boundary the writer just recorded is readable")
+	require.True(t, found)
+	require.Equal(t, streamID, record.StreamID)
+	require.Equal(t, cycleID, record.CycleID)
+	require.Empty(t, record.TurnID)
 }
 
 func TestLastLifecycleBoundaryValidatesTheCompleteJournal(t *testing.T) {
