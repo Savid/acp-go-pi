@@ -80,10 +80,15 @@ func TestSessionCloseSurrendersAnUnreleasedTurn(t *testing.T) {
 	require.ErrorIs(t, session.Close(t.Context()), context.DeadlineExceeded)
 }
 
-// TestSessionCloseIsTerminalAndIdempotent proves close has exactly one owner: a
-// second caller runs no teardown of its own, reports the first caller's result,
-// and the session admits no prompt, MCP refresh, or relaunch from the moment
-// the first caller claims it.
+// TestSessionCloseIsTerminalAndIdempotent proves a teardown that completes has
+// exactly one owner: the session admits no prompt, MCP refresh, or relaunch
+// from the moment the first caller claims the ladder, and a second caller
+// reports the first caller's result without running a rung of its own. The
+// owner's boundary completes here, so the claim it recorded is never released
+// and the second caller is a no-op whether it arrives while the ladder runs or
+// after it finished. The failed boundary the next Close still owes is the other
+// half of the claim, and TestCloseClaimIsSharedWhileItRunsAndReleasedWhenItFails
+// pins it.
 func TestSessionCloseIsTerminalAndIdempotent(t *testing.T) {
 	spawns := 0
 	agent := newStubClientAgent(t, newStubPiClient())
@@ -101,7 +106,7 @@ func TestSessionCloseIsTerminalAndIdempotent(t *testing.T) {
 		close(tearingDown)
 		<-release
 
-		return errors.New("shutdown")
+		return nil
 	}
 
 	session := &agentSession{agent: agent, id: "id", proc: process, sessionRoot: t.TempDir()}
@@ -123,12 +128,56 @@ func TestSessionCloseIsTerminalAndIdempotent(t *testing.T) {
 
 	close(release)
 
-	firstErr := <-first
-	require.Error(t, firstErr)
-	require.Equal(t, firstErr, <-second)
-	require.Equal(t, 1, process.shutdownCalls)
-	require.Equal(t, 1, process.closeCalls)
+	require.NoError(t, <-first)
+	require.NoError(t, <-second, "the second caller reported a result the owner never produced")
+	require.Equal(t, 1, process.shutdownCalls, "a second caller ran the shutdown ladder beside the owner")
+	require.Equal(t, 1, process.closeCalls, "a second caller ran the containment boundary beside the owner")
 	require.Zero(t, spawns, "a closing session spawned a pi process")
+}
+
+// TestCloseClaimIsSharedWhileItRunsAndReleasedWhenItFails pins both halves of
+// the teardown claim without depending on which goroutine the scheduler runs
+// first. A caller arriving while an attempt is in flight shares that attempt and
+// reports its result rather than opening a second ladder beside it; a completed
+// attempt keeps the claim so every later caller replays it; and a failed attempt
+// releases the claim, because the session still owns the boundary that attempt
+// did not reach and the next Close is what retries it.
+func TestCloseClaimIsSharedWhileItRunsAndReleasedWhenItFails(t *testing.T) {
+	session := &agentSession{id: "id"}
+
+	attempt, owner := session.beginClose()
+	require.True(t, owner, "the first caller did not own the teardown it opened")
+
+	shared, owner := session.beginClose()
+	require.False(t, owner, "a caller arriving mid-teardown opened a second ladder")
+	require.Same(t, attempt, shared)
+
+	session.mu.Lock()
+	require.True(t, session.closing, "the claim left admission unfenced")
+	session.mu.Unlock()
+
+	refused := errors.New("boundary refused")
+
+	reported := make(chan error, 1)
+	go func() { reported <- session.awaitClose(shared) }()
+
+	session.finishClose(attempt, refused)
+	require.ErrorIs(t, <-reported, refused, "the waiting caller did not report the owner's result")
+
+	session.mu.Lock()
+	require.Nil(t, session.closeAttempt, "a failed teardown cached a claim over a boundary it still owes")
+	session.mu.Unlock()
+
+	retry, owner := session.beginClose()
+	require.True(t, owner, "the close still owing a boundary was never retried")
+	require.NotSame(t, attempt, retry)
+
+	session.finishClose(retry, nil)
+
+	replayed, owner := session.beginClose()
+	require.False(t, owner, "a completed teardown ran a second ladder")
+	require.Same(t, retry, replayed)
+	require.NoError(t, session.awaitClose(replayed))
 }
 
 // TestClosedSessionOwnsNoSurvivingProcess proves the post-close relaunch door
