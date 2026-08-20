@@ -90,9 +90,39 @@ func TestConfigSelectionFailureBranches(t *testing.T) {
 	require.ErrorContains(t, session.applyModelSelection(t.Context(), "p/model"), "set model failed")
 
 	native.thinkingErr = errors.New("set thinking failed")
+	_, err = agent.SetSessionConfigOption(t.Context(),
+		SetConfigOptionRequest(session.id, configThoughtLevel, pi.ThinkingLevelHigh))
 	require.ErrorContains(
 		t,
-		session.applyThinkingLevelSelection(t.Context(), pi.ThinkingLevelHigh),
+		err,
 		"set thinking failed",
 	)
+	requireUnsupportedField(t, session.applyThinkingLevelSelection(t.Context(), ""), acpFieldValue)
+}
+
+func TestConfigThinkingLevelPassesThroughToNative(t *testing.T) {
+	const level = "registry-unknown"
+
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	native := newStubPiClient()
+	var sent string
+	native.thinkingFunc = func(value string) { sent = value }
+	session := &agentSession{
+		agent: agent, id: "selection", client: native, turn: make(chan struct{}, 1),
+	}
+	agent.sessions[session.id] = session
+
+	response, err := agent.SetSessionConfigOption(t.Context(),
+		SetConfigOptionRequest(session.id, configThoughtLevel, level))
+	require.NoError(t, err)
+	require.Equal(t, level, sent)
+	require.Len(t, response.ConfigOptions, 1)
+	require.NotNil(t, response.ConfigOptions[0].Select)
+	require.Equal(t, acp.SessionConfigValueId(level), response.ConfigOptions[0].Select.CurrentValue)
+	require.Len(t, *response.ConfigOptions[0].Select.Options.Ungrouped, len(pi.ThinkingLevels()))
+
+	unstable := sessionUnstableConfigOptions(session)
+	require.Len(t, unstable, 1)
+	require.NotNil(t, unstable[0].Select)
+	require.Equal(t, acp.SessionConfigValueId(level), unstable[0].Select.CurrentValue)
 }

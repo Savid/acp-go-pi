@@ -11,20 +11,22 @@ pi's own model catalog rather than a static list.
 
 Session configuration uses typed select option categories:
 
-| Category | Option id | Values |
+| Category | Option id | Advertised menu |
 | --- | --- | --- |
 | `model` | `model` | pi's model catalog, as `"provider/id"` |
 | `thought_level` | `thought_level` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 
 Use `session/set_config_option` with a selected option value id (the
 `SetModelRequest` helper builds the model form). Boolean payloads, unknown
-option ids, and unknown values are rejected with an invalid-params error
-naming the offending field. A model that pi's catalog does not know fails with
-pi's own error text.
+option ids, and empty values are rejected with an invalid-params error naming
+the offending field. A malformed model id is also rejected; a well-shaped
+model that pi's catalog does not know fails with pi's own error text.
 
-The adapter validates thinking levels itself against the enum above: pi
-natively accepts an invalid level and silently coerces it, so the adapter
-rejects unknown levels up front instead of letting them mutate silently.
+The thinking-level list is a menu for hosts, not an accepted-value set. Every
+non-empty value from establishment metadata or `session/set_config_option`
+travels unchanged to pi. pi currently acknowledges an unknown value without
+changing its effective native level; the adapter propagates that success and
+advertises the exact value the host sent.
 
 Each advertised model value includes harness-reported `_meta.pi` details:
 `modelId`, `contextWindow`, and `maxOutputTokens`. Missing values are omitted

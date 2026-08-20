@@ -619,8 +619,6 @@ func TestConformanceConfigOptions(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, response.ConfigOptions, 2)
 
-	_, err = conn.SetSessionConfigOption(ctx, SetConfigOptionRequest(sessionID, configThoughtLevel, "invalid"))
-	requireInvalidParams(t, err)
 	_, err = conn.SetSessionConfigOption(ctx, SetModelRequest(sessionID, "invalid"))
 	requireInvalidParams(t, err)
 	_, err = conn.SetSessionConfigOption(ctx, SetModelRequest(sessionID, "fake/missing"))
@@ -643,6 +641,22 @@ func TestConformanceConfigOptions(t *testing.T) {
 	var requestError *acp.RequestError
 	require.ErrorAs(t, err, &requestError)
 	require.Equal(t, -32601, requestError.Code)
+}
+
+func TestConformanceThinkingLevelPassesThrough(t *testing.T) {
+	const level = "registry-unknown"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn := connectConformanceAgent(t, ctx, &conformanceClient{}, defaultInitializeRequest(), successfulUnitScenario())
+	sessionID := newConformanceSession(t, ctx, conn)
+
+	response, err := conn.SetSessionConfigOption(ctx, SetConfigOptionRequest(sessionID, configThoughtLevel, level))
+	require.NoError(t, err)
+	require.Len(t, response.ConfigOptions, 2)
+	require.NotNil(t, response.ConfigOptions[1].Select)
+	require.Equal(t, configThoughtLevel, response.ConfigOptions[1].Select.Id)
+	require.Equal(t, acp.SessionConfigValueId(level), response.ConfigOptions[1].Select.CurrentValue)
 }
 
 func TestConformanceStoreResumeLoadAndPagination(t *testing.T) {

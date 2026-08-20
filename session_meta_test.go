@@ -63,7 +63,7 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{"type": "object"}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaThinkingLevelKey: true}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaThinkingLevelKey: "bad"}}},
+		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaThinkingLevelKey: ""}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: true}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: "bad"}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaAutoRetryKey: "yes"}}},
@@ -79,6 +79,18 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 		_, err := piOptionsFromMeta(value)
 		require.Error(t, err)
 	}
+}
+
+func TestPiOptionsThinkingLevelPassesThrough(t *testing.T) {
+	const level = "registry-unknown"
+
+	options, err := piOptionsFromMeta(map[string]any{
+		piMetaKey: map[string]any{
+			metaOptionsKey: map[string]any{metaThinkingLevelKey: level},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, level, options.ThinkingLevel)
 }
 
 func TestEnvironmentValidation(t *testing.T) {

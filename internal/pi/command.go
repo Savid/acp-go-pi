@@ -188,8 +188,8 @@ func (c *Client) SetModel(ctx context.Context, provider string, modelID string) 
 	})
 }
 
-// SetThinkingLevel sets the reasoning level. pi accepts invalid levels and
-// coerces them, so callers validate against IsValidThinkingLevel first.
+// SetThinkingLevel sends the requested reasoning level to pi. pi acknowledges
+// unknown values even when its effective thinking level does not change.
 func (c *Client) SetThinkingLevel(ctx context.Context, level string) error {
 	return c.simpleCall(ctx, map[string]any{commandTypeKey: commandSetThinkingLevel, "level": level})
 }

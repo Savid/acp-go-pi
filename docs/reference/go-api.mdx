@@ -89,7 +89,7 @@ processes receive neither capability nor descriptor.
 | `WithPiModel` | Session model as `"provider/id"`. |
 | `WithPiEnv` | Extra environment variables for this session's pi process. `PATH` is rejected; `WithPiExtraPathDirs` is the only session `PATH` authority. |
 | `WithPiExtraPathDirs` | Prepend absolute directories, in the order given, to this session's child `PATH`, ahead of the static base `PATH` from `WithEnv` and everything inherited. Order and duplicates are preserved. This launch-only value does not select the pi executable. |
-| `WithPiThinkingLevel` | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
+| `WithPiThinkingLevel` | Non-empty reasoning-level value passed unchanged to pi. `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max` are the advertised host menu, not an accepted-value set. |
 | `WithPiPermission` | Permission mode: `ask` (default) or `allow`. |
 | `WithPiAutoRetry` | Opt in to pi's native automatic retry of transient provider errors (5xx, timeouts). Default `false`: a native failure surfaces once, immediately, with the real cause. |
 | `WithPiOutputSchema` | Reserved for API symmetry; pi has no native structured-output surface, so setting it fails closed at session start. |

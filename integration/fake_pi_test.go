@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -865,9 +866,9 @@ func (s *fakePiServer) handleSetModel(id string, command map[string]any) {
 func (s *fakePiServer) handleSetThinkingLevel(id string, command map[string]any) {
 	level, _ := command["level"].(string)
 
-	// Real pi accepts any level string with success and silently coerces
-	// invalid values; only valid levels change state.
-	if pi.IsValidThinkingLevel(level) {
+	// Real pi acknowledges every level string; only an advertised menu value
+	// changes its effective state.
+	if slices.Contains(pi.ThinkingLevels(), level) {
 		s.mu.Lock()
 		s.session.thinkingLevel = level
 		s.appendEntryLocked(fakeEntryRow{

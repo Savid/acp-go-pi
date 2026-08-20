@@ -141,9 +141,7 @@ func (s *agentSession) applyModelSelection(ctx context.Context, value string) er
 }
 
 func (s *agentSession) applyThinkingLevelSelection(ctx context.Context, value string) error {
-	// pi accepts invalid levels with success and silently coerces them, so
-	// the wrapper validates the enum itself.
-	if !pi.IsValidThinkingLevel(value) {
+	if value == "" {
 		return unsupportedField(acpFieldValue)
 	}
 

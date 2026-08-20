@@ -386,7 +386,8 @@ func WithPiOutputSchema(schema map[string]any) PiOption {
 	}
 }
 
-// WithPiThinkingLevel configures the pi reasoning level for the session.
+// WithPiThinkingLevel configures a non-empty reasoning-level value that the
+// adapter passes unchanged to pi.
 func WithPiThinkingLevel(level string) PiOption {
 	return func(options *PiOptions) {
 		options.ThinkingLevel = level

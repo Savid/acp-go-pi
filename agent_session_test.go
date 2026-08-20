@@ -561,6 +561,28 @@ func TestStartSessionManagedModelAndSetupFailure(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestNewSessionPassesThinkingLevelThroughToNative(t *testing.T) {
+	const level = "registry-unknown"
+
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: "id", SessionFile: "/session", ThinkingLevel: pi.ThinkingLevelOff}
+	var sent string
+	client.thinkingFunc = func(value string) { sent = value }
+	agent := newStubClientAgent(t, client)
+
+	response, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd",
+		WithSessionPiOptions(NewPiOptions(WithPiThinkingLevel(level)))))
+	require.NoError(t, err)
+	require.Equal(t, level, sent)
+	require.Len(t, response.ConfigOptions, 1)
+	require.NotNil(t, response.ConfigOptions[0].Select)
+	require.Equal(t, acp.SessionConfigValueId(level), response.ConfigOptions[0].Select.CurrentValue)
+	require.Len(t, *response.ConfigOptions[0].Select.Options.Ungrouped, len(pi.ThinkingLevels()))
+
+	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: response.SessionId})
+	require.NoError(t, err)
+}
+
 func TestSetUpNativeSessionForkCommitMirrorFailure(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := newStubPiClient()
