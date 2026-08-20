@@ -331,13 +331,29 @@ func lifecycleCommandMethod(method string) bool {
 	}
 }
 
+// postResponseHookRequestID reads back the tag the request reader stamped. Only
+// the tag is a string: a real establishing request carries the mandatory
+// mcpServers array and an object-valued _meta beside it, so the params are
+// decoded as raw values and only the tag is read as one. Decoding them all as
+// strings would fail on every request this hook exists to serve.
 func postResponseHookRequestID(params json.RawMessage) string {
-	var tagged map[string]string
+	var tagged map[string]json.RawMessage
 	if err := json.Unmarshal(params, &tagged); err != nil {
 		return ""
 	}
 
-	return tagged[postResponseHookIDParam]
+	raw, present := tagged[postResponseHookIDParam]
+	if !present {
+		return ""
+	}
+
+	var id string
+
+	if err := json.Unmarshal(raw, &id); err != nil {
+		return ""
+	}
+
+	return id
 }
 
 type postResponseHooks struct {

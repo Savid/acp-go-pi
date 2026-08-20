@@ -259,6 +259,31 @@ func TestTagPostResponseHookRequestEdges(t *testing.T) {
 	}
 }
 
+// TestPostResponseHookRequestIDSurvivesARealRequestsParams pins the tag against
+// the params an establishing request actually carries. mcpServers is mandatory
+// and _meta is an object, so a reader that expected every value to be a string
+// recovered no tag at all — and a session whose hook never ran emitted no
+// opening snapshot, leaving its host waiting on an incarnation nobody would
+// ever name.
+func TestPostResponseHookRequestIDSurvivesARealRequestsParams(t *testing.T) {
+	tagged := tagPostResponseHookRequest([]byte(
+		`{"jsonrpc":"2.0","id":9,"method":"session/new","params":` +
+			`{"cwd":"/tmp/work","mcpServers":[],"_meta":{"lifecycle":{"versions":[1]}}}}`,
+	))
+
+	var msg struct {
+		Params json.RawMessage `json:"params"`
+	}
+	require.NoError(t, json.Unmarshal(tagged, &msg))
+	require.Equal(t, "9", postResponseHookRequestID(msg.Params))
+
+	require.Empty(t, postResponseHookRequestID(json.RawMessage(`{"cwd":"/tmp/work"}`)))
+	require.Empty(t, postResponseHookRequestID(json.RawMessage(
+		`{"`+postResponseHookIDParam+`":7}`,
+	)))
+	require.Empty(t, postResponseHookRequestID(json.RawMessage(`[]`)))
+}
+
 func TestPostResponseHooksMatchSuccessfulResponses(t *testing.T) {
 	hooks := &postResponseHooks{log: slog.New(slog.DiscardHandler)}
 	hooks.runAfterResponseWrite([]byte(`{`))
@@ -308,6 +333,12 @@ func TestLifecycleCommandHookErrors(t *testing.T) {
 	), nil)
 	require.Len(t, missing.hooks.all, 1)
 	missing.hooks.all[0].run()
+
+	untagged := &localAgentConnection{agent: missingAgent, hooks: &postResponseHooks{}}
+	untagged.enqueueLifecycleCommandHook(t.Context(), acp.AgentMethodSessionLoad, json.RawMessage(
+		`{"sessionId":"untagged"}`,
+	), nil)
+	require.Empty(t, untagged.hooks.all)
 
 	updateErr := errors.New("update failed")
 	client := &dispatcherClient{done: make(chan struct{}), updateErr: updateErr}
