@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -428,37 +429,39 @@ func (s *errorSessionStore) Delete(context.Context, SessionKey) error {
 }
 
 type stubPiClient struct {
-	mu           sync.Mutex
-	events       chan pi.Event
-	eventsFunc   func() <-chan pi.Event
-	uiRequests   chan pi.UIRequest
-	done         chan struct{}
-	err          error
-	abortErr     error
-	abortFunc    func(context.Context) error
-	promptErr    error
-	promptFunc   func(context.Context, string) error
-	respondErr   error
-	respondFunc  func(pi.UIResponse)
-	responses    []pi.UIResponse
-	stats        pi.SessionStats
-	statsErr     error
-	model        pi.Model
-	setModelErr  error
-	setModelFunc func(provider string, id string)
-	thinkingErr  error
-	thinkingFunc func(level string)
-	startErr     error
-	cloneCancel  bool
-	cloneErr     error
-	autoRetryErr error
-	autoRetrySet []bool
-	state        pi.SessionState
-	stateErr     error
-	models       []pi.Model
-	modelsErr    error
-	commands     []pi.SlashCommand
-	commandsErr  error
+	mu            sync.Mutex
+	events        chan pi.Event
+	eventsFunc    func() <-chan pi.Event
+	uiRequests    chan pi.UIRequest
+	done          chan struct{}
+	err           error
+	abortErr      error
+	abortFunc     func(context.Context) error
+	promptErr     error
+	promptFunc    func(context.Context, string) error
+	respondErr    error
+	respondFunc   func(pi.UIResponse)
+	responses     []pi.UIResponse
+	stats         pi.SessionStats
+	statsErr      error
+	model         pi.Model
+	setModelErr   error
+	setModelFunc  func(provider string, id string)
+	thinkingErr   error
+	thinkingFunc  func(level string)
+	startErr      error
+	cloneCancel   bool
+	cloneErr      error
+	autoRetryErr  error
+	autoRetrySet  []bool
+	state         pi.SessionState
+	stateErr      error
+	stateErrAfter int
+	stateCalls    int
+	models        []pi.Model
+	modelsErr     error
+	commands      []pi.SlashCommand
+	commandsErr   error
 }
 
 func newStubPiClient() *stubPiClient {
@@ -504,7 +507,17 @@ func (c *stubPiClient) Abort(ctx context.Context) error {
 }
 func (c *stubPiClient) Clone(context.Context) (bool, error) { return c.cloneCancel, c.cloneErr }
 func (c *stubPiClient) GetState(context.Context) (pi.SessionState, error) {
-	return c.state, c.stateErr
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.stateCalls++
+	// stateErrAfter lets a test fail a later read while earlier ones succeed,
+	// which is the only way to reach a read-back that follows a good read.
+	if c.stateErr != nil && c.stateCalls > c.stateErrAfter {
+		return pi.SessionState{}, c.stateErr
+	}
+
+	return c.state, nil
 }
 func (c *stubPiClient) GetAvailableModels(context.Context) ([]pi.Model, error) {
 	return c.models, c.modelsErr
@@ -521,7 +534,21 @@ func (c *stubPiClient) SetThinkingLevel(_ context.Context, level string) error {
 		c.thinkingFunc(level)
 	}
 
-	return c.thinkingErr
+	if c.thinkingErr != nil {
+		return c.thinkingErr
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Real pi acknowledges every level string and applies only the ones it
+	// knows, so the double retains its effective level for anything else and a
+	// read-back tells the two apart.
+	if slices.Contains(pi.ThinkingLevels(), level) {
+		c.state.ThinkingLevel = level
+	}
+
+	return nil
 }
 func (c *stubPiClient) SetAutoRetry(_ context.Context, enabled bool) error {
 	c.autoRetrySet = append(c.autoRetrySet, enabled)

@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/savid/acp-go-pi/internal/lifecycle"
+	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 type unitFakeModel struct {
@@ -643,20 +644,37 @@ func TestConformanceConfigOptions(t *testing.T) {
 	require.Equal(t, -32601, requestError.Code)
 }
 
+// TestConformanceThinkingLevelPassesThrough drives the read-back over the real
+// wire against a pi that acknowledges every level and applies only the ones it
+// knows. What the host reads back is the level pi runs, so a value pi declined
+// reports the level pi kept instead of the host's own request.
 func TestConformanceThinkingLevelPassesThrough(t *testing.T) {
-	const level = "registry-unknown"
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	conn := connectConformanceAgent(t, ctx, &conformanceClient{}, defaultInitializeRequest(), successfulUnitScenario())
 	sessionID := newConformanceSession(t, ctx, conn)
 
-	response, err := conn.SetSessionConfigOption(ctx, SetConfigOptionRequest(sessionID, configThoughtLevel, level))
+	currentThoughtLevel := func(response acp.SetSessionConfigOptionResponse) acp.SessionConfigValueId {
+		t.Helper()
+		require.Len(t, response.ConfigOptions, 2)
+		require.NotNil(t, response.ConfigOptions[1].Select)
+		require.Equal(t, configThoughtLevel, response.ConfigOptions[1].Select.Id)
+
+		return response.ConfigOptions[1].Select.CurrentValue
+	}
+
+	response, err := conn.SetSessionConfigOption(ctx,
+		SetConfigOptionRequest(sessionID, configThoughtLevel, pi.ThinkingLevelHigh))
 	require.NoError(t, err)
-	require.Len(t, response.ConfigOptions, 2)
-	require.NotNil(t, response.ConfigOptions[1].Select)
-	require.Equal(t, configThoughtLevel, response.ConfigOptions[1].Select.Id)
-	require.Equal(t, acp.SessionConfigValueId(level), response.ConfigOptions[1].Select.CurrentValue)
+	require.Equal(t, acp.SessionConfigValueId(pi.ThinkingLevelHigh), currentThoughtLevel(response))
+
+	for _, declined := range []acp.SessionConfigValueId{"registry-unknown", acp.SessionConfigValueId(" " + pi.ThinkingLevelMax + " ")} {
+		response, err = conn.SetSessionConfigOption(ctx,
+			SetConfigOptionRequest(sessionID, configThoughtLevel, declined))
+		require.NoError(t, err, "a value pi acknowledges is not a refusal")
+		require.Equal(t, acp.SessionConfigValueId(pi.ThinkingLevelHigh), currentThoughtLevel(response),
+			"pi kept the level it was already running, and that is what the host reads back")
+	}
 }
 
 func TestConformanceStoreResumeLoadAndPagination(t *testing.T) {

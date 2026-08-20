@@ -19,14 +19,22 @@ Session configuration uses typed select option categories:
 Use `session/set_config_option` with a selected option value id (the
 `SetModelRequest` helper builds the model form). Boolean payloads, unknown
 option ids, and empty values are rejected with an invalid-params error naming
-the offending field. A malformed model id is also rejected; a well-shaped
-model that pi's catalog does not know fails with pi's own error text.
+the offending field. Empty means the empty string exactly: a value made of
+whitespace names a model or level pi may not know, which is pi's to answer for,
+not this adapter's to trim away. A malformed model id is also rejected, and so
+is a well-shaped model pi's catalog does not know — but the refusal carries the
+uniform `{"error":"unsupported","field":"value"}` and nothing else. pi's own
+message for it is written to the adapter log, where the operator reads it; see
+[Caller-error contract](/docs/reference/acp-methods).
 
 The thinking-level list is a menu for hosts, not an accepted-value set. Every
 non-empty value from establishment metadata or `session/set_config_option`
-travels unchanged to pi. pi currently acknowledges an unknown value without
-changing its effective native level; the adapter propagates that success and
-advertises the exact value the host sent.
+travels unchanged to pi. pi acknowledges a value it does not apply, so that
+acknowledgement proves delivery and not adoption: after every set, on both
+doors, the adapter reads the effective level back from pi and advertises that.
+`currentValue` is therefore the level pi is running, never an echo of the
+request — a value pi declined leaves the previously effective level on show,
+and the host sees it on the same response rather than after a resume.
 
 Each advertised model value includes harness-reported `_meta.pi` details:
 `modelId`, `contextWindow`, and `maxOutputTokens`. Missing values are omitted

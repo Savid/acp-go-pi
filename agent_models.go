@@ -141,16 +141,34 @@ func (s *agentSession) applyModelSelection(ctx context.Context, value string) er
 }
 
 func (s *agentSession) applyThinkingLevelSelection(ctx context.Context, value string) error {
+	// Empty is the empty string exactly, never a value trimmed down to it. A
+	// member that carries nothing names no level and is the same shape defect
+	// as no member at all, so it is refused here. Whitespace is not that
+	// defect: it is a level name this adapter has no standing to judge, so it
+	// travels like every other value and the read-back below reports whichever
+	// level pi is left running. Trimming would decide on pi's behalf what a
+	// host meant.
 	if value == "" {
 		return unsupportedField(acpFieldValue)
 	}
 
-	if err := s.currentClient().SetThinkingLevel(ctx, value); err != nil {
+	client := s.currentClient()
+	if err := client.SetThinkingLevel(ctx, value); err != nil {
+		return err
+	}
+
+	// pi acknowledges a level it does not apply, so the acknowledgement proves
+	// delivery, never adoption. get_state is the only read that reports the
+	// level pi actually runs, and it decides what the session advertises: a
+	// host that names a value pi declines sees the retained level at once,
+	// rather than its own request read back to it.
+	state, err := client.GetState(ctx)
+	if err != nil {
 		return err
 	}
 
 	s.mu.Lock()
-	s.thinkingLevel = value
+	s.thinkingLevel = state.ThinkingLevel
 	s.mu.Unlock()
 
 	return nil

@@ -100,11 +100,16 @@ func TestConfigSelectionFailureBranches(t *testing.T) {
 	requireUnsupportedField(t, session.applyThinkingLevelSelection(t.Context(), ""), acpFieldValue)
 }
 
+// TestConfigThinkingLevelPassesThroughToNative pins both halves of the live-set
+// door: the value the host names travels to pi unchanged, and what the session
+// advertises afterwards is the level pi reports running — the retained one when
+// pi acknowledged the request without adopting it.
 func TestConfigThinkingLevelPassesThroughToNative(t *testing.T) {
-	const level = "registry-unknown"
+	const unknownLevel = "registry-unknown"
 
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	native := newStubPiClient()
+	native.state = pi.SessionState{ThinkingLevel: pi.ThinkingLevelLow}
 	var sent string
 	native.thinkingFunc = func(value string) { sent = value }
 	session := &agentSession{
@@ -113,16 +118,56 @@ func TestConfigThinkingLevelPassesThroughToNative(t *testing.T) {
 	agent.sessions[session.id] = session
 
 	response, err := agent.SetSessionConfigOption(t.Context(),
-		SetConfigOptionRequest(session.id, configThoughtLevel, level))
+		SetConfigOptionRequest(session.id, configThoughtLevel, unknownLevel))
 	require.NoError(t, err)
-	require.Equal(t, level, sent)
+	require.Equal(t, unknownLevel, sent, "the value still travels to pi unchanged")
 	require.Len(t, response.ConfigOptions, 1)
 	require.NotNil(t, response.ConfigOptions[0].Select)
-	require.Equal(t, acp.SessionConfigValueId(level), response.ConfigOptions[0].Select.CurrentValue)
+	require.Equal(t, acp.SessionConfigValueId(pi.ThinkingLevelLow), response.ConfigOptions[0].Select.CurrentValue,
+		"an acknowledged-but-unapplied value leaves the retained level advertised, not the echo")
 	require.Len(t, *response.ConfigOptions[0].Select.Options.Ungrouped, len(pi.ThinkingLevels()))
 
 	unstable := sessionUnstableConfigOptions(session)
 	require.Len(t, unstable, 1)
 	require.NotNil(t, unstable[0].Select)
-	require.Equal(t, acp.SessionConfigValueId(level), unstable[0].Select.CurrentValue)
+	require.Equal(t, acp.SessionConfigValueId(pi.ThinkingLevelLow), unstable[0].Select.CurrentValue)
+
+	// Whitespace is a level pi does not know, not an absent one: it is not
+	// refused as empty, it travels, and the advert reports what pi kept.
+	response, err = agent.SetSessionConfigOption(t.Context(),
+		SetConfigOptionRequest(session.id, configThoughtLevel, " high "))
+	require.NoError(t, err)
+	require.Equal(t, " high ", sent)
+	require.Equal(t, acp.SessionConfigValueId(pi.ThinkingLevelLow), response.ConfigOptions[0].Select.CurrentValue)
+
+	response, err = agent.SetSessionConfigOption(t.Context(),
+		SetConfigOptionRequest(session.id, configThoughtLevel, pi.ThinkingLevelMax))
+	require.NoError(t, err)
+	require.Equal(t, pi.ThinkingLevelMax, sent)
+	require.Equal(t, acp.SessionConfigValueId(pi.ThinkingLevelMax), response.ConfigOptions[0].Select.CurrentValue,
+		"a value pi adopts is advertised because pi reports it, not because the host asked for it")
+}
+
+// TestConfigThinkingLevelReadBackFailure pins that a set whose effective level
+// cannot be read back fails rather than advertising a level the adapter cannot
+// vouch for.
+func TestConfigThinkingLevelReadBackFailure(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	native := newStubPiClient()
+	native.state = pi.SessionState{ThinkingLevel: pi.ThinkingLevelLow}
+	native.stateErr = errors.New("read back failed")
+	session := &agentSession{
+		agent: agent, id: "selection", client: native, turn: make(chan struct{}, 1),
+		thinkingLevel: pi.ThinkingLevelLow,
+	}
+	agent.sessions[session.id] = session
+
+	_, err := agent.SetSessionConfigOption(t.Context(),
+		SetConfigOptionRequest(session.id, configThoughtLevel, pi.ThinkingLevelMax))
+	require.ErrorContains(t, err, "read back failed")
+
+	session.mu.Lock()
+	advertised := session.thinkingLevel
+	session.mu.Unlock()
+	require.Equal(t, pi.ThinkingLevelLow, advertised, "an unreadable set leaves the last proven level in place")
 }

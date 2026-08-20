@@ -1061,8 +1061,18 @@ func (a *Agent) setUpNativeSession(
 			return a.nativeStartFailure(ctx, failureCauseTransport, levelErr, proc)
 		}
 
+		// pi acknowledges a level it does not apply, so the acknowledgement
+		// proves delivery, never adoption. What the session records — and
+		// therefore advertises — is the level read back from pi, so a value pi
+		// silently declined leaves the prior effective level on show instead of
+		// an echo of the request.
+		applied, levelErr := client.GetState(ctx)
+		if levelErr != nil {
+			return a.nativeStartFailure(ctx, failureCauseTransport, levelErr, proc)
+		}
+
 		session.mu.Lock()
-		session.thinkingLevel = level
+		session.thinkingLevel = applied.ThinkingLevel
 		session.mu.Unlock()
 	}
 

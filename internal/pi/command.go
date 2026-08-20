@@ -189,7 +189,9 @@ func (c *Client) SetModel(ctx context.Context, provider string, modelID string) 
 }
 
 // SetThinkingLevel sends the requested reasoning level to pi. pi acknowledges
-// unknown values even when its effective thinking level does not change.
+// unknown values even when its effective thinking level does not change, so a
+// caller that needs the level pi actually runs reads GetState back rather than
+// trusting this acknowledgement.
 func (c *Client) SetThinkingLevel(ctx context.Context, level string) error {
 	return c.simpleCall(ctx, map[string]any{commandTypeKey: commandSetThinkingLevel, "level": level})
 }

@@ -217,6 +217,13 @@ func parsePiOptions(value any) (PiOptions, error) {
 
 			options.OutputSchema = cloneAnyMap(schema)
 		case metaThinkingLevelKey:
+			// Absence and presence-with-nothing are different requests, and
+			// only this arm can tell them apart: an absent key states no
+			// selection and the session takes whatever pi starts on, while a
+			// key that arrived states one and names none. Empty is the empty
+			// string exactly — whitespace names a level this adapter does not
+			// judge, so it travels and the level pi reports back is what the
+			// session advertises.
 			level, ok := item.(string)
 			if !ok || level == "" {
 				return PiOptions{}, unsupportedField(metaOptionPath(key))

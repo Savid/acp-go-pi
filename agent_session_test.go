@@ -561,26 +561,40 @@ func TestStartSessionManagedModelAndSetupFailure(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestNewSessionPassesThinkingLevelThroughToNative pins both halves of the
+// establishment door: the level named in `_meta.pi.options` travels to pi
+// unchanged, and the session advertises the level pi reports afterwards — the
+// one it retained when it acknowledged the request without adopting it.
 func TestNewSessionPassesThinkingLevelThroughToNative(t *testing.T) {
-	const level = "registry-unknown"
+	for _, test := range []struct {
+		name      string
+		requested string
+		effective string
+	}{
+		{name: "unapplied value leaves the retained level advertised", requested: "registry-unknown", effective: pi.ThinkingLevelOff},
+		{name: "whitespace is a value pi does not know, not an empty one", requested: " high ", effective: pi.ThinkingLevelOff},
+		{name: "an adopted value is advertised because pi reports it", requested: pi.ThinkingLevelMax, effective: pi.ThinkingLevelMax},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newStubPiClient()
+			client.state = pi.SessionState{SessionID: "id", SessionFile: "/session", ThinkingLevel: pi.ThinkingLevelOff}
+			var sent string
+			client.thinkingFunc = func(value string) { sent = value }
+			agent := newStubClientAgent(t, client)
 
-	client := newStubPiClient()
-	client.state = pi.SessionState{SessionID: "id", SessionFile: "/session", ThinkingLevel: pi.ThinkingLevelOff}
-	var sent string
-	client.thinkingFunc = func(value string) { sent = value }
-	agent := newStubClientAgent(t, client)
+			response, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd",
+				WithSessionPiOptions(NewPiOptions(WithPiThinkingLevel(test.requested)))))
+			require.NoError(t, err)
+			require.Equal(t, test.requested, sent, "the value still travels to pi unchanged")
+			require.Len(t, response.ConfigOptions, 1)
+			require.NotNil(t, response.ConfigOptions[0].Select)
+			require.Equal(t, acp.SessionConfigValueId(test.effective), response.ConfigOptions[0].Select.CurrentValue)
+			require.Len(t, *response.ConfigOptions[0].Select.Options.Ungrouped, len(pi.ThinkingLevels()))
 
-	response, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd",
-		WithSessionPiOptions(NewPiOptions(WithPiThinkingLevel(level)))))
-	require.NoError(t, err)
-	require.Equal(t, level, sent)
-	require.Len(t, response.ConfigOptions, 1)
-	require.NotNil(t, response.ConfigOptions[0].Select)
-	require.Equal(t, acp.SessionConfigValueId(level), response.ConfigOptions[0].Select.CurrentValue)
-	require.Len(t, *response.ConfigOptions[0].Select.Options.Ungrouped, len(pi.ThinkingLevels()))
-
-	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: response.SessionId})
-	require.NoError(t, err)
+			_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: response.SessionId})
+			require.NoError(t, err)
+		})
+	}
 }
 
 func TestSetUpNativeSessionForkCommitMirrorFailure(t *testing.T) {
@@ -684,6 +698,14 @@ func TestNativeSessionSetupBranches(t *testing.T) {
 		}
 		require.Error(t, agent.setUpNativeSession(t.Context(), newSession(client), start, pi.ModelRef{}, false))
 	}
+
+	// A set whose effective level cannot be read back fails the start rather
+	// than establishing a session that advertises a level pi never confirmed.
+	client = baseClient()
+	client.stateErr = errors.New("read back")
+	client.stateErrAfter = 1
+	require.Error(t, agent.setUpNativeSession(t.Context(), newSession(client),
+		sessionStart{MetaOptions: PiOptions{ThinkingLevel: "high"}}, pi.ModelRef{}, false))
 
 	client = baseClient()
 	client.state.SessionID = "different"

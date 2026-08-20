@@ -81,16 +81,19 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 	}
 }
 
+// TestPiOptionsThinkingLevelPassesThrough pins that establishment metadata
+// judges the member's shape and nothing else. Only the empty string names no
+// level; whitespace names one pi may not know, which is pi's to answer for.
 func TestPiOptionsThinkingLevelPassesThrough(t *testing.T) {
-	const level = "registry-unknown"
-
-	options, err := piOptionsFromMeta(map[string]any{
-		piMetaKey: map[string]any{
-			metaOptionsKey: map[string]any{metaThinkingLevelKey: level},
-		},
-	})
-	require.NoError(t, err)
-	require.Equal(t, level, options.ThinkingLevel)
+	for _, level := range []string{"registry-unknown", " high ", "\t"} {
+		options, err := piOptionsFromMeta(map[string]any{
+			piMetaKey: map[string]any{
+				metaOptionsKey: map[string]any{metaThinkingLevelKey: level},
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, level, options.ThinkingLevel)
+	}
 }
 
 func TestEnvironmentValidation(t *testing.T) {
