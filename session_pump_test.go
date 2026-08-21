@@ -402,8 +402,13 @@ func TestOutboxReservationAndEstablishmentFailureEdges(t *testing.T) {
 	outbox = newTestSessionOutbox(1)
 	outbox.state = outboxPromptPending
 	outbox.admission = admission
+	outbox.preAcceptance = []pi.Event{pi.QueueUpdateEvent{}}
+	outbox.releasePromptAdmission(newTurnDelivery())
+	require.Equal(t, outboxPromptPending, outbox.state, "a foreign delivery releases nothing")
+	require.Len(t, outbox.preAcceptance, 1, "a foreign delivery keeps the pending admission's frames")
 	outbox.releasePromptAdmission(admission)
 	require.Equal(t, outboxIdle, outbox.state)
+	require.Nil(t, outbox.preAcceptance, "an abandoned admission drops the frames it held")
 	require.False(t, outbox.beginCycleSettlement(&agentCycle{}))
 }
 

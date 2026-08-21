@@ -7,7 +7,15 @@ GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$
 
 # Removed public surfaces and forbidden hard-cutover terms. Hex-escaped so the
 # term list never contains a literal forbidden term. Expanded with `printf %b`.
-REMOVED_PUBLIC_TERMS = --cl\x69|pi\x20acp|pro\x78y|compatibilit\x79|deprecat\x65d|legac\x79|migratio\x6e|session/imp\x6frt|sdkMessag\x65|emitRawSDKMessag\x65s|setGoa\x6c|goa\x6cs|\x4e\x45\x53|SSE\x20MCP|mcpCapabilities\\.ac\x70|\\bExportSessio\x6e\\b|\\bImportSessio\x6e\\b|\\bDeleteSessio\x6e\\b|\\bParseConfi\x67\\b
+#
+# The singular activity-kind literal is banned in its delimited forms only: it
+# names nothing in the closed activity-kind set, but it is also an ordinary
+# English noun public docs use legitimately ("the goal of this package"). So the
+# pattern matches the three shapes an identifier or wire value takes -- the
+# backticked code span, the quoted string, and the ActivityGoal identifier. A
+# native pi command of the same name stays legal by construction: its code span
+# opens with a slash, so the bare delimited literal never appears.
+REMOVED_PUBLIC_TERMS = --cl\x69|pi\x20acp|pro\x78y|compatibilit\x79|deprecat\x65d|legac\x79|migratio\x6e|session/imp\x6frt|sdkMessag\x65|emitRawSDKMessag\x65s|setGoa\x6c|goa\x6cs|\x60goa\x6c\x60|"goa\x6c"|\\bActivityGoa\x6c\\b|\x4e\x45\x53|SSE\x20MCP|mcpCapabilities\\.ac\x70|\\bExportSessio\x6e\\b|\\bImportSessio\x6e\\b|\\bDeleteSessio\x6e\\b|\\bParseConfi\x67\\b
 
 .PHONY: build lint fmt-check fmt test coverage-check test-cross-compile test-integration-smoke test-integration-live test-integration-cover test-integration-attended test-integration-keystore test-integration-native-browser docs-audit clean tidy vuln modernize-check audit test/cover help
 

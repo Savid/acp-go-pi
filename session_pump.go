@@ -680,6 +680,12 @@ func (o *sessionOutbox) release(delivery *turnDelivery) {
 	o.wake()
 }
 
+// releasePromptAdmission returns an admission that never reached acceptance.
+// The frames held while it was pending are dropped with it: acceptance is the
+// only thing that can release them, and an admission that never published one
+// leaves them with no turn to be tagged for. Keeping them would let an
+// abandoned admission's diagnostics surface under a later prompt's route and
+// count against the retention bound this router kills the generation over.
 func (o *sessionOutbox) releasePromptAdmission(delivery *turnDelivery) {
 	if o == nil {
 		return
@@ -688,6 +694,8 @@ func (o *sessionOutbox) releasePromptAdmission(delivery *turnDelivery) {
 	o.mu.Lock()
 	if o.admission == delivery {
 		o.admission = nil
+		o.preAcceptance = nil
+
 		if !o.ended && !o.fenced && o.state == outboxPromptPending {
 			o.state = o.vacantStateLocked()
 		}
@@ -931,9 +939,10 @@ func (o *sessionOutbox) admit(event pi.Event) outboxAdmission {
 		// retries, and whatever an extension writes from the compaction hooks all
 		// arrive ahead of the command response. None of it bears work the prompt
 		// could own, and the response is the first record that can make later work
-		// belong to the prompt, so it is held here and released as raw diagnostics
-		// once acceptance is published rather than replayed with the prompt's
-		// route, action authority, or lifecycle identity.
+		// belong to the prompt, so it is held here and released once acceptance is
+		// published as raw frames tagged with the accepted turn's route. They stay
+		// diagnostics: nothing is dispatched through the prompt's delivery, and
+		// none of it claims the prompt's action authority or lifecycle identity.
 		if bearsCycleWork(event) {
 			return outboxAdmission{
 				disposition: outboxViolation,
@@ -1574,14 +1583,21 @@ func (s *agentSession) logUnroutedRecord(ctx context.Context, outbox *sessionOut
 // then stops that router's captured native generation beside the sole reader.
 // A later incarnation can replace every session-global process field without
 // changing these handles, so stale containment cannot terminate its successor.
-func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOutbox, cause string) {
+//
+// The returned channel closes when the observable poison report this call owns
+// has finished. It is nil unless this call is the non-owner that installed the
+// cause: the owner's own report runs before it finishes containment, so
+// awaiting containment already joins it. Callers that only need the admission
+// fence discard the join; containGenerationSync waits on it so a synchronous
+// return means the observable half has run too.
+func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOutbox, cause string) <-chan struct{} {
 	if outbox == nil {
-		return
+		return nil
 	}
 
 	releaseProducer, admitted := outbox.producers.acquire(1)
 	if !admitted {
-		return
+		return nil
 	}
 
 	s.mu.Lock()
@@ -1607,7 +1623,10 @@ func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOut
 
 	if !owner {
 		if firstPoison {
+			reported := make(chan struct{})
+
 			go func() {
+				defer close(reported)
 				defer releaseProducer()
 
 				containmentErr, _ := outbox.awaitContainment()
@@ -1620,11 +1639,13 @@ func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOut
 				s.fenceLifecycleGeneration(outbox.generation)
 				s.reportPoison(context.WithoutCancel(ctx), effectiveCause)
 			}()
-		} else {
-			releaseProducer()
+
+			return reported
 		}
 
-		return
+		releaseProducer()
+
+		return nil
 	}
 
 	containCtx, cancelContain := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
@@ -1667,6 +1688,8 @@ func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOut
 			s.reportPoison(containCtx, effectiveCause)
 		}
 	}()
+
+	return nil
 }
 
 func (s *agentSession) containGenerationSync(ctx context.Context, outbox *sessionOutbox, cause string) error {
@@ -1677,9 +1700,17 @@ func (s *agentSession) containGenerationSync(ctx context.Context, outbox *sessio
 		return err
 	}
 
-	s.containGeneration(ctx, outbox, cause)
+	reported := s.containGeneration(ctx, outbox, cause)
 
 	containmentErr, ok := outbox.awaitContainment()
+
+	// The non-owner reports poison from its own goroutine once the owner has
+	// finished, so a synchronous caller joins that report too. Without it the
+	// caller returns while an observable half of containment is still running.
+	if reported != nil {
+		<-reported
+	}
+
 	if !ok {
 		containmentErr = errors.Join(
 			pi.ErrProcessContainmentIncomplete,
