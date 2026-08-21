@@ -660,6 +660,9 @@ func TestQuiescenceRefusesAnUnprovenClass(t *testing.T) {
 
 	requireReduceRefusal(t, degenerate, ViolationUnnegotiatedFact, openSnapshot(),
 		QuiescenceEvent(QuiescenceFact{Quiescent: true, Source: ProofClassProcessContainment}))
+
+	requireReduceRefusal(t, richConfiguration(), ViolationUnnegotiatedFact, openSnapshot(),
+		QuiescenceEvent(QuiescenceFact{Quiescent: true, Source: ProofClass("quiet-for-a-while")}))
 }
 
 // TestReducerLatchesOnTheFirstRefusal pins fail-closed on the consumer side: a
