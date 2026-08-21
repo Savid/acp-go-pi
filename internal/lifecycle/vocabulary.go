@@ -30,22 +30,17 @@ const (
 )
 
 // ProofClass names how a configuration proves background quiescence. The set is
-// closed: quiet time, prompt return, process silence, queue drainage, a drain
-// window, and ACP idle are never members.
+// closed at one member: quiet time, prompt return, process silence, queue
+// drainage, a drain window, and ACP idle are never members.
 type ProofClass string
 
-const (
-	// ProofClassProcessContainment proves vacancy by containing the complete
-	// native process tree.
-	ProofClassProcessContainment ProofClass = "process-containment"
-	// ProofClassNativeSettledBarrier proves background quiescence from a
-	// structured native event with the session left open.
-	ProofClassNativeSettledBarrier ProofClass = "native-settled-barrier"
-)
+// ProofClassProcessContainment proves vacancy by containing the complete native
+// process tree.
+const ProofClassProcessContainment ProofClass = "process-containment"
 
-// Valid reports whether the proof class is one of the closed two.
+// Valid reports whether the proof class is the one closed member.
 func (c ProofClass) Valid() bool {
-	return c == ProofClassProcessContainment || c == ProofClassNativeSettledBarrier
+	return c == ProofClassProcessContainment
 }
 
 // ForegroundState is one foreground cycle's state. A finished cycle's outcome is
@@ -134,16 +129,13 @@ type ActivityKind string
 
 const (
 	ActivityTask     ActivityKind = "task"
-	ActivityMonitor  ActivityKind = "monitor"
 	ActivitySubagent ActivityKind = "subagent"
-	ActivityGoal     ActivityKind = "goal"
-	ActivityOther    ActivityKind = "other"
 )
 
 // Valid reports whether the kind is part of the closed activity vocabulary.
 func (k ActivityKind) Valid() bool {
 	switch k {
-	case ActivityTask, ActivityMonitor, ActivitySubagent, ActivityGoal, ActivityOther:
+	case ActivityTask, ActivitySubagent:
 		return true
 	default:
 		return false
