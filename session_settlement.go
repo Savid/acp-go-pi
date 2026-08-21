@@ -12,6 +12,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-pi/internal/lifecycle"
+	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 // sessionSettleTimeout bounds the settlement of one accepted turn. Settlement
@@ -19,6 +20,8 @@ import (
 // still gets a boundary that is either fully recorded or explicitly failed,
 // and close never waits on it forever.
 var sessionSettleTimeout = 60 * time.Second
+
+var errPromptSettlement = errors.New("prompt settlement failed")
 
 // turnSettlement is the signal close and delete wait on. It is published only
 // after the whole settlement order completed — the durable commit, the terminal
@@ -28,6 +31,7 @@ type turnSettlement struct {
 	done        chan struct{}
 	waiting     chan struct{}
 	waitingOnce sync.Once
+	finishOnce  sync.Once
 	err         error
 }
 
@@ -44,17 +48,19 @@ func (s *agentSession) openSettlement() {
 
 func (s *agentSession) completeSettlement(err error) {
 	s.mu.Lock()
-	settlement := s.settlement
-	s.settlement = nil
-	s.mu.Unlock()
 
+	settlement := s.settlement
 	if settlement == nil {
+		s.mu.Unlock()
+
 		return
 	}
 
-	settlement.err = err
-
-	close(settlement.done)
+	settlement.finishOnce.Do(func() {
+		settlement.err = err
+		close(settlement.done)
+	})
+	s.mu.Unlock()
 }
 
 // awaitSettlement blocks until the in-flight settlement has finished the whole
@@ -62,6 +68,10 @@ func (s *agentSession) completeSettlement(err error) {
 // still writing through, so it waits rather than racing it; the settlement's
 // own bounded context is what makes the wait terminate.
 func (s *agentSession) awaitSettlement() error {
+	return s.awaitSettlementContext(context.Background())
+}
+
+func (s *agentSession) awaitSettlementContext(ctx context.Context) error {
 	s.mu.Lock()
 	settlement := s.settlement
 	s.mu.Unlock()
@@ -71,7 +81,12 @@ func (s *agentSession) awaitSettlement() error {
 	}
 
 	settlement.waitingOnce.Do(func() { close(settlement.waiting) })
-	<-settlement.done
+
+	select {
+	case <-settlement.done:
+	case <-ctx.Done():
+		return fmt.Errorf("%w: join prompt settlement: %v", pi.ErrProcessContainmentIncomplete, ctx.Err())
+	}
 
 	return settlement.err
 }
@@ -108,13 +123,42 @@ func (s *agentSession) settlePrompt(
 	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(turnCtx), sessionSettleTimeout)
 	defer cancelSettle()
 
-	defer func() { s.completeSettlement(err) }()
+	s.mu.Lock()
+	outbox := s.outbox
+	s.mu.Unlock()
+
+	defer func() {
+		if recover() != nil {
+			containmentErr := s.containGenerationSync(
+				settleCtx,
+				outbox,
+				"prompt settlement failed",
+			)
+			if pi.ProcessContainmentComplete(containmentErr) {
+				s.fenceLifecycleStream()
+			}
+
+			resp = acp.PromptResponse{}
+			err = errors.Join(errPromptSettlement, containmentErr)
+		}
+
+		s.completeSettlement(err)
+	}()
 
 	if boundaryErr := s.joinTurnBoundary(settleCtx, outcome); boundaryErr != nil {
 		// Durability outranks the terminal event: a containment boundary that
 		// did not complete emits no terminal idle, and the incarnation ends
 		// unsettled so the next snapshot states the truth.
-		s.fenceLifecycleStream()
+		if pi.ProcessContainmentComplete(boundaryErr) {
+			s.fenceLifecycleStream()
+		}
+
+		if timedOut.Load() {
+			return acp.PromptResponse{}, errors.Join(
+				turnFailureError(failureCauseTimeout, fmt.Sprintf("pi turn exceeded %s", s.agent.turnTimeout())),
+				boundaryErr,
+			)
+		}
 
 		return acp.PromptResponse{}, boundaryErr
 	}
@@ -308,6 +352,14 @@ func turnOutcomeForStopReason(stop acp.StopReason) lifecycle.Outcome {
 // child's exit status and stderr tail where it died, the transport error
 // otherwise, and never a bare EOF.
 func (s *agentSession) transportFailure(ctx context.Context) error {
+	// A malformed or unterminated JSONL record is the transport's terminal
+	// fact even when containment makes the child exit immediately afterwards.
+	// Classifying the induced exit first would erase the structural failure and
+	// reintroduce a scheduler-dependent T4 result.
+	if client := s.currentClient(); client != nil && errors.Is(client.Err(), pi.ErrJSONLStructural) {
+		return turnFailureError(failureCauseTransport, pi.ErrJSONLStructural.Error())
+	}
+
 	if exitMessage, exited := s.processExitCause(ctx, "pi process exited"); exited {
 		s.agent.observe.RecordPiProcessExit(context.Background(), "unexpected", nil)
 
@@ -319,7 +371,11 @@ func (s *agentSession) transportFailure(ctx context.Context) error {
 	if client := s.currentClient(); client != nil {
 		if err := client.Err(); err != nil {
 			message = err.Error()
-			s.agent.log.ErrorContext(ctx, "pi turn transport failed", slog.Any("error", err))
+
+			s.agent.log.ErrorContext(ctx, "pi turn transport failed",
+				slog.String(acpFieldSessionID, string(s.id)),
+				slog.String(failureFieldCause, failureCauseTransport),
+			)
 		}
 	}
 

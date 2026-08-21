@@ -21,27 +21,132 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
+type closeOnErrContext struct {
+	context.Context //nolint:containedctx // The test wrapper deliberately intercepts Err at an exact admission edge.
+	onErr           func()
+	returnErr       func() error
+}
+
+type commandCatalogFailClient struct {
+	*directAgentClient
+	want error
+}
+
+func (c *commandCatalogFailClient) SessionUpdate(ctx context.Context, notification acp.SessionNotification) error {
+	if notification.Update.AvailableCommandsUpdate != nil {
+		return c.want
+	}
+
+	return c.directAgentClient.SessionUpdate(ctx, notification)
+}
+
+func (c *closeOnErrContext) Err() error {
+	if c.onErr != nil {
+		c.onErr()
+	}
+
+	if c.returnErr != nil {
+		return c.returnErr()
+	}
+
+	return nil
+}
+
 func TestStoreStartedSessionCloseErrorBranches(t *testing.T) {
 	closedAgent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	closedAgent.closed = true
-	rejected := &agentSession{agent: closedAgent, id: "rejected", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
+	rejected := attachTestNativeBoundary(&agentSession{agent: closedAgent, id: "rejected", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)})
 	require.ErrorIs(t, closedAgent.storeStartedSession(t.Context(), rejected), errAgentClosed)
 
 	fullAgent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))
 	fullAgent.sessions["filler"] = &agentSession{agent: fullAgent, id: "filler", turn: make(chan struct{}, sessionTurnCapacity)}
-	backpressured := &agentSession{agent: fullAgent, id: "backpressured", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
+	backpressured := attachTestNativeBoundary(&agentSession{agent: fullAgent, id: "backpressured", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)})
 	requireInvalidRequest(t, fullAgent.storeStartedSession(t.Context(), backpressured))
 
 	replaceAgent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	replaceAgent.sessions["shared"] = &agentSession{agent: replaceAgent, id: "shared", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
+	replaceAgent.sessions["shared"] = attachTestNativeBoundary(&agentSession{agent: replaceAgent, id: "shared", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)})
 	replacement := &agentSession{agent: replaceAgent, id: "shared", turn: make(chan struct{}, sessionTurnCapacity)}
 	require.NoError(t, replaceAgent.storeStartedSession(t.Context(), replacement))
 }
 
 func TestRemoveSessionCloseError(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	session := &agentSession{agent: agent, id: "id", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
-	agent.removeSession(t.Context(), "unmapped", session)
+	session := attachTestNativeBoundary(&agentSession{agent: agent, id: "id", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)})
+	require.Error(t, agent.removeSession(t.Context(), "unmapped", session))
+}
+
+func TestContainmentIncompleteInstallAndRemovalOwnersSurviveUntilAgentClose(t *testing.T) {
+	newIncomplete := func(agent *Agent, id acp.SessionId) (*agentSession, *stubProcess) {
+		process := newStubProcess(false)
+		process.close = pi.ErrProcessContainmentIncomplete
+
+		return attachTestNativeBoundary(&agentSession{
+			agent:       agent,
+			id:          id,
+			proc:        process,
+			turn:        make(chan struct{}, sessionTurnCapacity),
+			sessionRoot: t.TempDir(),
+		}), process
+	}
+	requireRetained := func(t *testing.T, agent *Agent, session *agentSession) {
+		t.Helper()
+		agent.mu.Lock()
+		_, retained := agent.retainedSessions[session]
+		agent.mu.Unlock()
+		require.True(t, retained, "the exact incomplete session lost addressable ownership")
+	}
+
+	t.Run("rejected install", func(t *testing.T) {
+		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+		session, process := newIncomplete(agent, "rejected")
+		agent.deleted[session.id] = struct{}{}
+
+		err := agent.storeStartedSession(t.Context(), session)
+		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+		requireRetained(t, agent, session)
+		require.Equal(t, 1, process.closeCalls)
+
+		require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+		requireRetained(t, agent, session)
+		require.Equal(t, 1, process.closeCalls, "Agent.Close reran rather than joined the immutable close")
+	})
+
+	t.Run("replaced install", func(t *testing.T) {
+		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+		previous, previousProcess := newIncomplete(agent, "shared")
+		replacementProcess := newStubProcess(false)
+		replacement := &agentSession{
+			agent: agent, id: "shared", proc: replacementProcess, turn: make(chan struct{}, sessionTurnCapacity),
+			sessionRoot: t.TempDir(),
+		}
+		attachTestNativeBoundary(replacement)
+		agent.sessions[previous.id] = previous
+
+		require.ErrorIs(t, agent.storeStartedSession(t.Context(), replacement), pi.ErrProcessContainmentIncomplete)
+		requireRetained(t, agent, previous)
+		require.Same(t, replacement, agent.sessions["shared"])
+
+		require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+		requireRetained(t, agent, previous)
+		require.Equal(t, 1, previousProcess.closeCalls)
+		require.Equal(t, 1, replacementProcess.closeCalls)
+	})
+
+	for _, path := range []string{"replay cleanup", "removal cleanup"} {
+		t.Run(path, func(t *testing.T) {
+			agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+			session, process := newIncomplete(agent, acp.SessionId(path))
+			agent.sessions[session.id] = session
+
+			require.ErrorIs(t, agent.removeSession(t.Context(), session.id, session), pi.ErrProcessContainmentIncomplete)
+			requireRetained(t, agent, session)
+			require.NotContains(t, agent.sessions, session.id)
+
+			require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+			requireRetained(t, agent, session)
+			require.Equal(t, 1, process.closeCalls)
+		})
+	}
 }
 
 // TestSameSessionIDKeepsOneLinearizedOwner proves the close-versus-same-id
@@ -53,6 +158,7 @@ func TestSameSessionIDKeepsOneLinearizedOwner(t *testing.T) {
 	superseded := &agentSession{
 		agent: agent, id: "id", proc: newStubProcess(false), sessionRoot: t.TempDir(),
 	}
+	attachTestNativeBoundary(superseded)
 
 	agent.mu.Lock()
 	agent.sessions[superseded.id] = superseded
@@ -61,6 +167,7 @@ func TestSameSessionIDKeepsOneLinearizedOwner(t *testing.T) {
 	replacement := &agentSession{
 		agent: agent, id: "id", proc: newStubProcess(false), sessionRoot: t.TempDir(),
 	}
+	attachTestNativeBoundary(replacement)
 	require.NoError(t, agent.storeStartedSession(t.Context(), replacement))
 
 	supersededProcess, ok := superseded.proc.(*stubProcess)
@@ -72,7 +179,7 @@ func TestSameSessionIDKeepsOneLinearizedOwner(t *testing.T) {
 	agent.mu.Unlock()
 
 	require.False(t, agent.detachSession("id", superseded))
-	agent.removeSession(t.Context(), "id", superseded)
+	require.NoError(t, agent.removeSession(t.Context(), "id", superseded))
 
 	agent.mu.Lock()
 	require.Same(t, replacement, agent.sessions["id"], "a superseded closer evicted the replacement")
@@ -93,12 +200,7 @@ func TestSameSessionIDKeepsOneLinearizedOwner(t *testing.T) {
 	require.Empty(t, replacement.turn, "close left the replacement's turn admission unbalanced")
 }
 
-// TestFailedCloseRetainsTheSessionItDidNotFinish pins the rule that a close
-// which failed still owes the boundary it did not reach. The id stays
-// addressable so a later close can retry that boundary, admission is fenced on
-// the session rather than by unmapping the id so no prompt slips in behind the
-// close, and only the completed boundary detaches the id.
-func TestFailedCloseRetainsTheSessionItDidNotFinish(t *testing.T) {
+func TestFailedCloseRetainsOneImmutableResult(t *testing.T) {
 	refused := errors.New("durability unavailable")
 	// The commit exhausts its own retries before the close reports the refusal.
 	store := &appendControlledStore{SessionStore: NewInMemorySessionStore(), failures: len(mirrorAppendDelays), err: refused}
@@ -112,6 +214,7 @@ func TestFailedCloseRetainsTheSessionItDidNotFinish(t *testing.T) {
 		sessionRoot: t.TempDir(),
 		turn:        make(chan struct{}, sessionTurnCapacity),
 	}
+	attachTestNativeBoundary(session)
 	agent.sessions[session.id] = session
 
 	t.Cleanup(func() { _ = agent.Close() })
@@ -120,7 +223,7 @@ func TestFailedCloseRetainsTheSessionItDidNotFinish(t *testing.T) {
 	require.ErrorIs(t, err, refused)
 
 	resolved, err := agent.session(session.id)
-	require.NoError(t, err, "a failed close orphaned the id whose boundary it still owes")
+	require.NoError(t, err, "a failed close lost the id carrying its immutable result")
 	require.Same(t, session, resolved)
 
 	_, err = agent.Prompt(t.Context(), acp.PromptRequest{SessionId: session.id})
@@ -128,14 +231,15 @@ func TestFailedCloseRetainsTheSessionItDidNotFinish(t *testing.T) {
 	require.Equal(t, len(mirrorAppendDelays), store.calls, "a prompt slipped in behind the close and drove the session")
 
 	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: session.id})
-	require.NoError(t, err, "the retried close did not re-run the boundary the first one refused")
+	require.ErrorIs(t, err, refused)
+	require.Equal(t, len(mirrorAppendDelays), store.calls, "a second close re-ran an immutable teardown")
 
 	journal, err := store.Load(t.Context(), SessionKey{SessionID: string(session.id), Subpath: SessionStoreLifecycleSubpath})
 	require.NoError(t, err)
-	require.Len(t, journal, 1, "the retry committed the boundary record the failed close owed")
+	require.Empty(t, journal)
 
 	agent.mu.Lock()
-	require.NotContains(t, agent.sessions, session.id, "a completed close left the id addressable")
+	require.Contains(t, agent.sessions, session.id)
 	agent.mu.Unlock()
 }
 
@@ -248,6 +352,45 @@ func TestResumeSessionPublishesTerminalNativeIdentityWithoutHistory(t *testing.T
 	require.NotContains(t, failingAgent.sessions, acp.SessionId("resume-id"))
 }
 
+func TestEstablishingMethodsFailClosedWhenOpeningCatalogIsRejected(t *testing.T) {
+	want := errors.New("opening catalog rejected")
+	entries := []SessionStoreEntry{
+		json.RawMessage(`{"type":"session","id":"resume-open","cwd":"/cwd"}`),
+		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`[{"type":"text","text":"hi"}]`)}),
+	}
+	newStore := func() SessionStore {
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: "resume-open"}, entries))
+		appendLifecycleBoundaryForRows(t, store, "resume-open", len(entries))
+
+		return store
+	}
+
+	for _, method := range []string{"new", "resume", "load"} {
+		t.Run(method, func(t *testing.T) {
+			client := newStubPiClient()
+			client.state = pi.SessionState{SessionID: "resume-open"}
+			opts := []Option{}
+			if method != "new" {
+				opts = append(opts, WithSessionStore(newStore()))
+			}
+			agent := newStubClientAgent(t, client, opts...)
+			agent.setConnection(&commandCatalogFailClient{directAgentClient: newDirectAgentClient(), want: want})
+
+			var err error
+			switch method {
+			case "new":
+				_, err = agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+			case "resume":
+				_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("resume-open", "/cwd"))
+			case "load":
+				_, err = agent.LoadSession(t.Context(), LoadSessionRequest("resume-open", "/cwd"))
+			}
+			require.ErrorIs(t, err, want)
+		})
+	}
+}
+
 func TestLoadSessionRemovesStartedSessionOnReplayFailure(t *testing.T) {
 	entries := []SessionStoreEntry{
 		json.RawMessage(`{"type":"session","id":"resume-load","cwd":"/cwd"}`),
@@ -260,13 +403,33 @@ func TestLoadSessionRemovesStartedSessionOnReplayFailure(t *testing.T) {
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "resume-load"}
 	agent := newStubClientAgent(t, client, WithSessionStore(store))
+	process := newStubProcess(false)
+	process.close = pi.ErrProcessContainmentIncomplete
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		return process, client, nil
+	}
 	connection := newDirectAgentClient()
 	connection.updateErr = errors.New("replay")
 	agent.setConnection(connection)
 
 	_, err := agent.LoadSession(t.Context(), LoadSessionRequest("resume-load", "/cwd"))
-	require.Error(t, err)
+	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
 	require.NotContains(t, agent.sessions, acp.SessionId("resume-load"))
+	agent.mu.Lock()
+	require.Len(t, agent.retainedSessions, 1)
+	var retained *agentSession
+	for session := range agent.retainedSessions {
+		retained = session
+	}
+	agent.mu.Unlock()
+	require.Same(t, process, retained.proc)
+	require.Equal(t, 1, process.closeCalls)
+	require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+	agent.mu.Lock()
+	_, stillRetained := agent.retainedSessions[retained]
+	agent.mu.Unlock()
+	require.True(t, stillRetained, "memoized Agent.Close erased replay quarantine")
+	require.Equal(t, 1, process.closeCalls, "Agent.Close did not join the replay cleanup's immutable result")
 }
 
 func TestListSessionsFilterAndDedupBranches(t *testing.T) {
@@ -332,6 +495,267 @@ func TestStartSessionEarlyFailureBranches(t *testing.T) {
 	badScratch.versionChecked = true
 	_, err = badScratch.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	require.Error(t, err)
+}
+
+func TestSessionConstructionPanicAndOwnershipHelperEdges(t *testing.T) {
+	originalMkdirTemp := materializeMkdirTemp
+	t.Cleanup(func() { materializeMkdirTemp = originalMkdirTemp })
+	materializeMkdirTemp = func(string, string) (string, error) { panic("constructor panic") }
+	agent := newStubClientAgent(t, nil)
+	agent.versionChecked = true
+	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	require.ErrorContains(t, err, "construction callback panicked")
+
+	bare := &Agent{retainedSessions: nil}
+	session := &agentSession{id: "retained"}
+	bare.retainIncompleteSession(session, errors.New("retain"))
+	require.Contains(t, bare.retainedSessions, session)
+
+	bare = &Agent{constructions: make(map[*nativeConstruction]struct{})}
+	owner := &nativeConstruction{done: make(chan struct{}), nativeBoundary: newNativeBoundaryTracker()}
+	bare.constructions[owner] = struct{}{}
+	closed, transferred := bare.transferConstructionToSession(owner, session)
+	require.False(t, closed)
+	require.True(t, transferred)
+	require.Contains(t, bare.retainedSessions, session)
+}
+
+func TestRestoreActiveSessionReleasesGateOnStoreFailure(t *testing.T) {
+	store := newFaultySessionStore()
+	store.loadErr = errors.New("load active prefix")
+	agent := NewAgent(WithSessionStore(store), WithLogger(slog.New(slog.DiscardHandler)))
+	session := &agentSession{agent: agent, id: "active", outbox: newTestSessionOutbox(1)}
+	_, err := agent.restoreActiveSession(t.Context(), session.id, session)
+	require.ErrorIs(t, err, store.loadErr)
+	release, err := session.beginRestore(t.Context())
+	require.NoError(t, err, "failed load retained the restore gate")
+	release()
+}
+
+func TestStartSessionStartupGateFailureMatrix(t *testing.T) {
+	type testCase struct {
+		name  string
+		setup func(*Agent, *stubPiClient, *context.Context)
+	}
+	tests := []testCase{
+		{
+			name: "discovery readiness observer panics",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceDiscovery && stage == RuntimeStartupReadiness {
+						panic("readiness observer")
+					}
+				}
+			},
+		},
+		{
+			name: "close wins after discovery readiness",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceDiscovery && stage == RuntimeStartupReadiness {
+						_, _ = agent.beginClose()
+					}
+				}
+			},
+		},
+		{
+			name: "close wins after scratch reservation",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ReserveScratchRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					_, _ = agent.beginClose()
+
+					return func() {}, nil
+				}
+			},
+		},
+		{
+			name: "configuration observer panics",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceSession && stage == RuntimeStartupConfiguration {
+						panic("configuration observer")
+					}
+				}
+			},
+		},
+		{
+			name: "close wins after configuration observer",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceSession && stage == RuntimeStartupConfiguration {
+						_, _ = agent.beginClose()
+					}
+				}
+			},
+		},
+		{
+			name: "close wins after native root acquisition",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					_, _ = agent.beginClose()
+
+					return func() {}, nil
+				}
+			},
+		},
+		{
+			name: "context cancels after native root acquisition",
+			setup: func(agent *Agent, _ *stubPiClient, ctx *context.Context) {
+				armed := false
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					armed = true
+
+					return func() {}, nil
+				}
+				*ctx = &closeOnErrContext{Context: *ctx, returnErr: func() error {
+					if armed {
+						return context.Canceled
+					}
+
+					return nil
+				}}
+			},
+		},
+		{
+			name: "close wins during final context check",
+			setup: func(agent *Agent, _ *stubPiClient, ctx *context.Context) {
+				armed := false
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					armed = true
+
+					return func() {}, nil
+				}
+				*ctx = &closeOnErrContext{Context: *ctx, onErr: func() {
+					if armed {
+						_, _ = agent.beginClose()
+					}
+				}}
+			},
+		},
+		{
+			name: "close wins during client start",
+			setup: func(agent *Agent, client *stubPiClient, _ *context.Context) {
+				client.startFunc = func(context.Context) error {
+					_, _ = agent.beginClose()
+
+					return nil
+				}
+			},
+		},
+		{
+			name: "native readiness observer panics",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceSession && stage == RuntimeStartupReadiness {
+						panic("native readiness observer")
+					}
+				}
+			},
+		},
+		{
+			name: "immutable construction refuses final transfer",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind != RuntimeResourceSession || stage != RuntimeStartupSession {
+						return
+					}
+					agent.mu.Lock()
+					for owner := range agent.constructions {
+						owner.immutable = true
+						owner.err = errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("waiter quarantine"))
+					}
+					agent.mu.Unlock()
+				}
+			},
+		},
+		{
+			name: "missing tracker refuses pump publication",
+			setup: func(agent *Agent, client *stubPiClient, _ *context.Context) {
+				client.startFunc = func(context.Context) error {
+					agent.mu.Lock()
+					for owner := range agent.constructions {
+						owner.nativeBoundary = nil
+					}
+					agent.mu.Unlock()
+
+					return nil
+				}
+			},
+		},
+		{
+			name: "session observer panics",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceSession && stage == RuntimeStartupSession {
+						panic("session observer")
+					}
+				}
+			},
+		},
+		{
+			name: "close wins during session observer",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceSession && stage == RuntimeStartupSession {
+						_, _ = agent.beginClose()
+					}
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := newStubPiClient()
+			client.state = pi.SessionState{SessionID: "startup-gate"}
+			agent := newStubClientAgent(t, client)
+			agent.versionChecked = true
+			ctx := t.Context()
+			test.setup(agent, client, &ctx)
+			_, err := agent.startSession(ctx, sessionStart{Cwd: "/cwd"})
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestStartSessionPostTransferObservationFailures(t *testing.T) {
+	originalTimeout := sessionSettleTimeout
+	t.Cleanup(func() { sessionSettleTimeout = originalTimeout })
+
+	t.Run("bounded process observation", func(t *testing.T) {
+		sessionSettleTimeout = originalTimeout
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "observed"}
+		agent := newStubClientAgent(t, client, WithRuntimeResourceHooks(RuntimeResourceHooks{
+			ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) { panic("observer") },
+		}))
+		agent.versionChecked = true
+		process := inventoryPiProcess{stubProcess: newStubProcess(false), count: 1}
+		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+			return process, client, nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	})
+
+	t.Run("close reenters process observation", func(t *testing.T) {
+		sessionSettleTimeout = originalTimeout
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "observed-close"}
+		var agent *Agent
+		agent = newStubClientAgent(t, client, WithRuntimeResourceHooks(RuntimeResourceHooks{
+			ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) {
+				_, _ = agent.beginClose()
+			},
+		}))
+		agent.versionChecked = true
+		process := inventoryPiProcess{stubProcess: newStubProcess(false), count: 1}
+		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+			return process, client, nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
 }
 
 func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
@@ -631,8 +1055,8 @@ func TestSessionInfoAndAgentBookkeeping(t *testing.T) {
 	err := agent.storeStartedSession(t.Context(), other)
 	requireInvalidRequest(t, err)
 	require.NoError(t, agent.storeStartedSession(t.Context(), session))
-	agent.removeSession(t.Context(), "missing", nil)
-	agent.removeSession(t.Context(), "id", session)
+	require.NoError(t, agent.removeSession(t.Context(), "missing", nil))
+	require.NoError(t, agent.removeSession(t.Context(), "id", session))
 	require.Nil(t, agent.sessions["id"])
 
 	agent.closed = true
@@ -924,11 +1348,13 @@ func TestRestoreActiveAndCleanupBranches(t *testing.T) {
 	active := &agentSession{agent: agent, id: id, cwd: "/cwd", fingerprint: sessionStartFingerprint(start), turn: make(chan struct{}, 1)}
 	agent.sessions[id] = active
 
-	session, loaded, started, err := agent.restoreSession(t.Context(), id, start, nil)
+	restored, err := agent.restoreSession(t.Context(), id, start, nil)
 	require.NoError(t, err)
-	require.Same(t, active, session)
-	require.Equal(t, entries, loaded)
-	require.False(t, started)
+	require.Same(t, active, restored.session)
+	require.Equal(t, entries, restored.entries)
+	require.False(t, restored.started)
+
+	restored.finish()
 
 	connection := newDirectAgentClient()
 	connection.updateErr = errors.New("replay")
@@ -1276,24 +1702,18 @@ func newPartialDeleteAgent(t *testing.T, refused error) (*Agent, *stubProcess, a
 		return nil
 	}
 
-	agent.sessions[id] = &agentSession{
+	agent.sessions[id] = attachTestNativeBoundary(&agentSession{
 		agent:       agent,
 		id:          id,
 		proc:        process,
 		sessionRoot: t.TempDir(),
 		turn:        make(chan struct{}, sessionTurnCapacity),
-	}
+	})
 
 	return agent, process, id
 }
 
-// TestFailedDeleteTeardownIsRetriedByTheNextDelete pins step 5 against the
-// wire posture of step 6. A delete whose teardown failed keeps everything the
-// host was told: the tombstone is durable and the id is hidden from list, load,
-// and resume. What it does not do is drop the obligation with the wrapper — the
-// agent still owns the native scope that teardown did not contain, so the next
-// delete on the same id retries it and completes it.
-func TestFailedDeleteTeardownIsRetriedByTheNextDelete(t *testing.T) {
+func TestFailedDeleteTeardownKeepsOneImmutableResult(t *testing.T) {
 	refused := errors.New("close the contained tree")
 	agent, process, id := newPartialDeleteAgent(t, refused)
 
@@ -1311,21 +1731,15 @@ func TestFailedDeleteTeardownIsRetriedByTheNextDelete(t *testing.T) {
 	require.Empty(t, listed.Sessions, "a tombstoned id stayed visible after its teardown failed")
 
 	_, err = agent.UnstableDeleteSession(t.Context(), DeleteSessionRequest(id))
-	require.NoError(t, err)
-	require.Equal(t, 2, process.closeCalls,
-		"the retried delete did not re-run the teardown the first one left unfinished")
+	require.ErrorIs(t, err, refused)
+	require.Equal(t, 1, process.closeCalls)
 
 	agent.mu.Lock()
-	require.NotContains(t, agent.pendingCleanups, id, "a completed cleanup stayed on the retry registry")
+	require.Contains(t, agent.sessions, id)
 	agent.mu.Unlock()
 }
 
-// TestAgentCloseSweepsAPartiallyDeletedSession pins the other retry path of the
-// same obligation. A hidden session whose teardown failed is reachable through
-// no map the shutdown sweep used to read, so shutdown would have exited leaving
-// its native scope running; the retained cleanup is swept with the live
-// sessions instead.
-func TestAgentCloseSweepsAPartiallyDeletedSession(t *testing.T) {
+func TestAgentCloseJoinsAPartiallyDeletedSessionResult(t *testing.T) {
 	refused := errors.New("close the contained tree")
 	agent, process, id := newPartialDeleteAgent(t, refused)
 
@@ -1333,13 +1747,11 @@ func TestAgentCloseSweepsAPartiallyDeletedSession(t *testing.T) {
 	require.ErrorIs(t, err, refused)
 
 	agent.mu.Lock()
-	require.Contains(t, agent.pendingCleanups, id)
-	require.NotContains(t, agent.sessions, id)
+	require.Contains(t, agent.sessions, id)
 	agent.mu.Unlock()
 
-	require.NoError(t, agent.Close())
-	require.Equal(t, 2, process.closeCalls,
-		"shutdown exited leaving a hidden session's native scope uncontained")
+	require.ErrorIs(t, agent.Close(), refused)
+	require.Equal(t, 1, process.closeCalls)
 }
 
 type settlementDeleteStore struct {
@@ -1374,6 +1786,7 @@ func TestDeleteTombstonesBeforeItFencesOrWaitsForSettlement(t *testing.T) {
 		proc:        newStubProcess(false),
 		sessionRoot: t.TempDir(),
 	}
+	attachTestNativeBoundary(session)
 	agent.sessions["id"] = session
 	session.openSettlement()
 	store.session = session
@@ -1405,7 +1818,8 @@ func TestDeleteTombstonesBeforeItFencesOrWaitsForSettlement(t *testing.T) {
 	session.completeSettlement(settleErr)
 
 	require.ErrorIs(t, <-done, settleErr, "partial cleanup is reported after the tombstone is durable")
-	require.NotContains(t, agent.sessions, acp.SessionId("id"))
+	require.Contains(t, agent.sessions, acp.SessionId("id"),
+		"the hidden id retains the exact immutable close owner")
 }
 
 // TestDeleteNeverWedgesBehindALivePrompt pins the reason the tombstone comes
@@ -1686,6 +2100,7 @@ func TestInstallUnderATombstoneTearsDownThePreparedReplacement(t *testing.T) {
 
 	proc := newStubProcess(false)
 	prepared := &agentSession{agent: agent, id: "gone", proc: proc, sessionRoot: t.TempDir()}
+	attachTestNativeBoundary(prepared)
 
 	requireUnknownSession(t, agent.storeStartedSession(t.Context(), prepared))
 
@@ -1704,6 +2119,7 @@ func TestInstallUnderATombstoneTearsDownThePreparedReplacement(t *testing.T) {
 		agent: agent, id: "gone", proc: newFailingCloseProcess(), sessionRoot: t.TempDir(),
 		turn: make(chan struct{}, sessionTurnCapacity),
 	}
+	attachTestNativeBoundary(failing)
 	requireUnknownSession(t, agent.storeStartedSession(t.Context(), failing))
 }
 

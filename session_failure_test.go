@@ -22,22 +22,25 @@ func TestProviderTurnFailureAndEmptyCloneError(t *testing.T) {
 }
 
 func TestNativeFailureClassification(t *testing.T) {
+	const secret = "stderr-and-transport-secret-sentinel"
+	logs := &strings.Builder{}
 	previousGrace := processExitClassifyGrace
 	processExitClassifyGrace = time.Millisecond
 	t.Cleanup(func() { processExitClassifyGrace = previousGrace })
 
-	agent := &Agent{log: slog.New(slog.DiscardHandler)}
+	agent := &Agent{log: slog.New(slog.NewTextHandler(logs, nil))}
 	session := &agentSession{agent: agent}
 	require.NoError(t, session.nativeTurnFailure(t.Context(), nil))
 	requirePiTurnFailure(t, session.nativeTurnFailure(t.Context(), &pi.CommandError{Message: "provider"}), failureCauseProvider)
-	requirePiTurnFailure(t, session.nativeTurnFailure(t.Context(), io.EOF), failureCauseTransport)
+	requirePiTurnFailure(t, session.nativeTurnFailure(t.Context(), errors.New(secret)), failureCauseTransport)
 
 	process := newStubProcess(true)
 	process.waitErr = errors.New("exit 2")
-	process.stderr = " stderr "
+	process.stderr = " " + secret + " "
 	session.proc = process
 	data := requirePiTurnFailure(t, session.nativeTurnFailure(t.Context(), io.EOF), failureCauseProcessExit)
-	require.Equal(t, "pi process exited: exit 2: stderr", data[jsonFieldMessage])
+	require.Equal(t, "pi process exited: exit 2: "+secret, data[jsonFieldMessage])
+	require.NotContains(t, logs.String(), secret)
 
 	process = newStubProcess(false)
 	session.proc = process
@@ -74,4 +77,12 @@ func TestNativeCauseIsBounded(t *testing.T) {
 
 	data := requirePiTurnFailure(t, turnFailureError(failureCauseProvider, strings.Repeat("a", nativeCauseMaxBytes+64)), failureCauseProvider)
 	require.Len(t, data[jsonFieldMessage], nativeCauseMaxBytes)
+
+	leading := strings.Repeat(" ", nativeCauseMaxBytes) + "secret suffix"
+	data = requirePiTurnFailure(t, turnFailureError(failureCauseProvider, leading), failureCauseProvider)
+	require.Empty(t, data[jsonFieldMessage])
+
+	broken := strings.Repeat("a", nativeCauseMaxBytes-1) + "\xe2\x82\xacsecret"
+	data = requirePiTurnFailure(t, turnFailureError(failureCauseProvider, broken), failureCauseProvider)
+	require.Equal(t, strings.Repeat("a", nativeCauseMaxBytes-1), data[jsonFieldMessage])
 }

@@ -46,6 +46,32 @@ func TestRuntimeResourceHooks(t *testing.T) {
 	require.Equal(t, 1, releases)
 }
 
+func TestRuntimeResourceAdmissionCancellationReleasesLateGrant(t *testing.T) {
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := acquireNativeRoot(cancelled, RuntimeResourceHooks{}, RuntimeResourceSession)
+	require.ErrorIs(t, err, context.Canceled)
+
+	for _, returnsRelease := range []bool{false, true} {
+		t.Run(map[bool]string{false: "nil grant", true: "valid grant"}[returnsRelease], func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			released := make(chan struct{})
+			_, err := acquireNativeRoot(ctx, RuntimeResourceHooks{AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+				cancel()
+				if returnsRelease {
+					return func() { close(released) }, nil
+				}
+
+				return nil, nil //nolint:nilnil // cancellation owns the invalid late result
+			}}, RuntimeResourceSession)
+			require.ErrorIs(t, err, context.Canceled)
+			if returnsRelease {
+				<-released
+			}
+		})
+	}
+}
+
 func TestNativeRootReleaseRequiresProcessTreeQuiescence(t *testing.T) {
 	releases := 0
 	release := func() { releases++ }

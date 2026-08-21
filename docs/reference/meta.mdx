@@ -108,9 +108,45 @@ notifications whether or not a prompt is in flight. `authoritativeQuiescence`
 is `true` only under the Linux supervised containment boundary, where session
 close proves whole-tree vacancy; that answer adds `quiescenceSource:
 "process-containment"`, and every other boundary answers `false` and certifies
-no quiescence fact. `activityKinds` is empty because every native pi event is
-foreground work. An absent offer, or an offer with no common version, omits
-the key from the response and leaves the extension dormant.
+no quiescence fact. `activityKinds` is empty because no native pi event carries a background
+activity entity: work the harness begins between prompts is still the
+session's one foreground, so it is reported as a foreground cycle and never as
+an `activity_update`. An absent offer, or an offer with no common version,
+omits the key from the response and leaves the extension dormant.
+
+Two events open a turn. A client prompt opens one with a `prompt_accepted`
+echoing its submission identity, followed by a `state_update` to `running`
+with `cause: "submission"`. Work pi begins on its own between prompts opens
+one with a `state_update` to `running` with `cause: "activity"` and no
+acceptance at all: no client frame was accepted, so there is no submission,
+client nonce, or run identity to state, and the cycle never borrows the route
+envelope of a prompt that is not running. Its ordinary assistant and tool
+output arrives as plain `session/update` notifications with no route envelope,
+and it ends with a terminal `idle` carrying `cause: "activity"` — emitted only
+after that cycle's native transcript and boundary record are durable. A
+`session/prompt` is refused with `session_prompt` backpressure while such a
+cycle is open.
+
+pi's own settle marker is the only thing that ends an agent-origin cycle
+normally. A pi extension that throws inside one marks that cycle failed without
+ending it, so the cycle still runs to the native marker and then reports
+`outcome: "failed"` with no stop reason. Anything this adapter could not
+describe — an update it could not deliver, a transcript or boundary it could not
+make durable, a terminal event the client did not accept — ends the incarnation
+instead: the stream stops with no terminal `idle` at all, the session is
+poisoned, and later requests are refused rather than answered from a cycle whose
+record is incomplete.
+
+A generation loss fences that incarnation and durably names the lost turn; a
+successful relaunch opens a new stream and snapshot rather than continuing the
+old sequence or reconstructing undelivered events. Before scratch or native
+admission, initial construction and relaunch enter an Agent-owned record.
+Immediately after spawn that record owns the exact process, client, provider
+root, generation root, and releases before observer callbacks run, then
+transfers atomically to the initial session or relaunch attempt. Close therefore
+either joins that construction, contains an unadopted successor, or owns the
+complete published generation; a bounded relaunch-join timeout memoizes
+containment-incomplete without initiating cleanup from the timeout path.
 
 While negotiated, every lifecycle event rides a `session/update`
 notification's `_meta["acp-go.dev/lifecycle"]` on an identity-only
@@ -125,10 +161,13 @@ method this adapter implements nowhere, because the key is reserved on every
 inbound surface rather than owned by any one method. Without it, an unknown
 method is still method-not-found.
 
-Every live-turn `session/update` and `_pi/rawEvent` notification carries the
-same exact `{version, turnNonce}` object in its notification `_meta`; raw-event
-payloads also carry their structural `sessionId`. Lifecycle and load-history
-updates remain outside a turn epoch and omit the envelope.
+Every `session/update` and `_pi/rawEvent` notification of a live
+**submission-origin** turn carries the same exact `{version, turnNonce}` object
+in its notification `_meta`; raw-event payloads also carry their structural
+`sessionId`. A nonce names the prompt that caused the turn, so the envelope
+appears only where a prompt is streaming: lifecycle updates, load-history
+updates, and everything an agent-origin cycle produces remain outside a turn
+epoch and omit it.
 
 When an assistant message finalizes, the wrapper bridge stamps a UUID into the
 native pi transcript before persistence. The corresponding checkpoint update
@@ -147,6 +186,12 @@ the reserved key. A pre-existing reserved key is an error. Permission requests
 remain structurally correlated by ACP session and tool-call fields: the
 permission `toolCallId` is pi's exact native id and matches the corresponding
 tool-call session updates. Permission requests carry no route metadata.
+
+Dialogs received between dispatched prompts are actively denied or cancelled
+at the native boundary and create no lifecycle action. If a correlated host
+request crosses its write fence but `action_update` or its first
+`requires_action` transition cannot be delivered, the request is cancelled,
+any partial blocker is retired, and the exact owning generation is contained.
 
 Structured output is not advertised: pi has no native structured-output
 surface, so no `structuredOutput` descriptor appears and an `outputSchema`

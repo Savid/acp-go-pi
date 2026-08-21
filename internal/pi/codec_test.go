@@ -11,9 +11,10 @@ func TestLineReaderFraming(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name  string
-		input string
-		want  []string
+		name    string
+		input   string
+		want    []string
+		wantErr error
 	}{
 		{
 			name:  "lf delimited records",
@@ -31,9 +32,10 @@ func TestLineReaderFraming(t *testing.T) {
 			want:  []string{"{\"text\":\"a b c\"}"},
 		},
 		{
-			name:  "final unterminated record",
-			input: "{\"a\":1}\n{\"b\":2}",
-			want:  []string{`{"a":1}`, `{"b":2}`},
+			name:    "final unterminated record",
+			input:   "{\"a\":1}\n{\"b\":2}",
+			want:    []string{`{"a":1}`},
+			wantErr: ErrJSONLStructural,
 		},
 		{
 			name:  "record larger than the reader buffer",
@@ -57,7 +59,11 @@ func TestLineReaderFraming(t *testing.T) {
 				}
 
 				if err != nil {
-					require.ErrorContains(t, err, "EOF")
+					if test.wantErr != nil {
+						require.ErrorIs(t, err, test.wantErr)
+					} else {
+						require.ErrorContains(t, err, "EOF")
+					}
 
 					break
 				}
@@ -74,7 +80,7 @@ func TestLineReaderRejectsOversizeRecord(t *testing.T) {
 	reader := NewLineReader(strings.NewReader(strings.Repeat("x", maxLineBytes+1)))
 	line, err := reader.Next()
 	require.Nil(t, line)
-	require.ErrorContains(t, err, "jsonl record exceeds")
+	require.ErrorIs(t, err, ErrJSONLStructural)
 }
 
 func TestDecodeMessageClassification(t *testing.T) {

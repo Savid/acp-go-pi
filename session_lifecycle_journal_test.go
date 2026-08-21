@@ -86,7 +86,8 @@ func TestCloseBoundaryOnAnIdleForegroundReadsBack(t *testing.T) {
 	require.Empty(t, turnID, "the terminal idle clears the turn")
 	require.NotEmpty(t, cycleID, "the cycle outlives the turn it carried")
 
-	require.NoError(t, s.commitCloseBoundary(t.Context(), true))
+	require.NoError(t, s.commitCloseForegroundMirror(t.Context()))
+	require.NoError(t, s.commitCloseResumableBoundary(t.Context(), true, s.prepareCloseLifecycleTerminal()))
 
 	record, found, err := s.agent.lastLifecycleBoundary(t.Context(), string(s.id))
 	require.NoError(t, err, "the close boundary the writer just recorded is readable")

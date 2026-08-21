@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestRecoverAgentGoroutineLogsPanic(t *testing.T) {
+func TestRecoverAgentGoroutineLogsOnlyTheFixedStage(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
@@ -17,7 +17,7 @@ func TestRecoverAgentGoroutineLogsPanic(t *testing.T) {
 		panic("boom")
 	}()
 
-	if !strings.Contains(buf.String(), "test goroutine") || !strings.Contains(buf.String(), "boom") {
+	if !strings.Contains(buf.String(), "test goroutine") || strings.Contains(buf.String(), "boom") {
 		t.Fatalf("panic log = %q", buf.String())
 	}
 }

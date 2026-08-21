@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 
 	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-pi/internal/lifecycle"
+	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 const lifecycleFieldVersion = "version"
@@ -34,6 +36,11 @@ var errLifecycleStreamFenced = errors.New("lifecycle stream is fenced")
 // request does not go out.
 var errLifecycleActionUnowned = errors.New("no open turn owns this lifecycle action")
 
+// errLifecycleActionAnnouncement is the fixed native-facing refusal used when
+// the host request crossed its write fence but its lifecycle announcement did
+// not become durable on the ordered stream.
+var errLifecycleActionAnnouncement = errors.New("lifecycle action announcement failed")
+
 // lifecycleState is the session's ordered lifecycle emitter for exactly one pi
 // process generation. The stream survives ordinary prompts, because the process
 // does; it ends when the generation ends, and the session's close fences the
@@ -47,15 +54,36 @@ type lifecycleState struct {
 	generation uint64
 	cycleID    string
 	turnID     string
+	// origin is the provenance of the turn currently holding the foreground. A
+	// cycle ends for the reason it opened, so an agent-origin cycle never
+	// reports the submission cause of a prompt that did not cause it.
+	origin lifecycle.Cause
+	// lostTurnID and lostCycleID are the identity a fence retired without a
+	// terminal event. The relaunch path writes that loss down as a boundary
+	// record, and it runs after the fence, so the identity outlives the fence
+	// that took it: a loss recorded under an empty turn would say a generation
+	// died owning nothing when it died mid-cycle.
+	lostTurnID  string
+	lostCycleID string
 	// blockers are the announced actions still blocking the current foreground
 	// cycle. The cycle is released when the last one resolves, never the first.
 	blockers map[string]struct{}
 	fenced   bool
 	closed   bool
+	// delivery is the ordered handoff chain. Stream reduction is claimed under
+	// lcMu, while host I/O waits outside it; each handoff waits for its exact
+	// predecessor before writing.
+	delivery      *lifecycleDeliveryFence
+	quarantineErr error
 	// vacancyProven records what the last completed boundary proved, so an
 	// opening snapshot states the boundary it has rather than the class the
 	// configuration advertises.
 	vacancyProven bool
+}
+
+type lifecycleDeliveryFence struct {
+	done chan struct{}
+	err  error
 }
 
 // openLifecycleStream mints a fresh incarnation for the current process
@@ -90,8 +118,15 @@ func (s *agentSession) openLifecycleStream(ctx context.Context, generation uint6
 	s.lc.generation = generation
 	s.lc.cycleID = cycleID
 	s.lc.turnID = ""
+	s.lc.origin = ""
+	s.lc.lostTurnID = ""
+	s.lc.lostCycleID = ""
 	s.lc.blockers = make(map[string]struct{})
 	s.lc.fenced = false
+	s.lc.quarantineErr = nil
+	initial := &lifecycleDeliveryFence{done: make(chan struct{})}
+	close(initial.done)
+	s.lc.delivery = initial
 
 	return s.emitLifecycleLocked(ctx, lifecycle.SnapshotEvent(cycleID, s.openingQuiescenceLocked()))
 }
@@ -115,8 +150,35 @@ func (s *agentSession) fenceLifecycleStream() {
 	s.lcMu.Lock()
 	defer s.lcMu.Unlock()
 
+	s.fenceLifecycleLocked()
+}
+
+// fenceLifecycleGeneration ends the incarnation a named native generation
+// owned. A containment raised on one generation never retires the stream a
+// later incarnation has already opened: the failure belongs to the process that
+// produced it, and the successor mints its own identity space.
+func (s *agentSession) fenceLifecycleGeneration(generation uint64) {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+
+	if s.lc.generation != generation {
+		return
+	}
+
+	s.fenceLifecycleLocked()
+}
+
+// fenceLifecycleLocked retires the open turn without a terminal event and keeps
+// its identity for the loss record the relaunch path still owes.
+func (s *agentSession) fenceLifecycleLocked() {
+	if s.lc.turnID != "" {
+		s.lc.lostTurnID = s.lc.turnID
+		s.lc.lostCycleID = s.lc.cycleID
+	}
+
 	s.lc.fenced = true
 	s.lc.turnID = ""
+	s.lc.origin = ""
 	s.lc.blockers = nil
 }
 
@@ -132,10 +194,8 @@ func (s *agentSession) closeLifecycleSession() {
 	s.lcMu.Lock()
 	defer s.lcMu.Unlock()
 
+	s.fenceLifecycleLocked()
 	s.lc.closed = true
-	s.lc.fenced = true
-	s.lc.turnID = ""
-	s.lc.blockers = nil
 
 	if s.lc.stream != nil {
 		s.lc.stream.Close()
@@ -164,6 +224,7 @@ func (s *agentSession) lifecycleAcceptTurn(ctx context.Context, submission lifec
 
 	s.lc.turnID = turnID
 	s.lc.cycleID = cycleID
+	s.lc.origin = lifecycle.CauseSubmission
 
 	if err := s.emitLifecycleLocked(ctx, lifecycle.AcceptedEvent(submission, turnID)); err != nil {
 		return err
@@ -172,25 +233,218 @@ func (s *agentSession) lifecycleAcceptTurn(ctx context.Context, submission lifec
 	return s.emitLifecycleLocked(ctx, lifecycle.RunningEvent(cycleID, turnID))
 }
 
-// lifecycleSettleTurn ends the accepted cycle with the outcome the turn
-// actually reached. Every blocker the cycle still holds terminalizes first: the
-// resolution is the reason the foreground may move.
-func (s *agentSession) lifecycleSettleTurn(ctx context.Context, stopReason string, outcome lifecycle.Outcome) error {
+// lifecycleOpenAgentCycle opens the foreground cycle the harness began on its
+// own. Exactly two events open a turn and this is the second: an
+// activity-caused running transition. It states no acceptance, because no
+// client frame was accepted, and no submission or run identity, because there
+// is none to echo.
+//
+// A generation that no longer owns a negotiated stream is an ownership failure.
+// The cycle belongs to the incarnation that produced it, and silently treating
+// the mismatch as absence would leave the router owning invisible work.
+func (s *agentSession) lifecycleOpenAgentCycle(ctx context.Context, cycle *agentCycle) error {
+	negotiated := s.agent.lifecycleNegotiated().Present()
+
 	s.lcMu.Lock()
 	defer s.lcMu.Unlock()
 
-	if s.lc.stream == nil || s.lc.turnID == "" {
-		return nil
+	if s.lc.stream == nil {
+		if !negotiated && !s.lc.negotiated.Present() {
+			return nil
+		}
+
+		return errLifecycleStreamFenced
+	}
+
+	if cycle == nil || s.lc.fenced || s.lc.closed {
+		return errLifecycleStreamFenced
+	}
+
+	if s.lc.generation != cycle.generation {
+		return fmt.Errorf("%w: native generation %d does not own lifecycle generation %d",
+			errLifecycleStreamFenced, cycle.generation, s.lc.generation)
+	}
+
+	if s.lc.turnID != "" {
+		return fmt.Errorf("%w: lifecycle foreground is already owned", errLifecycleStreamFenced)
+	}
+
+	if cycle.generation == 0 {
+		return fmt.Errorf("%w: agent cycle generation is absent", errLifecycleStreamFenced)
+	}
+
+	turnID, err := newLifecycleID("turn")
+	if err != nil {
+		return err
+	}
+
+	cycleID, err := newLifecycleID("cycle")
+	if err != nil {
+		return err
+	}
+
+	// Install ownership before delivery. A failed running transition is a lost
+	// cycle of this incarnation, not work whose identity never existed; the
+	// containment fence must therefore be able to retain these exact ids.
+	s.lc.turnID = turnID
+	s.lc.cycleID = cycleID
+	s.lc.origin = lifecycle.CauseActivity
+	cycle.turnID = turnID
+	cycle.cycleID = cycleID
+
+	if err := s.emitLifecycleLocked(ctx, lifecycle.AgentRunningEvent(cycleID, turnID)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// lifecycleSettleAgentCycle ends the agent-origin cycle with the outcome it
+// reached. It names the cycle's own identity rather than whatever the stream
+// holds now, so a cycle whose turn was already ended elsewhere is not ended
+// twice.
+func (s *agentSession) lifecycleSettleAgentCycle(ctx context.Context, cycle *agentCycle, verdict turnVerdict) error {
+	negotiated := s.agent.lifecycleNegotiated().Present()
+
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+
+	if s.lc.stream == nil {
+		if !negotiated && !s.lc.negotiated.Present() {
+			return nil
+		}
+
+		return errLifecycleStreamFenced
+	}
+
+	if cycle == nil || s.lc.fenced || s.lc.closed || s.lc.generation != cycle.generation {
+		return errLifecycleStreamFenced
+	}
+
+	if cycle.turnID == "" || cycle.cycleID == "" ||
+		s.lc.turnID != cycle.turnID || s.lc.cycleID != cycle.cycleID ||
+		s.lc.origin != lifecycle.CauseActivity {
+		return fmt.Errorf("%w: agent cycle does not own the lifecycle foreground", errLifecycleStreamFenced)
 	}
 
 	if err := s.terminalizeBlockersLocked(ctx); err != nil {
 		return err
 	}
 
-	turnID, cycleID := s.lc.turnID, s.lc.cycleID
-	s.lc.turnID = ""
+	if err := s.emitLifecycleLocked(ctx, lifecycle.IdleEventFor(
+		lifecycle.CauseActivity, cycle.cycleID, cycle.turnID, verdict.stopReason, verdict.outcome,
+	)); err != nil {
+		return err
+	}
 
-	return s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(cycleID, turnID, stopReason, outcome))
+	// Only a delivered terminal idle releases the identity. A delivery failure
+	// is an incarnation loss and fenceLifecycleLocked must still see the cycle.
+	s.lc.turnID = ""
+	s.lc.origin = ""
+
+	return nil
+}
+
+// lifecycleLossIdentity is the identity a generation-loss record names. A live
+// turn answers for itself; a turn a fence already retired answers with the
+// identity that fence kept, because the loss the relaunch path is about to
+// write down is exactly that turn's.
+func (s *agentSession) lifecycleLossIdentity() (string, string, string) {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+
+	if s.lc.stream == nil {
+		return "", "", ""
+	}
+
+	if s.lc.turnID != "" {
+		return s.lc.stream.ID(), s.lc.turnID, s.lc.cycleID
+	}
+
+	if s.lc.lostTurnID != "" {
+		return s.lc.stream.ID(), s.lc.lostTurnID, s.lc.lostCycleID
+	}
+
+	return s.lc.stream.ID(), "", s.lc.cycleID
+}
+
+// clearLifecycleLoss forgets a retired identity once its loss is durable. It
+// runs only after the commit, so a failed commit leaves the identity for the
+// retry that still owes the record.
+func (s *agentSession) clearLifecycleLoss() {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+
+	s.lc.lostTurnID = ""
+	s.lc.lostCycleID = ""
+}
+
+// lifecycleStreamID reports the incarnation a boundary record names, or the
+// empty string where the host negotiated no lifecycle stream.
+func (s *agentSession) lifecycleStreamID() string {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+
+	if s.lc.stream == nil {
+		return ""
+	}
+
+	return s.lc.stream.ID()
+}
+
+// lifecycleSettleTurn ends the accepted cycle with the outcome the turn
+// actually reached. Every blocker the cycle still holds terminalizes first: the
+// resolution is the reason the foreground may move.
+func (s *agentSession) lifecycleSettleTurn(ctx context.Context, stopReason string, outcome lifecycle.Outcome) error {
+	s.mu.Lock()
+	outbox := s.outbox
+	s.mu.Unlock()
+
+	s.lcMu.Lock()
+
+	if s.lc.stream == nil || s.lc.turnID == "" {
+		s.lcMu.Unlock()
+
+		return nil
+	}
+
+	if err := s.terminalizeBlockersLocked(ctx); err != nil {
+		s.lcMu.Unlock()
+
+		return errors.Join(err, s.containGenerationSync(ctx, outbox, "terminal lifecycle delivery failed"))
+	}
+
+	origin, err := s.lc.turnOriginLocked()
+	if err != nil {
+		s.fenceLifecycleLocked()
+		s.lcMu.Unlock()
+
+		return err
+	}
+
+	turnID, cycleID := s.lc.turnID, s.lc.cycleID
+
+	emitErr := s.emitLifecycleLocked(ctx, lifecycle.IdleEventFor(origin, cycleID, turnID, stopReason, outcome))
+	if emitErr == nil {
+		s.lc.turnID = ""
+		s.lc.origin = ""
+	}
+	s.lcMu.Unlock()
+
+	if emitErr != nil {
+		return errors.Join(emitErr, s.containGenerationSync(ctx, outbox, "terminal lifecycle delivery failed"))
+	}
+
+	return nil
+}
+
+func (l *lifecycleState) turnOriginLocked() (lifecycle.Cause, error) {
+	switch l.origin {
+	case lifecycle.CauseSubmission, lifecycle.CauseActivity:
+		return l.origin, nil
+	default:
+		return "", fmt.Errorf("%w: open lifecycle turn has no valid origin", errLifecycleStreamFenced)
+	}
 }
 
 // pendingAction is the lifecycle identity of one request awaiting an answer. It
@@ -199,17 +453,20 @@ func (s *agentSession) lifecycleSettleTurn(ctx context.Context, stopReason strin
 type pendingAction struct {
 	actionID string
 	streamID string
-	owner    lifecycle.Owner
+	// generation is the native process incarnation the owner turn ran on. An
+	// action captured for one incarnation is never announced on another, even
+	// where a later stream reuses the same identity space.
+	generation uint64
+	owner      lifecycle.Owner
+	outbox     *sessionOutbox
 }
 
 // prepareLifecycleAction mints the identity for one permission or elicitation
 // without publishing anything. Nothing is announced yet: the request that
 // answers the action goes on the wire first.
 //
-// There are three states here and only two of them are the same. With no
-// incarnation — the extension is not negotiated — or with the incarnation
-// already fenced, there is no stream to correlate against and the request goes
-// out plainly: that is the absence of the extension, not a hole in it.
+// With no negotiated incarnation the request goes out plainly. A fenced
+// negotiated incarnation is an ownership failure and refuses the request.
 //
 // A live incarnation with no open turn is neither. While version 1 is
 // negotiated the correlation is stamped on *every* permission and elicitation,
@@ -221,14 +478,41 @@ type pendingAction struct {
 // the pump refuses an unattributable dialog: the caller answers pi with a
 // native cancel rather than putting a correlation-less request on the wire.
 func (s *agentSession) prepareLifecycleAction() (pendingAction, bool, error) {
+	return s.prepareLifecycleActionFor(nil)
+}
+
+func (s *agentSession) prepareLifecycleActionFor(outbox *sessionOutbox) (pendingAction, bool, error) {
+	if outbox == nil {
+		s.mu.Lock()
+		outbox = s.outbox
+		s.mu.Unlock()
+	}
+
 	s.lcMu.Lock()
 	defer s.lcMu.Unlock()
 
-	if s.lc.stream == nil || s.lc.fenced {
-		return pendingAction{}, false, nil
+	if s.lc.stream == nil {
+		negotiated := s.lc.negotiated.Present()
+		if !negotiated && s.agent != nil {
+			negotiated = s.agent.lifecycleNegotiated().Present()
+		}
+
+		if !negotiated {
+			return pendingAction{}, false, nil
+		}
+
+		return pendingAction{}, false, errLifecycleStreamFenced
+	}
+
+	if s.lc.fenced || s.lc.closed {
+		return pendingAction{}, false, errLifecycleStreamFenced
 	}
 
 	if s.lc.turnID == "" {
+		return pendingAction{}, false, errLifecycleActionUnowned
+	}
+
+	if outbox != nil && outbox.generation != s.lc.generation {
 		return pendingAction{}, false, errLifecycleActionUnowned
 	}
 
@@ -238,16 +522,41 @@ func (s *agentSession) prepareLifecycleAction() (pendingAction, bool, error) {
 	}
 
 	return pendingAction{
-		actionID: actionID,
-		streamID: s.lc.stream.ID(),
-		owner:    lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: s.lc.turnID},
+		actionID:   actionID,
+		streamID:   s.lc.stream.ID(),
+		generation: s.lc.generation,
+		owner:      lifecycle.Owner{Type: lifecycle.OwnerTurn, ID: s.lc.turnID},
+		outbox:     outbox,
 	}, true, nil
+}
+
+// revokeLifecycleAction removes any blocker inserted before a failed
+// announcement fenced delivery. No compensating frame is emitted: the ordered
+// stream could not publish the announcement completely and is contained with
+// its exact native generation.
+func (s *agentSession) revokeLifecycleAction(action pendingAction) {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+
+	if s.lc.generation != action.generation {
+		return
+	}
+
+	delete(s.lc.blockers, action.actionID)
+	s.fenceLifecycleLocked()
 }
 
 // announceLifecycleAction publishes the ordered action for a request already on
 // the wire, plus the transition its blocking causes. A blocking action never
 // moves the foreground by itself, so the accompanying transition is emitted with
 // it and only for the first blocker of the cycle.
+//
+// The owner is authenticated against the live foreground, not merely against
+// the existence of one. An action captured while turn A held the foreground is
+// announced only while turn A still holds it on the same incarnation: a delayed
+// one arriving under turn B would otherwise block B's cycle on a request B
+// never caused and hand B a blocker it can never resolve. The refusal is what
+// makes the caller answer pi with a native cancel instead.
 func (s *agentSession) announceLifecycleAction(
 	ctx context.Context,
 	action pendingAction,
@@ -256,8 +565,13 @@ func (s *agentSession) announceLifecycleAction(
 	s.lcMu.Lock()
 	defer s.lcMu.Unlock()
 
-	if s.lc.stream == nil || s.lc.turnID == "" {
+	if s.lc.stream == nil {
 		return nil
+	}
+
+	if s.lc.fenced || s.lc.generation != action.generation ||
+		s.lc.stream.ID() != action.streamID || s.lc.turnID != action.owner.ID {
+		return errLifecycleActionUnowned
 	}
 
 	event := lifecycle.ActionEvent(action.actionID, kind, lifecycle.ActionPending, action.owner, true)
@@ -278,28 +592,55 @@ func (s *agentSession) announceLifecycleAction(
 // lifecycleResolveAction resolves an announced action exactly once and releases
 // the cycle when the last action blocking it resolves.
 func (s *agentSession) lifecycleResolveAction(ctx context.Context, actionID string, state lifecycle.ActionState) error {
+	s.mu.Lock()
+	outbox := s.outbox
+	s.mu.Unlock()
+
+	return s.lifecycleResolveCapturedAction(ctx, outbox, actionID, state)
+}
+
+func (s *agentSession) lifecycleResolveCapturedAction(
+	ctx context.Context,
+	outbox *sessionOutbox,
+	actionID string,
+	state lifecycle.ActionState,
+) error {
 	s.lcMu.Lock()
-	defer s.lcMu.Unlock()
 
 	if s.lc.stream == nil {
+		s.lcMu.Unlock()
+
 		return nil
 	}
 
 	if _, held := s.lc.blockers[actionID]; !held {
+		s.lcMu.Unlock()
+
 		return nil
+	}
+
+	if err := s.emitLifecycleLocked(ctx, lifecycle.ActionResolvedEvent(actionID, state)); err != nil {
+		s.lcMu.Unlock()
+
+		return errors.Join(err, s.containGenerationSync(ctx, outbox, "action resolution delivery failed"))
 	}
 
 	delete(s.lc.blockers, actionID)
 
-	if err := s.emitLifecycleLocked(ctx, lifecycle.ActionResolvedEvent(actionID, state)); err != nil {
-		return err
-	}
-
 	if len(s.lc.blockers) > 0 || s.lc.turnID == "" {
+		s.lcMu.Unlock()
+
 		return nil
 	}
 
-	return s.emitLifecycleLocked(ctx, lifecycle.RunningEvent(s.lc.cycleID, s.lc.turnID))
+	err := s.emitLifecycleLocked(ctx, lifecycle.RunningEvent(s.lc.cycleID, s.lc.turnID))
+	s.lcMu.Unlock()
+
+	if err != nil {
+		return errors.Join(err, s.containGenerationSync(ctx, outbox, "action resolution delivery failed"))
+	}
+
+	return nil
 }
 
 // terminalizeBlockersLocked cancels every action still blocking the cycle. A
@@ -308,11 +649,11 @@ func (s *agentSession) lifecycleResolveAction(ctx context.Context, actionID stri
 // would be a post-terminal mutation.
 func (s *agentSession) terminalizeBlockersLocked(ctx context.Context) error {
 	for actionID := range s.lc.blockers {
-		delete(s.lc.blockers, actionID)
-
 		if err := s.emitLifecycleLocked(ctx, lifecycle.ActionResolvedEvent(actionID, lifecycle.ActionCancelled)); err != nil {
 			return err
 		}
+
+		delete(s.lc.blockers, actionID)
 	}
 
 	return nil
@@ -337,10 +678,20 @@ func (s *agentSession) lifecycleTerminalizeOwned(ctx context.Context) error {
 		return nil
 	}
 
+	origin, err := s.lc.turnOriginLocked()
+	if err != nil {
+		s.fenceLifecycleLocked()
+
+		return err
+	}
+
 	turnID, cycleID := s.lc.turnID, s.lc.cycleID
 	s.lc.turnID = ""
+	s.lc.origin = ""
 
-	return s.emitLifecycleLocked(ctx, lifecycle.IdleEvent(cycleID, turnID, lifecycle.StopReasonCancelled, lifecycle.OutcomeCancelled))
+	return s.emitLifecycleLocked(ctx, lifecycle.IdleEventFor(
+		origin, cycleID, turnID, lifecycle.StopReasonCancelled, lifecycle.OutcomeCancelled,
+	))
 }
 
 // lifecycleCertifyBoundary states the quiescence fact a completed close
@@ -370,7 +721,11 @@ func (s *agentSession) lifecycleCertifyBoundary(ctx context.Context, barrier str
 // published, and a delivery that fails fences the incarnation rather than
 // leaving a gap the host cannot see.
 func (s *agentSession) emitLifecycleLocked(ctx context.Context, event lifecycle.Event) error {
-	if s.lc.fenced {
+	if s.lc.fenced || s.lc.quarantineErr != nil {
+		if s.lc.quarantineErr != nil {
+			return s.lc.quarantineErr
+		}
+
 		return errLifecycleStreamFenced
 	}
 
@@ -381,13 +736,72 @@ func (s *agentSession) emitLifecycleLocked(ctx context.Context, event lifecycle.
 		return err
 	}
 
-	if err := s.deliverLifecycleNotification(ctx, envelope); err != nil {
-		s.lc.fenced = true
+	generation := s.lc.generation
+	prior := s.lc.delivery
+	delivery := &lifecycleDeliveryFence{done: make(chan struct{})}
+	s.lc.delivery = delivery
 
-		return err
+	// Host I/O may block or ignore cancellation. The ordered delivery owner is
+	// retained in the chain, but it never retains lcMu while it waits.
+	s.lcMu.Unlock()
+
+	if prior != nil {
+		<-prior.done
+		err = prior.err
 	}
 
-	return nil
+	if err == nil {
+		err = s.deliverLifecycleNotification(ctx, envelope)
+	}
+
+	s.lcMu.Lock()
+
+	if s.lc.generation != generation {
+		err = errors.Join(err, errLifecycleStreamFenced)
+	}
+
+	if s.lc.quarantineErr != nil {
+		err = errors.Join(err, s.lc.quarantineErr)
+	}
+
+	if err != nil {
+		s.lc.fenced = true
+	}
+
+	delivery.err = err
+	close(delivery.done)
+
+	return err
+}
+
+func (s *agentSession) quarantineLifecycleGeneration(generation uint64, err error) {
+	if err == nil {
+		return
+	}
+
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+
+	if s.lc.generation != generation || s.lc.quarantineErr != nil {
+		return
+	}
+
+	s.lc.quarantineErr = errors.Join(pi.ErrProcessContainmentIncomplete, err)
+}
+
+func (s *agentSession) lifecycleGenerationQuarantine(generation uint64) error {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+
+	if s.lc.quarantineErr == nil {
+		return nil
+	}
+
+	if s.lc.generation != generation {
+		return errLifecycleStreamFenced
+	}
+
+	return s.lc.quarantineErr
 }
 
 // deliverLifecycleNotification writes one carrier notification. It carries the
@@ -395,6 +809,14 @@ func (s *agentSession) emitLifecycleLocked(ctx context.Context, event lifecycle.
 // envelope and the native message identity belong to notifications that mean
 // something on their own.
 func (s *agentSession) deliverLifecycleNotification(ctx context.Context, envelope map[string]any) error {
+	s.mu.Lock()
+	detached := s.lifecycleDeliveryDetached
+	s.mu.Unlock()
+
+	if detached {
+		return nil
+	}
+
 	s.agent.mu.Lock()
 	closed := s.agent.closed
 	conn := s.agent.conn
@@ -413,6 +835,12 @@ func (s *agentSession) deliverLifecycleNotification(ctx context.Context, envelop
 		SessionId: s.id,
 		Update:    lifecycleCarrier(),
 	})
+}
+
+func (s *agentSession) detachLifecycleDelivery() {
+	s.mu.Lock()
+	s.lifecycleDeliveryDetached = true
+	s.mu.Unlock()
 }
 
 // lifecycleActionMeta renders the action correlation value the agent stamps on

@@ -143,3 +143,19 @@ func TestForkExtensionStoreLimitAfterNativeClone(t *testing.T) {
 	close(client.events)
 	close(client.uiRequests)
 }
+
+func TestForkFailsClosedWhenOpeningCatalogIsRejected(t *testing.T) {
+	store := newFaultySessionStore()
+	appendForkParentRows(t, store,
+		json.RawMessage(`{"type":"session","id":"`+string(forkParentID)+`","cwd":"/cwd"}`),
+		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`[{"type":"text","text":"hi"}]`)}),
+	)
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: forkChildID}
+	agent := newStubClientAgent(t, client, WithSessionStore(store))
+	want := errors.New("fork opening catalog rejected")
+	agent.setConnection(&commandCatalogFailClient{directAgentClient: newDirectAgentClient(), want: want})
+
+	_, err := agent.handleForkSession(t.Context(), forkRaw(t, forkParams(t)))
+	require.ErrorIs(t, err, want)
+}

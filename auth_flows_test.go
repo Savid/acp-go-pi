@@ -334,6 +334,7 @@ func TestAbortWatchArrivingAfterTheFlowEndedIsAnsweredAtOnce(t *testing.T) {
 
 	exchange := harness.broker.registerExchange("ex-abort", flow)
 	require.NotNil(t, exchange)
+	bindTestAuthExchange(t, harness, exchange)
 
 	dialog := harness.deliver(t.Context(), pi.AuthMessage{ID: "ex-abort", Kind: pi.AuthKindCancel})
 	answer := harness.awaitAnswer(dialog)

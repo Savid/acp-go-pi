@@ -63,9 +63,11 @@ func TestSessionEstablishmentRejectsUnvalidatedOptions(t *testing.T) {
 	_, err := agent.NewSession(t.Context(), NewSessionRequest(t.TempDir()))
 
 	// The client is told which option the agent refuses to serve under and
-	// nothing else; the reason is the operator's, and it is in the log.
+	// nothing else. The log names only the fixed option field and never copies
+	// the detailed validation error.
 	requireUnsupportedOption(t, err, optionFieldImageLimits)
-	require.Contains(t, logs.String(), "MaxOutputBytesPerImage")
+	require.Contains(t, logs.String(), optionFieldImageLimits)
+	require.NotContains(t, logs.String(), "MaxOutputBytesPerImage")
 }
 
 func TestEffectiveOutputImageLimit(t *testing.T) {

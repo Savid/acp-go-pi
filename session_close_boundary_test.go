@@ -103,6 +103,69 @@ func TestSettleCloseBoundary(t *testing.T) {
 	})
 }
 
+func TestCloseBoundaryExactTerminalOwnershipEdges(t *testing.T) {
+	want := errors.New("close terminal delivery")
+
+	t.Run("quiescence delivery failure", func(t *testing.T) {
+		session, client := lifecycleSession(t, true)
+		require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+		client.updateErr = want
+		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+		require.ErrorIs(t, session.settleCloseBoundary(t.Context(), proc, nil), want)
+	})
+
+	t.Run("captured blockers are sorted", func(t *testing.T) {
+		session, _ := lifecycleSession(t, false)
+		require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+		require.NoError(t, session.lifecycleAcceptTurn(t.Context(), testSubmission()))
+		session.lc.blockers = map[string]struct{}{"z": {}, "a": {}}
+		terminal := session.prepareCloseLifecycleTerminal()
+		require.Equal(t, []string{"a", "z"}, terminal.blockers)
+	})
+
+	t.Run("ownership mutation fences publication", func(t *testing.T) {
+		session, _ := lifecycleSession(t, false)
+		require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+		terminal := session.prepareCloseLifecycleTerminal()
+		session.lc.generation++
+		err := session.publishCloseLifecycleTerminal(t.Context(), terminal)
+		require.ErrorContains(t, err, "ownership changed")
+		require.True(t, session.lc.fenced)
+	})
+
+	t.Run("blocker cancellation delivery failure", func(t *testing.T) {
+		session, client := lifecycleSession(t, false)
+		require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+		require.NoError(t, session.lifecycleAcceptTurn(t.Context(), testSubmission()))
+		action, ok, err := session.prepareLifecycleAction()
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.NoError(t, session.announceLifecycleAction(t.Context(), action, lifecycle.ActionPermission))
+		terminal := session.prepareCloseLifecycleTerminal()
+		client.updateErr = want
+		require.ErrorIs(t, session.publishCloseLifecycleTerminal(t.Context(), terminal), want)
+		require.Contains(t, session.lc.blockers, action.actionID)
+	})
+
+	t.Run("idle delivery fails after exact blockers are removed", func(t *testing.T) {
+		session, base := lifecycleSession(t, false)
+		require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+		require.NoError(t, session.lifecycleAcceptTurn(t.Context(), testSubmission()))
+		action, ok, err := session.prepareLifecycleAction()
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.NoError(t, session.announceLifecycleAction(t.Context(), action, lifecycle.ActionPermission))
+		terminal := session.prepareCloseLifecycleTerminal()
+		session.agent.conn = &lifecycleIdleFailureClient{directAgentClient: base, want: want}
+		require.ErrorIs(t, session.publishCloseLifecycleTerminal(t.Context(), terminal), want)
+		require.Empty(t, session.lc.blockers)
+		require.NotEmpty(t, session.lc.turnID)
+	})
+
+	require.False(t, sameLifecycleBlockers(map[string]struct{}{"a": {}}, nil))
+	require.False(t, sameLifecycleBlockers(map[string]struct{}{"a": {}}, []string{"b"}))
+}
+
 // TestCloseSettlesOnAFencedOrNeverOpenedIncarnation pins the branch of the
 // close-fenced order that runs when there is no live incarnation to speak on. A
 // cancel or an incarnation loss already fenced the stream, and a session between
@@ -316,6 +379,7 @@ func TestAgentCloseOwesTheSameDurableRungAsAWireClose(t *testing.T) {
 			sessionRoot:     root,
 			sessionFilePath: sessionFile,
 		}
+		attachTestNativeBoundary(session)
 		agent.sessions["embedded"] = session
 		require.NoError(t, session.openLifecycleStream(t.Context(), 1))
 

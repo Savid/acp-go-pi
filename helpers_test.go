@@ -53,6 +53,59 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 	return agent
 }
 
+// testNativeDialog binds legacy unit-test entry points to the exact native
+// generation they arrange. Production dialog delivery has no unbound adapter.
+func testNativeDialog(session *agentSession, request pi.UIRequest) *nativeDialog {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	return &nativeDialog{request: request, outbox: session.outbox, client: session.client}
+}
+
+func (s *agentSession) handleUIDialog(ctx context.Context, request pi.UIRequest) {
+	s.handleNativeUIDialog(ctx, testNativeDialog(s, request))
+}
+
+func (s *agentSession) handleElicitationDialog(ctx context.Context, request pi.UIRequest) {
+	s.handleNativeElicitationDialog(ctx, testNativeDialog(s, request))
+}
+
+func (s *agentSession) createDialogElicitation(
+	ctx context.Context,
+	conn agentClient,
+	request pi.UIRequest,
+) (pi.UIResponse, bool) {
+	return s.createBoundDialogElicitation(ctx, conn, testNativeDialog(s, request))
+}
+
+func (s *agentSession) requestPermissionAnswer(
+	ctx context.Context,
+	request pi.UIRequest,
+	prompt pi.PermissionPrompt,
+) string {
+	return s.requestBoundPermissionAnswer(ctx, testNativeDialog(s, request), prompt)
+}
+
+func announcedActionRequest[T any](
+	ctx context.Context,
+	session *agentSession,
+	kind lifecycle.ActionKind,
+	send func(context.Context, map[string]any) (T, error),
+	resolved func(T, error) lifecycle.ActionState,
+	failNativeCallbacks ...func(),
+) (T, error) {
+	session.mu.Lock()
+	outbox := session.outbox
+	session.mu.Unlock()
+
+	var failNative func()
+	if len(failNativeCallbacks) > 0 {
+		failNative = failNativeCallbacks[0]
+	}
+
+	return announcedBoundActionRequest(ctx, session, kind, send, resolved, outbox, failNative)
+}
+
 func testContainmentOption() Option {
 	return func(*Options) {}
 }
@@ -293,6 +346,158 @@ func newStubProcess(exited bool) *stubProcess {
 	return process
 }
 
+func (s *agentSession) reservePromptForeground(delivery *turnDelivery) error {
+	if err := s.claimPromptForeground(context.Background(), delivery); err != nil {
+		return err
+	}
+
+	if _, _, err := s.reserveClaimedPromptForeground(delivery); err != nil {
+		s.finishPromptForeground(delivery)
+
+		return err
+	}
+
+	return nil
+}
+
+func reserveOutboxPrompt(outbox *sessionOutbox, delivery *turnDelivery) error {
+	if err := outbox.claimPromptAdmission(delivery); err != nil {
+		return err
+	}
+
+	if err := outbox.reserveClaimed(delivery); err != nil {
+		outbox.releasePromptAdmission(delivery)
+
+		return err
+	}
+
+	return nil
+}
+
+func bindTestOutbox(session *agentSession) *sessionOutbox {
+	outbox := newTestSessionOutbox(1)
+	if err := outbox.bindRuntime(session.proc, session.client, nil, nil, session.providerProcessRoot, outbox.nativeBoundary); err != nil {
+		panic(err)
+	}
+	session.outbox = outbox
+	session.pumpGeneration = 1
+	if session.nativeBoundary == nil {
+		session.nativeBoundary = outbox.nativeBoundary
+	}
+
+	return outbox
+}
+
+// attachTestNativeBoundary gives manually assembled legacy fixtures an exact
+// construction-owned native boundary. Production constructors must never mint
+// this owner implicitly.
+func attachTestNativeBoundary(session *agentSession) *agentSession {
+	if session == nil || session.nativeBoundary != nil {
+		return session
+	}
+	if session.outbox != nil && session.outbox.nativeBoundary != nil {
+		session.nativeBoundary = session.outbox.nativeBoundary
+	} else {
+		session.nativeBoundary = newNativeBoundaryTracker()
+	}
+
+	return session
+}
+
+func newTestSessionOutbox(generation uint64) *sessionOutbox {
+	outbox := newSessionOutbox(generation, newNativeBoundaryTracker())
+	outbox.established = true
+	outbox.finishEstablishmentLocked()
+
+	return outbox
+}
+
+func bindTestRuntime(
+	outbox *sessionOutbox,
+	process piProcess,
+	client piClient,
+	cancel context.CancelFunc,
+	done chan struct{},
+	root *providerProcessRoot,
+) {
+	if err := outbox.bindRuntime(process, client, cancel, done, root, outbox.nativeBoundary); err != nil {
+		panic(err)
+	}
+}
+
+func bindTestEstablishingOutbox(session *agentSession, generation uint64, process piProcess, client piClient) *sessionOutbox {
+	boundary := newNativeBoundaryTracker()
+	outbox := newSessionOutbox(generation, boundary)
+	if err := outbox.bindRuntime(process, client, nil, nil, nil, boundary); err != nil {
+		panic(err)
+	}
+	session.proc = process
+	session.client = client
+	session.nativeBoundary = boundary
+	session.outbox = outbox
+	session.pumpGeneration = generation
+
+	return outbox
+}
+
+func establishTestSession(session *agentSession) {
+	if session == nil || session.outbox == nil {
+		return
+	}
+
+	session.outbox.mu.Lock()
+	session.outbox.openingAccepted = true
+	session.outbox.established = true
+	session.outbox.finishEstablishmentLocked()
+	session.outbox.mu.Unlock()
+}
+
+func startTestPump(session *agentSession, client piClient) uint64 {
+	if session.nativeBoundary == nil {
+		session.nativeBoundary = newNativeBoundaryTracker()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	generation, err := session.startPumpContext(ctx, cancel, client, session.nativeBoundary)
+	if err != nil {
+		panic(err)
+	}
+	session.mu.Lock()
+	outbox := session.outbox
+	session.mu.Unlock()
+	outbox.mu.Lock()
+	outbox.established = true
+	outbox.finishEstablishmentLocked()
+	outbox.mu.Unlock()
+
+	return generation
+}
+
+func (o *sessionOutbox) currentCycle() *agentCycle {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return o.cycle
+}
+
+func (o *sessionOutbox) nativeQueueDrained() bool {
+	if o == nil {
+		return true
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return o.nativeQueueDepth == 0
+}
+
+func (s *agentSession) activeTurnDelivery() *turnDelivery {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.turnEvents
+}
+
 func (*stubProcess) CloseStdin() error { return nil }
 func (p *stubProcess) Exited() <-chan struct{} {
 	if p.onExited != nil {
@@ -429,46 +634,57 @@ func (s *errorSessionStore) Delete(context.Context, SessionKey) error {
 }
 
 type stubPiClient struct {
-	mu            sync.Mutex
-	events        chan pi.Event
-	eventsFunc    func() <-chan pi.Event
-	uiRequests    chan pi.UIRequest
-	done          chan struct{}
-	err           error
-	abortErr      error
-	abortFunc     func(context.Context) error
-	promptErr     error
-	promptFunc    func(context.Context, string) error
-	respondErr    error
-	respondFunc   func(pi.UIResponse)
-	responses     []pi.UIResponse
-	stats         pi.SessionStats
-	statsErr      error
-	model         pi.Model
-	setModelErr   error
-	setModelFunc  func(provider string, id string)
-	thinkingErr   error
-	thinkingFunc  func(level string)
-	startErr      error
-	cloneCancel   bool
-	cloneErr      error
-	autoRetryErr  error
-	autoRetrySet  []bool
-	state         pi.SessionState
-	stateErr      error
-	stateErrAfter int
-	stateCalls    int
-	models        []pi.Model
-	modelsErr     error
-	commands      []pi.SlashCommand
-	commandsErr   error
+	mu              sync.Mutex
+	events          chan pi.Event
+	eventsFunc      func() <-chan pi.Event
+	uiRequests      chan pi.UIRequest
+	boundaries      chan pi.ResponseBoundary
+	done            chan struct{}
+	err             error
+	abortErr        error
+	abortFunc       func(context.Context) error
+	promptErr       error
+	promptFunc      func(context.Context, string) error
+	promptWriteFunc func(context.Context, string) error
+	afterAccepted   func()
+	respondErr      error
+	respondFunc     func(pi.UIResponse)
+	responses       []pi.UIResponse
+	stats           pi.SessionStats
+	statsErr        error
+	model           pi.Model
+	setModelErr     error
+	setModelFunc    func(provider string, id string)
+	thinkingErr     error
+	thinkingFunc    func(level string)
+	startErr        error
+	startFunc       func(context.Context) error
+	cloneCancel     bool
+	cloneErr        error
+	autoRetryErr    error
+	autoRetryFunc   func(context.Context, bool) error
+	autoRetrySet    []bool
+	state           pi.SessionState
+	stateErr        error
+	stateErrAfter   int
+	stateCalls      int
+	models          []pi.Model
+	modelsErr       error
+	commands        []pi.SlashCommand
+	commandsErr     error
 }
 
 func newStubPiClient() *stubPiClient {
 	return &stubPiClient{events: make(chan pi.Event), uiRequests: make(chan pi.UIRequest), done: make(chan struct{})}
 }
 
-func (c *stubPiClient) Start(context.Context) error { return c.startErr }
+func (c *stubPiClient) Start(ctx context.Context) error {
+	if c.startFunc != nil {
+		return c.startFunc(ctx)
+	}
+
+	return c.startErr
+}
 func (c *stubPiClient) Events() <-chan pi.Event {
 	if c.eventsFunc != nil {
 		return c.eventsFunc()
@@ -477,8 +693,11 @@ func (c *stubPiClient) Events() <-chan pi.Event {
 	return c.events
 }
 func (c *stubPiClient) UIRequests() <-chan pi.UIRequest { return c.uiRequests }
-func (c *stubPiClient) Done() <-chan struct{}           { return c.done }
-func (c *stubPiClient) Err() error                      { return c.err }
+func (c *stubPiClient) ResponseBoundaries() <-chan pi.ResponseBoundary {
+	return c.boundaries
+}
+func (c *stubPiClient) Done() <-chan struct{} { return c.done }
+func (c *stubPiClient) Err() error            { return c.err }
 func (c *stubPiClient) RespondUI(response pi.UIResponse) error {
 	c.mu.Lock()
 	c.responses = append(c.responses, response)
@@ -492,11 +711,59 @@ func (c *stubPiClient) RespondUI(response pi.UIResponse) error {
 	return c.respondErr
 }
 func (c *stubPiClient) Prompt(ctx context.Context, message string, _ []pi.ImageContent) error {
-	if c.promptFunc != nil {
-		return c.promptFunc(ctx, message)
+	return c.PromptWithBoundary(ctx, message, nil, pi.CallBoundary{})
+}
+func (c *stubPiClient) PromptWithBoundary(
+	ctx context.Context,
+	message string,
+	_ []pi.ImageContent,
+	boundary pi.CallBoundary,
+) error {
+	var release func()
+	if boundary.BeforeDispatch != nil {
+		var err error
+
+		release, err = boundary.BeforeDispatch()
+		if err != nil {
+			return err
+		}
 	}
 
-	return c.promptErr
+	if c.promptWriteFunc != nil {
+		if err := c.promptWriteFunc(ctx, message); err != nil {
+			if release != nil {
+				release()
+			}
+
+			return err
+		}
+	}
+
+	if release != nil {
+		release()
+	}
+
+	var err error
+	if c.promptFunc != nil {
+		err = c.promptFunc(ctx, message)
+	} else {
+		err = c.promptErr
+	}
+	if err != nil {
+		return err
+	}
+
+	if boundary.Accepted != nil {
+		if err := boundary.Accepted(ctx); err != nil {
+			return err
+		}
+	}
+
+	if c.afterAccepted != nil {
+		c.afterAccepted()
+	}
+
+	return nil
 }
 func (c *stubPiClient) Abort(ctx context.Context) error {
 	if c.abortFunc != nil {
@@ -519,6 +786,15 @@ func (c *stubPiClient) GetState(context.Context) (pi.SessionState, error) {
 
 	return c.state, nil
 }
+func (c *stubPiClient) GetStateWithBoundary(ctx context.Context, boundary pi.CallBoundary) (pi.SessionState, error) {
+	release, err := runStubCallBoundary(boundary)
+	if err != nil {
+		return pi.SessionState{}, err
+	}
+	release()
+
+	return c.GetState(ctx)
+}
 func (c *stubPiClient) GetAvailableModels(context.Context) ([]pi.Model, error) {
 	return c.models, c.modelsErr
 }
@@ -528,6 +804,20 @@ func (c *stubPiClient) SetModel(_ context.Context, provider string, id string) (
 	}
 
 	return c.model, c.setModelErr
+}
+func (c *stubPiClient) SetModelWithBoundary(
+	ctx context.Context,
+	provider string,
+	id string,
+	boundary pi.CallBoundary,
+) (pi.Model, error) {
+	release, err := runStubCallBoundary(boundary)
+	if err != nil {
+		return pi.Model{}, err
+	}
+	release()
+
+	return c.SetModel(ctx, provider, id)
 }
 func (c *stubPiClient) SetThinkingLevel(_ context.Context, level string) error {
 	if c.thinkingFunc != nil {
@@ -550,8 +840,36 @@ func (c *stubPiClient) SetThinkingLevel(_ context.Context, level string) error {
 
 	return nil
 }
-func (c *stubPiClient) SetAutoRetry(_ context.Context, enabled bool) error {
+func (c *stubPiClient) SetThinkingLevelWithBoundary(ctx context.Context, level string, boundary pi.CallBoundary) error {
+	release, err := runStubCallBoundary(boundary)
+	if err != nil {
+		return err
+	}
+	release()
+
+	return c.SetThinkingLevel(ctx, level)
+}
+
+func runStubCallBoundary(boundary pi.CallBoundary) (func(), error) {
+	if boundary.BeforeDispatch == nil {
+		return func() {}, nil
+	}
+
+	release, err := boundary.BeforeDispatch()
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		release = func() {}
+	}
+
+	return release, nil
+}
+func (c *stubPiClient) SetAutoRetry(ctx context.Context, enabled bool) error {
 	c.autoRetrySet = append(c.autoRetrySet, enabled)
+	if c.autoRetryFunc != nil {
+		return c.autoRetryFunc(ctx, enabled)
+	}
 
 	return c.autoRetryErr
 }

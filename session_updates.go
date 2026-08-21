@@ -131,6 +131,31 @@ func (s *agentSession) emitOptionalUpdates(ctx context.Context, updates []acp.Se
 }
 
 func (s *agentSession) emitAvailableCommandsUpdate(ctx context.Context, force bool) error {
+	return s.emitAvailableCommandsUpdateWith(ctx, force, s.emitOptionalUpdates)
+}
+
+// emitRequiredAvailableCommandsUpdate is the construction/opening form. The
+// explicit catalog, including an empty one, is part of the session-open
+// snapshot and cannot be suppressed merely because the connection refused it.
+func (s *agentSession) emitRequiredAvailableCommandsUpdate(ctx context.Context) error {
+	return s.emitAvailableCommandsUpdateWith(ctx, true, func(ctx context.Context, updates []acp.SessionUpdate) error {
+		err := s.emitUpdates(ctx, updates)
+		// Direct embedded callers have no ACP notification transport to receive
+		// the catalog on. That is absence of a delivery surface, not refusal by
+		// an attached host; once a connection exists, every failure is required.
+		if errors.Is(err, errACPConnectionNotAttached) {
+			return nil
+		}
+
+		return err
+	})
+}
+
+func (s *agentSession) emitAvailableCommandsUpdateWith(
+	ctx context.Context,
+	force bool,
+	emitUpdates func(context.Context, []acp.SessionUpdate) error,
+) error {
 	current := availableCommandsFromNative(s.commands())
 
 	s.mu.Lock()
@@ -157,7 +182,7 @@ func (s *agentSession) emitAvailableCommandsUpdate(ctx context.Context, force bo
 		return nil
 	}
 
-	if err := s.emitOptionalUpdates(ctx, emit); err != nil {
+	if err := emitUpdates(ctx, emit); err != nil {
 		return err
 	}
 
@@ -288,25 +313,92 @@ func (s *agentSession) poisonedError() error {
 	return poisonedSessionError(s.poisonCause)
 }
 
-func (s *agentSession) poison(ctx context.Context, cause string) error {
+func (s *agentSession) admissionFenceError(ctx context.Context) error {
 	s.mu.Lock()
-	if s.poisonCause != "" {
-		cause = s.poisonCause
-		s.mu.Unlock()
+	cause := s.poisonCause
+	closing := s.closing
+	outboxes := append([]*sessionOutbox(nil), s.containmentOutboxes...)
+	closeAttempt := s.closeAttempt
+	s.mu.Unlock()
 
-		return poisonedSessionError(cause)
+	if cause == "" && !closing {
+		return nil
 	}
 
-	s.poisonCause = cause
-	cancel := s.cancel
+	var fenceErr error
+	if cause != "" {
+		fenceErr = poisonedSessionError(cause)
+	} else {
+		fenceErr = unknownSessionError()
+	}
+
+	containmentErr := awaitGenerationContainments(outboxes)
+	if closing && len(outboxes) == 0 && closeAttempt != nil {
+		containmentErr = errors.Join(containmentErr, s.awaitClose(closeAttempt))
+	}
+
+	return errors.Join(fenceErr, containmentErr, ctx.Err())
+}
+
+func (s *agentSession) awaitPoisonContainment() error {
+	s.mu.Lock()
+	outboxes := append([]*sessionOutbox(nil), s.containmentOutboxes...)
+	s.mu.Unlock()
+
+	return awaitGenerationContainments(outboxes)
+}
+
+func awaitGenerationContainments(outboxes []*sessionOutbox) error {
+	var containmentErr error
+
+	for _, outbox := range outboxes {
+		joined, _ := outbox.awaitContainment()
+		containmentErr = errors.Join(containmentErr, joined)
+	}
+
+	return containmentErr
+}
+
+func (s *agentSession) poison(ctx context.Context, cause string) error {
+	if outbox := s.outboxRouter(); outbox != nil {
+		s.containGeneration(ctx, outbox, cause)
+
+		return s.admissionFenceError(ctx)
+	}
+
+	s.mu.Lock()
+	cause, first, cancel := s.installPoisonLocked(cause)
 	s.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
 
+	if first {
+		s.reportPoison(ctx, cause)
+	}
+
+	return poisonedSessionError(cause)
+}
+
+// installPoisonLocked publishes the permanent admission cause. Callers that
+// also fence a native router do both while holding the session and outbox locks,
+// so no prompt can observe one half of containment without the other.
+func (s *agentSession) installPoisonLocked(cause string) (string, bool, context.CancelFunc) {
+	if s.poisonCause != "" {
+		return s.poisonCause, false, s.cancel
+	}
+
+	s.poisonCause = cause
+
+	return cause, true, s.cancel
+}
+
+// reportPoison performs the observable, potentially blocking half after the
+// cause is already an admission fence.
+func (s *agentSession) reportPoison(ctx context.Context, cause string) {
 	if s.agent == nil {
-		return poisonedSessionError(cause)
+		return
 	}
 
 	s.agent.log.ErrorContext(ctx, "poison pi session after native invariant violation",
@@ -317,11 +409,8 @@ func (s *agentSession) poison(ctx context.Context, cause string) error {
 	if err := s.emitClearAvailableCommandsUpdate(ctx); err != nil {
 		s.agent.log.ErrorContext(ctx, "clear available pi commands after poison failed",
 			slog.String(acpFieldSessionID, string(s.id)),
-			slog.String(jsonFieldError, err.Error()),
 		)
 	}
-
-	return poisonedSessionError(cause)
 }
 
 func poisonedSessionError(cause string) error {

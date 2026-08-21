@@ -180,13 +180,16 @@ func TestSessionUpdateEmissionAndPoisoning(t *testing.T) {
 }
 
 func TestClearCommandsAndPoisonEmitFailures(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	const secret = "clear-command-client-error-secret-sentinel"
+	logs := &strings.Builder{}
+	agent := NewAgent(WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
 	client := newDirectAgentClient()
 	agent.setConnection(client)
 	session := &agentSession{agent: agent, id: "id", advertisedCommands: []acp.AvailableCommand{{Name: "one"}}}
-	client.updateErr = errors.New("clear")
+	client.updateErr = errors.New(secret)
 	require.Error(t, session.emitClearAvailableCommandsUpdate(t.Context()))
 	require.Error(t, session.poison(t.Context(), "broken"))
+	require.NotContains(t, logs.String(), secret)
 	require.Equal(t, "text", liveSessionTitleFromPrompt([]acp.ContentBlock{{}, acp.TextBlock("text")}))
 }
 

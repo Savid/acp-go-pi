@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +25,18 @@ type dispatcherParams struct {
 type actionWriteFailureWriter struct {
 	err   error
 	short bool
+}
+
+type actionPanicWriter struct {
+	written *[]byte
+}
+
+func (w actionPanicWriter) Write(data []byte) (int, error) {
+	if w.written != nil {
+		*w.written = append(*w.written, data...)
+	}
+
+	panic("transport writer secret")
 }
 
 func (w actionWriteFailureWriter) Write(data []byte) (int, error) {
@@ -46,6 +59,31 @@ type dispatcherClient struct {
 	done         chan struct{}
 	updateErr    error
 	updateCtxErr error
+}
+
+type blockingOpeningClient struct {
+	*directAgentClient
+	entered  chan struct{}
+	release  chan struct{}
+	returned chan struct{}
+	once     sync.Once
+}
+
+func (c *blockingOpeningClient) SessionUpdate(ctx context.Context, notification acp.SessionNotification) error {
+	blocked := false
+	c.once.Do(func() {
+		blocked = true
+		close(c.entered)
+	})
+	if blocked {
+		<-c.release
+		close(c.returned)
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+
+	return c.directAgentClient.SessionUpdate(ctx, notification)
 }
 
 func (c *dispatcherClient) Done() <-chan struct{} {
@@ -291,8 +329,8 @@ func TestPostResponseHooksMatchSuccessfulResponses(t *testing.T) {
 
 	firstRan := make(chan struct{})
 	secondRan := make(chan struct{})
-	hooks.enqueue("1", func() { close(firstRan) })
-	hooks.enqueue("2", func() { close(secondRan) })
+	hooks.enqueue("1", func() (func(), bool) { return func() { close(firstRan) }, true })
+	hooks.enqueue("2", func() (func(), bool) { return func() { close(secondRan) }, true })
 
 	hooks.runAfterResponseWrite([]byte(`{"jsonrpc":"2.0","id":2,"error":{"code":-32603}}`))
 	hooks.runAfterResponseWrite([]byte(`{"jsonrpc":"2.0","result":{}}`))
@@ -321,6 +359,12 @@ func TestPostResponseHooksMatchSuccessfulResponses(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first hook did not run")
 	}
+
+	hooks.enqueue("4", func() (func(), bool) { return nil, false })
+	hooks.runAfterResponseWrite([]byte(`{"jsonrpc":"2.0","id":4,"result":{}}`))
+	hooks.mu.Lock()
+	require.Empty(t, hooks.all)
+	hooks.mu.Unlock()
 }
 
 func TestLifecycleCommandHookErrors(t *testing.T) {
@@ -332,7 +376,8 @@ func TestLifecycleCommandHookErrors(t *testing.T) {
 		`{"sessionId":"missing","_acp_go_pi_post_response_hook_id":"response"}`,
 	), nil)
 	require.Len(t, missing.hooks.all, 1)
-	missing.hooks.all[0].run()
+	_, admitted := missing.hooks.all[0].admit()
+	require.False(t, admitted)
 
 	untagged := &localAgentConnection{agent: missingAgent, hooks: &postResponseHooks{}}
 	untagged.enqueueLifecycleCommandHook(t.Context(), acp.AgentMethodSessionLoad, json.RawMessage(
@@ -344,7 +389,7 @@ func TestLifecycleCommandHookErrors(t *testing.T) {
 	client := &dispatcherClient{done: make(chan struct{}), updateErr: updateErr}
 	agent := NewAgent(WithLogger(logger))
 	agent.conn = client
-	agent.sessions["session"] = &agentSession{
+	session := &agentSession{
 		agent: agent,
 		id:    "session",
 		availableCommands: []pi.SlashCommand{{
@@ -352,6 +397,9 @@ func TestLifecycleCommandHookErrors(t *testing.T) {
 			Description: "Show help",
 		}},
 	}
+	session.outbox = newTestSessionOutbox(1)
+	session.outbox.generationDone = t.Context().Done()
+	agent.sessions["session"] = session
 	conn := &localAgentConnection{agent: agent, hooks: &postResponseHooks{}}
 	canceledCtx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -359,8 +407,65 @@ func TestLifecycleCommandHookErrors(t *testing.T) {
 		`{"sessionId":"session","_acp_go_pi_post_response_hook_id":"response"}`,
 	), nil)
 	require.Len(t, conn.hooks.all, 1)
-	conn.hooks.all[0].run()
+	run, admitted := conn.hooks.all[0].admit()
+	require.True(t, admitted)
+	run()
 	require.NoError(t, client.updateCtxErr)
+
+	closedSession := &agentSession{agent: agent, id: "closed-session", closing: true}
+	closedSession.outbox = newTestSessionOutbox(2)
+	agent.sessions[closedSession.id] = closedSession
+	closedConn := &localAgentConnection{agent: agent, hooks: &postResponseHooks{}}
+	closedConn.enqueueLifecycleCommandHook(t.Context(), acp.AgentMethodSessionLoad, json.RawMessage(
+		`{"sessionId":"closed-session","_acp_go_pi_post_response_hook_id":"closed"}`,
+	), nil)
+	require.Len(t, closedConn.hooks.all, 1)
+	_, admitted = closedConn.hooks.all[0].admit()
+	require.False(t, admitted)
+}
+
+func TestBlockedPostResponseHookCannotVetoCloseOrContinueAfterRelease(t *testing.T) {
+	originalWait := sessionCloseTurnWaitContext
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		bounded, cancel := context.WithCancel(ctx)
+		cancel()
+
+		return bounded, func() {}
+	}
+	t.Cleanup(func() { sessionCloseTurnWaitContext = originalWait })
+
+	host := &blockingOpeningClient{
+		directAgentClient: newDirectAgentClient(),
+		entered:           make(chan struct{}),
+		release:           make(chan struct{}),
+		returned:          make(chan struct{}),
+	}
+	agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
+	agent.conn = host
+	process := newStubProcess(false)
+	native := newStubPiClient()
+	session := &agentSession{agent: agent, id: "session", proc: process, client: native}
+	outbox := bindTestEstablishingOutbox(session, 1, process, native)
+	generationCtx, cancelGeneration := context.WithCancel(context.Background())
+	outbox.generationDone = generationCtx.Done()
+	outbox.pumpCancel = cancelGeneration
+	agent.sessions[session.id] = session
+
+	conn := &localAgentConnection{agent: agent, hooks: &postResponseHooks{log: agent.log}}
+	conn.enqueueLifecycleCommandHook(t.Context(), acp.AgentMethodSessionLoad, json.RawMessage(
+		`{"sessionId":"session","_acp_go_pi_post_response_hook_id":"1"}`,
+	), nil)
+	conn.hooks.runAfterResponseWrite([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	<-host.entered
+
+	require.ErrorIs(t, session.Close(t.Context()), pi.ErrProcessContainmentIncomplete)
+	require.Equal(t, 1, process.shutdownCalls)
+	require.Equal(t, 1, process.closeCalls)
+	require.Nil(t, session.lc.stream)
+	close(host.release)
+	<-host.returned
+	require.NoError(t, outbox.producers.waitChildren(t.Context()))
+	require.Nil(t, session.lc.stream, "late hook release opened lifecycle state")
 }
 
 func TestLocalAgentConnectionClientCallErrors(t *testing.T) {
@@ -448,6 +553,38 @@ func TestActionRequestWriteTracking(t *testing.T) {
 	require.ErrorIs(t, err, io.ErrShortWrite)
 	require.ErrorIs(t, <-ack, io.ErrShortWrite)
 	requests.resolve("unknown", nil)
+
+	for _, test := range []struct {
+		name        string
+		fullWrite   bool
+		wantWritten bool
+	}{
+		{name: "panic before request bytes"},
+		{name: "panic after full request", fullWrite: true, wantWritten: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := newActionRequestWrites()
+			acked := make(chan error, 1)
+			require.NoError(t, requests.register("action", func(err error) { acked <- err }))
+			var written []byte
+			var sink *[]byte
+			if test.fullWrite {
+				sink = &written
+			}
+			writer := &actionRequestWriteWriter{writer: actionPanicWriter{written: sink}, requests: requests}
+
+			n, panicErr := writer.Write(payload)
+			require.Zero(t, n)
+			require.ErrorIs(t, panicErr, errLifecycleActionRequest)
+			require.ErrorIs(t, <-acked, errLifecycleActionRequest)
+			require.NotContains(t, panicErr.Error(), "transport writer secret")
+			if test.wantWritten {
+				require.Equal(t, payload, written)
+			} else {
+				require.Empty(t, written)
+			}
+		})
+	}
 
 	require.Empty(t, outboundLifecycleActionID(json.RawMessage(`not-json`)))
 	require.Empty(t, outboundLifecycleActionID(json.RawMessage(`{"id":1,"method":"other"}`)))

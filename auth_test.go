@@ -78,6 +78,7 @@ func newAuthHarness(t *testing.T, opts ...Option) *authHarness {
 
 	session, err := agent.startAndStoreSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	require.NoError(t, err)
+	establishTestSession(session)
 
 	harness.agent = agent
 	harness.broker = agent.providerAuth
@@ -107,6 +108,16 @@ func newAuthHarness(t *testing.T, opts ...Option) *authHarness {
 	return harness
 }
 
+func bindTestAuthExchange(t *testing.T, harness *authHarness, exchange *authExchange) {
+	t.Helper()
+
+	bound, ok := harness.broker.bindExchange(
+		exchange.id, harness.client, harness.session.outbox.generation,
+	)
+	require.True(t, ok)
+	require.Same(t, exchange, bound)
+}
+
 func decodeAuthCommand(message string) (pi.AuthRequest, error) {
 	payload, found := strings.CutPrefix(message, "/"+pi.AuthCommandName+" ")
 	if !found {
@@ -129,7 +140,10 @@ func (h *authHarness) scriptBridge(reply func(ctx context.Context, request pi.Au
 // dialog id so a test can wait for the answer the broker wrote back.
 func (h *authHarness) deliver(ctx context.Context, message pi.AuthMessage) string {
 	request := h.dialogRequest(message)
-	h.broker.handleAuthDialog(ctx, h.session, request)
+	h.session.mu.Lock()
+	outbox := h.session.outbox
+	h.session.mu.Unlock()
+	h.broker.handleAuthDialog(ctx, h.session, outbox, request)
 
 	return request.ID
 }
@@ -330,7 +344,8 @@ func TestRequestedProviderAuthResidenceFailsInitializationWhenIncompleteOrUnusab
 		_, err := agent.Initialize(t.Context(), defaultInitializeRequest())
 		requireUnsupportedOption(t, err, optionFieldProviderAuthRoot)
 		requireUnsupportedOption(t, agent.sessionStartConfigurationError(), optionFieldProviderAuthRoot)
-		require.Contains(t, logs.String(), test.want, test.name)
+		require.Contains(t, logs.String(), optionFieldProviderAuthRoot, test.name)
+		require.NotContains(t, logs.String(), test.want, test.name)
 		require.Nil(t, agent.providerAuth)
 	}
 }

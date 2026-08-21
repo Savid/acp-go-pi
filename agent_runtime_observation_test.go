@@ -42,7 +42,9 @@ func TestRuntimeObservationHooksComposeExactLifetimes(t *testing.T) {
 
 	observeRuntimeProcess(t.Context(), hooks, RuntimeProcessProviderDescendant, 2)
 	observeRuntimeProcessSnapshot(t.Context(), hooks, RuntimeProcessProviderDescendant, 3)
-	observeRuntimeStartupStage(t.Context(), hooks, RuntimeResourceRuntime, RuntimeStartupReadiness, time.Now(), nil)
+	require.NoError(t, observeRuntimeStartupStage(
+		t.Context(), hooks, RuntimeResourceRuntime, RuntimeStartupReadiness, time.Now(), nil,
+	))
 	observeRuntimeContainment(t.Context(), hooks, RuntimeContainmentAuthoritative)
 	require.Equal(t, int64(2), processDelta)
 	require.Equal(t, 3, snapshot)
@@ -68,4 +70,38 @@ func TestBestEffortRuntimeObservationPublishesNoProviderSnapshots(t *testing.T) 
 	observeRuntimeProcessSnapshot(t.Context(), hooks, RuntimeProcessProviderDescendant, 0)
 	observeRuntimeProcessSnapshot(t.Context(), hooks, RuntimeProcessProviderDescendant, 9)
 	require.Zero(t, called)
+}
+
+func TestBoundedRuntimeObservationCancellationEdges(t *testing.T) {
+	require.NoError(t, observeRuntimeStartupStage(
+		t.Context(), RuntimeResourceHooks{}, RuntimeResourceRuntime, RuntimeStartupReadiness, time.Now(), nil,
+	))
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, runBoundedHook(cancelled, "cancelled", func() error { return nil }), context.Canceled)
+
+	post := &postStepCancelledContext{Context: t.Context(), never: make(chan struct{})}
+	require.ErrorIs(t, runBoundedHook(post, "late", func() error {
+		post.cancelled.Store(true)
+
+		return nil
+	}), context.Canceled)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- runBoundedHook(ctx, "blocked", func() error {
+			close(entered)
+			<-release
+
+			return nil
+		})
+	}()
+	<-entered
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	close(release)
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode"
 )
 
@@ -31,7 +32,7 @@ type Client struct {
 	writeMu sync.Mutex
 
 	pendingMu sync.Mutex
-	pending   map[string]chan Response
+	pending   map[string]*pendingCall
 	failure   error
 	failed    bool
 
@@ -42,8 +43,74 @@ type Client struct {
 
 	events     chan Event
 	uiRequests chan UIRequest
+	boundaries chan ResponseBoundary
 	done       chan struct{}
 	wg         sync.WaitGroup
+}
+
+// CallBoundary supplies command boundaries that must be linearized with the
+// JSONL transport itself. BeforeDispatch runs immediately before the command
+// write and holds its returned release function through that write. Accepted
+// is carried to the event consumer when a successful response is decoded; the
+// stdout reader waits for that consumer to resolve it before reading further.
+type CallBoundary struct {
+	BeforeDispatch func() (release func(), err error)
+	Accepted       func(context.Context) error
+}
+
+type pendingCall struct {
+	response  chan callResult
+	accepted  func(context.Context) error
+	writeDone chan struct{}
+	writeErr  error
+}
+
+type callResult struct {
+	response Response
+	boundary error
+}
+
+// ResponseBoundary is a successful command-response watermark that the sole
+// event consumer must resolve. The client does not read a later stdout record
+// until Resolve returns, so every event delivered before this boundary has been
+// fully processed and every later event observes its accepted transition.
+type ResponseBoundary struct {
+	owner *responseBoundaryOwner
+}
+
+type responseBoundaryOwner struct {
+	accepted func(context.Context) error
+	result   chan error
+	once     sync.Once
+}
+
+// Resolve executes the response hook exactly once and releases the JSONL
+// reader. The pump's generation context owns the hook: cancellation therefore
+// interrupts every production hook before teardown joins the pump.
+func (b ResponseBoundary) Resolve(ctx context.Context) {
+	if b.owner == nil {
+		return
+	}
+
+	b.owner.once.Do(func() {
+		b.resolveOwned(ctx)
+	})
+}
+
+func (b ResponseBoundary) resolveOwned(ctx context.Context) {
+	var err error
+
+	defer func() {
+		if recover() != nil {
+			err = errors.New("pi response boundary hook panicked")
+		}
+
+		b.owner.result <- err
+	}()
+
+	if b.owner.accepted != nil {
+		err = b.owner.accepted(ctx)
+	}
 }
 
 // NewClient constructs a client over pi's stdin writer and stdout reader.
@@ -51,9 +118,10 @@ func NewClient(stdin io.Writer, stdout io.Reader) *Client {
 	return &Client{
 		stdin:      stdin,
 		lines:      NewLineReader(stdout),
-		pending:    make(map[string]chan Response, 4),
+		pending:    make(map[string]*pendingCall, 4),
 		events:     make(chan Event),
 		uiRequests: make(chan UIRequest),
+		boundaries: make(chan ResponseBoundary, 1),
 		done:       make(chan struct{}),
 	}
 }
@@ -104,6 +172,12 @@ func (c *Client) UIRequests() <-chan UIRequest {
 	return c.uiRequests
 }
 
+// ResponseBoundaries returns successful command-response watermarks. The event
+// consumer must resolve each boundary in stream order.
+func (c *Client) ResponseBoundaries() <-chan ResponseBoundary {
+	return c.boundaries
+}
+
 // Done is closed when the read loop has exited.
 func (c *Client) Done() <-chan struct{} {
 	return c.done
@@ -117,7 +191,7 @@ func (c *Client) Err() error {
 	return c.failure
 }
 
-// DecodeFailures counts malformed stdout records that were skipped.
+// DecodeFailures reports whether the terminal structural record was malformed.
 func (c *Client) DecodeFailures() uint64 {
 	return c.decodeFailures.Load()
 }
@@ -131,6 +205,20 @@ func (c *Client) StrayResponses() uint64 {
 // response. fields must not contain "id"; the command "type" key is required.
 // A success:false response is returned with a nil error; use Response.Err.
 func (c *Client) Call(ctx context.Context, fields map[string]any) (Response, error) {
+	return c.call(ctx, fields, CallBoundary{})
+}
+
+// CallWithBoundary is Call with transport-linearized dispatch and successful
+// response hooks.
+func (c *Client) CallWithBoundary(
+	ctx context.Context,
+	fields map[string]any,
+	boundary CallBoundary,
+) (Response, error) {
+	return c.call(ctx, fields, boundary)
+}
+
+func (c *Client) call(ctx context.Context, fields map[string]any, boundary CallBoundary) (Response, error) {
 	commandType, _ := fields[commandTypeKey].(string)
 	if commandType == "" {
 		return Response{}, fmt.Errorf("pi command requires a type field")
@@ -145,29 +233,92 @@ func (c *Client) Call(ctx context.Context, fields map[string]any) (Response, err
 
 	payload["id"] = id
 
-	response := make(chan Response, 1)
-	if err := c.registerPending(id, response); err != nil {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return Response{}, fmt.Errorf("encode %s command: %w", commandType, err)
+	}
+
+	response := make(chan callResult, 1)
+	waiter := &pendingCall{
+		response:  response,
+		accepted:  boundary.Accepted,
+		writeDone: make(chan struct{}),
+	}
+
+	if err := c.registerPending(id, waiter); err != nil {
 		return Response{}, err
 	}
 
-	if err := c.writeLine(payload); err != nil {
+	var release func()
+
+	if boundary.BeforeDispatch != nil {
+		var err error
+
+		release, err = boundary.BeforeDispatch()
+		if err != nil {
+			waiter.finishWrite(err)
+			c.unregisterPending(id)
+
+			return Response{}, err
+		}
+	}
+
+	writeErr := c.writeEncodedLine(encoded)
+	waiter.finishWrite(writeErr)
+
+	if writeErr != nil {
+		if release != nil {
+			release()
+		}
+
 		c.unregisterPending(id)
 
-		return Response{}, fmt.Errorf("write %s command: %w", commandType, err)
+		return Response{}, fmt.Errorf("write %s command: %w", commandType, writeErr)
+	}
+
+	if release != nil {
+		release()
 	}
 
 	select {
-	case resp, ok := <-response:
+	case result, ok := <-response:
 		if !ok {
 			return Response{}, c.closedError()
 		}
 
-		return resp, nil
-	case <-ctx.Done():
-		c.unregisterPending(id)
+		if result.boundary != nil {
+			return Response{}, result.boundary
+		}
 
-		return Response{}, ctx.Err()
+		return result.response, nil
+	case <-ctx.Done():
+		if c.unregisterPending(id) {
+			return Response{}, ctx.Err()
+		}
+
+		// The stdout reader already claimed a response. A successful native
+		// response owns its acceptance boundary from that instant onward, so
+		// caller cancellation cannot turn it back into an unaccepted command.
+		return c.awaitClaimedResponse(ctx, response)
 	}
+}
+
+func (c *Client) awaitClaimedResponse(ctx context.Context, response <-chan callResult) (Response, error) {
+	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), responseBoundarySettlementTimeout)
+	defer cancelSettle()
+
+	var result callResult
+	select {
+	case result = <-response:
+	case <-settleCtx.Done():
+		return Response{}, fmt.Errorf("%w: join claimed response boundary: %w", ErrTransportClosed, settleCtx.Err())
+	}
+
+	if result.boundary != nil {
+		return Response{}, result.boundary
+	}
+
+	return result.response, nil
 }
 
 // RespondUI answers one extension UI dialog request on pi stdin.
@@ -184,22 +335,44 @@ func (c *Client) RespondUI(response UIResponse) error {
 }
 
 func (c *Client) writeLine(payload any) error {
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("encode jsonl record: %w", err)
-	}
+	// UIResponse contains only JSON primitives, so encoding cannot fail. Keeping
+	// an error branch here would pretend an unreachable transport state exists.
+	encoded, _ := json.Marshal(payload)
 
+	return c.writeEncodedLine(encoded)
+}
+
+func (c *Client) writeEncodedLine(encoded []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	if _, err := c.stdin.Write(append(encoded, '\n')); err != nil {
-		return err
+	record := make([]byte, len(encoded)+1)
+	copy(record, encoded)
+	record[len(encoded)] = '\n'
+
+	n, err := c.stdin.Write(record)
+	if n != len(record) {
+		err = errors.Join(err, io.ErrShortWrite)
 	}
 
-	return nil
+	return err
 }
 
-func (c *Client) registerPending(id string, response chan Response) error {
+func (p *pendingCall) finishWrite(err error) {
+	p.writeErr = err
+	close(p.writeDone)
+}
+
+func (p *pendingCall) awaitWrite(ctx context.Context) error {
+	select {
+	case <-p.writeDone:
+		return p.writeErr
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+func (c *Client) registerPending(id string, call *pendingCall) error {
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
 
@@ -207,16 +380,22 @@ func (c *Client) registerPending(id string, response chan Response) error {
 		return c.closedErrorLocked()
 	}
 
-	c.pending[id] = response
+	c.pending[id] = call
 
 	return nil
 }
 
-func (c *Client) unregisterPending(id string) {
+func (c *Client) unregisterPending(id string) bool {
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
 
+	if _, ok := c.pending[id]; !ok {
+		return false
+	}
+
 	delete(c.pending, id)
+
+	return true
 }
 
 func (c *Client) closedError() error {
@@ -240,8 +419,8 @@ func (c *Client) readLoop(ctx context.Context) {
 	for {
 		line, err := c.lines.Next()
 		if len(line) > 0 && !isBlank(line) {
-			if !c.dispatch(ctx, line) {
-				failure = context.Cause(ctx)
+			if dispatchErr := c.dispatch(ctx, line); dispatchErr != nil {
+				failure = dispatchErr
 
 				break
 			}
@@ -259,55 +438,111 @@ func (c *Client) readLoop(ctx context.Context) {
 	c.finish(failure)
 }
 
-// dispatch routes one record; it returns false when ctx ended mid-delivery.
-func (c *Client) dispatch(ctx context.Context, line []byte) bool {
+// dispatch routes one record and terminalizes the stream on its first
+// structural decode failure.
+func (c *Client) dispatch(ctx context.Context, line []byte) error {
 	message, err := DecodeMessage(line)
 	if err != nil {
 		c.decodeFailures.Add(1)
 
-		return true
+		return ErrJSONLStructural
+	}
+
+	if message.Kind == MessageKindResponse {
+		waiter, ok := c.claimPending(message.Response.ID)
+
+		if boundaryErr := c.resolveClaimed(ctx, message.Response, waiter, ok); boundaryErr != nil {
+			return boundaryErr
+		}
+
+		return nil
 	}
 
 	switch message.Kind {
-	case MessageKindResponse:
-		c.resolve(message.Response)
-
-		return true
 	case MessageKindUIRequest:
 		select {
 		case c.uiRequests <- message.UIRequest:
-			return true
+			return nil
 		case <-ctx.Done():
-			return false
+			return context.Cause(ctx)
 		}
 	default:
 		select {
 		case c.events <- message.Event:
-			return true
+			return nil
 		case <-ctx.Done():
-			return false
+			return context.Cause(ctx)
 		}
 	}
 }
 
-func (c *Client) resolve(response Response) {
+func (c *Client) claimPending(id string) (*pendingCall, bool) {
 	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
 
-	waiter, ok := c.pending[response.ID]
+	waiter, ok := c.pending[id]
 	if ok {
-		delete(c.pending, response.ID)
+		delete(c.pending, id)
 	}
 
-	c.pendingMu.Unlock()
+	return waiter, ok
+}
 
+func (c *Client) resolveClaimed(ctx context.Context, response Response, waiter *pendingCall, ok bool) error {
 	if !ok {
 		c.strayResponses.Add(1)
 
-		return
+		return nil
 	}
 
-	waiter <- response
+	if writeErr := waiter.awaitWrite(ctx); writeErr != nil {
+		waiter.response <- callResult{boundary: writeErr}
+
+		return fmt.Errorf("response preceded a complete command write: %w", writeErr)
+	}
+
+	var (
+		boundaryErr      error
+		fatalBoundaryErr error
+	)
+
+	if response.Success && waiter.accepted != nil {
+		settleCtx, cancelSettle := context.WithTimeout(context.Background(), responseBoundarySettlementTimeout)
+		boundary := ResponseBoundary{owner: &responseBoundaryOwner{
+			accepted: waiter.accepted,
+			result:   make(chan error, 1),
+		}}
+
+		select {
+		case c.boundaries <- boundary:
+		case <-settleCtx.Done():
+			boundaryErr = fmt.Errorf("%w: hand off successful response boundary: %w",
+				ErrTransportClosed, settleCtx.Err())
+			fatalBoundaryErr = boundaryErr
+		}
+
+		if boundaryErr == nil {
+			select {
+			case boundaryErr = <-boundary.owner.result:
+			case <-settleCtx.Done():
+				boundaryErr = fmt.Errorf("%w: settle successful response boundary: %w",
+					ErrTransportClosed, settleCtx.Err())
+				fatalBoundaryErr = boundaryErr
+			}
+		}
+
+		cancelSettle()
+	}
+
+	waiter.response <- callResult{response: response, boundary: boundaryErr}
+
+	return fatalBoundaryErr
 }
+
+// responseBoundarySettlementTimeout bounds only the acceptance handoff.
+// Once a successful response is decoded, caller cancellation cannot bypass
+// this boundary; a missing consumer instead fails the call deterministically.
+var responseBoundarySettlementTimeout = 10 * time.Second
 
 func (c *Client) finish(failure error) {
 	c.pendingMu.Lock()
@@ -315,13 +550,14 @@ func (c *Client) finish(failure error) {
 	c.failure = failure
 
 	for id, waiter := range c.pending {
-		close(waiter)
+		close(waiter.response)
 		delete(c.pending, id)
 	}
 	c.pendingMu.Unlock()
 
 	close(c.events)
 	close(c.uiRequests)
+	close(c.boundaries)
 	close(c.done)
 }
 

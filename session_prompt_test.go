@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +19,30 @@ import (
 	"github.com/savid/acp-go-pi/internal/lifecycle"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
+
+type blockingPanicStore struct {
+	*InMemorySessionStore
+	target  string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingPanicStore) Append(ctx context.Context, key SessionKey, entries []SessionStoreEntry) error {
+	panicked := false
+	if key.Subpath == s.target {
+		s.once.Do(func() {
+			panicked = true
+			close(s.entered)
+			<-s.release
+		})
+	}
+	if panicked {
+		panic("session store panic secret")
+	}
+
+	return s.InMemorySessionStore.Append(ctx, key, entries)
+}
 
 func TestPromptContentMapping(t *testing.T) {
 	mime := "image/png"
@@ -100,12 +126,181 @@ func TestPromptClientPromptFailure(t *testing.T) {
 	requirePiTurnFailure(t, err, failureCauseTransport)
 }
 
+func TestPromptExactGenerationFailureEdges(t *testing.T) {
+	newSession := func() (*agentSession, *stubPiClient, *stubProcess, *sessionOutbox) {
+		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+		client := newStubPiClient()
+		process := newStubProcess(false)
+		session := &agentSession{agent: agent, id: "id", client: client, proc: process}
+		outbox := bindTestOutbox(session)
+
+		return session, client, process, outbox
+	}
+
+	t.Run("foreground claim refused", func(t *testing.T) {
+		session, _, _, _ := newSession()
+		session.promptAdmission = newTurnDelivery()
+		_, err := session.Prompt(t.Context(), TextPromptRequest("id", "claim", "hi"))
+		requireInvalidRequest(t, err)
+	})
+
+	t.Run("close wins after foreground claim", func(t *testing.T) {
+		session, _, process, _ := newSession()
+		process.onExited = func() {
+			session.mu.Lock()
+			session.closing = true
+			session.mu.Unlock()
+		}
+		_, err := session.Prompt(t.Context(), TextPromptRequest("id", "reserve", "hi"))
+		requireInvalidParams(t, err)
+	})
+
+	t.Run("unaccepted write failure fences generation", func(t *testing.T) {
+		session, client, process, _ := newSession()
+		client.promptErr = errors.New("prompt write")
+		_, err := session.Prompt(t.Context(), TextPromptRequest("id", "write", "hi"))
+		requirePiTurnFailure(t, err, failureCauseTransport)
+		require.Equal(t, 1, process.closeCalls)
+	})
+
+	t.Run("poison outranks unaccepted write failure", func(t *testing.T) {
+		session, client, _, _ := newSession()
+		client.promptFunc = func(context.Context, string) error {
+			session.mu.Lock()
+			session.poisonCause = "write poisoned"
+			session.mu.Unlock()
+
+			return errors.New("prompt write")
+		}
+		_, err := session.Prompt(t.Context(), TextPromptRequest("id", "poison", "hi"))
+		require.ErrorContains(t, err, "write poisoned")
+	})
+
+	t.Run("cancelled turn observes structural transport owner", func(t *testing.T) {
+		session, client, _, outbox := newSession()
+		client.err = pi.ErrJSONLStructural
+		cancelled, cancel := context.WithCancel(t.Context())
+		cancel()
+		outcome := session.runPromptTurn(cancelled, outbox, newTurnDelivery(), &promptTurnState{})
+		require.True(t, outcome.transportEnded)
+		require.False(t, outcome.contextEnded)
+	})
+}
+
+func TestPromptRecoversEndedGenerationBeforeReservingSuccessor(t *testing.T) {
+	agent := NewAgent(
+		WithLogger(slog.New(slog.DiscardHandler)),
+		WithSessionStore(NewInMemorySessionStore()),
+	)
+	connection := newDirectAgentClient()
+	agent.setConnection(connection)
+
+	oldClient := newStubPiClient()
+	oldProcess := newStubProcess(true)
+	successorClient := newStubPiClient()
+	successorProcess := newStubProcess(false)
+
+	sessionFile := filepath.Join(t.TempDir(), "session.jsonl")
+	require.NoError(t, os.WriteFile(sessionFile, []byte("{\"type\":\"session\"}\n"), 0o600))
+	successorClient.state = pi.SessionState{SessionID: "id", SessionFile: sessionFile}
+	successorClient.stats = pi.SessionStats{SessionID: "id"}
+
+	session := &agentSession{
+		agent:           agent,
+		id:              "id",
+		client:          oldClient,
+		proc:            oldProcess,
+		sessionFilePath: sessionFile,
+	}
+	prepareRelaunchFixture(t, session)
+
+	starts := 0
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		starts++
+
+		return successorProcess, successorClient, nil
+	}
+
+	var prompts atomic.Int32
+	successorClient.promptFunc = func(ctx context.Context, message string) error {
+		prompts.Add(1)
+
+		go func() {
+			for session.outboxRouter().foreground() == nil {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Millisecond):
+				}
+			}
+
+			for _, event := range []pi.Event{
+				pi.MessageStartEvent{Message: pi.AgentMessage{Role: messageRoleAssistant}},
+				pi.MessageUpdateEvent{AssistantMessageEvent: pi.AssistantMessageEvent{
+					Type: assistantEventTextDelta, Delta: "reply:" + message,
+				}},
+				pi.MessageEndEvent{Message: pi.AgentMessage{Role: messageRoleAssistant, StopReason: stopReasonStop}},
+				pi.AgentSettledEvent{},
+			} {
+				select {
+				case successorClient.events <- event:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+
+		return nil
+	}
+
+	startTestPump(session, oldClient)
+	session.mu.Lock()
+	oldPumpDone := session.pumpDone
+	session.mu.Unlock()
+	close(oldClient.events)
+	close(oldClient.uiRequests)
+	<-oldPumpDone
+
+	readText := func(start int) string {
+		var output strings.Builder
+		for _, update := range connection.updates[start:] {
+			if update.AgentMessageChunk != nil && update.AgentMessageChunk.Content.Text != nil {
+				output.WriteString(update.AgentMessageChunk.Content.Text.Text)
+			}
+		}
+
+		return output.String()
+	}
+
+	firstUpdate := len(connection.updates)
+	first, err := session.Prompt(t.Context(), TextPromptRequest("id", "first", "one"))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, first.StopReason)
+	require.Contains(t, readText(firstUpdate), "reply:one")
+	require.Equal(t, 1, starts)
+	require.Equal(t, int32(1), prompts.Load())
+	require.Equal(t, 1, oldProcess.closeCalls)
+	require.Zero(t, successorProcess.shutdownCalls)
+	require.Zero(t, successorProcess.closeCalls)
+
+	secondUpdate := len(connection.updates)
+	second, err := session.Prompt(t.Context(), TextPromptRequest("id", "second", "two"))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, second.StopReason)
+	require.Contains(t, readText(secondUpdate), "reply:two")
+	require.Equal(t, int32(2), prompts.Load())
+	require.Zero(t, successorProcess.shutdownCalls)
+	require.Zero(t, successorProcess.closeCalls)
+
+	session.stopPump()
+}
+
 func TestPromptParentCancellationContainsProcessTree(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := newStubPiClient()
 	process := newStubProcess(false)
 	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
-	session.startPump(client)
+	startTestPump(session, client)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	promptDone := make(chan struct {
@@ -135,7 +330,7 @@ func TestPromptParentCancellationReturnsContainmentFailure(t *testing.T) {
 	process := newStubProcess(false)
 	process.close = pi.ErrProcessContainmentIncomplete
 	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
-	session.startPump(client)
+	startTestPump(session, client)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	promptDone := make(chan error, 1)
@@ -186,7 +381,7 @@ func TestPromptTransportEndReturnsContainmentProofFailure(t *testing.T) {
 	process := newStubProcess(false)
 	process.close = fenceErr
 	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
-	session.startPump(client)
+	startTestPump(session, client)
 	t.Cleanup(session.stopPump)
 
 	go func() {
@@ -210,7 +405,7 @@ func TestPromptHandleTurnEventEmitFailure(t *testing.T) {
 	agent.setConnection(connection)
 	client := newStubPiClient()
 	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
-	session.startPump(client)
+	startTestPump(session, client)
 	t.Cleanup(session.stopPump)
 
 	go func() {
@@ -509,7 +704,9 @@ func TestPromptAcceptanceDeliveryFailureFailsTheTurn(t *testing.T) {
 	connection := newDirectAgentClient()
 	agent.setConnection(connection)
 	session := &agentSession{agent: agent, id: "id", client: newStubPiClient(), proc: newStubProcess(false)}
-	require.NoError(t, session.openLifecycleStream(t.Context(), 0))
+	generation := startTestPump(session, session.client)
+	t.Cleanup(session.stopPump)
+	require.NoError(t, session.openLifecycleStream(t.Context(), generation))
 
 	connection.updateErr = errors.New("accept delivery")
 	request := TextPromptRequest("id", "turn", "hi")
@@ -532,19 +729,107 @@ func TestAwaitSettlementWaitsForTheWholeOrder(t *testing.T) {
 	require.NoError(t, session.awaitSettlement(), "no armed settlement settles nothing")
 
 	session.openSettlement()
+	session.mu.Lock()
+	settlement := session.settlement
+	session.mu.Unlock()
 	settleErr := errors.New("settlement commit failed")
 	done := make(chan error, 1)
 	go func() { done <- session.awaitSettlement() }()
 
+	<-settlement.waiting
 	select {
 	case err := <-done:
 		t.Fatalf("awaitSettlement returned before the order completed: %v", err)
-	case <-time.After(20 * time.Millisecond):
+	default:
 	}
 
 	session.completeSettlement(settleErr)
 	require.ErrorIs(t, <-done, settleErr)
-	require.NoError(t, session.awaitSettlement(), "a completed latch is consumed")
+	require.ErrorIs(t, session.awaitSettlement(), settleErr, "the completed latch keeps its immutable result")
+}
+
+func TestPromptSettlementStorePanicContainsOnceAgainstClose(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		target string
+	}{
+		{name: "mirror panic", target: ""},
+		{name: "journal panic", target: SessionStoreLifecycleSubpath},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &blockingPanicStore{
+				InMemorySessionStore: NewInMemorySessionStore(),
+				target:               test.target,
+				entered:              make(chan struct{}),
+				release:              make(chan struct{}),
+			}
+			logs := &strings.Builder{}
+			agent := NewAgent(testContainmentOption(), WithSessionStore(store),
+				WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
+			agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+			connection := newDirectAgentClient()
+			agent.setConnection(connection)
+			process := newStubProcess(false)
+			shutdownEntered := make(chan struct{})
+			process.shutdownFunc = func(context.Context) error {
+				close(shutdownEntered)
+
+				return nil
+			}
+			native := newStubPiClient()
+			session := &agentSession{agent: agent, id: "settlement-panic", proc: process, client: native}
+			outbox := newTestSessionOutbox(1)
+			bindTestRuntime(outbox, process, native, nil, nil, nil)
+			session.outbox = outbox
+			session.pumpGeneration = 1
+			session.sessionFilePath = filepath.Join(t.TempDir(), "session.jsonl")
+			require.NoError(t, os.WriteFile(session.sessionFilePath, []byte("{\"type\":\"message\"}\n"), 0o600))
+			require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+			require.NoError(t, session.lifecycleAcceptTurn(t.Context(), testSubmission()))
+			session.openSettlement()
+			baseline := len(connection.notifications)
+
+			type promptResult struct {
+				response acp.PromptResponse
+				err      error
+			}
+			settled := make(chan promptResult, 1)
+			go func() {
+				var timedOut atomic.Bool
+				response, err := session.settlePrompt(context.Background(),
+					TextPromptRequest(session.id, "turn", "hello"),
+					&promptTurnState{stopReason: stopReasonStop}, promptOutcome{settled: true}, &timedOut)
+				settled <- promptResult{response: response, err: err}
+			}()
+			<-store.entered
+
+			closed := make(chan error, 1)
+			go func() { closed <- session.Close(context.Background()) }()
+			<-shutdownEntered
+			close(store.release)
+
+			result := <-settled
+			require.Zero(t, result.response)
+			require.ErrorIs(t, result.err, errPromptSettlement)
+			require.NotContains(t, result.err.Error(), "session store panic secret")
+			closeErr := <-closed
+			require.ErrorIs(t, closeErr, errPromptSettlement)
+			require.Equal(t, 1, process.shutdownCalls)
+			require.Equal(t, 1, process.closeCalls)
+			require.NotContains(t, logs.String(), "session store panic secret")
+			for _, notification := range connection.notifications[baseline:] {
+				rawEnvelope, ok := notification.Meta[lifecycleMetaKey]
+				if !ok {
+					continue
+				}
+				envelope := anyMap(t, rawEnvelope)
+				event := anyMap(t, envelope["event"])
+				require.NotEqual(t, "idle", event["state"])
+			}
+			require.ErrorIs(t, session.awaitSettlement(), errPromptSettlement)
+			require.ErrorIs(t, session.Close(t.Context()), errPromptSettlement)
+		})
+	}
 }
 
 func TestTurnOutcomeForStopReason(t *testing.T) {

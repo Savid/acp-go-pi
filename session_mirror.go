@@ -39,7 +39,6 @@ func (s *agentSession) commitMirror(ctx context.Context) error {
 		if errors.Is(err, os.ErrNotExist) {
 			s.agent.log.DebugContext(ctx, "no native session file to mirror",
 				slog.String(acpFieldSessionID, string(s.id)),
-				slog.String("path", path),
 			)
 
 			return nil
@@ -58,22 +57,15 @@ func (s *agentSession) commitMirror(ctx context.Context) error {
 		newRows = append(newRows, SessionStoreEntry(row))
 	}
 
-	s.commitMu.Lock()
+	var appended bool
 
-	if s.persistFenced {
-		s.commitMu.Unlock()
-
-		return nil
-	}
-
-	appendCtx, finishAppend := s.agent.observe.StartSessionStore(ctx, "append")
-	err = appendMirrorEntries(appendCtx, s.agent.sessionStore(), SessionKey{SessionID: string(s.id)}, newRows)
-
-	finishAppend(err)
-	s.commitMu.Unlock()
-
+	appended, err = s.appendMirrorRows(ctx, newRows)
 	if err != nil {
 		return fmt.Errorf("%w: %w", errSessionMirrorAppend, err)
+	}
+
+	if !appended {
+		return nil
 	}
 
 	s.mu.Lock()
@@ -83,6 +75,31 @@ func (s *agentSession) commitMirror(ctx context.Context) error {
 	s.mu.Unlock()
 
 	return nil
+}
+
+func (s *agentSession) appendMirrorRows(ctx context.Context, rows []SessionStoreEntry) (appended bool, err error) {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+
+	if s.persistFenced {
+		return false, nil
+	}
+
+	appendCtx, finishAppend := s.agent.observe.StartSessionStore(ctx, "append")
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			finishAppend(errors.New("session store append panicked"))
+
+			panic(recovered)
+		}
+
+		finishAppend(err)
+	}()
+
+	err = appendMirrorEntries(appendCtx, s.agent.sessionStore(), SessionKey{SessionID: string(s.id)}, rows)
+
+	return err == nil, err
 }
 
 // mirrorAppendDelays is the wait before each attempt at one durable append. A

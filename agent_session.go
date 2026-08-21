@@ -62,7 +62,9 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 		ConfigOptions: sessionConfigOptions(session),
 	}
 
-	a.publishSessionOpenInline(ctx, session)
+	if openErr := a.publishSessionOpenInline(ctx, session); openErr != nil {
+		return acp.NewSessionResponse{}, openErr
+	}
 
 	return resp, nil
 }
@@ -72,7 +74,7 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 	ctx, finish := a.observe.StartACP(ctx, params.Meta, "session/resume")
 	defer func() { finish(observer.ACPResult{Err: err}) }()
 
-	session, entries, started, err := a.restoreSession(ctx, params.SessionId, sessionStart{
+	restored, err := a.restoreSession(ctx, params.SessionId, sessionStart{
 		Cwd:                   params.Cwd,
 		AdditionalDirectories: sessionAdditionalDirectories(params.AdditionalDirectories),
 		McpServers:            params.McpServers,
@@ -83,12 +85,17 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 		return acp.ResumeSessionResponse{}, err
 	}
 
-	if emitErr := session.emitNativeMessageIdentity(ctx, terminalAssistantMessageID(entries)); emitErr != nil {
-		if started {
-			a.removeSession(ctx, params.SessionId, session)
+	defer restored.finish()
+
+	session := restored.session
+
+	if emitErr := session.emitNativeMessageIdentity(ctx, terminalAssistantMessageID(restored.entries)); emitErr != nil {
+		var cleanupErr error
+		if restored.started {
+			cleanupErr = a.removeSession(ctx, params.SessionId, session)
 		}
 
-		return acp.ResumeSessionResponse{}, emitErr
+		return acp.ResumeSessionResponse{}, errors.Join(emitErr, cleanupErr)
 	}
 
 	session.emitCurrentUsageUpdate(ctx)
@@ -97,7 +104,9 @@ func (a *Agent) ResumeSession(ctx context.Context, params acp.ResumeSessionReque
 		ConfigOptions: sessionConfigOptions(session),
 	}
 
-	a.publishSessionOpenInline(ctx, session)
+	if openErr := a.publishSessionOpenInline(ctx, session); openErr != nil {
+		return acp.ResumeSessionResponse{}, openErr
+	}
 
 	return resp, nil
 }
@@ -108,7 +117,7 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 	ctx, finish := a.observe.StartACP(ctx, params.Meta, "session/load")
 	defer func() { finish(observer.ACPResult{Err: err}) }()
 
-	session, entries, started, err := a.restoreSession(ctx, params.SessionId, sessionStart{
+	restored, err := a.restoreSession(ctx, params.SessionId, sessionStart{
 		Cwd:                   params.Cwd,
 		AdditionalDirectories: sessionAdditionalDirectories(params.AdditionalDirectories),
 		McpServers:            params.McpServers,
@@ -119,12 +128,17 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 		return acp.LoadSessionResponse{}, err
 	}
 
-	if replayErr := session.replayStoredSession(ctx, entries); replayErr != nil {
-		if started {
-			a.removeSession(ctx, params.SessionId, session)
+	defer restored.finish()
+
+	session := restored.session
+
+	if replayErr := session.replayStoredSession(ctx, restored.entries); replayErr != nil {
+		var cleanupErr error
+		if restored.started {
+			cleanupErr = a.removeSession(ctx, params.SessionId, session)
 		}
 
-		return acp.LoadSessionResponse{}, replayErr
+		return acp.LoadSessionResponse{}, errors.Join(replayErr, cleanupErr)
 	}
 
 	session.emitCurrentUsageUpdate(ctx)
@@ -133,50 +147,78 @@ func (a *Agent) LoadSession(ctx context.Context, params acp.LoadSessionRequest) 
 		ConfigOptions: sessionConfigOptions(session),
 	}
 
-	a.publishSessionOpenInline(ctx, session)
+	if openErr := a.publishSessionOpenInline(ctx, session); openErr != nil {
+		return acp.LoadSessionResponse{}, openErr
+	}
 
 	return resp, nil
+}
+
+// restoredSession is what the shared load/resume path resolved: the session to
+// answer with, the stored prefix to replay, whether this call started it, and
+// the gate an active session holds until its replay is done.
+type restoredSession struct {
+	session *agentSession
+	entries []SessionStoreEntry
+	started bool
+	// release ends the restore gate. It is nil for a session this call started,
+	// which no other caller can reach yet.
+	release func()
+}
+
+// finish ends whatever the restore held. It is safe to call on a zero value, so
+// every exit of a restoring method can defer it unconditionally.
+func (r restoredSession) finish() {
+	if r.release != nil {
+		r.release()
+	}
 }
 
 // restoreSession runs the shared load/resume path: meta and path validation,
 // deleted/tombstone checks, active-session reuse, then a store-backed
 // hydrate.
+//
+// A live session is gated before its prefix is read. The gate excludes an
+// in-flight prompt and every new agent-origin cycle in one transition and holds
+// until the caller's replay is done, because a transcript that keeps being
+// written while it is being read would answer the restore with a snapshot the
+// session has already moved past.
 func (a *Agent) restoreSession(
 	ctx context.Context,
 	sessionID acp.SessionId,
 	start sessionStart,
 	meta map[string]any,
-) (*agentSession, []SessionStoreEntry, bool, error) {
+) (restoredSession, error) {
 	metaOptions, err := piOptionsFromMeta(meta)
 	if err != nil {
-		return nil, nil, false, err
+		return restoredSession{}, err
 	}
 
 	start.MetaOptions = metaOptions
 
 	if validationErr := validateSessionStartPaths(start.Cwd, start.AdditionalDirectories); validationErr != nil {
-		return nil, nil, false, validationErr
+		return restoredSession{}, validationErr
 	}
 
 	if a.isDeleted(sessionID) {
-		return nil, nil, false, unknownSessionError()
+		return restoredSession{}, unknownSessionError()
+	}
+
+	if session := a.activeSessionForStart(sessionID, start); session != nil {
+		return a.restoreActiveSession(ctx, sessionID, session)
 	}
 
 	entries, boundary, err := a.loadCurrentStoreEntries(ctx, string(sessionID))
 	if err != nil {
-		return nil, nil, false, err
-	}
-
-	if session := a.activeSessionForStart(sessionID, start); session != nil {
-		return session, entries, false, nil
+		return restoredSession{}, err
 	}
 
 	if len(entries) == 0 {
-		return nil, nil, false, unknownSessionError()
+		return restoredSession{}, unknownSessionError()
 	}
 
 	if openErr := a.ensureOpen(); openErr != nil {
-		return nil, nil, false, openErr
+		return restoredSession{}, openErr
 	}
 
 	start.HydrateEntries = entries
@@ -184,10 +226,33 @@ func (a *Agent) restoreSession(
 
 	session, err := a.startAndStoreSession(ctx, start)
 	if err != nil {
-		return nil, nil, false, err
+		return restoredSession{}, err
 	}
 
-	return session, entries, true, nil
+	return restoredSession{session: session, entries: entries, started: true}, nil
+}
+
+// restoreActiveSession answers a restore from a session that is already live.
+// The gate is taken before the store is read and released by the caller after
+// replay, so the entries handed back are exactly the prefix the gate froze.
+func (a *Agent) restoreActiveSession(
+	ctx context.Context,
+	sessionID acp.SessionId,
+	session *agentSession,
+) (restoredSession, error) {
+	release, err := session.beginRestore(ctx)
+	if err != nil {
+		return restoredSession{}, err
+	}
+
+	entries, _, err := a.loadCurrentStoreEntries(ctx, string(sessionID))
+	if err != nil {
+		release()
+
+		return restoredSession{}, err
+	}
+
+	return restoredSession{session: session, entries: entries, release: release}, nil
 }
 
 // ListSessions lists active sessions and stored pi sessions.
@@ -312,19 +377,6 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 		return acp.CloseSessionResponse{}, err
 	}
 
-	// The window where a prompt could still resolve this id and relaunch the
-	// process being closed is shut by fencing admission on the session itself,
-	// not by unmapping the id. A close that fails still owes the boundary it did
-	// not finish, and an id that no longer resolves can never be told to retry
-	// it: the id is detached only once the boundary has completed.
-	session.fenceAdmission()
-
-	// Ladder steps 2-4 before the native interrupt: a parked provider-auth
-	// login is answered while the process that parked it is still there.
-	session.settleBoundaryInteractions(ctx)
-
-	_ = session.cancelForClose(ctx)
-
 	closeErr := session.Close(ctx)
 	if closeErr != nil {
 		return acp.CloseSessionResponse{}, closeErr
@@ -356,11 +408,9 @@ func (a *Agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest
 // session the host still owns would silently drop every later commit it makes
 // while reporting success on each one.
 //
-// A delete that tombstoned and then failed partway through teardown keeps that
-// wire posture — the tombstone is durable and the id stays hidden — and retains
-// the cleanup it did not finish. Hiding is a wire fact rather than a bookkeeping
-// one, so this agent still owns the native scope behind a hidden id: a later
-// delete on the same id retries the teardown, and Agent.Close sweeps it.
+// A delete that tombstoned and then failed teardown keeps that wire posture —
+// the tombstone is durable and the id stays hidden — while retaining the exact
+// session owner and its one immutable close result.
 func (a *Agent) UnstableDeleteSession(
 	ctx context.Context,
 	params acp.UnstableDeleteSessionRequest,
@@ -382,26 +432,15 @@ func (a *Agent) UnstableDeleteSession(
 
 	a.mu.Lock()
 
-	detached := session != nil && a.sessions[params.SessionId] == session
-	if detached {
-		delete(a.sessions, params.SessionId)
+	_, alreadyDeleted := a.deleted[params.SessionId]
+	if current := a.sessions[params.SessionId]; current != nil {
+		session = current
 	}
 
 	a.deleted[params.SessionId] = struct{}{}
-
-	// A delete addressed at an id whose earlier delete tombstoned it and then
-	// failed partway through teardown is that teardown's retry: the session it
-	// left unfinished comes back out of the cleanup registry and is torn down
-	// here, so the retained obligation is discharged on the very path the host
-	// retried.
-	if pending := a.pendingCleanups[params.SessionId]; session == nil {
-		session = pending
-	}
-
-	delete(a.pendingCleanups, params.SessionId)
 	a.mu.Unlock()
 
-	if detached {
+	if session != nil && !alreadyDeleted {
 		a.observe.AddActiveSession(ctx, -1)
 	}
 
@@ -414,31 +453,17 @@ func (a *Agent) UnstableDeleteSession(
 	// nothing behind a session the host was told is gone.
 	session.fencePersistence()
 
-	session.settleBoundaryInteractions(ctx)
-
-	_ = session.cancelForClose(ctx)
-
-	// Partial cleanup is reported only now, with the tombstone already durable
-	// and the id already hidden. Hiding is a wire fact and not a bookkeeping
-	// one: the session whose teardown did not finish is retained, because this
-	// agent still owns the native scope and the store entries that teardown
-	// owed, and dropping it with the response would leave both to nobody.
 	if cleanupErr := session.Close(ctx); cleanupErr != nil {
-		a.retainPendingCleanup(params.SessionId, session)
-
 		return acp.UnstableDeleteSessionResponse{}, cleanupErr
 	}
 
-	return acp.UnstableDeleteSessionResponse{}, nil
-}
-
-// retainPendingCleanup records a tombstoned session whose teardown failed, so a
-// later delete on the same id retries it and Agent.Close sweeps it.
-func (a *Agent) retainPendingCleanup(sessionID acp.SessionId, session *agentSession) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	if a.sessions[params.SessionId] == session {
+		delete(a.sessions, params.SessionId)
+	}
+	a.mu.Unlock()
 
-	a.pendingCleanups[sessionID] = session
+	return acp.UnstableDeleteSessionResponse{}, nil
 }
 
 // session resolves an addressed id to its live session. The tombstone is
@@ -523,16 +548,40 @@ func (a *Agent) detachSession(sessionID acp.SessionId, session *agentSession) bo
 	return true
 }
 
-func (a *Agent) removeSession(ctx context.Context, sessionID acp.SessionId, session *agentSession) {
+func (a *Agent) removeSession(ctx context.Context, sessionID acp.SessionId, session *agentSession) error {
 	if a.detachSession(sessionID, session) {
 		a.observe.AddActiveSession(context.Background(), -1)
 	}
 
-	if session != nil {
-		if err := session.Close(ctx); err != nil {
-			a.log.DebugContext(ctx, "close removed pi session failed", slog.String(jsonFieldError, err.Error()))
-		}
+	if session == nil {
+		return nil
 	}
+
+	err := session.Close(ctx)
+	a.retainIncompleteSession(session, err)
+
+	return err
+}
+
+func (a *Agent) retainIncompleteSession(session *agentSession, err error) {
+	if session == nil {
+		return
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if err == nil {
+		delete(a.retainedSessions, session)
+
+		return
+	}
+
+	if a.retainedSessions == nil {
+		a.retainedSessions = make(map[*agentSession]struct{})
+	}
+
+	a.retainedSessions[session] = struct{}{}
 }
 
 func (a *Agent) ensureOpen() error {
@@ -558,43 +607,44 @@ func (a *Agent) storeStartedSession(ctx context.Context, session *agentSession) 
 	if a.closed {
 		a.mu.Unlock()
 
-		if err := session.Close(ctx); err != nil {
-			a.log.DebugContext(ctx, "close rejected pi session failed", slog.String(jsonFieldError, err.Error()))
-		}
+		closeErr := session.Close(ctx)
+		a.retainIncompleteSession(session, closeErr)
 
-		return errAgentClosed
+		return errors.Join(errAgentClosed, closeErr)
 	}
 
 	if _, deleted := a.deleted[session.id]; deleted {
 		a.mu.Unlock()
 
-		if err := session.Close(ctx); err != nil {
-			a.log.DebugContext(ctx, "close tombstoned pi session failed", slog.String(jsonFieldError, err.Error()))
-		}
+		closeErr := session.Close(ctx)
+		a.retainIncompleteSession(session, closeErr)
 
-		return unknownSessionError()
+		return errors.Join(unknownSessionError(), closeErr)
 	}
 
 	previous := a.sessions[session.id]
 	if previous == nil && len(a.sessions) >= a.maxActiveSessions() {
 		a.mu.Unlock()
 
-		if err := session.Close(ctx); err != nil {
-			a.log.DebugContext(ctx, "close backpressured pi session failed", slog.String(jsonFieldError, err.Error()))
-		}
+		closeErr := session.Close(ctx)
+		a.retainIncompleteSession(session, closeErr)
 
-		return backpressureError("active_sessions")
+		return errors.Join(backpressureError("active_sessions"), closeErr)
 	}
 
 	a.sessions[session.id] = session
+	delete(a.retainedSessions, session)
 	a.mu.Unlock()
 
 	if previous != nil {
-		if err := previous.Close(ctx); err != nil {
-			a.log.WarnContext(ctx, "close replaced pi session failed", slog.String(jsonFieldError, err.Error()))
+		closeErr := previous.Close(ctx)
+		a.retainIncompleteSession(previous, closeErr)
+
+		if pi.ProcessContainmentComplete(closeErr) {
+			return nil
 		}
 
-		return nil
+		return closeErr
 	}
 
 	a.observe.AddActiveSession(ctx, 1)
@@ -603,11 +653,6 @@ func (a *Agent) storeStartedSession(ctx context.Context, session *agentSession) 
 }
 
 func (a *Agent) startAndStoreSession(ctx context.Context, start sessionStart) (*agentSession, error) {
-	if err := a.beginNativeConstruction(); err != nil {
-		return nil, err
-	}
-	defer a.endNativeConstruction()
-
 	session, err := a.startSession(ctx, start)
 	if err != nil {
 		return nil, err
@@ -618,6 +663,198 @@ func (a *Agent) startAndStoreSession(ctx context.Context, start sessionStart) (*
 	}
 
 	return session, nil
+}
+
+func (a *Agent) updateNativeConstruction(
+	construction *nativeConstruction,
+	update func(*nativeConstruction),
+) {
+	if construction == nil {
+		return
+	}
+
+	a.mu.Lock()
+	// Ownership publication continues after a close waiter memoizes the
+	// construction as incomplete. The verdict is immutable; newly acquired
+	// handles are not. Dropping one here would orphan the exact resource the
+	// late constructor is obligated to quarantine.
+	update(construction)
+	a.mu.Unlock()
+}
+
+func (a *Agent) nativeConstructionError(construction *nativeConstruction) error {
+	if construction == nil {
+		return nil
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return construction.err
+}
+
+// transferConstructionToSession moves every exact cleanup handle from the
+// construction fence to a retained session in one Agent critical section.
+// The retained entry closes the publication gap before store installation.
+func (a *Agent) transferConstructionToSession(
+	construction *nativeConstruction,
+	session *agentSession,
+) (bool, bool) {
+	a.mu.Lock()
+	if construction.immutable {
+		closed := a.closed
+		a.mu.Unlock()
+
+		return closed, false
+	}
+
+	if session != nil {
+		if a.retainedSessions == nil {
+			a.retainedSessions = make(map[*agentSession]struct{})
+		}
+
+		a.retainedSessions[session] = struct{}{}
+	}
+
+	closed := a.closed
+	if construction.err == nil {
+		delete(a.constructions, construction)
+	}
+
+	close(construction.done)
+	a.mu.Unlock()
+
+	return closed, true
+}
+
+// transferConstructionToRelaunch moves the exact post-spawn owner into the
+// relaunch attempt before any observer callback can run.
+func (a *Agent) transferConstructionToRelaunch(
+	construction *nativeConstruction,
+	attempt *sessionRelaunchAttempt,
+) bool {
+	a.mu.Lock()
+	if construction.immutable {
+		a.mu.Unlock()
+
+		return false
+	}
+
+	attempt.mu.Lock()
+	attempt.proc = construction.proc
+	attempt.client = construction.client
+	attempt.processRoot = construction.processRoot
+	attempt.generationRoot = construction.generationRoot
+	attempt.nativeRelease = construction.nativeRelease
+	attempt.nativeBoundary = construction.nativeBoundary
+
+	if construction.err == nil {
+		delete(a.constructions, construction)
+	}
+
+	close(construction.done)
+	attempt.mu.Unlock()
+	a.mu.Unlock()
+
+	return true
+}
+
+func (a *Agent) cleanupNativeConstruction(
+	ctx context.Context,
+	construction *nativeConstruction,
+	cause error,
+) error {
+	if construction == nil {
+		return nil
+	}
+
+	construction.cleanupOnce.Do(func() {
+		construction.cleanupErr = a.cleanupNativeConstructionOwned(ctx, construction, cause)
+	})
+
+	return construction.cleanupErr
+}
+
+func (a *Agent) cleanupNativeConstructionOwned(
+	ctx context.Context,
+	construction *nativeConstruction,
+	cause error,
+) error {
+	a.mu.Lock()
+	immutable := construction.immutable
+	proc := construction.proc
+	root := construction.processRoot
+	session := construction.session
+	nativeRelease := construction.nativeRelease
+	scratchRelease := construction.scratchRelease
+	sessionRoot := construction.sessionRoot
+	browserShim := construction.browserShim
+	residence := construction.residence
+	a.mu.Unlock()
+
+	if !immutable && !pi.ProcessContainmentComplete(cause) {
+		return cause
+	}
+
+	cleanupCtx, cancelCleanup := context.WithTimeout(ctx, sessionShutdownTimeout)
+	defer cancelCleanup()
+
+	var containmentErr error
+	if session != nil {
+		containmentErr = session.stopPumpBounded(cleanupCtx)
+	}
+
+	if proc != nil {
+		shutdownErr := construction.nativeBoundary.run(cleanupCtx, "construction shutdown", func() error {
+			return proc.Shutdown(cleanupCtx)
+		})
+
+		var killErr error
+		if immutable {
+			// A constructor that returned after Agent.Close timed out is a late
+			// native result, not an ordinary graceful startup failure. Its exact
+			// quarantine always executes every containment rung synchronously.
+			killErr = construction.nativeBoundary.run(cleanupCtx, "construction kill", proc.Kill)
+		}
+
+		closeErr := construction.nativeBoundary.run(cleanupCtx, "construction close", proc.Close)
+
+		containmentErr = errors.Join(containmentErr, shutdownErr, killErr, closeErr)
+	}
+
+	if root != nil {
+		complete := providerProcessTreeComplete(containmentErr)
+		retireErr := runNativeBoundaryStep(cleanupCtx, "construction retirement", func() error {
+			root.retire(context.WithoutCancel(cleanupCtx), complete)
+
+			return nil
+		})
+		containmentErr = errors.Join(containmentErr, retireErr)
+	}
+
+	if !pi.ProcessContainmentComplete(containmentErr) {
+		return containmentErr
+	}
+
+	resourceErr := runNativeBoundaryStep(cleanupCtx, "construction resource cleanup", func() error {
+		return finalizeSessionRuntimeResources(
+			containmentErr,
+			nativeRelease,
+			sessionRoot,
+			scratchRelease,
+			browserShim,
+			residence,
+		)
+	})
+
+	if immutable {
+		// Retain the waiter's immutable incomplete verdict even after the late
+		// resource has been successfully contained. The cleanup is evidence that
+		// nothing was orphaned, not permission to rewrite Agent.Close's answer.
+		return errors.Join(cause, resourceErr)
+	}
+
+	return resourceErr
 }
 
 func (a *Agent) connection() agentClient {
@@ -724,6 +961,71 @@ func unknownSessionError() *acp.RequestError {
 // the native setup sequence (auto-retry off, thinking level, model, catalog,
 // state, commands).
 func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *agentSession, err error) {
+	construction, err := a.beginNativeConstruction()
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = errors.Join(
+				errors.New("pi session construction callback panicked"),
+				a.nativeConstructionError(construction),
+			)
+		}
+
+		if err != nil {
+			ownerErr := a.nativeConstructionError(construction)
+			cause := errors.Join(err, ownerErr)
+			cleanupErr := a.cleanupNativeConstruction(context.WithoutCancel(ctx), construction, cause)
+			err = errors.Join(cause, cleanupErr)
+			a.finishNativeConstruction(construction, cleanupErr != nil, cleanupErr)
+
+			return
+		}
+
+		closed, transferred := a.transferConstructionToSession(construction, session)
+		if !transferred {
+			ownerErr := a.nativeConstructionError(construction)
+			cleanupErr := a.cleanupNativeConstruction(context.WithoutCancel(ctx), construction, ownerErr)
+			err = errors.Join(ownerErr, cleanupErr)
+			session = nil
+
+			return
+		}
+		// The process observer is external and may synchronously reenter
+		// Agent.Close. Construction ownership has already transferred to the
+		// claimable session, so that reentry never waits on its own callback.
+		observeErr := session.observeProviderProcessBounded(context.WithoutCancel(ctx), session.outboxRouter())
+		if observeErr != nil {
+			a.retainIncompleteSession(session, observeErr)
+			session = nil
+			err = observeErr
+
+			return
+		}
+
+		a.mu.Lock()
+		closed = closed || a.closed
+		a.mu.Unlock()
+
+		if closed {
+			closeErr := session.Close(context.WithoutCancel(ctx))
+			a.retainIncompleteSession(session, closeErr)
+			session = nil
+			err = errors.Join(errAgentClosed, closeErr)
+		}
+	}()
+
+	return a.startSessionConstruction(ctx, start, construction)
+}
+
+//nolint:gocyclo // Startup is one fail-closed ownership ladder whose ordered gates must remain visible.
+func (a *Agent) startSessionConstruction(
+	ctx context.Context,
+	start sessionStart,
+	construction *nativeConstruction,
+) (session *agentSession, err error) {
 	defer func() { a.recordNativeContainment(err) }()
 
 	// Every session-establishing method fails here on agent configuration a
@@ -734,7 +1036,17 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 
 	readinessStarted := time.Now()
 	versionErr := a.ensureVersion(ctx)
-	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery, RuntimeStartupReadiness, readinessStarted, versionErr)
+
+	observationErr := observeRuntimeStartupStage(
+		ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery, RuntimeStartupReadiness, readinessStarted, versionErr,
+	)
+	if observationErr != nil {
+		return nil, errors.Join(versionErr, observationErr)
+	}
+
+	if closedErr := a.ensureOpen(); closedErr != nil {
+		return nil, closedErr
+	}
 
 	if versionErr != nil {
 		return nil, versionErr
@@ -759,6 +1071,14 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		return nil, err
 	}
 
+	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
+		owner.scratchRelease = scratchRelease
+	})
+
+	if closedErr := a.ensureOpen(); closedErr != nil {
+		return nil, closedErr
+	}
+
 	var (
 		dirs          sessionDirs
 		nativeRelease func()
@@ -766,19 +1086,16 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		residence     *pi.SessionResidence
 	)
 
-	keepScratch := false
-	defer func() {
-		if !keepScratch {
-			err = finalizeSessionRuntimeResources(
-				err, nativeRelease, dirs.SessionRoot, scratchRelease, browserShim, residence,
-			)
-		}
-	}()
-
 	dirs, browserShim, err = a.createSessionRuntime()
 	if err != nil {
 		return nil, err
 	}
+
+	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
+		owner.generationRoot = dirs.Root
+		owner.sessionRoot = dirs.SessionRoot
+		owner.browserShim = browserShim
+	})
 
 	hydratedPath := ""
 
@@ -807,6 +1124,10 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	if err != nil {
 		return nil, err
 	}
+
+	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
+		owner.residence = residence
+	})
 
 	extensionPaths := residenceFiles.ExtensionPaths
 
@@ -847,22 +1168,26 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		SeedFiles: a.options.SeedFiles,
 	}
 	if writeErr := agentDir.Write(); writeErr != nil {
-		observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, writeErr)
+		writeObservationErr := observeRuntimeStartupStage(
+			ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, writeErr,
+		)
 
 		var seedErr *pi.SeedFileError
 		if errors.As(writeErr, &seedErr) {
-			return nil, unsupportedField("seedFiles." + seedErr.Name)
+			return nil, errors.Join(unsupportedField("seedFiles."+seedErr.Name), writeObservationErr)
 		}
 
-		return nil, writeErr
+		return nil, errors.Join(writeErr, writeObservationErr)
 	}
 
 	// Reconciled after the seed write, so an operator-seeded settings.json is
 	// the baseline this and every later launch starts from.
 	if reconcileErr := a.reconcileHomeStartupDefaults(dirs.AgentDir); reconcileErr != nil {
-		observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, reconcileErr)
+		reconcileObservationErr := observeRuntimeStartupStage(
+			ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, reconcileErr,
+		)
 
-		return nil, reconcileErr
+		return nil, errors.Join(reconcileErr, reconcileObservationErr)
 	}
 
 	seededResources, err := agentDirExplicitResources(agentDir)
@@ -879,7 +1204,15 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 	// replaced by a seed with the same registration name.
 	extensionPaths = append(seededResources.Extensions, extensionPaths...)
 
-	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, nil)
+	if configurationObservationErr := observeRuntimeStartupStage(
+		ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, nil,
+	); configurationObservationErr != nil {
+		return nil, configurationObservationErr
+	}
+
+	if closedErr := a.ensureOpen(); closedErr != nil {
+		return nil, closedErr
+	}
 
 	spec := pi.LaunchSpec{
 		ExecutablePath:      executable,
@@ -910,11 +1243,53 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		return nil, err
 	}
 
+	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
+		owner.nativeRelease = nativeRelease
+	})
+
+	if closedErr := a.ensureOpen(); closedErr != nil {
+		return nil, closedErr
+	}
+
+	// Final native-launch gate: no hook or ownership transfer occurs between
+	// this check and startTrackedPiProcess.
+	if contextErr := ctx.Err(); contextErr != nil {
+		return nil, contextErr
+	}
+
+	if closedErr := a.ensureOpen(); closedErr != nil {
+		return nil, closedErr
+	}
+
 	spawnStarted := time.Now()
 	proc, client, processRoot, err := a.startTrackedPiProcess(startCtx, spec)
-	observeRuntimeStartupStage(startCtx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSpawn, spawnStarted, err)
+	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
+		owner.proc = proc
+		owner.client = client
+
+		owner.processRoot = processRoot
+		if owner.err == nil {
+			owner.err = err
+		}
+	})
+
+	observationErr = observeRuntimeStartupStage(
+		startCtx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSpawn, spawnStarted, err,
+	)
 
 	finishStart(err)
+
+	if observationErr != nil {
+		if errors.Is(observationErr, errRuntimeObservationPanic) {
+			observationErr = errors.Join(errors.New("pi session construction callback panicked"), observationErr)
+		}
+
+		return nil, errors.Join(err, observationErr)
+	}
+
+	if closedErr := a.ensureOpen(); closedErr != nil {
+		return nil, errors.Join(err, closedErr)
+	}
 
 	if err != nil {
 		return nil, a.nativeStartFailure(ctx, failureCauseProcessExit, err, nil)
@@ -939,52 +1314,60 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 		nativeRootRelease:     nativeRelease,
 		scratchRootRelease:    scratchRelease,
 		providerProcessRoot:   processRoot,
+		nativeBoundary:        construction.nativeBoundary,
 	}
-
-	// The cleanup defer must hold its own reference: failure paths return a
-	// nil session, which resets the named return before the defer runs.
-	created := session
-	started := true
-
-	defer func() {
-		if started && err != nil {
-			created.stopPump()
-
-			shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), sessionShutdownTimeout)
-			shutdownErr := proc.Shutdown(shutdownCtx)
-
-			cancelShutdown()
-
-			closeErr := proc.Close()
-			cleanupErr := errors.Join(shutdownErr, closeErr)
-			created.retireProviderProcess(context.Background(), closeErr)
-
-			err = errors.Join(err, cleanupErr)
-		}
-	}()
+	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
+		owner.session = session
+	})
 
 	readinessStarted = time.Now()
-	err = client.Start(context.WithoutCancel(ctx))
-	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupReadiness, readinessStarted, err)
+	generationCtx, generationCancel := context.WithCancel(context.Background())
+	err = client.Start(generationCtx)
+	observationErr = observeRuntimeStartupStage(
+		ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupReadiness, readinessStarted, err,
+	)
 
 	if err != nil {
+		generationCancel()
+
 		return nil, err
 	}
 
-	session.startPump(client)
+	if observationErr != nil {
+		generationCancel()
+
+		return nil, observationErr
+	}
+
+	if closedErr := a.ensureOpen(); closedErr != nil {
+		generationCancel()
+
+		return nil, closedErr
+	}
+
+	if _, pumpErr := session.startPumpContext(generationCtx, generationCancel, client, construction.nativeBoundary); pumpErr != nil {
+		generationCancel()
+
+		return nil, pumpErr
+	}
 
 	sessionStarted := time.Now()
 	err = a.setUpNativeSession(ctx, session, start, modelRef, hasModel)
-	observeRuntimeStartupStage(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSession, sessionStarted, err)
+
+	observationErr = observeRuntimeStartupStage(
+		ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSession, sessionStarted, err,
+	)
+	if observationErr != nil {
+		return nil, errors.Join(err, observationErr)
+	}
+
+	if closedErr := a.ensureOpen(); closedErr != nil {
+		return nil, errors.Join(err, closedErr)
+	}
 
 	if err != nil {
 		return nil, err
 	}
-
-	started = false
-	keepScratch = true
-
-	processRoot.observe(ctx, proc)
 
 	return session, nil
 }
@@ -1081,7 +1464,7 @@ func (a *Agent) setUpNativeSession(
 		if setErr != nil {
 			var commandErr *pi.CommandError
 			if errors.As(setErr, &commandErr) {
-				a.log.ErrorContext(ctx, "pi rejected the configured model", slog.String("message", commandErr.Message))
+				a.log.ErrorContext(ctx, "pi rejected the configured model")
 
 				return unsupportedField(metaOptionPath(metaModelKey))
 			}
@@ -1157,7 +1540,9 @@ func (a *Agent) resolveInitialModel(options PiOptions) (pi.ModelRef, bool, error
 func (s *agentSession) emitCurrentUsageUpdate(ctx context.Context) {
 	stats, err := s.currentClient().GetSessionStats(ctx)
 	if err != nil {
-		s.agent.log.DebugContext(ctx, "get pi session stats failed", slog.String(jsonFieldError, err.Error()))
+		s.agent.log.DebugContext(ctx, "get pi session stats failed",
+			slog.String(acpFieldSessionID, string(s.id)),
+		)
 
 		return
 	}

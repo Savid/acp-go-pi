@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -85,8 +86,6 @@ type agentSession struct {
 	// client event and UI request streams for the life of the process.
 	pumpCancel context.CancelFunc
 	pumpDone   chan struct{}
-	dialogWG   sync.WaitGroup
-
 	turn       chan struct{}
 	cancelMu   sync.Mutex
 	toolMu     sync.Mutex
@@ -122,7 +121,9 @@ type agentSession struct {
 	// one outbox, one lifecycle incarnation, and every event either produced.
 	pumpGeneration       uint64
 	outbox               *sessionOutbox
+	promptAdmission      *turnDelivery
 	turnEvents           *turnDelivery
+	containmentOutboxes  []*sessionOutbox
 	turnNativeSettled    bool
 	settlement           *turnSettlement
 	turnFenceStarted     bool
@@ -140,6 +141,7 @@ type agentSession struct {
 	scratchRootRelease   func()
 	nativeContainmentErr error
 	providerProcessRoot  *providerProcessRoot
+	nativeBoundary       *nativeBoundaryTracker
 	browserShim          *pi.BrowserShim
 	residence            *pi.SessionResidence
 	authClosed           bool
@@ -148,19 +150,38 @@ type agentSession struct {
 	// requested the session admits no prompt, relaunch, or MCP-tool refresh
 	// ever again, whether or not the teardown that requested it succeeded.
 	closing bool
-	// closeAttempt is the teardown ladder in flight. A concurrent Close waits
-	// on it and reports its result rather than tearing the same resources down
-	// beside it; an attempt that failed clears the field, because the session
-	// still owns everything that teardown did not finish.
-	closeAttempt *sessionCloseAttempt
+	// closeAttempt is the immutable teardown result every concurrent and later
+	// Close joins.
+	closeAttempt              *sessionCloseAttempt
+	relaunchAttempt           *sessionRelaunchAttempt
+	lifecycleDeliveryDetached bool
 }
 
-// sessionCloseAttempt is one run of the session teardown ladder. Its result is
-// published by closing done, so a waiter always reads the result of the attempt
-// it actually waited on and never a later one's.
 type sessionCloseAttempt struct {
-	done chan struct{}
-	err  error
+	done             chan struct{}
+	err              error
+	outbox           *sessionOutbox
+	containment      *generationContainment
+	containmentOwner bool
+	relaunch         *sessionRelaunchAttempt
+	finishOnce       sync.Once
+	settlement       atomic.Uint32
+}
+
+// sessionRelaunchAttempt is the exact in-flight successor construction a
+// close election must join when close wins before publication.
+type sessionRelaunchAttempt struct {
+	mu             sync.Mutex
+	finishOnce     sync.Once
+	done           chan struct{}
+	err            error
+	proc           piProcess
+	client         piClient
+	processRoot    *providerProcessRoot
+	generationRoot string
+	nativeRelease  func()
+	outbox         *sessionOutbox
+	nativeBoundary *nativeBoundaryTracker
 }
 
 // turnToolCall is the exact-ID lifecycle published for one native tool call.
@@ -184,7 +205,7 @@ type turnToolCall struct {
 // dialogCancel tracks one pending extension UI dialog so session/cancel and
 // teardown can resolve it as cancelled.
 type dialogCancel struct {
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 }
 
 // promptTurnState accumulates per-turn results while streaming events.

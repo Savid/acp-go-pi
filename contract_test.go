@@ -458,7 +458,7 @@ func TestConformanceTurnFailuresT1ThroughT6(t *testing.T) {
 		}
 	})
 
-	t.Run("T4 malformed records are skipped", func(t *testing.T) {
+	t.Run("T4 malformed record terminalizes generation", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		scenario := successfulUnitScenario()
@@ -466,9 +466,10 @@ func TestConformanceTurnFailuresT1ThroughT6(t *testing.T) {
 		scenario.GarbageLines = 3
 		conn := connectConformanceAgent(t, ctx, &conformanceClient{}, defaultInitializeRequest(), scenario)
 		sessionID := newConformanceSession(t, ctx, conn)
-		response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "garbage"))
-		require.NoError(t, err)
-		require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+		_, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "garbage"))
+		requirePiTurnFailure(t, err, failureCauseTransport)
+		_, err = conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "later"))
+		require.Error(t, err)
 	})
 
 	t.Run("T5 cancel guard", func(t *testing.T) {

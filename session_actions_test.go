@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +17,15 @@ import (
 	"github.com/savid/acp-go-pi/internal/lifecycle"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
+
+func actionLifecycleSession(t *testing.T, authoritative bool) (*agentSession, *directAgentClient) {
+	t.Helper()
+
+	session, client := lifecycleSession(t, authoritative)
+	session.outbox = newTestSessionOutbox(1)
+
+	return session, client
+}
 
 type lifecycleActionWireWriter struct {
 	lines          chan []byte
@@ -38,6 +50,112 @@ type lifecycleActionWireMessage struct {
 	ID     *json.RawMessage `json:"id"`
 	Method string           `json:"method"`
 	Params json.RawMessage  `json:"params"`
+}
+
+type heldActionClient struct {
+	*recordingClient
+	kind      lifecycle.ActionKind
+	started   chan struct{}
+	cancelled chan struct{}
+}
+
+type faultingActionClient struct {
+	*directAgentClient
+	mode    string
+	entered chan struct{}
+	release chan struct{}
+}
+
+type blockingActionAnnouncementClient struct {
+	*heldActionClient
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingActionAnnouncementClient) SessionUpdate(ctx context.Context, notification acp.SessionNotification) error {
+	envelope, _ := notification.Meta[lifecycleMetaKey].(map[string]any)
+	event, _ := envelope["event"].(map[string]any)
+	action, _ := event["action"].(map[string]any)
+	if event["type"] == string(lifecycle.EventActionUpdate) && action["state"] == string(lifecycle.ActionPending) {
+		c.once.Do(func() { close(c.entered) })
+		<-c.release
+	}
+
+	return c.recordingClient.SessionUpdate(ctx, notification)
+}
+
+func (c *faultingActionClient) CreateElicitation(
+	ctx context.Context,
+	_ acp.UnstableCreateElicitationRequest,
+	_ elicitationScope,
+) (acp.UnstableCreateElicitationResponse, error) {
+	switch c.mode {
+	case "panic before write":
+		panic("action writer secret before write")
+	case "panic after write":
+		acknowledgeActionRequestWrite(ctx, nil)
+		panic("action writer secret after write")
+	case "ignore cancellation":
+		acknowledgeActionRequestWrite(ctx, nil)
+		close(c.entered)
+		<-c.release
+	}
+
+	return acp.UnstableCreateElicitationResponse{}, nil
+}
+
+func actionFailureSession(t *testing.T, conn agentClient) (*agentSession, *stubProcess, *stubPiClient) {
+	t.Helper()
+
+	agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
+	agent.conn = conn
+	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
+	process := newStubProcess(false)
+	native := newStubPiClient()
+	session := &agentSession{agent: agent, id: "action-failure", proc: process, client: native}
+	outbox := newTestSessionOutbox(1)
+	bindTestRuntime(outbox, process, native, nil, nil, nil)
+	session.outbox = outbox
+	session.pumpGeneration = 1
+	require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+	require.NoError(t, session.lifecycleAcceptTurn(t.Context(), testSubmission()))
+
+	return session, process, native
+}
+
+func (c *heldActionClient) RequestPermission(
+	ctx context.Context,
+	_ acp.RequestPermissionRequest,
+) (acp.RequestPermissionResponse, error) {
+	if c.kind != lifecycle.ActionPermission {
+		return acp.RequestPermissionResponse{}, errors.New("unexpected permission request")
+	}
+
+	acknowledgeActionRequestWrite(ctx, nil)
+	close(c.started)
+	<-ctx.Done()
+	close(c.cancelled)
+
+	return acp.RequestPermissionResponse{}, ctx.Err()
+}
+
+func (c *heldActionClient) CreateElicitation(
+	ctx context.Context,
+	_ acp.UnstableCreateElicitationRequest,
+	_ elicitationScope,
+) (acp.UnstableCreateElicitationResponse, error) {
+	if c.kind != lifecycle.ActionElicitation {
+		return acp.UnstableCreateElicitationResponse{}, errors.New("unexpected elicitation request")
+	}
+
+	acknowledgeActionRequestWrite(ctx, nil)
+	close(c.started)
+	<-ctx.Done()
+	close(c.cancelled)
+
+	return acp.UnstableCreateElicitationResponse{}, ctx.Err()
 }
 
 func nextLifecycleActionWireMessage(t *testing.T, lines <-chan []byte) lifecycleActionWireMessage {
@@ -80,11 +198,309 @@ func TestActionAnswerClassificationAndPlainRequest(t *testing.T) {
 	require.Equal(t, "plain", value)
 }
 
+func TestActionWriterPanicFailsClosedAndAnswersNativeDialogOnce(t *testing.T) {
+	for _, mode := range []string{"panic before write", "panic after write"} {
+		t.Run(mode, func(t *testing.T) {
+			client := &faultingActionClient{directAgentClient: newDirectAgentClient(), mode: mode}
+			session, process, native := actionFailureSession(t, client)
+
+			session.handleElicitationDialog(t.Context(), pi.UIRequest{ID: "dialog", Method: uiMethodInput})
+
+			require.NoError(t, session.awaitPoisonContainment())
+			require.Equal(t, 1, process.shutdownCalls)
+			require.Equal(t, 1, process.closeCalls)
+			native.mu.Lock()
+			require.Len(t, native.responses, 1)
+			require.Equal(t, "dialog", native.responses[0].ID)
+			native.mu.Unlock()
+
+			_, err := session.acquireTurn(t.Context())
+			require.Error(t, err)
+			require.NotContains(t, err.Error(), "action writer secret")
+		})
+	}
+}
+
+func TestActionFailureDeniesExactEmittingClientBeforeContainingGeneration(t *testing.T) {
+	host := &faultingActionClient{directAgentClient: newDirectAgentClient(), mode: "panic after write"}
+	session, oldProcess, oldClient := actionFailureSession(t, host)
+	oldOutbox := session.outbox
+	dialog := &nativeDialog{
+		request: pi.UIRequest{ID: "old-dialog", Method: uiMethodInput},
+		outbox:  oldOutbox,
+		client:  oldClient,
+	}
+	trace := make([]string, 0, 3)
+	oldClient.respondFunc = func(pi.UIResponse) { trace = append(trace, "deny") }
+	oldProcess.shutdownFunc = func(context.Context) error {
+		trace = append(trace, "shutdown")
+
+		return nil
+	}
+	oldProcess.closeFunc = func() error {
+		trace = append(trace, "close")
+
+		return nil
+	}
+
+	successorProcess := newStubProcess(false)
+	successorClient := newStubPiClient()
+	successor := newTestSessionOutbox(2)
+	bindTestRuntime(successor, successorProcess, successorClient, nil, nil, nil)
+	session.mu.Lock()
+	session.proc = successorProcess
+	session.client = successorClient
+	session.outbox = successor
+	session.mu.Unlock()
+
+	session.handleNativeElicitationDialog(t.Context(), dialog)
+	require.NoError(t, session.awaitPoisonContainment())
+
+	oldClient.mu.Lock()
+	require.Len(t, oldClient.responses, 1)
+	require.Equal(t, "old-dialog", oldClient.responses[0].ID)
+	oldClient.mu.Unlock()
+	successorClient.mu.Lock()
+	require.Empty(t, successorClient.responses)
+	successorClient.mu.Unlock()
+	require.Equal(t, 1, oldProcess.shutdownCalls)
+	require.Equal(t, []string{"deny", "shutdown", "close"}, trace)
+	require.Zero(t, successorProcess.shutdownCalls)
+	require.Zero(t, successorProcess.closeCalls)
+}
+
+func TestActionWriterIgnoringCancellationCannotVetoNativeCloseAndIsRetained(t *testing.T) {
+	originalActionTimeout := sessionActionRequestTimeout
+	originalCloseWait := sessionCloseTurnWaitContext
+	sessionActionRequestTimeout = 20 * time.Millisecond
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		return context.WithTimeout(ctx, 20*time.Millisecond)
+	}
+	t.Cleanup(func() {
+		sessionActionRequestTimeout = originalActionTimeout
+		sessionCloseTurnWaitContext = originalCloseWait
+	})
+
+	client := &faultingActionClient{
+		directAgentClient: newDirectAgentClient(),
+		mode:              "ignore cancellation",
+		entered:           make(chan struct{}),
+		release:           make(chan struct{}),
+	}
+	session, process, native := actionFailureSession(t, client)
+	agent := session.agent
+	agent.sessions[session.id] = session
+
+	dialogDone := make(chan struct{})
+	go func() {
+		defer close(dialogDone)
+		session.handleElicitationDialog(context.Background(), pi.UIRequest{ID: "held", Method: uiMethodInput})
+	}()
+	<-client.entered
+
+	closeErr := agent.Close()
+	require.ErrorIs(t, closeErr, pi.ErrProcessContainmentIncomplete)
+	require.Equal(t, 1, process.shutdownCalls, "bounded host delivery cannot veto native shutdown")
+	require.Equal(t, 1, process.closeCalls, "bounded host delivery cannot veto native close")
+	native.mu.Lock()
+	require.Len(t, native.responses, 1)
+	native.mu.Unlock()
+	agent.mu.Lock()
+	require.Same(t, session, agent.sessions[session.id])
+	agent.mu.Unlock()
+
+	close(client.release)
+	<-dialogDone
+	require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+}
+
+func TestActionRequestCancellationAtEachWriteBarrierContainsExactGeneration(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		acknowledge func(context.Context)
+	}{
+		{name: "before write acknowledgement"},
+		{
+			name: "after failed write acknowledgement",
+			acknowledge: func(ctx context.Context) {
+				acknowledgeActionRequestWrite(ctx, errors.New("write failed"))
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			session, process, _ := actionFailureSession(t, newDirectAgentClient())
+			outbox := session.outbox
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			requestCtx, cancelRequest := context.WithCancel(context.Background())
+
+			type result struct {
+				value string
+				err   error
+			}
+			resultCh := make(chan result, 1)
+			failedNative := 0
+			go func() {
+				value, err := announcedBoundActionRequest(
+					requestCtx,
+					session,
+					lifecycle.ActionPermission,
+					func(ctx context.Context, _ map[string]any) (string, error) {
+						if testCase.acknowledge != nil {
+							testCase.acknowledge(ctx)
+						}
+						close(entered)
+						<-release
+
+						return "late", nil
+					},
+					func(string, error) lifecycle.ActionState { return lifecycle.ActionAccepted },
+					outbox,
+					func() { failedNative++ },
+				)
+				resultCh <- result{value: value, err: err}
+			}()
+
+			<-entered
+			cancelRequest()
+			got := <-resultCh
+			require.Empty(t, got.value)
+			require.ErrorIs(t, got.err, errLifecycleActionRequest)
+			require.Equal(t, 1, failedNative)
+			require.Equal(t, 1, process.shutdownCalls)
+			require.Equal(t, 1, process.closeCalls)
+
+			close(release)
+			require.NoError(t, outbox.producers.waitChildren(t.Context()))
+			require.NoError(t, outbox.interactions.waitChildren(t.Context()))
+		})
+	}
+}
+
+func TestCloseCancelsAndJoinsHostActionBeforeNativeInterrupt(t *testing.T) {
+	trace := make([]string, 0, 4)
+	var traceMu sync.Mutex
+	record := func(value string) {
+		traceMu.Lock()
+		trace = append(trace, value)
+		traceMu.Unlock()
+	}
+
+	host := &heldActionClient{
+		recordingClient: newRecordingClient(),
+		kind:            lifecycle.ActionElicitation,
+		started:         make(chan struct{}),
+		cancelled:       make(chan struct{}),
+	}
+	session, process, native := actionFailureSession(t, host)
+	native.respondFunc = func(pi.UIResponse) { record("deny") }
+	native.abortFunc = func(context.Context) error {
+		record("abort")
+
+		return nil
+	}
+	process.shutdownFunc = func(context.Context) error {
+		record("shutdown")
+
+		return nil
+	}
+	process.closeFunc = func() error {
+		record("close")
+
+		return nil
+	}
+
+	releaseDialog, admitted := session.admitDialogHandler(session.outbox)
+	require.True(t, admitted)
+	dialog := &nativeDialog{
+		request: pi.UIRequest{ID: "barrier", Method: uiMethodInput},
+		outbox:  session.outbox,
+		client:  native,
+		done:    releaseDialog,
+	}
+	dialogDone := make(chan struct{})
+	go func() {
+		defer close(dialogDone)
+		defer dialog.complete()
+		session.handleNativeElicitationDialog(context.Background(), dialog)
+	}()
+	<-host.started
+
+	require.NoError(t, session.Close(t.Context()))
+	<-dialogDone
+	<-host.cancelled
+	traceMu.Lock()
+	got := append([]string(nil), trace...)
+	traceMu.Unlock()
+	require.Equal(t, []string{"deny", "abort", "shutdown", "close"}, got)
+}
+
+func TestTimedOutActionAnnouncementRetainsImmutableGeneration(t *testing.T) {
+	originalWait := sessionCloseTurnWaitContext
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		bounded, cancel := context.WithCancel(ctx)
+		cancel()
+
+		return bounded, cancel
+	}
+	t.Cleanup(func() { sessionCloseTurnWaitContext = originalWait })
+
+	host := &blockingActionAnnouncementClient{
+		heldActionClient: &heldActionClient{
+			recordingClient: newRecordingClient(),
+			kind:            lifecycle.ActionElicitation,
+			started:         make(chan struct{}),
+			cancelled:       make(chan struct{}),
+		},
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	session, process, native := actionFailureSession(t, host)
+	releaseDialog, admitted := session.admitDialogHandler(session.outbox)
+	require.True(t, admitted)
+	dialog := &nativeDialog{
+		request: pi.UIRequest{ID: "blocked-announcement", Method: uiMethodInput},
+		outbox:  session.outbox,
+		client:  native,
+		done:    releaseDialog,
+	}
+	dialogDone := make(chan struct{})
+	go func() {
+		defer close(dialogDone)
+		defer dialog.complete()
+		session.handleNativeElicitationDialog(context.Background(), dialog)
+	}()
+	<-host.entered
+	require.True(t, session.lcMu.TryLock(), "blocked lifecycle delivery retained lcMu")
+	session.lcMu.Unlock()
+
+	closed := make(chan error, 1)
+	go func() { closed <- session.Close(context.Background()) }()
+	require.ErrorIs(t, <-closed, pi.ErrProcessContainmentIncomplete)
+	require.Equal(t, 1, process.shutdownCalls)
+	require.Equal(t, 1, process.closeCalls)
+
+	session.lcMu.Lock()
+	sequence := session.lc.stream.Sequence()
+	require.Empty(t, session.lc.blockers)
+	session.lcMu.Unlock()
+	close(host.release)
+	<-dialogDone
+
+	session.lcMu.Lock()
+	require.Equal(t, sequence, session.lc.stream.Sequence())
+	require.Empty(t, session.lc.blockers)
+	require.ErrorIs(t, session.lc.quarantineErr, pi.ErrProcessContainmentIncomplete)
+	session.lcMu.Unlock()
+	require.Equal(t, 1, process.shutdownCalls, "late announcement release repeated containment")
+	require.Equal(t, 1, process.closeCalls, "late announcement release repeated cleanup")
+}
+
 // TestAnnouncedActionRequestLifecycle pins the ordered action contract: the
 // request carries the action identity on the wire, the announcement follows
 // it, and the resolution lands exactly once with the answer's classification.
 func TestAnnouncedActionRequestLifecycle(t *testing.T) {
-	s, client := lifecycleSession(t, false)
+	s, client := actionLifecycleSession(t, false)
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{SubmissionID: "s", ClientNonce: "n"}))
 
@@ -150,9 +566,9 @@ func TestAnnouncedActionRequestLifecycle(t *testing.T) {
 			return "unpublished", nil
 		},
 		func(string, error) lifecycle.ActionState { return lifecycle.ActionAccepted })
-	require.ErrorContains(t, err, "announce delivery")
+	require.ErrorIs(t, err, errLifecycleActionAnnouncement)
 
-	fenced, _ := lifecycleSession(t, false)
+	fenced, _ := actionLifecycleSession(t, false)
 	require.NoError(t, fenced.openLifecycleStream(t.Context(), 1))
 	require.NoError(t, fenced.lifecycleAcceptTurn(t.Context(), testSubmission()))
 	original := lifecycleRandRead
@@ -162,6 +578,178 @@ func TestAnnouncedActionRequestLifecycle(t *testing.T) {
 		func(context.Context, map[string]any) (string, error) { return "never sent", nil },
 		func(string, error) lifecycle.ActionState { return lifecycle.ActionAccepted })
 	require.ErrorContains(t, err, "entropy")
+}
+
+// TestAnnouncementFailureRevokesHeldHostAction exercises both action methods
+// at both delivery seams. The host deliberately never answers; cancellation of
+// its exact request is therefore the only way the call can return.
+func TestAnnouncementFailureRevokesHeldHostAction(t *testing.T) {
+	for _, kind := range []lifecycle.ActionKind{lifecycle.ActionPermission, lifecycle.ActionElicitation} {
+		for _, failAfter := range []int{3, 4} {
+			stage := "pending"
+			if failAfter == 4 {
+				stage = "requires_action"
+			}
+			t.Run(string(kind)+"/"+stage, func(t *testing.T) {
+				logs := &strings.Builder{}
+				recording := newRecordingClient()
+				recording.lifecycleFailAfter = failAfter
+				recording.failureErr = errors.New("provider announcement sentinel")
+				client := &heldActionClient{
+					recordingClient: recording,
+					kind:            kind,
+					started:         make(chan struct{}),
+					cancelled:       make(chan struct{}),
+				}
+				agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
+				agent.conn = client
+				agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+				process := newStubProcess(false)
+				native := newStubPiClient()
+				session := &agentSession{agent: agent, id: "action", proc: process, client: native}
+				outbox := newTestSessionOutbox(1)
+				bindTestRuntime(outbox, process, native, nil, nil, nil)
+				session.outbox = outbox
+				session.pumpGeneration = 1
+				require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+				require.NoError(t, session.lifecycleAcceptTurn(t.Context(), testSubmission()))
+
+				result := make(chan error, 1)
+				go func() {
+					switch kind {
+					case lifecycle.ActionPermission:
+						_, err := session.requestAnnouncedPermission(context.Background(), client, acp.RequestPermissionRequest{SessionId: session.id}, dialogActionBinding{outbox: outbox})
+						result <- err
+					case lifecycle.ActionElicitation:
+						_, err := session.requestAnnouncedElicitation(context.Background(), client, acp.UnstableCreateElicitationRequest{
+							Form: &acp.UnstableCreateElicitationForm{},
+						}, elicitationScope{SessionID: session.id}, dialogActionBinding{outbox: outbox})
+						result <- err
+					}
+				}()
+
+				<-client.started
+				require.ErrorIs(t, <-result, errLifecycleActionAnnouncement)
+				<-client.cancelled
+				require.NoError(t, session.awaitPoisonContainment())
+
+				session.lcMu.Lock()
+				require.Empty(t, session.lc.blockers)
+				require.True(t, session.lc.fenced)
+				session.lcMu.Unlock()
+				require.Equal(t, 1, process.shutdownCalls)
+				require.Equal(t, 1, process.closeCalls)
+				require.NotContains(t, logs.String(), "provider announcement sentinel")
+			})
+		}
+	}
+}
+
+func TestActionAdmissionFailureMatrixCancelsExactNativeOwner(t *testing.T) {
+	session, _ := actionLifecycleSession(t, false)
+	require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+	require.NoError(t, session.lifecycleAcceptTurn(t.Context(), testSubmission()))
+
+	for _, testCase := range []struct {
+		name  string
+		ctx   context.Context //nolint:containedctx // The table selects exact cancelled/live admission contexts.
+		setup func(*sessionOutbox)
+	}{
+		{
+			name: "caller already cancelled",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+
+				return ctx
+			}(),
+		},
+		{
+			name: "generation handler admission closed",
+			ctx:  t.Context(),
+			setup: func(outbox *sessionOutbox) {
+				outbox.interactions.releaseRoot()
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			outbox := newTestSessionOutbox(1)
+			if testCase.setup != nil {
+				testCase.setup(outbox)
+			}
+			cancelled := 0
+			_, err := announcedBoundActionRequest(testCase.ctx, session, lifecycle.ActionPermission,
+				func(context.Context, map[string]any) (string, error) {
+					t.Fatal("failed admission reached host request")
+
+					return "", nil
+				},
+				func(string, error) lifecycle.ActionState { return lifecycle.ActionFailed },
+				outbox,
+				func() { cancelled++ },
+			)
+			require.Error(t, err)
+			require.Equal(t, 1, cancelled)
+		})
+	}
+
+	cancelled := 0
+	session.outbox = nil
+	_, err := announcedBoundActionRequest(t.Context(), session, lifecycle.ActionPermission,
+		func(context.Context, map[string]any) (string, error) {
+			t.Fatal("unowned action reached host request")
+
+			return "", nil
+		},
+		func(string, error) lifecycle.ActionState { return lifecycle.ActionFailed },
+		nil,
+		func() { cancelled++ },
+	)
+	require.ErrorIs(t, err, errLifecycleActionUnowned)
+	require.Equal(t, 1, cancelled)
+}
+
+func TestLifecycleActionAnnouncementPanicIsContained(t *testing.T) {
+	err := runLifecycleActionAnnouncement(t.Context(), nil, pendingAction{}, lifecycle.ActionPermission)
+	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+}
+
+func TestStaleStreamAfterActionWriteIsRevokedWithoutAnswer(t *testing.T) {
+	s, _ := actionLifecycleSession(t, false)
+	process := newStubProcess(false)
+	native := newStubPiClient()
+	s.proc = process
+	s.client = native
+	outbox := newTestSessionOutbox(1)
+	bindTestRuntime(outbox, process, native, nil, nil, nil)
+	s.outbox = outbox
+	s.pumpGeneration = 1
+	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
+	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
+
+	cancelled := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := announcedActionRequest(context.Background(), s, lifecycle.ActionPermission,
+			func(ctx context.Context, _ map[string]any) (string, error) {
+				// The request's full write has completed. Fence the stream before
+				// reporting that write to the announcement coordinator.
+				s.fenceLifecycleStream()
+				acknowledgeActionRequestWrite(ctx, nil)
+				<-ctx.Done()
+				close(cancelled)
+
+				return "", ctx.Err()
+			},
+			func(string, error) lifecycle.ActionState { return lifecycle.ActionFailed })
+		result <- err
+	}()
+
+	require.ErrorIs(t, <-result, errLifecycleActionAnnouncement)
+	<-cancelled
+	require.NoError(t, s.awaitPoisonContainment())
+	require.Equal(t, 1, process.shutdownCalls)
+	require.Equal(t, 1, process.closeCalls)
 }
 
 // TestAnnouncedPermissionCrossesTheRequestWriteBarrier pins the transport
@@ -194,7 +782,7 @@ func TestAnnouncedPermissionCrossesTheRequestWriteBarrier(t *testing.T) {
 		}
 	})
 
-	session := &agentSession{agent: agent, id: "session"}
+	session := &agentSession{agent: agent, id: "session", outbox: newTestSessionOutbox(1)}
 	require.NoError(t, session.openLifecycleStream(t.Context(), 1))
 	require.NoError(t, session.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{
 		SubmissionID: "submission", ClientNonce: "nonce",
@@ -215,7 +803,7 @@ func TestAnnouncedPermissionCrossesTheRequestWriteBarrier(t *testing.T) {
 	go func() {
 		response, err := session.requestAnnouncedPermission(t.Context(), connection, acp.RequestPermissionRequest{
 			SessionId: session.id,
-		})
+		}, dialogActionBinding{outbox: session.outbox})
 		done <- result{response: response, err: err}
 	}()
 
@@ -266,7 +854,7 @@ func TestAnnouncedPermissionCrossesTheRequestWriteBarrier(t *testing.T) {
 // TestAnnouncedElicitationStampsActionMeta pins that the action correlation
 // rides either elicitation variant's own _meta when a turn owns the request.
 func TestAnnouncedElicitationStampsActionMeta(t *testing.T) {
-	s, _ := lifecycleSession(t, false)
+	s, _ := actionLifecycleSession(t, false)
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 	require.NoError(t, s.lifecycleAcceptTurn(t.Context(), lifecycle.Submission{SubmissionID: "s", ClientNonce: "n"}))
 
@@ -286,22 +874,20 @@ func TestAnnouncedElicitationStampsActionMeta(t *testing.T) {
 		Url: &acp.UnstableCreateElicitationUrl{
 			ElicitationId: "url", Message: "open", Mode: elicitationModeURL, Url: "https://example.test",
 		},
-	}, elicitationScope{})
+	}, elicitationScope{}, dialogActionBinding{outbox: s.outbox})
 	require.NoError(t, err)
 	require.Len(t, dialog.elicitationRequests, 2)
 	require.Contains(t, dialog.elicitationRequests[1].Url.Meta, lifecycleMetaKey)
 }
 
-// TestUnownedLifecycleActionIsRefusedRatherThanSentBare pins the three states
+// TestUnownedLifecycleActionIsRefusedRatherThanSentBare pins the states
 // prepareLifecycleAction distinguishes. While version 1 is negotiated every
-// permission and elicitation carries the correlation, so there is no shape for
-// one with no owner to name: a live incarnation with no open turn refuses the
-// request instead of putting a correlation-less one on the wire, and the caller
-// answers pi with a native cancel. The absence of an incarnation is a different
-// thing entirely and still sends plainly.
+// permission and elicitation carries the correlation, so a fenced stream or a
+// live incarnation with no owner refuses the request. Only an unnegotiated
+// session sends plainly.
 func TestUnownedLifecycleActionIsRefusedRatherThanSentBare(t *testing.T) {
-	t.Run("no incarnation sends plainly", func(t *testing.T) {
-		s, _ := lifecycleSession(t, false)
+	t.Run("unnegotiated sends plainly", func(t *testing.T) {
+		s := &agentSession{agent: NewAgent()}
 
 		action, announceable, err := s.prepareLifecycleAction()
 		require.NoError(t, err)
@@ -309,19 +895,53 @@ func TestUnownedLifecycleActionIsRefusedRatherThanSentBare(t *testing.T) {
 		require.Zero(t, action)
 	})
 
-	t.Run("a fenced incarnation sends plainly", func(t *testing.T) {
-		s, _ := lifecycleSession(t, false)
+	t.Run("a fenced incarnation refuses", func(t *testing.T) {
+		s, _ := actionLifecycleSession(t, false)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 		s.fenceLifecycleStream()
 
 		_, announceable, err := s.prepareLifecycleAction()
-		require.NoError(t, err)
+		require.ErrorIs(t, err, errLifecycleStreamFenced)
 		require.False(t, announceable)
 	})
 
+	t.Run("a stale callback sends no uncorrelated request", func(t *testing.T) {
+		s, _ := actionLifecycleSession(t, false)
+		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
+		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
+
+		callbackEntered := make(chan struct{})
+		releaseCallback := make(chan struct{})
+		sent := make(chan struct{}, 1)
+		result := make(chan error, 1)
+		go func() {
+			close(callbackEntered)
+			<-releaseCallback
+			_, err := announcedActionRequest(context.Background(), s, lifecycle.ActionPermission,
+				func(context.Context, map[string]any) (int, error) {
+					sent <- struct{}{}
+
+					return 0, nil
+				},
+				func(int, error) lifecycle.ActionState { return lifecycle.ActionCancelled },
+			)
+			result <- err
+		}()
+
+		<-callbackEntered
+		s.fenceLifecycleStream()
+		close(releaseCallback)
+		require.ErrorIs(t, <-result, errLifecycleStreamFenced)
+		select {
+		case <-sent:
+			t.Fatal("a stale negotiated callback sent a bare host request")
+		default:
+		}
+	})
+
 	t.Run("a live incarnation with no open turn refuses", func(t *testing.T) {
-		s, _ := lifecycleSession(t, false)
+		s, _ := actionLifecycleSession(t, false)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 
 		_, announceable, err := s.prepareLifecycleAction()
@@ -339,7 +959,7 @@ func TestUnownedLifecycleActionIsRefusedRatherThanSentBare(t *testing.T) {
 	})
 
 	t.Run("an open turn always owns its action", func(t *testing.T) {
-		s, _ := lifecycleSession(t, false)
+		s, _ := actionLifecycleSession(t, false)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 
@@ -354,7 +974,7 @@ func TestUnownedLifecycleActionIsRefusedRatherThanSentBare(t *testing.T) {
 	// The refusal reaches the caller as a failed request, which both dialog
 	// legs already answer with a deterministic native cancel.
 	t.Run("the announced request refuses with it", func(t *testing.T) {
-		s, _ := lifecycleSession(t, false)
+		s, _ := actionLifecycleSession(t, false)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 
 		_, err := announcedActionRequest(t.Context(), s, lifecycle.ActionPermission,

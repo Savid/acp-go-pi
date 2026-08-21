@@ -64,16 +64,23 @@ type actionRequestWriteWriter struct {
 	requests *actionRequestWrites
 }
 
-func (w *actionRequestWriteWriter) Write(data []byte) (int, error) {
+func (w *actionRequestWriteWriter) Write(data []byte) (n int, err error) {
 	actionID := outboundLifecycleActionID(data)
 
-	n, err := w.writer.Write(data)
+	defer func() {
+		if recover() != nil {
+			n = 0
+			err = errLifecycleActionRequest
+		}
+
+		if actionID != "" {
+			w.requests.resolve(actionID, err)
+		}
+	}()
+
+	n, err = w.writer.Write(data)
 	if err == nil && n != len(data) {
 		err = io.ErrShortWrite
-	}
-
-	if actionID != "" {
-		w.requests.resolve(actionID, err)
 	}
 
 	return n, err
@@ -203,21 +210,32 @@ func (c *localAgentConnection) enqueueLifecycleCommandHook(ctx context.Context, 
 		return
 	}
 
-	c.hooks.enqueue(responseID, func() {
-		hookCtx := context.WithoutCancel(ctx)
-
+	c.hooks.enqueue(responseID, func() (func(), bool) {
 		session, err := c.agent.session(sessionID)
 		if err != nil {
-			c.agent.log.ErrorContext(hookCtx, "post-response session open lookup failed",
+			c.agent.log.ErrorContext(ctx, "post-response session open lookup failed",
 				slog.String(jsonFieldMethod, method),
 				slog.String(acpFieldSessionID, string(sessionID)),
-				slog.String(jsonFieldError, err.Error()),
 			)
 
-			return
+			return nil, false
 		}
 
-		session.publishSessionOpen(hookCtx)
+		hookCtx, release, admitted := session.admitPostResponseHook()
+		if !admitted {
+			return nil, false
+		}
+
+		return func() {
+			defer release()
+
+			if err := session.publishSessionOpen(hookCtx); err != nil {
+				c.agent.log.ErrorContext(hookCtx, "post-response session open failed closed",
+					slog.String(jsonFieldMethod, method),
+					slog.String(acpFieldSessionID, string(sessionID)),
+				)
+			}
+		}, true
 	})
 }
 
@@ -364,20 +382,20 @@ type postResponseHooks struct {
 
 type postResponseHook struct {
 	responseID string
-	run        func()
+	admit      func() (run func(), admitted bool)
 }
 
 func (h *postResponseHooks) wrap(writer io.Writer) io.Writer {
 	return &postResponseWriter{writer: writer, hooks: h}
 }
 
-func (h *postResponseHooks) enqueue(responseID string, run func()) {
+func (h *postResponseHooks) enqueue(responseID string, admit func() (func(), bool)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	h.all = append(h.all, postResponseHook{
 		responseID: responseID,
-		run:        run,
+		admit:      admit,
 	})
 }
 
@@ -388,7 +406,7 @@ func (h *postResponseHooks) runAfterResponseWrite(data []byte) {
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(data), &msg); err != nil {
 		if h.log != nil {
-			h.log.Debug("parse response for post-response hook failed", slog.String(jsonFieldError, err.Error()))
+			h.log.Debug("parse response for post-response hook failed")
 		}
 
 		return
@@ -409,10 +427,15 @@ func (h *postResponseHooks) runAfterResponseWrite(data []byte) {
 		h.all = append(h.all[:index], h.all[index+1:]...)
 		h.mu.Unlock()
 
+		run, admitted := hook.admit()
+		if !admitted {
+			return
+		}
+
 		go func() {
 			defer recoverAgentGoroutine(context.Background(), h.log, "post-response hook")
 
-			hook.run()
+			run()
 		}()
 
 		return
@@ -556,6 +579,11 @@ func (c *localAgentConnection) registerActionRequestWrite(ctx context.Context, a
 
 		return err
 	}
+
+	go func() {
+		<-ctx.Done()
+		c.requestWrites.resolve(actionID, errLifecycleActionRequest)
+	}()
 
 	return nil
 }

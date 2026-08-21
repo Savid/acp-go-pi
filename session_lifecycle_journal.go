@@ -70,10 +70,11 @@ var errLifecycleBoundaryCommit = errors.New("append lifecycle boundary record")
 
 var lifecycleBoundaryNow = time.Now
 
-// commitLifecycleBoundary durably records one boundary. It is awaited before
-// the event that boundary precedes: a terminal idle a store does not stand
-// behind, or a quiescence fact with no resumable snapshot behind it, would be a
-// claim the next incarnation cannot honour.
+// commitLifecycleBoundary durably records one boundary. Prompt settlement
+// writes it before terminal idle. Close writes its foreground mirror first,
+// publishes the terminal transition, then writes this resumable boundary before
+// quiescence; a quiescence fact without that snapshot would be a claim the next
+// incarnation cannot honour.
 func (s *agentSession) commitLifecycleBoundary(ctx context.Context, record lifecycleBoundaryRecord) error {
 	if s.id == "" {
 		// The store addresses a session by its native identity, so a session

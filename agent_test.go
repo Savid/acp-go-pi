@@ -23,6 +23,18 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
+type finishAttemptOnErrContext struct {
+	context.Context //nolint:containedctx // The test wrapper closes the attempt only when the waiter inspects Err.
+	once            sync.Once
+	finish          func()
+}
+
+func (c *finishAttemptOnErrContext) Err() error {
+	c.once.Do(c.finish)
+
+	return c.Context.Err()
+}
+
 func TestAgentDirectSurfaceAndVersionChecks(t *testing.T) {
 	agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
 	resolved, err := agent.lookPath("sh")
@@ -68,6 +80,41 @@ func TestAgentDirectSurfaceAndVersionChecks(t *testing.T) {
 	_, err = agent.HandleExtensionMethod(t.Context(), "_pi/unknown", nil)
 	require.ErrorIs(t, err, errAgentClosed)
 	require.NoError(t, agent.Close())
+}
+
+func TestEnsureVersionContainsGenerationWhenCloseWinsAfterCreation(t *testing.T) {
+	restoreRuntimeGenerationSeams(t)
+
+	agent := NewAgent(
+		testContainmentOption(),
+		WithExecutablePath("/fake/pi"),
+		WithLogger(slog.New(slog.DiscardHandler)),
+	)
+	probeCalls := 0
+	agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
+		probeCalls++
+
+		return pi.DefaultMinimumVersion, nil
+	}
+
+	mkdirTemp := runtimeGenerationMkdirTemp
+	var closeAttempt *agentCloseAttempt
+	runtimeGenerationMkdirTemp = func(parent, pattern string) (string, error) {
+		root, err := mkdirTemp(parent, pattern)
+		if err == nil {
+			var owner bool
+			closeAttempt, owner = agent.beginClose()
+			require.True(t, owner)
+		}
+
+		return root, err
+	}
+
+	err := agent.ensureVersion(t.Context())
+	require.ErrorIs(t, err, errAgentClosed)
+	require.Zero(t, probeCalls, "a generation created after close was not admitted to the probe")
+	require.NotNil(t, closeAttempt)
+	agent.finishClose(closeAttempt, nil)
 }
 
 func TestContainmentModePlatformMatrix(t *testing.T) {
@@ -224,6 +271,390 @@ func TestAgentRetainsContainmentFailureAfterSessionRemoval(t *testing.T) {
 	require.Contains(t, agent.sessions, acp.SessionId("id"),
 		"a close that could not contain the tree dropped the session that still owns it")
 	require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+}
+
+func TestAgentCloseBoundsNeverReturningConstruction(t *testing.T) {
+	originalWait := sessionCloseTurnWaitContext
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		bounded, cancel := context.WithCancel(ctx)
+		cancel()
+
+		return bounded, func() {}
+	}
+	t.Cleanup(func() { sessionCloseTurnWaitContext = originalWait })
+
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	owner, err := agent.beginNativeConstruction()
+	require.NoError(t, err)
+
+	closeErr := agent.Close()
+	require.ErrorIs(t, closeErr, pi.ErrProcessContainmentIncomplete)
+	agent.mu.Lock()
+	require.Contains(t, agent.constructions, owner)
+	require.ErrorIs(t, owner.err, pi.ErrProcessContainmentIncomplete)
+	agent.mu.Unlock()
+}
+
+func TestQuarantinedAgentCloseCannotDetachOrReleaseSessions(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	process := newStubProcess(false)
+	session := &agentSession{agent: agent, id: "retained", proc: process}
+	agent.sessions[session.id] = session
+
+	attempt, owner := agent.beginClose()
+	require.True(t, owner)
+	want := errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("agent waiter quarantine"))
+	require.True(t, agent.quarantineClose(attempt, want))
+	require.ErrorIs(t, agent.close(attempt), want)
+	agent.finishClose(attempt, nil)
+	require.ErrorIs(t, agent.awaitClose(attempt), want)
+	require.Same(t, session, agent.sessions[session.id])
+	require.Zero(t, process.shutdownCalls)
+	require.Zero(t, process.closeCalls)
+}
+
+func TestAgentConstructionQuarantineContainsLateSpawnPublication(t *testing.T) {
+	originalWait := sessionCloseTurnWaitContext
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		bounded, cancel := context.WithCancel(ctx)
+		cancel()
+
+		return bounded, func() {}
+	}
+	t.Cleanup(func() { sessionCloseTurnWaitContext = originalWait })
+
+	for _, testCase := range []struct {
+		name         string
+		spawnProcess bool
+	}{
+		{name: "valid process", spawnProcess: true},
+		{name: "nil process"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var nativeReleases, scratchReleases int
+			agent := NewAgent(
+				testContainmentOption(),
+				WithExecutablePath("/fake/pi"),
+				WithScratchDir(t.TempDir()),
+				WithLogger(slog.New(slog.DiscardHandler)),
+				WithRuntimeResourceHooks(RuntimeResourceHooks{
+					AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+						return func() { nativeReleases++ }, nil
+					},
+					ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+						return func() { scratchReleases++ }, nil
+					},
+				}),
+			)
+			agent.versionChecked = true
+
+			spawnEntered := make(chan struct{})
+			releaseSpawn := make(chan struct{})
+			process := newStubProcess(false)
+			agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+				close(spawnEntered)
+				<-releaseSpawn
+				if !testCase.spawnProcess {
+					return nil, nil, nil
+				}
+
+				return process, newStubPiClient(), nil
+			}
+
+			startDone := make(chan error, 1)
+			go func() {
+				_, err := agent.startSession(context.Background(), sessionStart{Cwd: t.TempDir()})
+				startDone <- err
+			}()
+			<-spawnEntered
+
+			agent.mu.Lock()
+			require.Len(t, agent.constructions, 1)
+			var owner *nativeConstruction
+			for construction := range agent.constructions {
+				owner = construction
+			}
+			require.NotEmpty(t, owner.sessionRoot)
+			require.NotNil(t, owner.nativeRelease)
+			require.NotNil(t, owner.scratchRelease)
+			agent.mu.Unlock()
+
+			closeErr := agent.Close()
+			require.ErrorIs(t, closeErr, pi.ErrProcessContainmentIncomplete)
+
+			close(releaseSpawn)
+			require.ErrorIs(t, <-startDone, pi.ErrProcessContainmentIncomplete)
+
+			agent.mu.Lock()
+			require.Contains(t, agent.constructions, owner)
+			require.True(t, owner.immutable)
+			require.ErrorIs(t, owner.err, pi.ErrProcessContainmentIncomplete)
+			if testCase.spawnProcess {
+				require.Same(t, process, owner.proc, "late spawn was not transferred to its exact quarantine")
+				require.NotNil(t, owner.client)
+				require.NotNil(t, owner.processRoot)
+			} else {
+				require.Nil(t, owner.proc)
+				require.Nil(t, owner.client)
+				require.NotNil(t, owner.processRoot, "the failed spawn's exact tracker root was discarded")
+			}
+			agent.mu.Unlock()
+
+			if testCase.spawnProcess {
+				require.Equal(t, 1, process.shutdownCalls)
+				require.Equal(t, 1, process.killCalls)
+				require.Equal(t, 1, process.closeCalls)
+			} else {
+				require.Zero(t, process.shutdownCalls)
+				require.Zero(t, process.killCalls)
+				require.Zero(t, process.closeCalls)
+			}
+			require.Equal(t, 1, nativeReleases)
+			require.Equal(t, 1, scratchReleases)
+			require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+		})
+	}
+}
+
+func TestAgentOwnershipHelpersPreserveImmutableQuarantine(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+
+	// Nil is not a construction owner. These guards are intentionally fail
+	// closed for internal callers that have not yet admitted native work.
+	agent.finishNativeConstruction(nil, false, nil)
+	agent.updateNativeConstruction(nil, func(*nativeConstruction) { t.Fatal("nil construction was updated") })
+	require.Nil(t, agent.nativeConstructionError(nil))
+	require.NoError(t, agent.cleanupNativeConstruction(t.Context(), nil, nil))
+	agent.retainIncompleteSession(nil, errors.New("ignored"))
+
+	owner, err := agent.beginNativeConstruction()
+	require.NoError(t, err)
+	want := errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("immutable construction"))
+	agent.mu.Lock()
+	owner.immutable = true
+	owner.err = want
+	agent.mu.Unlock()
+
+	session := &agentSession{agent: agent, id: "late"}
+	closed, transferred := agent.transferConstructionToSession(owner, session)
+	require.False(t, closed)
+	require.False(t, transferred)
+	require.False(t, agent.transferConstructionToRelaunch(owner, &sessionRelaunchAttempt{}))
+	agent.finishNativeConstruction(owner, false, nil)
+	require.ErrorIs(t, agent.nativeConstructionError(owner), pi.ErrProcessContainmentIncomplete)
+
+	agent.retainIncompleteSession(session, errors.New("retain"))
+	require.Contains(t, agent.retainedSessions, session)
+	agent.retainIncompleteSession(session, nil)
+	require.NotContains(t, agent.retainedSessions, session)
+
+	agent.mu.Lock()
+	agent.deleted["deleted"] = struct{}{}
+	agent.sessions["deleted"] = &agentSession{fingerprint: sessionStartFingerprint(sessionStart{})}
+	agent.mu.Unlock()
+	require.Nil(t, agent.activeSessionForStart("deleted", sessionStart{}))
+	require.Nil(t, agent.connection())
+	require.False(t, agent.clientSupportsFormElicitation())
+}
+
+func TestAgentCloseContainsPanicsAndQuarantineIsOneShot(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	// A corrupt retained owner exercises the outer containment guard. Close must
+	// publish one immutable failure rather than allow the panic to escape.
+	agent.retainedSessions[nil] = struct{}{}
+	require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+
+	other := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	process := newStubProcess(false)
+	session := &agentSession{agent: other, id: "same", proc: process}
+	other.sessions[session.id] = session
+	other.retainedSessions[session] = struct{}{}
+	attempt, owner := other.beginClose()
+	require.True(t, owner)
+	want := errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("waiter"))
+	require.True(t, other.quarantineClose(attempt, want))
+	require.False(t, other.quarantineClose(attempt, errors.New("replacement")))
+	require.ErrorIs(t, other.awaitClose(attempt), want)
+}
+
+func TestAgentCloseSettlementAndRetainedOwnerEdges(t *testing.T) {
+	want := errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("linearized waiter"))
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	attempt := &agentCloseAttempt{done: make(chan struct{}), err: want}
+	attempt.settlement.Store(closeSettlementFinalizing)
+	originalWait := sessionCloseTurnWaitContext
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		bounded, cancel := context.WithCancel(ctx)
+		cancel()
+
+		return &finishAttemptOnErrContext{
+			Context: bounded,
+			finish: func() {
+				attempt.finishOnce.Do(func() { close(attempt.done) })
+			},
+		}, func() {}
+	}
+	t.Cleanup(func() { sessionCloseTurnWaitContext = originalWait })
+	require.ErrorIs(t, agent.awaitClose(attempt), want)
+	sessionCloseTurnWaitContext = originalWait
+
+	retainedOnly := &agentSession{agent: agent, id: "retained-only"}
+	agent.sessions[retainedOnly.id] = retainedOnly
+	agent.retainedSessions[retainedOnly] = struct{}{}
+	closeAttempt := &agentCloseAttempt{done: make(chan struct{})}
+	require.NoError(t, agent.close(closeAttempt))
+
+	quarantined := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	qAttempt := &agentCloseAttempt{done: make(chan struct{}), err: want}
+	qAttempt.settlement.Store(closeSettlementQuarantined)
+	close(qAttempt.done)
+	require.ErrorIs(t, quarantined.close(qAttempt), want)
+
+	qOwner := &agentSession{agent: quarantined, id: "quarantine-retained"}
+	qSessionAttempt, qSessionOwner := qOwner.beginClose()
+	require.True(t, qSessionOwner)
+	quarantined.retainedSessions[qOwner] = struct{}{}
+	openAttempt := &agentCloseAttempt{done: make(chan struct{})}
+	require.True(t, quarantined.quarantineClose(openAttempt, want))
+	require.ErrorIs(t, qOwner.awaitClose(qSessionAttempt), want)
+}
+
+func TestEnsureVersionCloseFenceMatrix(t *testing.T) {
+	type setupFunc func(*Agent, *context.Context)
+	tests := []struct {
+		name  string
+		setup setupFunc
+	}{
+		{
+			name:  "closed before admission",
+			setup: func(agent *Agent, _ *context.Context) { _, _ = agent.beginClose() },
+		},
+		{
+			name: "close during executable resolution",
+			setup: func(agent *Agent, _ *context.Context) {
+				agent.options.ExecutablePath = ""
+				agent.lookPath = func(string) (string, error) {
+					_, _ = agent.beginClose()
+
+					return "/fake/pi", nil
+				}
+			},
+		},
+		{
+			name: "close during discovery scratch reservation",
+			setup: func(agent *Agent, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ReserveScratchRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					_, _ = agent.beginClose()
+
+					return func() {}, nil
+				}
+			},
+		},
+		{
+			name: "close during discovery native root acquisition",
+			setup: func(agent *Agent, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					_, _ = agent.beginClose()
+
+					return func() {}, nil
+				}
+			},
+		},
+		{
+			name: "context cancels at final probe gate",
+			setup: func(agent *Agent, ctx *context.Context) {
+				armed := false
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					armed = true
+
+					return func() {}, nil
+				}
+				*ctx = &closeOnErrContext{Context: *ctx, returnErr: func() error {
+					if armed {
+						return context.Canceled
+					}
+
+					return nil
+				}}
+			},
+		},
+		{
+			name: "close during final context check",
+			setup: func(agent *Agent, ctx *context.Context) {
+				armed := false
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					armed = true
+
+					return func() {}, nil
+				}
+				*ctx = &closeOnErrContext{Context: *ctx, onErr: func() {
+					if armed {
+						_, _ = agent.beginClose()
+					}
+				}}
+			},
+		},
+		{
+			name: "close during native version probe",
+			setup: func(agent *Agent, _ *context.Context) {
+				agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
+					_, _ = agent.beginClose()
+
+					return pi.DefaultMinimumVersion, nil
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := NewAgent(testContainmentOption(), WithExecutablePath("/fake/pi"), WithScratchDir(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
+			agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
+				return pi.DefaultMinimumVersion, nil
+			}
+			ctx := t.Context()
+			test.setup(agent, &ctx)
+			require.Error(t, agent.ensureVersion(ctx))
+		})
+	}
+}
+
+func TestConstructionProcessObserverCanReenterAgentClose(t *testing.T) {
+	var agent *Agent
+	var closeErr error
+	var reenter atomic.Bool
+	hooks := RuntimeResourceHooks{ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) {
+		if reenter.CompareAndSwap(false, true) {
+			closeErr = agent.Close()
+		}
+	}}
+	agent = NewAgent(testContainmentOption(), WithRuntimeResourceHooks(hooks), WithLogger(slog.New(slog.DiscardHandler)))
+
+	construction, err := agent.beginNativeConstruction()
+	require.NoError(t, err)
+	process := inventoryPiProcess{stubProcess: newStubProcess(false), count: 1}
+	root := agent.processes.registerDeferred()
+	session := &agentSession{agent: agent, id: "observer-reentry", proc: process, providerProcessRoot: root}
+	session.nativeBoundary = construction.nativeBoundary
+	construction.proc = process
+	construction.processRoot = root
+	construction.session = session
+	closed, transferred := agent.transferConstructionToSession(construction, session)
+	require.False(t, closed)
+	require.True(t, transferred)
+
+	done := make(chan struct{})
+	go func() {
+		root.observe(context.Background(), process)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("construction observer reentry self-waited")
+	}
+	require.NoError(t, closeErr)
 }
 
 func TestServeReturnsIncompleteFailedSpawnWithoutInstalledSession(t *testing.T) {

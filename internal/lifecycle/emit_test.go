@@ -491,3 +491,12 @@ func TestEmitRefusesADiscriminantWithoutItsPayload(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), stream.Sequence())
 }
+
+func TestAgentRunningEventUsesActivityCause(t *testing.T) {
+	event := AgentRunningEvent("cycle", "turn")
+	require.Equal(t, EventStateUpdate, event.Type)
+	require.Equal(t, ForegroundRunning, event.State.State)
+	require.Equal(t, "cycle", event.State.CycleID)
+	require.Equal(t, "turn", event.State.TurnID)
+	require.Equal(t, CauseActivity, event.State.Cause)
+}

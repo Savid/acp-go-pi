@@ -1,9 +1,15 @@
 package piacp
 
 import (
+	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
+
+	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 // TestLifecycleIdentityNamesTheIncarnation pins the boundary-record identity:
@@ -22,4 +28,27 @@ func TestLifecycleIdentityNamesTheIncarnation(t *testing.T) {
 	require.NotEmpty(t, streamID)
 	require.NotEmpty(t, turnID)
 	require.NotEmpty(t, cycleID)
+}
+
+func TestSettlementWaitIsBoundedAndCompletedBoundaryFencesLifecycle(t *testing.T) {
+	session, _ := lifecycleSession(t, false)
+	session.openSettlement()
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := session.awaitSettlementContext(cancelled)
+	require.ErrorContains(t, err, context.Canceled.Error())
+	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+
+	want := errors.New("completed failed boundary")
+	done := make(chan struct{})
+	close(done)
+	session.mu.Lock()
+	session.turnFenceStarted = true
+	session.turnFenceDone = done
+	session.turnFenceErr = want
+	session.mu.Unlock()
+
+	_, err = session.settlePrompt(t.Context(), acp.PromptRequest{}, &promptTurnState{}, promptOutcome{}, &atomic.Bool{})
+	require.ErrorIs(t, err, want)
+	require.True(t, session.lc.fenced)
 }

@@ -23,17 +23,44 @@ func reserveScratchRoot(ctx context.Context, hooks RuntimeResourceHooks, kind Ru
 }
 
 func acquireRuntimeResource(ctx context.Context, acquire func(context.Context, RuntimeResourceKind) (func(), error), kind RuntimeResourceKind, resource string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	if acquire == nil {
 		return func() {}, nil
 	}
 
-	release, err := acquire(ctx, kind)
+	hookCtx, cancelHook := context.WithTimeout(ctx, sessionSettleTimeout)
+	defer cancelHook()
+
+	var release func()
+
+	err := runBoundedHook(hookCtx, "acquire "+resource, func() error {
+		acquired, acquireErr := acquire(hookCtx, kind)
+
+		if hookCtx.Err() != nil {
+			if acquired != nil {
+				acquired()
+			}
+
+			return hookCtx.Err()
+		}
+
+		if acquireErr != nil {
+			return acquireErr
+		}
+
+		if acquired == nil {
+			return errors.New(resource + " hook returned nil release")
+		}
+
+		release = acquired
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-
-	if release == nil {
-		return nil, errors.New(resource + " hook returned nil release")
 	}
 
 	var once sync.Once

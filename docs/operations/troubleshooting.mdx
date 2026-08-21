@@ -21,6 +21,29 @@ active turn only after queuing it. `TestFakePiBusyRejectionAndSteerAck`
 Wait for the active turn to settle, or cancel it, before prompting again; the
 adapter does not expose pi's steering queue.
 
+The same refusal covers two more cases where the single foreground is already
+occupied. pi can begin work between prompts — the session projects it as an
+agent-origin cycle and refuses a `session/prompt` until that cycle reaches its
+durable boundary. A native steering or follow-up queue pi has not drained is
+also work already accepted ahead of the new prompt, and is refused on the same
+terms; the adapter reads only that queue's size and never its entries.
+
+An active `session/load` or `session/resume` reads the same single foreground
+from the other side. It is refused with `"limit": "session_restore"` while a
+prompt is in flight, while an agent-origin cycle is open or settling, or while
+the native queue is non-empty, because the session's transcript is still being
+written and the stored prefix is one it has already moved past. A restore that
+is admitted holds that foreground until its replay finishes, so a `session/prompt`
+arriving during a replay is refused with `"limit": "session_prompt"` and any
+work pi begins meanwhile is held rather than projected mid-replay.
+
+A native record the adapter cannot place — assistant or tool output, a turn or
+agent bracket, a retry or compaction pair, a settle marker, or a second
+`agent_start`, all with no cycle open — is an invariant failure rather than
+something to guess at. The generation is fenced and the session is poisoned;
+later requests report `session poisoned` with a structural cause. Recovering
+means opening a fresh session.
+
 ## Forking a fresh session fails
 
 Forking runs through the `_pi/session/fork` extension method, and a fork of a
@@ -35,7 +58,7 @@ the rejected empty fork and a successful fork after a seeded turn.
 
 ## A cancel lands while a permission or elicitation dialog is open
 
-`session/cancel` marks the turn cancelled and resolves every pending
+`session/cancel` and terminal close mark the turn cancelled and resolve every pending
 dialog as cancelled, and a cancelled dialog fails closed: the adapter
 answers pi's native dialog — deny for a permission dialog, cancel for an
 elicitation/question dialog — so the blocked tool call or question resolves
@@ -46,6 +69,13 @@ already cancelled and is resolved the same way. `TestRegisterDialogCancelledTurn
 (`session_permissions_test.go`) pins that a dialog registered on a cancelled
 turn begins with an already-cancelled context and leaves no pending dialog
 behind.
+
+A dialog received between dispatched prompts has no submission owner. The
+adapter immediately answers it with native deny/cancel instead of publishing a
+host request or leaving pi blocked. If a written permission or elicitation
+request cannot be announced on the negotiated lifecycle stream, its request
+context is revoked and the exact process generation is contained without
+waiting for a host answer.
 
 ## Output stops but the turn stays active
 
@@ -88,7 +118,7 @@ diagnosis:
 
 | Observation | Conclusion |
 | --- | --- |
-| Session creation or the state probes fail | pi install or wiring problem — confirm `pi` is on `PATH` and is version 0.80.6 or newer, and inspect the `process_exit` cause and the stderr tail in the adapter log. |
+| Session creation or the state probes fail | pi install or wiring problem — confirm `pi` is on `PATH` and is version 0.80.6 or newer, and inspect the bounded `process_exit` wire cause. Adapter logs intentionally contain only fixed classifications and stages. |
 | Session creation and probes succeed; prompts fail with cause `provider` | Credential problem — credentials were not injected for the session (ambient shell keys are scrubbed) or the provider refused them. |
 
 <Note>

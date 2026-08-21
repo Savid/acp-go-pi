@@ -105,11 +105,15 @@ type authFlow struct {
 	presentPollMs        int64
 	nativeCause          string
 
-	parkedDialog string
+	parkedDialog     string
+	parkedClient     piClient
+	parkedGeneration uint64
 	// abortDialog is the dialog the bridge leaves open for the life of one
 	// native login. Answering it aborts that login.
-	abortDialog   string
-	pendingSecret string
+	abortDialog     string
+	abortClient     piClient
+	abortGeneration uint64
+	pendingSecret   string
 
 	// mintErr records why the native mint never produced a presentation, so a
 	// repeated idempotency key is answered with the same failure rather than

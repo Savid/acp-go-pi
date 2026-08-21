@@ -123,12 +123,30 @@ type Entries struct {
 // Prompt sends a user prompt. The response acknowledges acceptance; results
 // stream as events afterwards.
 func (c *Client) Prompt(ctx context.Context, message string, images []ImageContent) error {
+	return c.PromptWithBoundary(ctx, message, images, CallBoundary{})
+}
+
+// PromptWithBoundary sends a prompt with hooks at the native command write and
+// successful acceptance response. The event consumer resolves the accepted
+// hook on a detached bounded context at the exact response boundary, so later
+// prompt events cannot overtake it and caller cancellation cannot bypass it.
+func (c *Client) PromptWithBoundary(
+	ctx context.Context,
+	message string,
+	images []ImageContent,
+	boundary CallBoundary,
+) error {
 	fields := map[string]any{commandTypeKey: commandPrompt, "message": message}
 	if len(images) > 0 {
 		fields["images"] = images
 	}
 
-	return c.simpleCall(ctx, fields)
+	response, err := c.CallWithBoundary(ctx, fields, boundary)
+	if err != nil {
+		return err
+	}
+
+	return response.Err()
 }
 
 // Abort aborts the current agent operation. The terminal events for the
@@ -166,6 +184,11 @@ func (c *Client) GetState(ctx context.Context) (SessionState, error) {
 	return callWithData[SessionState](ctx, c, map[string]any{commandTypeKey: commandGetState})
 }
 
+// GetStateWithBoundary is GetState with a transport-linearized write boundary.
+func (c *Client) GetStateWithBoundary(ctx context.Context, boundary CallBoundary) (SessionState, error) {
+	return callWithDataBoundary[SessionState](ctx, c, map[string]any{commandTypeKey: commandGetState}, boundary)
+}
+
 // GetAvailableModels lists all configured models.
 func (c *Client) GetAvailableModels(ctx context.Context) ([]Model, error) {
 	data, err := callWithData[struct {
@@ -181,11 +204,21 @@ func (c *Client) GetAvailableModels(ctx context.Context) ([]Model, error) {
 // SetModel switches to a specific model and returns the selected catalog
 // entry.
 func (c *Client) SetModel(ctx context.Context, provider string, modelID string) (Model, error) {
-	return callWithData[Model](ctx, c, map[string]any{
+	return c.SetModelWithBoundary(ctx, provider, modelID, CallBoundary{})
+}
+
+// SetModelWithBoundary is SetModel with a transport-linearized write boundary.
+func (c *Client) SetModelWithBoundary(
+	ctx context.Context,
+	provider string,
+	modelID string,
+	boundary CallBoundary,
+) (Model, error) {
+	return callWithDataBoundary[Model](ctx, c, map[string]any{
 		commandTypeKey: commandSetModel,
 		"provider":     provider,
 		"modelId":      modelID,
-	})
+	}, boundary)
 }
 
 // SetThinkingLevel sends the requested reasoning level to pi. pi acknowledges
@@ -193,7 +226,13 @@ func (c *Client) SetModel(ctx context.Context, provider string, modelID string) 
 // caller that needs the level pi actually runs reads GetState back rather than
 // trusting this acknowledgement.
 func (c *Client) SetThinkingLevel(ctx context.Context, level string) error {
-	return c.simpleCall(ctx, map[string]any{commandTypeKey: commandSetThinkingLevel, "level": level})
+	return c.SetThinkingLevelWithBoundary(ctx, level, CallBoundary{})
+}
+
+// SetThinkingLevelWithBoundary is SetThinkingLevel with a
+// transport-linearized write boundary.
+func (c *Client) SetThinkingLevelWithBoundary(ctx context.Context, level string, boundary CallBoundary) error {
+	return c.simpleCallBoundary(ctx, map[string]any{commandTypeKey: commandSetThinkingLevel, "level": level}, boundary)
 }
 
 // SetAutoRetry enables or disables automatic retry on transient errors. The
@@ -239,7 +278,11 @@ func (c *Client) GetCommands(ctx context.Context) ([]SlashCommand, error) {
 }
 
 func (c *Client) simpleCall(ctx context.Context, fields map[string]any) error {
-	response, err := c.Call(ctx, fields)
+	return c.simpleCallBoundary(ctx, fields, CallBoundary{})
+}
+
+func (c *Client) simpleCallBoundary(ctx context.Context, fields map[string]any, boundary CallBoundary) error {
+	response, err := c.CallWithBoundary(ctx, fields, boundary)
 	if err != nil {
 		return err
 	}
@@ -259,9 +302,18 @@ func (c *Client) cancellableCall(ctx context.Context, fields map[string]any) (bo
 }
 
 func callWithData[T any](ctx context.Context, c *Client, fields map[string]any) (T, error) {
+	return callWithDataBoundary[T](ctx, c, fields, CallBoundary{})
+}
+
+func callWithDataBoundary[T any](
+	ctx context.Context,
+	c *Client,
+	fields map[string]any,
+	boundary CallBoundary,
+) (T, error) {
 	var data T
 
-	response, err := c.Call(ctx, fields)
+	response, err := c.CallWithBoundary(ctx, fields, boundary)
 	if err != nil {
 		return data, err
 	}

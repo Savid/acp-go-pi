@@ -3,10 +3,12 @@ package piacp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,66 +20,518 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
-func withSessionCloseTurnWait(t *testing.T, wait time.Duration) {
-	t.Helper()
-
-	original := sessionCloseTurnWait
-	sessionCloseTurnWait = wait
-
-	t.Cleanup(func() { sessionCloseTurnWait = original })
+type signalErrContext struct {
+	context.Context //nolint:containedctx // The test wrapper mutates ownership when Err is inspected.
+	entered         chan struct{}
+	once            sync.Once
+	mutate          func()
 }
 
-// TestSessionCloseWaitsForTheInFlightTurn proves close blocks on the session's
-// single turn admission rather than tearing the native generation down beneath
-// a live turn. Close signals the turn's cancel immediately before it waits, so
-// observing that signal with the shutdown ladder still untouched is a
-// linearized proof that the wait is real, and the admission is balanced after.
-func TestSessionCloseWaitsForTheInFlightTurn(t *testing.T) {
+type relaunchCatalogEndingClient struct {
+	*directAgentClient
+	session *agentSession
+}
+
+type appendCallbackStore struct {
+	SessionStore
+	afterAppend func()
+}
+
+func (s *appendCallbackStore) Append(ctx context.Context, key SessionKey, entries []SessionStoreEntry) error {
+	if err := s.SessionStore.Append(ctx, key, entries); err != nil {
+		return err
+	}
+	if s.afterAppend != nil {
+		s.afterAppend()
+	}
+
+	return nil
+}
+
+func (c *relaunchCatalogEndingClient) SessionUpdate(ctx context.Context, notification acp.SessionNotification) error {
+	if notification.Update.AvailableCommandsUpdate != nil {
+		c.session.mu.Lock()
+		outbox := c.session.outbox
+		c.session.mu.Unlock()
+		outbox.end()
+	}
+
+	return c.directAgentClient.SessionUpdate(ctx, notification)
+}
+
+func (c *signalErrContext) Err() error {
+	c.once.Do(func() {
+		if c.mutate != nil {
+			c.mutate()
+		}
+		close(c.entered)
+	})
+
+	return nil
+}
+
+// TestCloseBoundWithARealLeaseCommitsNothing proves a timed-out operation join
+// is containment-incomplete. Native containment may finish, but the holder can
+// still touch session state, so close publishes no terminal boundary and keeps
+// every cleanup/resource owner addressable.
+func TestCloseBoundWithARealLeaseCommitsNothing(t *testing.T) {
+	originalWaitContext := sessionCloseTurnWaitContext
+	waiting := make(chan context.CancelFunc, 1)
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		waitCtx, cancel := context.WithCancel(ctx)
+		waiting <- cancel
+
+		return waitCtx, cancel
+	}
+	t.Cleanup(func() { sessionCloseTurnWaitContext = originalWaitContext })
+
+	session, client := lifecycleSession(t, true)
 	process := newStubProcess(false)
-	session := &agentSession{
-		agent:       NewAgent(WithLogger(slog.New(slog.DiscardHandler))),
-		id:          "id",
-		proc:        process,
-		sessionRoot: t.TempDir(),
-	}
-
-	release, err := session.acquireTurn(t.Context())
-	require.NoError(t, err)
-
-	waiting := make(chan struct{})
-	session.cancel = func() { close(waiting) }
-
-	closed := make(chan error, 1)
-	go func() { closed <- session.Close(context.Background()) }()
-
-	<-waiting
-	require.Zero(t, process.shutdownCalls, "close reached the shutdown ladder with a turn in flight")
-
-	release()
-	require.NoError(t, <-closed)
-	require.Equal(t, 1, process.shutdownCalls)
-	require.Equal(t, 1, process.closeCalls)
-	require.Empty(t, session.turn, "close left the turn admission unbalanced")
-}
-
-// TestSessionCloseSurrendersAnUnreleasedTurn proves the wait is bounded: a turn
-// that never releases costs close its bound and is reported, rather than
-// blocking teardown forever.
-func TestSessionCloseSurrendersAnUnreleasedTurn(t *testing.T) {
-	withSessionCloseTurnWait(t, time.Millisecond)
-
-	session := &agentSession{
-		agent:       NewAgent(WithLogger(slog.New(slog.DiscardHandler))),
-		id:          "id",
-		proc:        newStubProcess(false),
-		sessionRoot: t.TempDir(),
-	}
+	root := t.TempDir()
+	nativeReleases := 0
+	scratchReleases := 0
+	session.proc = process
+	attachTestNativeBoundary(session)
+	session.sessionRoot = root
+	session.nativeRootRelease = func() { nativeReleases++ }
+	session.scratchRootRelease = func() { scratchReleases++ }
+	require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+	require.NoError(t, session.lifecycleAcceptTurn(t.Context(), testSubmission()))
+	wantTurn := session.lc.turnID
+	baseline := len(client.notifications)
 
 	release, err := session.acquireTurn(t.Context())
 	require.NoError(t, err)
 	t.Cleanup(release)
 
-	require.ErrorIs(t, session.Close(t.Context()), context.DeadlineExceeded)
+	done := make(chan error, 1)
+	go func() { done <- session.Close(context.Background()) }()
+	<-waiting // the pre-native interaction join completed without waiting
+	cancelWait := <-waiting
+
+	require.Equal(t, 1, process.shutdownCalls)
+	require.Equal(t, 1, process.closeCalls)
+	require.DirExists(t, root)
+	require.Zero(t, nativeReleases)
+	require.Zero(t, scratchReleases)
+	require.False(t, session.lc.closed)
+	require.Equal(t, wantTurn, session.lc.turnID)
+	require.Len(t, client.notifications, baseline)
+
+	cancelWait()
+	closeErr := <-done
+	require.ErrorIs(t, closeErr, pi.ErrProcessContainmentIncomplete)
+	require.DirExists(t, root)
+	require.Zero(t, nativeReleases)
+	require.Zero(t, scratchReleases)
+
+	entries, loadErr := session.agent.sessionStore().Load(t.Context(), SessionKey{
+		SessionID: string(session.id),
+		Subpath:   SessionStoreLifecycleSubpath,
+	})
+	require.NoError(t, loadErr)
+	require.Empty(t, entries, "an unjoined holder gained a durable close boundary")
+}
+
+func TestCloseWinningDispatchFenceWritesNoPrompt(t *testing.T) {
+	client := newStubPiClient()
+	writes := 0
+	client.promptFunc = func(context.Context, string) error {
+		writes++
+
+		return nil
+	}
+	process := newStubProcess(false)
+	session := &agentSession{agent: NewAgent(), id: "dispatch-fence", proc: process, client: client}
+	outbox := newTestSessionOutbox(1)
+	bindTestRuntime(outbox, process, client, nil, nil, nil)
+	delivery := newTurnDelivery()
+	require.NoError(t, reserveOutboxPrompt(outbox, delivery))
+	session.outbox = outbox
+	session.turnEvents = delivery
+
+	_, owner := session.beginClose()
+	require.True(t, owner)
+	err := client.PromptWithBoundary(t.Context(), "must-not-write", nil, pi.CallBoundary{
+		BeforeDispatch: func() (func(), error) { return session.beginPromptDispatch(t.Context(), outbox, delivery) },
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown session")
+	require.NotContains(t, err.Error(), limitSessionPrompt)
+	require.Zero(t, writes)
+}
+
+func TestTimedOutShutdownRemainsTrackedAndAllowsMandatoryClose(t *testing.T) {
+	tracker := &nativeBoundaryTracker{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	closeCalls := 0
+	ctx, cancel := context.WithCancel(context.Background())
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- tracker.run(ctx, "shutdown", func() error {
+			close(entered)
+			<-release
+
+			return nil
+		})
+	}()
+	<-entered
+	cancel()
+	require.ErrorIs(t, <-shutdownDone, pi.ErrProcessContainmentIncomplete)
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- tracker.run(t.Context(), "close", func() error {
+			closeCalls++
+
+			return nil
+		})
+	}()
+	require.NoError(t, <-closeDone)
+	require.Equal(t, 1, closeCalls)
+	require.ErrorIs(t, tracker.retainedIncomplete(), pi.ErrProcessContainmentIncomplete,
+		"later mandatory containment erased the timed-out phase owner")
+	close(release)
+}
+
+func TestNativeBoundaryCancellationPrecheckAndTimeoutPrecedence(t *testing.T) {
+	t.Run("already cancelled never starts", func(t *testing.T) {
+		tracker := newNativeBoundaryTracker()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		started := false
+
+		err := tracker.run(ctx, "shutdown", func() error {
+			started = true
+
+			return nil
+		})
+		require.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+		require.False(t, started)
+	})
+
+	t.Run("deadline beats simultaneous late success", func(t *testing.T) {
+		tracker := newNativeBoundaryTracker()
+		ctx, cancel := context.WithCancel(context.Background())
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		result := make(chan error, 1)
+		go func() {
+			result <- tracker.run(ctx, "shutdown", func() error {
+				close(entered)
+				<-release
+
+				return nil
+			})
+		}()
+		<-entered
+		cancel()
+		close(release)
+
+		err := <-result
+		require.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+		require.ErrorIs(t, tracker.retainedIncomplete(), pi.ErrProcessContainmentIncomplete)
+	})
+}
+
+func TestExactGenerationSharesOneNativeBoundaryTracker(t *testing.T) {
+	tracker := newNativeBoundaryTracker()
+	agent := NewAgent()
+	construction := &nativeConstruction{done: make(chan struct{}), nativeBoundary: tracker}
+	agent.constructions[construction] = struct{}{}
+	attempt := &sessionRelaunchAttempt{done: make(chan struct{})}
+
+	require.True(t, agent.transferConstructionToRelaunch(construction, attempt))
+	require.Same(t, tracker, attempt.nativeBoundary)
+
+	session := &agentSession{agent: agent, nativeBoundary: attempt.nativeBoundary}
+	outbox := newSessionOutbox(7, tracker)
+	require.NoError(t, outbox.bindRuntime(nil, nil, nil, nil, nil, session.nativeBoundary))
+	require.Same(t, tracker, session.nativeBoundary)
+	require.Same(t, tracker, outbox.nativeBoundary)
+}
+
+func TestMissingNativeBoundaryFailsClosedWithoutNativeMutation(t *testing.T) {
+	outbox := newSessionOutbox(1, nil)
+	require.ErrorIs(t, outbox.bindRuntime(nil, nil, nil, nil, nil, nil), pi.ErrProcessContainmentIncomplete)
+
+	process := newStubProcess(false)
+	session := &agentSession{agent: NewAgent(), proc: process}
+	require.ErrorIs(t, session.Close(t.Context()), pi.ErrProcessContainmentIncomplete)
+	require.Zero(t, process.shutdownCalls)
+	require.Zero(t, process.killCalls)
+	require.Zero(t, process.closeCalls)
+}
+
+func TestGenerationProducerRootClosesAdmissionBeforeFinalWait(t *testing.T) {
+	producers := newGenerationProducers()
+	releaseChild, admitted := producers.acquire(1)
+	require.True(t, admitted)
+	producers.releaseRoot()
+
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	cancelWait()
+	require.ErrorIs(t, producers.wait(waitCtx), pi.ErrProcessContainmentIncomplete)
+
+	releaseChild()
+	require.NoError(t, producers.wait(t.Context()))
+	_, admitted = producers.acquire(1)
+	require.False(t, admitted, "a producer was admitted after the final wait became safe")
+}
+
+func TestLifecycleAdmissionAndMissingOwnerEdges(t *testing.T) {
+	t.Run("close wins during turn admission", func(t *testing.T) {
+		session := &agentSession{agent: NewAgent()}
+		ctx := &signalErrContext{Context: t.Context(), entered: make(chan struct{}), mutate: func() {
+			session.closing = true
+		}}
+		_, err := session.acquireTurn(ctx)
+		requireInvalidParams(t, err)
+	})
+
+	closing := &agentSession{closing: true}
+	_, err := closing.beginRelaunch()
+	requireInvalidParams(t, err)
+	require.ErrorIs(t, (&agentSession{}).refreshMCPTools(t.Context()), pi.ErrProcessContainmentIncomplete)
+	require.Nil(t, func() *generationContainment {
+		containment, owner := (&agentSession{}).claimTurnContainment(nil)
+		require.False(t, owner)
+
+		return containment
+	}())
+	require.ErrorIs(t, (&agentSession{}).stopTurnGeneration(t.Context(), nil), pi.ErrProcessContainmentIncomplete)
+	require.NoError(t, (&agentSession{nativeBoundary: newNativeBoundaryTracker()}).cancelNativeLocked(t.Context(), false))
+	require.NoError(t, (&agentSession{}).observeProviderProcessBounded(t.Context(), nil))
+}
+
+func TestRepeatedInteractionSettlementJoinsOneMemoizedTracker(t *testing.T) {
+	session := &agentSession{agent: NewAgent()}
+	outbox := newTestSessionOutbox(1)
+	session.outbox = outbox
+	release, admitted := outbox.interactions.acquire(1)
+	require.True(t, admitted)
+	wantDone := outbox.interactions.done
+
+	bounded, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, session.settleBoundaryInteractions(bounded, outbox), pi.ErrProcessContainmentIncomplete)
+	require.Equal(t, wantDone, outbox.interactions.done)
+	require.ErrorIs(t, session.settleBoundaryInteractions(bounded, outbox), pi.ErrProcessContainmentIncomplete)
+	require.Equal(t, wantDone, outbox.interactions.done)
+	_, admitted = session.admitDialogHandler(outbox)
+	require.False(t, admitted, "retry reopened interaction admission")
+
+	release()
+	require.NoError(t, session.settleBoundaryInteractions(t.Context(), outbox))
+}
+
+func TestCancelRetainsTimedOutInteractionOwnerAfterNativeContainment(t *testing.T) {
+	originalWait := sessionCloseTurnWaitContext
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		bounded, cancel := context.WithCancel(ctx)
+		cancel()
+
+		return bounded, func() {}
+	}
+	t.Cleanup(func() { sessionCloseTurnWaitContext = originalWait })
+
+	for _, activeTurn := range []bool{true, false} {
+		t.Run(fmt.Sprintf("active=%t", activeTurn), func(t *testing.T) {
+			process := newStubProcess(false)
+			native := newStubPiClient()
+			outbox := newTestSessionOutbox(1)
+			bindTestRuntime(outbox, process, native, nil, nil, nil)
+			session := &agentSession{
+				agent: NewAgent(WithLogger(slog.New(slog.DiscardHandler))),
+				proc:  process, client: native, outbox: outbox, nativeBoundary: outbox.nativeBoundary,
+			}
+			if activeTurn {
+				session.cancel = func() {}
+				session.turnFenceDone = make(chan struct{})
+			}
+			release, admitted := outbox.interactions.acquire(1)
+			require.True(t, admitted)
+
+			err := session.cancelNativeLocked(t.Context(), false)
+			require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+			require.Equal(t, 1, process.closeCalls)
+			require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
+
+			release()
+			require.NoError(t, outbox.interactions.wait(t.Context()))
+		})
+	}
+}
+
+func TestTurnContainmentAndCloseFailureEdges(t *testing.T) {
+	t.Run("active turn without generation", func(t *testing.T) {
+		cancelled := false
+		session := &agentSession{cancel: func() { cancelled = true }, turnFenceDone: make(chan struct{})}
+		err := session.fenceActiveTurnLocked(t.Context())
+		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+		require.True(t, cancelled)
+	})
+
+	t.Run("pump join bound", func(t *testing.T) {
+		process := newStubProcess(false)
+		outbox := newTestSessionOutbox(1)
+		bindTestRuntime(outbox, process, newStubPiClient(), nil, make(chan struct{}), nil)
+		cancelled, cancel := context.WithCancel(t.Context())
+		cancel()
+		require.ErrorIs(t, (&agentSession{}).stopTurnGeneration(cancelled, outbox), pi.ErrProcessContainmentIncomplete)
+		require.Zero(t, process.killCalls)
+	})
+
+	t.Run("close panic finishes selected containment", func(t *testing.T) {
+		process := newStubProcess(false)
+		outbox := newTestSessionOutbox(1)
+		bindTestRuntime(outbox, process, newStubPiClient(), nil, nil, nil)
+		session := &agentSession{agent: NewAgent(WithLogger(slog.New(slog.DiscardHandler))), outbox: outbox, cancel: func() { panic("turn cancel") }}
+		attempt, owner := session.beginClose()
+		require.True(t, owner)
+		require.True(t, attempt.containmentOwner)
+		require.ErrorIs(t, session.closeOwned(t.Context(), attempt), pi.ErrProcessContainmentIncomplete)
+		containmentErr, ok := outbox.awaitContainment()
+		require.True(t, ok)
+		require.ErrorIs(t, containmentErr, pi.ErrProcessContainmentIncomplete)
+	})
+
+	t.Run("prior poison containment remains immutable", func(t *testing.T) {
+		process := newStubProcess(false)
+		current := newTestSessionOutbox(2)
+		bindTestRuntime(current, process, newStubPiClient(), nil, nil, nil)
+		old := newTestSessionOutbox(1)
+		old.mu.Lock()
+		containment, _ := old.claimContainmentLocked(containmentOwnerTurn)
+		old.mu.Unlock()
+		old.finishContainment(containment, pi.ErrProcessContainmentIncomplete)
+		session := &agentSession{agent: NewAgent(), outbox: current, containmentOutboxes: []*sessionOutbox{old}}
+		session.lc.generation = current.generation
+		err := session.Close(t.Context())
+		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+		require.ErrorIs(t, session.lifecycleGenerationQuarantine(current.generation), pi.ErrProcessContainmentIncomplete)
+	})
+
+	t.Run("producer join remains incomplete after native close", func(t *testing.T) {
+		originalWait := sessionCloseTurnWaitContext
+		sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+			bounded, cancel := context.WithCancel(ctx)
+			cancel()
+
+			return bounded, func() {}
+		}
+		t.Cleanup(func() { sessionCloseTurnWaitContext = originalWait })
+
+		process := newStubProcess(false)
+		outbox := newTestSessionOutbox(1)
+		pumpDone := make(chan struct{})
+		close(pumpDone)
+		bindTestRuntime(outbox, process, newStubPiClient(), nil, pumpDone, nil)
+		release, admitted := outbox.producers.acquire(1)
+		require.True(t, admitted)
+		outbox.producers.releaseRoot()
+		session := &agentSession{agent: NewAgent(), outbox: outbox}
+		err := session.Close(t.Context())
+		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+		require.Equal(t, 1, process.closeCalls)
+		release()
+	})
+}
+
+func TestQuarantinedSessionCloseCannotPublishOrReleaseAfterContainment(t *testing.T) {
+	session, client := lifecycleSession(t, false)
+	process := newStubProcess(false)
+	native := newStubPiClient()
+	outbox := newTestSessionOutbox(1)
+	bindTestRuntime(outbox, process, native, nil, nil, nil)
+	session.proc = process
+	session.client = native
+	session.outbox = outbox
+	nativeReleases := 0
+	scratchReleases := 0
+	session.nativeRootRelease = func() { nativeReleases++ }
+	session.scratchRootRelease = func() { scratchReleases++ }
+	require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+	baseline := len(client.notifications)
+
+	attempt, owner := session.beginClose()
+	require.True(t, owner)
+	want := errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("waiter quarantine"))
+	require.True(t, session.quarantineCloseAttempt(want))
+	require.ErrorIs(t, session.closeOwned(t.Context(), attempt), pi.ErrProcessContainmentIncomplete)
+	require.Equal(t, 1, process.shutdownCalls)
+	require.Equal(t, 1, process.closeCalls)
+	require.False(t, session.lc.closed)
+	require.Len(t, client.notifications, baseline)
+	require.Zero(t, nativeReleases)
+	require.Zero(t, scratchReleases)
+	require.ErrorIs(t, session.awaitClose(attempt), want)
+}
+
+func TestCloseWaiterJoinsOwnerThatAlreadyLinearizedFinalSettlement(t *testing.T) {
+	originalWait := sessionCloseTurnWaitContext
+	entered := make(chan struct{})
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		bounded, cancel := context.WithCancel(ctx)
+		cancel()
+		close(entered)
+
+		return bounded, func() {}
+	}
+	t.Cleanup(func() { sessionCloseTurnWaitContext = originalWait })
+
+	session := &agentSession{}
+	attempt, owner := session.beginClose()
+	require.True(t, owner)
+	require.True(t, attempt.beginFinalSettlement())
+	done := make(chan error, 1)
+	go func() { done <- session.awaitClose(attempt) }()
+	<-entered
+	select {
+	case err := <-done:
+		t.Fatalf("waiter read the result before final publication: %v", err)
+	default:
+	}
+
+	want := errors.New("final result")
+	session.finishClose(attempt, want)
+	require.ErrorIs(t, <-done, want)
+}
+
+func TestIncompleteActionJoinDoesNotTouchLifecycle(t *testing.T) {
+	originalWait := sessionCloseTurnWaitContext
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		bounded, cancel := context.WithCancel(ctx)
+		cancel()
+
+		return bounded, func() {}
+	}
+	t.Cleanup(func() { sessionCloseTurnWaitContext = originalWait })
+
+	session, _ := lifecycleSession(t, false)
+	process := newStubProcess(false)
+	native := newStubPiClient()
+	outbox := newTestSessionOutbox(1)
+	bindTestRuntime(outbox, process, native, nil, nil, nil)
+	session.proc = process
+	session.client = native
+	session.outbox = outbox
+	require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+	require.NoError(t, session.lifecycleAcceptTurn(t.Context(), testSubmission()))
+	wantTurn, wantCycle := session.lc.turnID, session.lc.cycleID
+	releaseAction, admitted := outbox.interactions.acquire(1)
+	require.True(t, admitted)
+
+	err := session.Close(t.Context())
+	releaseAction()
+	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.False(t, session.lc.closed)
+	require.Equal(t, wantTurn, session.lc.turnID)
+	require.Equal(t, wantCycle, session.lc.cycleID)
 }
 
 // TestSessionCloseIsTerminalAndIdempotent proves a teardown that completes has
@@ -86,9 +540,7 @@ func TestSessionCloseSurrendersAnUnreleasedTurn(t *testing.T) {
 // reports the first caller's result without running a rung of its own. The
 // owner's boundary completes here, so the claim it recorded is never released
 // and the second caller is a no-op whether it arrives while the ladder runs or
-// after it finished. The failed boundary the next Close still owes is the other
-// half of the claim, and TestCloseClaimIsSharedWhileItRunsAndReleasedWhenItFails
-// pins it.
+// after it finished.
 func TestSessionCloseIsTerminalAndIdempotent(t *testing.T) {
 	spawns := 0
 	agent := newStubClientAgent(t, newStubPiClient())
@@ -117,8 +569,20 @@ func TestSessionCloseIsTerminalAndIdempotent(t *testing.T) {
 
 	<-tearingDown
 
-	_, err := session.acquireTurn(t.Context())
-	requireInvalidParams(t, err)
+	admissionEntered := make(chan struct{})
+	admission := make(chan error, 1)
+	go func() {
+		close(admissionEntered)
+		_, err := session.acquireTurn(context.Background())
+		admission <- err
+	}()
+	<-admissionEntered
+	select {
+	case err := <-admission:
+		t.Fatalf("admission returned before the close owner completed: %v", err)
+	default:
+	}
+
 	requireInvalidParams(t, session.refreshMCPTools(t.Context()))
 	requireInvalidParams(t, session.ensureProcessAlive(t.Context()))
 	requireInvalidParams(t, session.relaunchProcess(t.Context()))
@@ -130,19 +594,106 @@ func TestSessionCloseIsTerminalAndIdempotent(t *testing.T) {
 
 	require.NoError(t, <-first)
 	require.NoError(t, <-second, "the second caller reported a result the owner never produced")
+	requireInvalidParams(t, <-admission)
 	require.Equal(t, 1, process.shutdownCalls, "a second caller ran the shutdown ladder beside the owner")
 	require.Equal(t, 1, process.closeCalls, "a second caller ran the containment boundary beside the owner")
 	require.Zero(t, spawns, "a closing session spawned a pi process")
 }
 
-// TestCloseClaimIsSharedWhileItRunsAndReleasedWhenItFails pins both halves of
-// the teardown claim without depending on which goroutine the scheduler runs
-// first. A caller arriving while an attempt is in flight shares that attempt and
-// reports its result rather than opening a second ladder beside it; a completed
-// attempt keeps the claim so every later caller replays it; and a failed attempt
-// releases the claim, because the session still owns the boundary that attempt
-// did not reach and the next Close is what retries it.
-func TestCloseClaimIsSharedWhileItRunsAndReleasedWhenItFails(t *testing.T) {
+func TestHostCloseNativePanicsPublishIncompleteContainment(t *testing.T) {
+	const secret = "host-close-native-panic-secret-sentinel"
+
+	for _, stage := range []string{"shutdown", "close"} {
+		t.Run(stage, func(t *testing.T) {
+			logs := &strings.Builder{}
+			process := newStubProcess(false)
+			switch stage {
+			case "shutdown":
+				process.shutdownFunc = func(context.Context) error { panic(secret) }
+			case "close":
+				process.closeFunc = func() error { panic(secret) }
+			}
+
+			session := &agentSession{
+				agent:       NewAgent(WithLogger(slog.New(slog.NewTextHandler(logs, nil)))),
+				id:          "id",
+				proc:        process,
+				sessionRoot: t.TempDir(),
+			}
+
+			err := session.Close(t.Context())
+			require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+			require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
+			require.NotContains(t, logs.String(), secret)
+
+			replayed, owner := session.beginClose()
+			require.False(t, owner)
+			require.ErrorIs(t, session.awaitClose(replayed), pi.ErrProcessContainmentIncomplete)
+		})
+	}
+}
+
+func TestHostCloseRetirementHookPanicPublishesIncompleteContainment(t *testing.T) {
+	const secret = "retirement-hook-panic-secret-sentinel"
+
+	armed := false
+	tracker := newProviderProcessTracker(RuntimeResourceHooks{
+		ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) {
+			if armed {
+				panic(secret)
+			}
+		},
+	})
+	root := tracker.register()
+	process := inventoryPiProcess{stubProcess: newStubProcess(false), count: 1}
+	root.observe(t.Context(), process)
+	armed = true
+
+	logs := &strings.Builder{}
+	session := &agentSession{
+		agent:               NewAgent(WithLogger(slog.New(slog.NewTextHandler(logs, nil)))),
+		id:                  "id",
+		proc:                process,
+		providerProcessRoot: root,
+		sessionRoot:         t.TempDir(),
+	}
+
+	err := session.Close(t.Context())
+	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
+	require.NotContains(t, logs.String(), secret)
+	require.Same(t, root, session.providerProcessRoot)
+}
+
+func TestHostCloseResidualPanicPublishesIncompleteResult(t *testing.T) {
+	const secret = "host-close-residual-panic-secret-sentinel"
+
+	logs := &strings.Builder{}
+	process := newStubProcess(false)
+	session := &agentSession{
+		agent: NewAgent(WithLogger(slog.New(slog.NewTextHandler(logs, nil)))),
+		id:    "id",
+		proc:  process,
+		nativeRootRelease: func() {
+			panic(secret)
+		},
+		sessionRoot: t.TempDir(),
+	}
+	attachTestNativeBoundary(session)
+
+	err := session.Close(t.Context())
+	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
+	require.NotContains(t, logs.String(), secret)
+	require.Equal(t, 1, process.shutdownCalls)
+	require.Equal(t, 1, process.closeCalls)
+
+	replayed, owner := session.beginClose()
+	require.False(t, owner)
+	require.ErrorIs(t, session.awaitClose(replayed), pi.ErrProcessContainmentIncomplete)
+}
+
+func TestCloseClaimPublishesOneImmutableResult(t *testing.T) {
 	session := &agentSession{id: "id"}
 
 	attempt, owner := session.beginClose()
@@ -164,20 +715,13 @@ func TestCloseClaimIsSharedWhileItRunsAndReleasedWhenItFails(t *testing.T) {
 	session.finishClose(attempt, refused)
 	require.ErrorIs(t, <-reported, refused, "the waiting caller did not report the owner's result")
 
-	session.mu.Lock()
-	require.Nil(t, session.closeAttempt, "a failed teardown cached a claim over a boundary it still owes")
-	session.mu.Unlock()
-
-	retry, owner := session.beginClose()
-	require.True(t, owner, "the close still owing a boundary was never retried")
-	require.NotSame(t, attempt, retry)
-
-	session.finishClose(retry, nil)
-
 	replayed, owner := session.beginClose()
-	require.False(t, owner, "a completed teardown ran a second ladder")
-	require.Same(t, retry, replayed)
-	require.NoError(t, session.awaitClose(replayed))
+	require.False(t, owner, "a failed immutable teardown opened a second ladder")
+	require.Same(t, attempt, replayed)
+	require.ErrorIs(t, session.awaitClose(replayed), refused)
+
+	session.finishClose(attempt, nil)
+	require.ErrorIs(t, session.awaitClose(replayed), refused, "a second publication changed the teardown result")
 }
 
 // TestClosedSessionOwnsNoSurvivingProcess proves the post-close relaunch door
@@ -221,6 +765,7 @@ func TestRefreshMCPToolsRefusesACloseClaimedMidCheck(t *testing.T) {
 		proc:              process,
 		mcpRefreshPending: true,
 	}
+	attachTestNativeBoundary(session)
 	process.onExited = func() {
 		session.mu.Lock()
 		session.closing = true
@@ -287,6 +832,380 @@ func TestRelaunchRefusesToAdoptAfterCloseBegins(t *testing.T) {
 	})
 }
 
+// TestCloseAndRelaunchElectOneExactGeneration exercises both winners around
+// the former process-publication/outbox gap. Every transition is handshaked:
+// no scheduler timing is used to decide the winner.
+func TestCloseAndRelaunchElectOneExactGeneration(t *testing.T) {
+	t.Run("close wins before atomic publication", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		process := newStubProcess(false)
+		client := newStubPiClient()
+		started := make(chan struct{})
+		releaseStart := make(chan struct{})
+		client.startFunc = func(context.Context) error {
+			close(started)
+			<-releaseStart
+
+			return nil
+		}
+		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+			return process, client, nil
+		}
+
+		session := &agentSession{agent: agent, id: "id"}
+		prepareRelaunchFixture(t, session)
+
+		relaunchDone := make(chan error, 1)
+		go func() { relaunchDone <- session.relaunchProcess(context.Background()) }()
+		<-started
+
+		attempt, owner := session.beginClose()
+		require.True(t, owner)
+		require.Nil(t, attempt.outbox)
+		require.NotNil(t, attempt.relaunch)
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- session.closeOwned(context.Background(), attempt) }()
+
+		close(releaseStart)
+		requireInvalidParams(t, <-relaunchDone)
+		require.NoError(t, <-closeDone)
+		require.Equal(t, 1, process.killCalls)
+		require.Equal(t, 1, process.closeCalls)
+		session.mu.Lock()
+		require.Nil(t, session.proc)
+		require.Nil(t, session.outbox)
+		session.mu.Unlock()
+	})
+
+	t.Run("relaunch publishes the whole generation before close", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		process := newStubProcess(false)
+		client := newStubPiClient()
+		published := make(chan struct{})
+		releaseConfig := make(chan struct{})
+		client.state = pi.SessionState{SessionID: "id"}
+		client.autoRetryFunc = func(context.Context, bool) error {
+			close(published)
+			<-releaseConfig
+
+			return pi.ErrTransportClosed
+		}
+		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+			return process, client, nil
+		}
+
+		session := &agentSession{agent: agent, id: "id"}
+		prepareRelaunchFixture(t, session)
+
+		relaunchDone := make(chan error, 1)
+		go func() { relaunchDone <- session.relaunchProcess(context.Background()) }()
+		<-published
+
+		attempt, owner := session.beginClose()
+		require.True(t, owner)
+		require.NotNil(t, attempt.outbox)
+		require.Same(t, process, attempt.outbox.proc)
+		require.Same(t, client, attempt.outbox.client)
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- session.closeOwned(context.Background(), attempt) }()
+
+		close(releaseConfig)
+		require.ErrorIs(t, <-relaunchDone, pi.ErrTransportClosed)
+		require.NoError(t, <-closeDone)
+		require.Equal(t, 1, process.shutdownCalls)
+		require.Equal(t, 1, process.closeCalls)
+	})
+}
+
+func TestRelaunchObserverPanicHoistsAndContainsUnpublishedGeneration(t *testing.T) {
+	const secret = "relaunch-observer-panic-secret"
+
+	observerEntered := make(chan struct{})
+	panicObserver := make(chan struct{})
+	agent := newStubClientAgent(t, newStubPiClient(), WithRuntimeResourceHooks(RuntimeResourceHooks{
+		ObserveStartupStage: func(_ context.Context, _ RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+			if stage != RuntimeStartupSpawn {
+				return
+			}
+
+			close(observerEntered)
+			<-panicObserver
+			panic(secret)
+		},
+	}))
+
+	process := newStubProcess(false)
+	var reaped sync.Once
+	process.killFunc = func() error {
+		reaped.Do(func() { close(process.exited) })
+
+		return nil
+	}
+	process.close = pi.ErrProcessContainmentIncomplete
+	client := newStubPiClient()
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		return process, client, nil
+	}
+
+	session := &agentSession{agent: agent, id: "id"}
+	prepareRelaunchFixture(t, session)
+
+	relaunched := make(chan error, 1)
+	go func() { relaunched <- session.relaunchProcess(context.Background()) }()
+	<-observerEntered
+
+	session.mu.Lock()
+	attempt := session.relaunchAttempt
+	session.mu.Unlock()
+	attempt.mu.Lock()
+	replacementRoot := attempt.generationRoot
+	replacement := attempt.proc
+	attempt.mu.Unlock()
+	require.NotNil(t, attempt)
+	require.Same(t, process, replacement)
+	require.DirExists(t, replacementRoot)
+
+	closeAttempt, owner := session.beginClose()
+	require.True(t, owner)
+	require.Same(t, attempt, closeAttempt.relaunch)
+	closed := make(chan error, 1)
+	go func() { closed <- session.closeOwned(context.Background(), closeAttempt) }()
+	select {
+	case err := <-closed:
+		t.Fatalf("close returned before the hoisted replacement published containment: %v", err)
+	default:
+	}
+
+	close(panicObserver)
+	require.ErrorIs(t, <-relaunched, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, <-closed, pi.ErrProcessContainmentIncomplete)
+	require.Equal(t, 1, process.killCalls)
+	require.Equal(t, 1, process.closeCalls)
+	require.DirExists(t, replacementRoot, "an unproved replacement containment lost its root")
+	select {
+	case <-process.Exited():
+	default:
+		t.Fatal("the exact replacement process was not reaped")
+	}
+
+	replayed, owner := session.beginClose()
+	require.False(t, owner)
+	require.Same(t, session.closeAttempt, replayed)
+	require.ErrorIs(t, session.awaitClose(replayed), pi.ErrProcessContainmentIncomplete)
+}
+
+func TestRelaunchObserverPanicRootRemovalFailureIsRetainedAgainstClose(t *testing.T) {
+	restoreMaterializeSeams(t)
+	observerEntered := make(chan struct{})
+	panicObserver := make(chan struct{})
+	nativeReleases := 0
+	agent := newStubClientAgent(t, newStubPiClient(), WithRuntimeResourceHooks(RuntimeResourceHooks{
+		AcquireNativeRoot: func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
+			if kind != RuntimeResourceSession {
+				return func() {}, nil
+			}
+
+			return func() { nativeReleases++ }, nil
+		},
+		ObserveStartupStage: func(_ context.Context, _ RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+			if stage == RuntimeStartupSpawn {
+				close(observerEntered)
+				<-panicObserver
+				panic("relaunch removal observer secret")
+			}
+		},
+	}))
+	process := newStubProcess(false)
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		return process, newStubPiClient(), nil
+	}
+	session := &agentSession{agent: agent, id: "id"}
+	prepareRelaunchFixture(t, session)
+
+	relaunched := make(chan error, 1)
+	go func() { relaunched <- session.relaunchProcess(context.Background()) }()
+	<-observerEntered
+	session.mu.Lock()
+	attempt := session.relaunchAttempt
+	session.mu.Unlock()
+	attempt.mu.Lock()
+	replacementRoot := attempt.generationRoot
+	attempt.mu.Unlock()
+	removeErr := errors.New("relaunch generation removal failed")
+	originalRemoveAll := materializeRemoveAll
+	materializeRemoveAll = func(path string) error {
+		if path == replacementRoot {
+			return removeErr
+		}
+
+		return originalRemoveAll(path)
+	}
+
+	closeAttempt, owner := session.beginClose()
+	require.True(t, owner)
+	require.Same(t, attempt, closeAttempt.relaunch)
+	closed := make(chan error, 1)
+	go func() { closed <- session.closeOwned(context.Background(), closeAttempt) }()
+	close(panicObserver)
+	require.ErrorIs(t, <-relaunched, removeErr)
+	require.ErrorIs(t, <-closed, removeErr)
+	require.Equal(t, 1, process.killCalls)
+	require.Equal(t, 1, process.closeCalls)
+	require.Equal(t, 1, nativeReleases)
+	require.DirExists(t, replacementRoot)
+	require.ErrorIs(t, session.Close(t.Context()), removeErr)
+}
+
+func TestAwaitRelaunchTimeoutMemoizesWithoutBoundaryOrCleanup(t *testing.T) {
+	originalWaitContext := sessionRelaunchWaitContext
+	waiting := make(chan context.CancelFunc, 1)
+	sessionRelaunchWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		waitCtx, cancel := context.WithCancel(ctx)
+		waiting <- cancel
+
+		return waitCtx, cancel
+	}
+	t.Cleanup(func() { sessionRelaunchWaitContext = originalWaitContext })
+
+	process := newStubProcess(false)
+	root := t.TempDir()
+	releases := 0
+	attempt := &sessionRelaunchAttempt{
+		done:           make(chan struct{}),
+		proc:           process,
+		generationRoot: root,
+		nativeRelease:  func() { releases++ },
+	}
+	session := &agentSession{agent: NewAgent(testContainmentOption()), id: "id", relaunchAttempt: attempt}
+
+	closed := make(chan error, 1)
+	go func() { closed <- session.Close(context.Background()) }()
+	cancelWait := <-waiting
+	cancelWait()
+	closeErr := <-closed
+	require.ErrorIs(t, closeErr, pi.ErrProcessContainmentIncomplete)
+	require.Zero(t, process.killCalls)
+	require.Zero(t, process.shutdownCalls)
+	require.Zero(t, process.closeCalls)
+	require.Zero(t, releases)
+	require.DirExists(t, root)
+
+	session.finishRelaunch(attempt, nil)
+	require.ErrorIs(t, session.Close(t.Context()), pi.ErrProcessContainmentIncomplete)
+}
+
+func TestInitialConstructionObserverFailureRemainsAgentOwnedAgainstClose(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		closeErr   error
+		removeFail bool
+	}{
+		{name: "containment incomplete", closeErr: pi.ErrProcessContainmentIncomplete},
+		{name: "root removal failure", removeFail: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			restoreMaterializeSeams(t)
+			cwd := t.TempDir()
+			observerEntered := make(chan struct{})
+			failObserver := make(chan struct{})
+			process := newStubProcess(false)
+			process.close = test.closeErr
+			nativeReleases := 0
+			scratchReleases := 0
+			removeErr := errors.New("construction root removal failed")
+
+			agent := newStubClientAgent(t, newStubPiClient(), WithRuntimeResourceHooks(RuntimeResourceHooks{
+				AcquireNativeRoot: func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
+					if kind != RuntimeResourceSession {
+						return func() {}, nil
+					}
+
+					return func() { nativeReleases++ }, nil
+				},
+				ReserveScratchRoot: func(_ context.Context, kind RuntimeResourceKind) (func(), error) {
+					if kind != RuntimeResourceSession {
+						return func() {}, nil
+					}
+
+					return func() { scratchReleases++ }, nil
+				},
+				ObserveStartupStage: func(_ context.Context, _ RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if stage == RuntimeStartupSpawn {
+						close(observerEntered)
+						<-failObserver
+						panic("observer payload must stay secret")
+					}
+				},
+			}))
+			agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+				return process, newStubPiClient(), nil
+			}
+
+			if test.removeFail {
+				originalRemoveAll := materializeRemoveAll
+				materializeRemoveAll = func(path string) error {
+					if strings.Contains(filepath.Base(path), "acp-go-pi-session-") {
+						return removeErr
+					}
+
+					return originalRemoveAll(path)
+				}
+			}
+
+			started := make(chan error, 1)
+			go func() {
+				_, err := agent.startSession(context.Background(), sessionStart{Cwd: cwd})
+				started <- err
+			}()
+			<-observerEntered
+
+			agent.mu.Lock()
+			require.Len(t, agent.constructions, 1)
+			var owner *nativeConstruction
+			for owner = range agent.constructions {
+			}
+			require.Same(t, process, owner.proc)
+			require.NotNil(t, owner.client)
+			require.NotNil(t, owner.processRoot)
+			require.NotEmpty(t, owner.generationRoot)
+			require.NotNil(t, owner.nativeRelease)
+			require.NotNil(t, owner.scratchRelease)
+			agent.mu.Unlock()
+
+			closed := make(chan error, 1)
+			go func() { closed <- agent.Close() }()
+			select {
+			case err := <-closed:
+				t.Fatalf("Agent.Close returned before the observer callback unwound: %v", err)
+			default:
+			}
+
+			close(failObserver)
+			startErr := <-started
+			require.ErrorContains(t, startErr, "construction callback panicked")
+			closeResult := <-closed
+			if test.removeFail {
+				require.ErrorIs(t, startErr, removeErr)
+				require.ErrorIs(t, closeResult, removeErr)
+				require.Equal(t, 1, nativeReleases)
+				require.Zero(t, scratchReleases)
+			} else {
+				require.ErrorIs(t, startErr, pi.ErrProcessContainmentIncomplete)
+				require.ErrorIs(t, closeResult, pi.ErrProcessContainmentIncomplete)
+				require.Zero(t, nativeReleases)
+				require.Zero(t, scratchReleases)
+			}
+
+			agent.mu.Lock()
+			require.Contains(t, agent.constructions, owner,
+				"memoized Agent.Close erased the exact construction quarantine")
+			require.NotEmpty(t, owner.sessionRoot)
+			require.DirExists(t, owner.sessionRoot)
+			agent.mu.Unlock()
+		})
+	}
+}
+
 func TestRuntimeRelaunchRefusesDurableHomeWithExplicitIsolation(t *testing.T) {
 	sessionRoot := t.TempDir()
 	agent := NewAgent(testProcessIsolationOption(), WithHome(filepath.Join(t.TempDir(), "home")))
@@ -312,6 +1231,7 @@ func TestSessionTurnLifecycleBranches(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithTurnTimeout(time.Second))
 	client := newStubPiClient()
 	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
+	attachTestNativeBoundary(session)
 
 	release, err := session.acquireTurn(t.Context())
 	require.NoError(t, err)
@@ -331,11 +1251,11 @@ func TestSessionTurnLifecycleBranches(t *testing.T) {
 	client.abortErr = errors.New("abort")
 	require.Error(t, session.Cancel(t.Context()))
 	noClient := &agentSession{}
-	require.NoError(t, noClient.Cancel(t.Context()))
+	require.ErrorIs(t, noClient.Cancel(t.Context()), pi.ErrProcessContainmentIncomplete)
 
 	cancelled := 0
 	session.cancel = func() { cancelled++ }
-	dialogCtx, cancelDialog := context.WithCancel(context.Background())
+	dialogCtx, cancelDialog := context.WithCancelCause(context.Background())
 	session.pendingDialogs = map[string]*dialogCancel{"dialog": {cancel: cancelDialog}}
 	session.cancelPendingInteractions()
 	require.True(t, session.wasTurnCancelled())
@@ -346,6 +1266,7 @@ func TestSessionTurnLifecycleBranches(t *testing.T) {
 	process.shutdown = errors.New("shutdown")
 	process.close = errors.New("close")
 	closing := &agentSession{agent: agent, proc: process, cancel: func() { cancelled++ }, sessionRoot: t.TempDir()}
+	attachTestNativeBoundary(closing)
 	require.Error(t, closing.Close(t.Context()))
 	require.Equal(t, 1, cancelled)
 }
@@ -357,10 +1278,15 @@ func TestSessionCancelEscalatesUnacknowledgedAbort(t *testing.T) {
 
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := newStubPiClient()
-	client.abortFunc = func(ctx context.Context) error {
-		<-ctx.Done()
+	abortEntered := make(chan struct{})
+	releaseAbort := make(chan struct{})
+	abortReturned := make(chan struct{})
+	client.abortFunc = func(context.Context) error {
+		close(abortEntered)
+		<-releaseAbort
+		close(abortReturned)
 
-		return ctx.Err()
+		return nil
 	}
 
 	process := newStubProcess(false)
@@ -371,12 +1297,16 @@ func TestSessionCancelEscalatesUnacknowledgedAbort(t *testing.T) {
 		proc:   process,
 		cancel: turnCancel,
 	}
+	bindTestOutbox(session)
 
-	require.NoError(t, session.Cancel(t.Context()))
+	require.ErrorIs(t, session.Cancel(t.Context()), pi.ErrProcessContainmentIncomplete)
+	<-abortEntered
 	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
-	require.Equal(t, 1, process.killCalls)
-	require.Equal(t, 1, process.closeCalls)
-	require.NoError(t, session.nativeContainmentError())
+	require.Equal(t, 1, process.killCalls, "a timed-out abort must escalate to kill")
+	require.Equal(t, 1, process.closeCalls, "a timed-out abort must still reach close")
+	require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
+	close(releaseAbort)
+	<-abortReturned
 }
 
 func TestSessionCancelContainsAcknowledgedAbortBeforeReturning(t *testing.T) {
@@ -400,12 +1330,14 @@ func TestSessionCancelContainsAcknowledgedAbortBeforeReturning(t *testing.T) {
 		cancel:        turnCancel,
 		turnFenceDone: make(chan struct{}),
 	}
+	bindTestOutbox(session)
 
 	cancelDone := make(chan error, 1)
 	go func() { cancelDone <- session.Cancel(t.Context()) }()
 
 	<-closeStarted
-	require.NoError(t, turnCtx.Err(), "turn context must remain live until the selected boundary completes")
+	require.NoError(t, turnCtx.Err(),
+		"the turn context remains live until the selected native boundary completes")
 	select {
 	case err := <-cancelDone:
 		t.Fatalf("cancel settled before the selected containment boundary: %v", err)
@@ -450,8 +1382,8 @@ func TestUnvalidatedCancelNeverTouchesNativeState(t *testing.T) {
 			process := newStubProcess(false)
 			turnCtx, turnCancel := context.WithCancel(t.Context())
 			t.Cleanup(turnCancel)
-			dialogCtx, cancelDialog := context.WithCancel(t.Context())
-			t.Cleanup(cancelDialog)
+			dialogCtx, cancelDialog := context.WithCancelCause(t.Context())
+			t.Cleanup(func() { cancelDialog(context.Canceled) })
 
 			session := &agentSession{
 				agent:          agent,
@@ -494,8 +1426,8 @@ func TestValidatedCancelContainsTheActiveTurn(t *testing.T) {
 	process := newStubProcess(false)
 	turnCtx, turnCancel := context.WithCancel(t.Context())
 	t.Cleanup(turnCancel)
-	dialogCtx, cancelDialog := context.WithCancel(t.Context())
-	t.Cleanup(cancelDialog)
+	dialogCtx, cancelDialog := context.WithCancelCause(t.Context())
+	t.Cleanup(func() { cancelDialog(context.Canceled) })
 
 	session := &agentSession{
 		agent:          NewAgent(WithLogger(slog.New(slog.DiscardHandler))),
@@ -506,6 +1438,7 @@ func TestValidatedCancelContainsTheActiveTurn(t *testing.T) {
 		turnNonce:      "active-turn",
 		pendingDialogs: map[string]*dialogCancel{"dialog": {cancel: cancelDialog}},
 	}
+	bindTestOutbox(session)
 
 	require.NoError(t, session.cancelRouted(t.Context(), turnRouteMeta("active-turn")))
 	require.Equal(t, int64(1), aborts.Load())
@@ -543,8 +1476,9 @@ func TestSessionCancelRecordsPumpObservedSettlementForTheCommitAfterContainment(
 
 	turnCtx, turnCancel := context.WithCancel(t.Context())
 	delivery := newTurnDelivery()
-	outbox := newSessionOutbox(1)
-	outbox.adopt(delivery)
+	outbox := newTestSessionOutbox(1)
+	require.NoError(t, reserveOutboxPrompt(outbox, delivery))
+	require.NoError(t, outbox.activate(delivery))
 	session := &agentSession{
 		agent:           agent,
 		id:              "id",
@@ -556,6 +1490,7 @@ func TestSessionCancelRecordsPumpObservedSettlementForTheCommitAfterContainment(
 		turnFenceDone:   make(chan struct{}),
 		sessionFilePath: path,
 	}
+	bindTestRuntime(outbox, process, session.client, nil, nil, nil)
 
 	// Reproduce the response-barrier race: the outbox has accepted
 	// agent_settled, but cancellation prevents delivery to the prompt loop.
@@ -610,6 +1545,7 @@ func TestSessionCancelWithoutNativeSettlementPreservesMirror(t *testing.T) {
 		turnFenceDone:   make(chan struct{}),
 		sessionFilePath: path,
 	}
+	bindTestOutbox(session)
 
 	require.NoError(t, session.Cancel(t.Context()))
 	entries, err := store.Load(t.Context(), SessionKey{SessionID: "id"})
@@ -656,6 +1592,7 @@ func TestSessionCloseAndTimeoutDoNotCommitSettledCancellation(t *testing.T) {
 				turnFenceDone:     make(chan struct{}),
 				sessionFilePath:   path,
 			}
+			bindTestOutbox(session)
 
 			require.NoError(t, test.fence(session))
 			entries, err := store.Load(t.Context(), SessionKey{SessionID: "id"})
@@ -689,6 +1626,7 @@ func TestSettledCancelMirrorFailureFailsTheSettlement(t *testing.T) {
 		turnFenceDone:     make(chan struct{}),
 		sessionFilePath:   path,
 	}
+	bindTestOutbox(session)
 
 	require.NoError(t, session.Cancel(t.Context()))
 
@@ -716,7 +1654,7 @@ func TestPromptTimeoutContainsProcessTreeBeforeReturning(t *testing.T) {
 		return nil
 	}
 	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
-	session.startPump(client)
+	startTestPump(session, client)
 
 	promptDone := make(chan error, 1)
 	go func() {
@@ -755,6 +1693,7 @@ func TestTurnFenceInactiveIdempotentAndErrorBranches(t *testing.T) {
 		cancel:        turnCancel,
 		turnFenceDone: make(chan struct{}),
 	}
+	bindTestOutbox(active)
 	err := active.fenceTurnAfterContext(t.Context())
 	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
 	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
@@ -764,33 +1703,6 @@ func TestTurnFenceInactiveIdempotentAndErrorBranches(t *testing.T) {
 
 	settling := &agentSession{cancel: func() {}, turnSettling: true}
 	require.NoError(t, settling.fenceTurnAfterContext(t.Context()))
-}
-
-func TestSessionCancelEscalationFailures(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	abortErr := errors.New("abort")
-
-	t.Run("missing process", func(t *testing.T) {
-		turnCtx, turnCancel := context.WithCancel(t.Context())
-		session := &agentSession{agent: agent}
-
-		require.ErrorIs(t, session.terminateCancelledTurn(t.Context(), nil, turnCancel, abortErr), abortErr)
-		require.ErrorIs(t, turnCtx.Err(), context.Canceled)
-	})
-
-	t.Run("incomplete process containment", func(t *testing.T) {
-		turnCtx, turnCancel := context.WithCancel(t.Context())
-		process := newStubProcess(false)
-		process.kill = errors.New("kill")
-		process.close = pi.ErrProcessContainmentIncomplete
-		session := &agentSession{agent: agent}
-
-		err := session.terminateCancelledTurn(t.Context(), process, turnCancel, abortErr)
-		require.ErrorIs(t, err, abortErr)
-		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
-		require.ErrorIs(t, turnCtx.Err(), context.Canceled)
-		require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
-	})
 }
 
 func TestRelaunchProcessBranches(t *testing.T) {
@@ -1005,6 +1917,7 @@ func TestRefreshMCPToolsKeepsRetryPendingAfterFailedRelaunch(t *testing.T) {
 
 func prepareRelaunchFixture(t *testing.T, session *agentSession) {
 	t.Helper()
+	attachTestNativeBoundary(session)
 	parent := t.TempDir()
 	sessionRoot, err := os.MkdirTemp(parent, "acp-go-pi-session-*")
 	require.NoError(t, err)
@@ -1192,6 +2105,161 @@ func TestRelaunchAdmissionFailureBranches(t *testing.T) {
 	})
 }
 
+func TestRelaunchExactOwnershipGateMatrix(t *testing.T) {
+	type setupFunc func(*agentSession, *Agent, *stubPiClient, *context.Context)
+	tests := []struct {
+		name  string
+		setup setupFunc
+	}{
+		{
+			name: "session closes after native root",
+			setup: func(session *agentSession, agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					session.mu.Lock()
+					session.closing = true
+					session.mu.Unlock()
+
+					return func() {}, nil
+				}
+			},
+		},
+		{
+			name: "agent closes after native root",
+			setup: func(_ *agentSession, agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					_, _ = agent.beginClose()
+
+					return func() {}, nil
+				}
+			},
+		},
+		{
+			name: "context cancels at final spawn gate",
+			setup: func(_ *agentSession, agent *Agent, _ *stubPiClient, ctx *context.Context) {
+				armed := false
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					armed = true
+
+					return func() {}, nil
+				}
+				*ctx = &closeOnErrContext{Context: *ctx, returnErr: func() error {
+					if armed {
+						return context.Canceled
+					}
+
+					return nil
+				}}
+			},
+		},
+		{
+			name: "immutable construction refuses transfer",
+			setup: func(_ *agentSession, agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+					agent.mu.Lock()
+					for owner := range agent.constructions {
+						owner.immutable = true
+						owner.err = errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("relaunch waiter"))
+					}
+					agent.mu.Unlock()
+
+					return newStubProcess(false), newStubPiClient(), nil
+				}
+			},
+		},
+		{
+			name: "spawn observer panics",
+			setup: func(_ *agentSession, agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, _ RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if stage == RuntimeStartupSpawn {
+						panic("spawn observer")
+					}
+				}
+			},
+		},
+		{
+			name: "agent closes during spawn observer",
+			setup: func(_ *agentSession, agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, _ RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if stage == RuntimeStartupSpawn {
+						_, _ = agent.beginClose()
+					}
+				}
+			},
+		},
+		{
+			name: "readiness observer panics",
+			setup: func(_ *agentSession, agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, _ RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if stage == RuntimeStartupReadiness {
+						panic("readiness observer")
+					}
+				}
+			},
+		},
+		{
+			name: "session closes during client start",
+			setup: func(session *agentSession, _ *Agent, client *stubPiClient, _ *context.Context) {
+				client.startFunc = func(context.Context) error {
+					session.mu.Lock()
+					session.closing = true
+					session.mu.Unlock()
+
+					return nil
+				}
+			},
+		},
+		{
+			name: "establishment gate ends during catalog publication",
+			setup: func(session *agentSession, agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.setConnection(&relaunchCatalogEndingClient{directAgentClient: newDirectAgentClient(), session: session})
+			},
+		},
+		{
+			name: "spawn callback panics",
+			setup: func(_ *agentSession, agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+					panic("spawn callback")
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
+			client := newStubPiClient()
+			client.state = pi.SessionState{SessionID: "id"}
+			session := &agentSession{agent: agent, id: "id", proc: newStubProcess(true), client: newStubPiClient()}
+			prepareRelaunchFixture(t, session)
+			agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+				return newStubProcess(false), client, nil
+			}
+			ctx := t.Context()
+			test.setup(session, agent, client, &ctx)
+			require.Error(t, session.relaunchProcess(ctx))
+		})
+	}
+
+	duplicate := &agentSession{relaunchAttempt: &sessionRelaunchAttempt{}}
+	_, err := duplicate.beginRelaunch()
+	require.ErrorContains(t, err, "already in progress")
+
+	require.NoError(t, (&agentSession{}).containHoistedRelaunch(t.Context(), &sessionRelaunchAttempt{}))
+	process := newStubProcess(false)
+	attempt := &sessionRelaunchAttempt{proc: process, nativeBoundary: newNativeBoundaryTracker()}
+	require.NoError(t, (&agentSession{}).containHoistedRelaunch(t.Context(), attempt))
+	require.Equal(t, 1, process.killCalls)
+	require.Equal(t, 1, process.closeCalls)
+
+	containedProcess := newStubProcess(false)
+	outbox := newTestSessionOutbox(1)
+	bindTestRuntime(outbox, containedProcess, newStubPiClient(), nil, nil, nil)
+	attempt = &sessionRelaunchAttempt{outbox: outbox}
+	session := &agentSession{agent: NewAgent()}
+	require.NoError(t, session.containHoistedRelaunch(t.Context(), attempt))
+	require.Equal(t, 1, containedProcess.closeCalls)
+}
+
 // TestRelaunchPublicationFailureBranches pins the late relaunch failures:
 // once the replacement process is live, a catalog fetch, catalog publication,
 // or lifecycle stream that cannot complete retires the whole replacement
@@ -1262,4 +2330,55 @@ func TestRelaunchRecordsGenerationLossBeforeLaunch(t *testing.T) {
 	require.ErrorIs(t, session.relaunchProcess(t.Context()), errLifecycleBoundaryCommit)
 	require.True(t, session.lc.fenced, "the lost generation's stream ends even when its record cannot commit")
 	require.Zero(t, spawns, "an unrecorded generation loss admits no replacement")
+}
+
+func TestRelaunchRechecksCloseAfterRecordingGenerationLoss(t *testing.T) {
+	store := &appendCallbackStore{SessionStore: NewInMemorySessionStore()}
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+	agent.lifecycle = lifecycle.Negotiated{
+		Versions:             []int{1},
+		UpdatesOutsidePrompt: true,
+		ActivityKinds:        []lifecycle.ActivityKind{},
+	}
+	agent.setConnection(newDirectAgentClient())
+	session := &agentSession{agent: agent, id: "id", proc: newStubProcess(true), client: newStubPiClient()}
+	prepareRelaunchFixture(t, session)
+	require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+
+	store.afterAppend = func() {
+		store.afterAppend = nil
+		session.mu.Lock()
+		session.closing = true
+		session.mu.Unlock()
+	}
+	spawns := 0
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		spawns++
+
+		return newStubProcess(false), newStubPiClient(), nil
+	}
+
+	requireInvalidParams(t, session.relaunchProcess(t.Context()))
+	require.Zero(t, spawns, "close won after the durable loss record but before native launch")
+}
+
+func TestCloseRetainsIncompleteSettlementOwner(t *testing.T) {
+	store := newFaultySessionStore()
+	session, _ := lifecycleSession(t, false)
+	session.agent.options.SessionStore = store
+	require.NoError(t, session.openLifecycleStream(t.Context(), 1))
+
+	process := newStubProcess(false)
+	native := newStubPiClient()
+	session.proc = process
+	session.client = native
+	outbox := bindTestOutbox(session)
+	require.Same(t, outbox.nativeBoundary, session.nativeBoundary)
+	store.appendErr = pi.ErrProcessContainmentIncomplete
+
+	err := session.Close(t.Context())
+	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
+	require.Equal(t, 1, process.shutdownCalls)
+	require.Equal(t, 1, process.closeCalls)
 }

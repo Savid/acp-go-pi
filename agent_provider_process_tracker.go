@@ -38,27 +38,34 @@ func newProviderProcessTracker(hooks RuntimeResourceHooks) *providerProcessTrack
 }
 
 func (t *providerProcessTracker) register() *providerProcessRoot {
+	root := t.registerDeferred()
+	t.update(context.Background(), root.id, providerProcessEntry{})
+
+	return root
+}
+
+// registerDeferred records ownership without invoking an observation hook.
+// Spawn callers use it so they can attach the returned root, process, and
+// client to their construction owner before any observer can block or panic.
+func (t *providerProcessTracker) registerDeferred() *providerProcessRoot {
 	t.mu.Lock()
 	t.nextID++
 	t.entries[t.nextID] = providerProcessEntry{}
 	root := &providerProcessRoot{tracker: t, id: t.nextID}
-	startPublisher := t.markDirtyLocked()
 	t.mu.Unlock()
-
-	if startPublisher {
-		t.publish(context.Background())
-	}
 
 	return root
 }
 
 func (r *providerProcessRoot) observe(ctx context.Context, process any) {
 	inventory, ok := process.(providerProcessInventory)
-	if !ok {
+	if ok {
+		r.tracker.update(ctx, r.id, providerProcessEntry{inventory: inventory})
+
 		return
 	}
 
-	r.tracker.update(ctx, r.id, providerProcessEntry{inventory: inventory})
+	r.tracker.update(ctx, r.id, providerProcessEntry{})
 }
 
 func (r *providerProcessRoot) retire(ctx context.Context, complete bool) {

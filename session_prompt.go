@@ -187,7 +187,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		return acp.PromptResponse{}, err
 	}
 
-	if poisonErr := s.poisonedError(); poisonErr != nil {
+	if poisonErr := s.admissionFenceError(ctx); poisonErr != nil {
 		return acp.PromptResponse{}, poisonErr
 	}
 
@@ -195,77 +195,78 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
-	defer releaseTurn()
 
-	if poisonErr := s.poisonedError(); poisonErr != nil {
-		return acp.PromptResponse{}, poisonErr
-	}
+	var observationOutbox *sessionOutbox
+
+	defer func() {
+		releaseTurn()
+
+		if observationOutbox != nil && observationOutbox.claimProviderObservation() {
+			_ = s.observeProviderProcessBounded(context.WithoutCancel(ctx), observationOutbox)
+		}
+	}()
 
 	mapped, err := promptToPi(ctx, params.Prompt, s.agent.imageLimits(), s.agent.inputHandoffRoot())
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
 
-	if err := s.rejectImagesForUnsupportedModel(mapped); err != nil {
-		return acp.PromptResponse{}, err
+	if imageErr := s.rejectImagesForUnsupportedModel(mapped); imageErr != nil {
+		return acp.PromptResponse{}, imageErr
 	}
-
-	if err := s.refreshMCPTools(ctx); err != nil {
-		return acp.PromptResponse{}, s.nativeTurnFailure(ctx, err)
-	}
-	defer s.observeProviderProcess(context.WithoutCancel(ctx))
-
-	s.resetTurnTools()
-
-	turnCtx, cancel := context.WithCancel(ctx)
-	turnCtx = withTurnRoute(turnCtx, route.turnNonce)
 
 	delivery := newTurnDelivery()
 
+	if admissionErr := s.claimPromptForeground(ctx, delivery); admissionErr != nil {
+		return acp.PromptResponse{}, admissionErr
+	}
+
+	var cancel context.CancelFunc
+
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+
+		s.finishPromptForeground(delivery)
+	}()
+
+	outbox, client, reserveErr := s.refreshAndReservePrompt(ctx, delivery)
+	if reserveErr != nil {
+		var requestErr *acp.RequestError
+		if errors.As(reserveErr, &requestErr) {
+			return acp.PromptResponse{}, reserveErr
+		}
+
+		return acp.PromptResponse{}, s.nativeTurnFailure(ctx, reserveErr)
+	}
+
+	observationOutbox = outbox
+
+	s.resetTurnTools()
+
+	turnCtx, turnCancel := context.WithCancel(ctx)
+	cancel = turnCancel
+	turnCtx = withTurnRoute(turnCtx, route.turnNonce)
+
 	s.cancelMu.Lock()
 	s.mu.Lock()
-	s.cancel = cancel
+	s.cancel = turnCancel
 	s.turnCancelled = false
 	s.turnNonce = route.turnNonce
-	s.turnEvents = delivery
-	s.turnNativeSettled = false
 	s.turnFenceStarted = false
 	s.turnFenceDone = make(chan struct{})
 	s.turnFenceErr = nil
 	s.turnSettling = false
 	s.turnCommitOnCancel = false
 	s.turnImagesEmitted = false
-	outbox := s.outbox
 	s.mu.Unlock()
 	s.cancelMu.Unlock()
 
-	outbox.adopt(delivery)
-
-	defer func() {
-		cancel()
-		outbox.release(delivery)
-
-		s.cancelMu.Lock()
-		defer s.cancelMu.Unlock()
-
-		s.mu.Lock()
-		s.cancel = nil
-		s.turnCancelled = false
-		s.turnNonce = ""
-		s.turnSettling = false
-		s.turnNativeSettled = false
-		s.turnCommitOnCancel = false
-
-		if s.turnEvents == delivery {
-			s.turnEvents = nil
-		}
-		s.mu.Unlock()
-
-		close(delivery.done)
-		s.resetTurnTools()
-	}()
-
-	var timedOut atomic.Bool
+	var (
+		timedOut       atomic.Bool
+		nativeAccepted atomic.Bool
+	)
 
 	if timeout := s.agent.turnTimeout(); timeout > 0 {
 		timer := time.AfterFunc(timeout, func() {
@@ -274,8 +275,26 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		defer timer.Stop()
 	}
 
-	client := s.currentClient()
-	if promptErr := client.Prompt(turnCtx, mapped.Message, mapped.Images); promptErr != nil {
+	boundary := pi.CallBoundary{
+		BeforeDispatch: func() (func(), error) {
+			return s.beginPromptDispatch(turnCtx, outbox, delivery)
+		},
+		Accepted: func(acceptCtx context.Context) error {
+			nativeAccepted.Store(true)
+			s.openSettlement()
+
+			return s.acceptPromptResponse(acceptCtx, outbox, delivery, submission)
+		},
+	}
+	if promptErr := client.PromptWithBoundary(turnCtx, mapped.Message, mapped.Images, boundary); promptErr != nil {
+		if nativeAccepted.Load() {
+			return s.settlePrompt(turnCtx, params, &promptTurnState{}, promptOutcome{failure: promptErr}, &timedOut)
+		}
+
+		if poisonErr := s.admissionFenceError(ctx); poisonErr != nil {
+			return acp.PromptResponse{}, poisonErr
+		}
+
 		// The native dispatcher never took the frame, so this creates neither
 		// submission nor turn and settles nothing.
 		fenceErr := s.fenceTurnAfterFailure(context.WithoutCancel(ctx))
@@ -283,16 +302,47 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		return acp.PromptResponse{}, errors.Join(s.nativeTurnFailure(ctx, promptErr), fenceErr)
 	}
 
-	s.openSettlement()
-
-	if acceptErr := s.lifecycleAcceptTurn(turnCtx, submission); acceptErr != nil {
-		return s.settlePrompt(turnCtx, params, &promptTurnState{}, promptOutcome{failure: acceptErr}, &timedOut)
-	}
-
 	state := &promptTurnState{}
-	outcomeOfTurn := s.runPromptTurn(turnCtx, delivery, state)
+	outcomeOfTurn := s.runPromptTurn(turnCtx, outbox, delivery, state)
 
 	return s.settlePrompt(turnCtx, params, state, outcomeOfTurn, &timedOut)
+}
+
+// finishPromptForeground ends one prompt's hold on the session and hands the
+// router back. The order is the point: the turn's route, its delivery, and the
+// shared tool tracker are all finished before the release, because the release
+// wakes the pump into a drain that can open an agent-origin cycle immediately.
+// Releasing first would let this turn's own cleanup erase the first tool that
+// cycle started.
+func (s *agentSession) finishPromptForeground(delivery *turnDelivery) {
+	s.cancelMu.Lock()
+
+	s.mu.Lock()
+	s.cancel = nil
+	s.turnCancelled = false
+	s.turnNonce = ""
+	s.turnSettling = false
+	s.turnNativeSettled = false
+	s.turnCommitOnCancel = false
+
+	if s.turnEvents == delivery {
+		s.turnEvents = nil
+	}
+
+	if s.promptAdmission == delivery {
+		s.promptAdmission = nil
+	}
+
+	outbox := s.outbox
+	s.mu.Unlock()
+
+	delivery.abandonQueuedDialogs(context.Background(), s)
+	close(delivery.done)
+	s.resetTurnTools()
+	s.cancelMu.Unlock()
+
+	outbox.release(delivery)
+	outbox.releasePromptAdmission(delivery)
 }
 
 // promptOutcome is how the streaming loop ended. Every accepted exit returns
@@ -313,7 +363,15 @@ type promptOutcome struct {
 
 // runPromptTurn streams the accepted turn until it ends, and reports how it
 // ended instead of writing a response of its own.
-func (s *agentSession) runPromptTurn(ctx context.Context, delivery *turnDelivery, state *promptTurnState) promptOutcome {
+func (s *agentSession) runPromptTurn(
+	ctx context.Context,
+	outbox *sessionOutbox,
+	delivery *turnDelivery,
+	state *promptTurnState,
+) promptOutcome {
+	deliveryCtx, cancelDelivery := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
+	defer cancelDelivery()
+
 	for {
 		select {
 		case event, ok := <-delivery.events:
@@ -321,7 +379,7 @@ func (s *agentSession) runPromptTurn(ctx context.Context, delivery *turnDelivery
 				return promptOutcome{transportEnded: true}
 			}
 
-			settled, err := s.handleTurnEvent(ctx, event, state)
+			settled, err := s.handleTurnEvent(deliveryCtx, event, state)
 			if err != nil {
 				return promptOutcome{failure: err}
 			}
@@ -329,18 +387,25 @@ func (s *agentSession) runPromptTurn(ctx context.Context, delivery *turnDelivery
 			if settled {
 				return promptOutcome{settled: true}
 			}
-		case request := <-delivery.uiRequests:
-			if request.IsDialog() {
-				s.dialogWG.Add(1)
-
+		case dialog := <-delivery.uiRequests:
+			if dialog != nil && dialog.claim() {
 				go func() {
-					defer s.dialogWG.Done()
+					defer dialog.complete()
 					defer recoverAgentGoroutine(context.WithoutCancel(ctx), agentLogger(s.agent), "UI dialog handler")
 
-					s.handleUIDialog(ctx, request)
+					s.handleNativeUIDialog(ctx, dialog)
 				}()
 			}
 		case <-ctx.Done():
+			// Internal containment cancels the turn context after the client has
+			// terminalized a malformed or unterminated JSONL stream. That fixed
+			// structural terminal outranks the cancellation it caused; otherwise
+			// the same T4 record can nondeterministically become a successful
+			// cancelled response.
+			if outbox != nil && outbox.client != nil && outbox.client.Err() != nil {
+				return promptOutcome{transportEnded: true}
+			}
+
 			return promptOutcome{contextEnded: true}
 		}
 	}
@@ -390,14 +455,22 @@ func (s *agentSession) handleTurnEvent(ctx context.Context, event pi.Event, stat
 		}
 
 		return false, s.publishNativeToolTerminal(ctx, typed.ToolCallID, status, typed.Result)
+	case pi.ExtensionErrorEvent:
+		// The wrapper-owned extensions are the permission bridge and the MCP
+		// client, so an extension that threw is a cycle whose permission
+		// admission or tool surface may no longer be the one the host believes
+		// it authorized. The cycle fails closed and states nothing about which
+		// extension or why: the native path and the thrown error are
+		// adapter-internal and reach the operator's log, never the client.
+		return false, extensionTurnFailure()
 	default:
 		// The remaining decoded types are foreground machinery inside
 		// agent_settled's own scope — the agent and turn brackets, the queue
-		// update, the compaction and auto-retry pairs, the extension error,
-		// and a type this package does not model. None carries an entity ACP
-		// or the lifecycle extension can name, so none projects an update.
-		// They still reached the session outbox, which is what keeps them off
-		// the raw-event stream's gap detector.
+		// update, and the compaction and auto-retry pairs — plus a type this
+		// package does not model. None carries an entity ACP or the lifecycle
+		// extension can name, so none projects an update. They still reached
+		// the session outbox, which is what keeps them off the raw-event
+		// stream's gap detector.
 		return false, nil
 	}
 }
@@ -579,7 +652,7 @@ func acpStopReason(s *agentSession, state *promptTurnState) acp.StopReason {
 	case stopReasonStop, "":
 		return acp.StopReasonEndTurn
 	default:
-		s.agent.log.Debug("unknown pi stop reason", slog.String("stop_reason", state.stopReason))
+		s.agent.log.Debug("unknown pi stop reason")
 
 		return acp.StopReasonEndTurn
 	}
@@ -588,7 +661,9 @@ func acpStopReason(s *agentSession, state *promptTurnState) acp.StopReason {
 func (s *agentSession) settledSessionStats(ctx context.Context) *pi.SessionStats {
 	stats, err := s.currentClient().GetSessionStats(ctx)
 	if err != nil {
-		s.agent.log.DebugContext(ctx, "get pi session stats failed", slog.String(jsonFieldError, err.Error()))
+		s.agent.log.DebugContext(ctx, "get pi session stats failed",
+			slog.String(acpFieldSessionID, string(s.id)),
+		)
 
 		return nil
 	}

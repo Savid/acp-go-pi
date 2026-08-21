@@ -25,31 +25,35 @@ const (
 	schemaFieldType = "type"
 )
 
-// handleElicitationDialog relays one non-permission extension dialog
+// handleNativeElicitationDialog relays one non-permission extension dialog
 // (select without the permission marker, confirm, input, editor) as an ACP
 // form elicitation. When the client does not advertise form elicitation the
 // dialog fails closed with a deterministic native cancel.
-func (s *agentSession) handleElicitationDialog(ctx context.Context, request pi.UIRequest) {
+func (s *agentSession) handleNativeElicitationDialog(ctx context.Context, dialog *nativeDialog) {
+	request := dialog.request
+
 	conn := s.agent.connection()
 	if conn == nil || !s.agent.clientSupportsFormElicitation() {
-		s.respondUIDialog(ctx, pi.UICancelResponse(request.ID))
+		dialog.answer(ctx, s, pi.UICancelResponse(request.ID))
 
 		return
 	}
 
 	ctx, finish := s.agent.observe.StartElicitation(ctx)
 
-	response, accepted := s.createDialogElicitation(ctx, conn, request)
+	response, accepted := s.createBoundDialogElicitation(ctx, conn, dialog)
 	finish(observer.ElicitationResult{Accepted: accepted})
 
-	s.respondUIDialog(ctx, response)
+	dialog.answer(ctx, s, response)
 }
 
-func (s *agentSession) createDialogElicitation(
+func (s *agentSession) createBoundDialogElicitation(
 	ctx context.Context,
 	conn agentClient,
-	request pi.UIRequest,
+	dialog *nativeDialog,
 ) (pi.UIResponse, bool) {
+	request := dialog.request
+
 	dialogCtx, finishDialog := s.registerDialog(ctx, request.ID)
 	defer finishDialog()
 
@@ -59,11 +63,15 @@ func (s *agentSession) createDialogElicitation(
 			Mode:            elicitationModeForm,
 			RequestedSchema: elicitationSchemaForDialog(request),
 		},
-	}, elicitationScope{SessionID: s.id, TurnNonce: turnNonceFromContext(ctx), RequestID: request.ID})
+	}, elicitationScope{SessionID: s.id, TurnNonce: turnNonceFromContext(ctx), RequestID: request.ID}, dialogActionBinding{
+		outbox: dialog.outbox,
+		failNative: func() {
+			dialog.answer(context.WithoutCancel(ctx), s, pi.UICancelResponse(request.ID))
+		},
+	})
 	if err != nil {
 		s.agent.log.DebugContext(ctx, "elicitation request failed closed",
 			slog.String(acpFieldSessionID, string(s.id)),
-			slog.String(jsonFieldError, err.Error()),
 		)
 
 		return pi.UICancelResponse(request.ID), false

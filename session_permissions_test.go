@@ -14,6 +14,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
+	"github.com/savid/acp-go-pi/internal/lifecycle"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -360,6 +361,27 @@ func TestRequestPermissionUsesExactNativeToolCallID(t *testing.T) {
 	require.Len(t, permissionClient.permissionRequests, 1)
 }
 
+func TestPermissionOwnershipFailureSynchronouslyDeniesExactDialog(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+	host := newDialogStubClient()
+	agent.setConnection(host)
+	native := newStubPiClient()
+	session := &agentSession{agent: agent, id: "permission-owner", client: native}
+	outbox := newTestSessionOutbox(1)
+	bindTestRuntime(outbox, nil, native, nil, nil, nil)
+	session.outbox = outbox
+	turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
+
+	answer := session.requestPermissionAnswer(turnCtx, pi.UIRequest{ID: "exact-deny"}, pi.PermissionPrompt{
+		ToolCallID: "call", ToolName: "bash",
+	})
+	require.Equal(t, string(permissionOptionDeny), answer)
+	require.Empty(t, host.permissionRequests)
+	require.Len(t, native.responses, 1)
+	require.Equal(t, pi.UIValueResponse("exact-deny", pi.PermissionOptionDeny), native.responses[0])
+}
+
 func TestPermissionPublishesPendingCallBeforeRequestAndNativeStartUpdatesIt(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := &orderedPermissionClient{dialogStubClient: newDialogStubClient()}
@@ -369,6 +391,9 @@ func TestPermissionPublishesPendingCallBeforeRequestAndNativeStartUpdatesIt(t *t
 	agent.setConnection(client)
 	native := newStubPiClient()
 	session := &agentSession{agent: agent, id: "session", client: native}
+	outbox := newTestSessionOutbox(1)
+	bindTestRuntime(outbox, nil, native, nil, nil, nil)
+	session.outbox = outbox
 	turnCtx := activatePermissionTestTurn(t, session, permissionTestTurnNonce)
 
 	session.handleUIDialog(turnCtx, pi.UIRequest{
@@ -713,6 +738,9 @@ func TestMalformedPermissionMarkerFailsClosed(t *testing.T) {
 	agent.setConnection(permissionClient)
 	native := newStubPiClient()
 	session := &agentSession{agent: agent, id: "session", client: native}
+	outbox := newTestSessionOutbox(1)
+	bindTestRuntime(outbox, nil, native, nil, nil, nil)
+	session.outbox = outbox
 
 	requests := []pi.UIRequest{
 		{ID: "missing", Method: uiMethodSelect, Title: pi.PermissionTitleMarker + `{"toolName":"bash"}`},
@@ -739,9 +767,45 @@ func TestRespondUIDialogFailures(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	session := &agentSession{agent: agent, id: "session"}
 
-	session.respondUIDialog(t.Context(), pi.UICancelResponse("no-client"))
+	session.respondExactUIDialog(t.Context(), nil, nil, pi.UICancelResponse("no-client"))
 	native := newStubPiClient()
 	native.respondErr = errors.New("respond failed")
 	session.client = native
-	session.respondUIDialog(t.Context(), pi.UICancelResponse("error"))
+	outbox := newTestSessionOutbox(1)
+	bindTestRuntime(outbox, nil, native, nil, nil, nil)
+	session.outbox = outbox
+	session.respondExactUIDialog(t.Context(), outbox, native, pi.UICancelResponse("error"))
+}
+
+func TestExactUIDialogResponseRefusesMissingBlockedAndStaleOwners(t *testing.T) {
+	session := &agentSession{agent: NewAgent(WithLogger(slog.New(slog.DiscardHandler)))}
+	session.handleNativeUIDialog(t.Context(), nil)
+	session.respondExactClientUIDialog(t.Context(), nil, pi.UICancelResponse("nil"))
+
+	native := newStubPiClient()
+	outbox := newTestSessionOutbox(1)
+	bindTestRuntime(outbox, nil, native, nil, nil, nil)
+	session.outbox = outbox
+
+	require.NoError(t, outbox.dispatchMu.lock(t.Context()))
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	session.respondExactUIDialog(cancelled, outbox, native, pi.UICancelResponse("blocked"))
+	outbox.dispatchMu.Unlock()
+	require.Empty(t, native.responses)
+
+	outbox.end()
+	session.respondExactUIDialog(t.Context(), outbox, native, pi.UICancelResponse("ended"))
+	require.Empty(t, native.responses)
+
+	retainedClient := newStubPiClient()
+	retained := newTestSessionOutbox(2)
+	bindTestRuntime(retained, nil, retainedClient, nil, nil, nil)
+	session.containmentOutboxes = []*sessionOutbox{nil, retained}
+	session.respondExactClientUIDialog(t.Context(), retainedClient, pi.UICancelResponse("retained"))
+	require.Equal(t, []pi.UIResponse{pi.UICancelResponse("retained")}, retainedClient.responses)
+
+	unknown := newStubPiClient()
+	session.respondExactClientUIDialog(t.Context(), unknown, pi.UICancelResponse("unknown"))
+	require.Empty(t, unknown.responses)
 }

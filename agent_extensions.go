@@ -92,7 +92,10 @@ func (a *Agent) handleForkSession(
 	}
 
 	session.emitCurrentUsageUpdate(ctx)
-	a.publishSessionOpenInline(ctx, session)
+
+	if openErr := a.publishSessionOpenInline(ctx, session); openErr != nil {
+		return acp.UnstableForkSessionResponse{}, openErr
+	}
 
 	return acp.UnstableForkSessionResponse{
 		SessionId:     session.id,

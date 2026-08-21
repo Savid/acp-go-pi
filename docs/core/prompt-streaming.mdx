@@ -33,6 +33,22 @@ Two interactive flows are layered on top of the stream:
   elicitation support. Without it, the dialog is cancelled deterministically
   and the turn proceeds — see [Elicitation](/docs/features/elicitation).
 
+A native dialog is answerable only while a dispatched prompt owns the turn.
+Permission and elicitation dialogs that arrive between prompts are actively
+answered with native deny/cancel, including dialogs produced by agent-origin
+work; they are never left pending or attributed to a prompt that did not cause
+them. If the host request is written but its lifecycle action announcement
+fails, the adapter cancels that exact host request, retires the partial action,
+and contains the owning native generation.
+The negotiated request send is bounded and panic-safe. A writer panic before
+or after its write acknowledgement, or a writer that ignores cancellation,
+uses one fixed detail-free failure, revokes the action, answers the native
+dialog once, and synchronously contains the captured generation. Close first
+cancels and joins every admitted request sender before it starts native Abort,
+Shutdown, Kill, or Close; a sender that never returns leaves the exact session
+generation in containment-incomplete retained ownership with native teardown
+unstarted.
+
 Native image output is validated before it reaches the wire: the bytes must
 decode, must sniff as a raster, must not contradict a declared media type that
 names a different known raster, and must fit the per-image and per-tool-call
@@ -162,7 +178,9 @@ A turn resolves one of three ways:
   adapter synchronously mirrors that durable aborted generation before the
   cancelled response. If escalation stops the runtime before
   `agent_settled`, no fresh generation is mirrored. The next prompt lazily
-  relaunches the same logical session from the resulting committed state.
+  relaunches the same logical session from the resulting committed state. The
+  lost generation's lifecycle stream ends at the containment fence; relaunch
+  opens a fresh stream and snapshot, and no missing output is reconstructed.
 - **Failure** — a process exit, transport break, provider error, or
   `WithTurnTimeout` expiry ends the prompt with a `pi_turn_failed` JSON-RPC
   error. Timeout uses the same selected containment boundary before returning. Failures

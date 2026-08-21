@@ -128,6 +128,19 @@ func RunningEvent(cycleID, turnID string) Event {
 	}}
 }
 
+// AgentRunningEvent opens the foreground cycle an agent-origin activity caused.
+// It is the second of the two events that can open a turn: the native harness
+// began work nobody submitted, so there is no acceptance to precede it and no
+// submission identity to borrow.
+func AgentRunningEvent(cycleID, turnID string) Event {
+	return Event{Type: EventStateUpdate, State: &StateTransition{
+		State:   ForegroundRunning,
+		CycleID: cycleID,
+		TurnID:  turnID,
+		Cause:   CauseActivity,
+	}}
+}
+
 // RequiresActionEvent reports the cycle a blocking action stopped. A blocking
 // action never moves the foreground by itself, so this transition always
 // accompanies the action that caused it.
@@ -144,11 +157,19 @@ func RequiresActionEvent(cycleID, turnID string) Event {
 // reason and recorded outcome. A failed outcome carries no stop reason: no ACP v1
 // stop reason names a failure and the v1 error carries it instead.
 func IdleEvent(cycleID, turnID, stopReason string, outcome Outcome) Event {
+	return IdleEventFor(CauseSubmission, cycleID, turnID, stopReason, outcome)
+}
+
+// IdleEventFor ends a cycle whose cause is stated by the caller. A cycle ends
+// for the same reason it opened, so an agent-origin cycle reports the activity
+// cause rather than borrowing the submission one from a prompt that never
+// existed.
+func IdleEventFor(cause Cause, cycleID, turnID, stopReason string, outcome Outcome) Event {
 	return Event{Type: EventStateUpdate, State: &StateTransition{
 		State:      ForegroundIdle,
 		CycleID:    cycleID,
 		TurnID:     turnID,
-		Cause:      CauseSubmission,
+		Cause:      cause,
 		StopReason: stopReason,
 		Outcome:    outcome,
 	}}
