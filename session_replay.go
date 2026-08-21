@@ -18,6 +18,7 @@ const (
 	messageRoleUser       = "user"
 	messageRoleAssistant  = "assistant"
 	messageRoleToolResult = "toolResult"
+	messageRoleCustom     = "custom"
 
 	contentBlockTypeText     = "text"
 	contentBlockTypeThinking = "thinking"

@@ -926,20 +926,28 @@ func (o *sessionOutbox) admit(event pi.Event) outboxAdmission {
 
 	switch o.state {
 	case outboxPromptPending, outboxReserved:
-		if _, reported := event.(pi.QueueUpdateEvent); reported {
-			if len(o.preAcceptance) >= outboxQueueCapacity {
-				return outboxAdmission{disposition: outboxOverflow}
+		// pi decides whether the transcript must be compacted before it accepts a
+		// prompt, so the queue report, the compaction pair, its summarization
+		// retries, and whatever an extension writes from the compaction hooks all
+		// arrive ahead of the command response. None of it bears work the prompt
+		// could own, and the response is the first record that can make later work
+		// belong to the prompt, so it is held here and released as raw diagnostics
+		// once acceptance is published rather than replayed with the prompt's
+		// route, action authority, or lifecycle identity.
+		if bearsCycleWork(event) {
+			return outboxAdmission{
+				disposition: outboxViolation,
+				violation:   "pi produced work before prompt acceptance",
 			}
-
-			o.preAcceptance = append(o.preAcceptance, event)
-
-			return outboxAdmission{disposition: outboxDeferred}
 		}
 
-		return outboxAdmission{
-			disposition: outboxViolation,
-			violation:   "pi produced work before prompt acceptance",
+		if len(o.preAcceptance) >= outboxQueueCapacity {
+			return outboxAdmission{disposition: outboxOverflow}
 		}
+
+		o.preAcceptance = append(o.preAcceptance, event)
+
+		return outboxAdmission{disposition: outboxDeferred}
 	case outboxSettling, outboxAgentSettling, outboxRestoring, outboxConfiguring:
 		return o.retainLocked(event)
 	case outboxIdle, outboxForeground, outboxAgentCycle, outboxClosing:
@@ -978,13 +986,10 @@ func (o *sessionOutbox) classifyLocked(event pi.Event) outboxAdmission {
 	case outboxIdle:
 		return o.classifyVacantLocked(event)
 	case outboxAgentCycle:
-		if _, opens := event.(pi.AgentStartEvent); opens {
-			// A second opener over an open cycle means this adapter's model of
-			// what pi is running is already wrong, and the records that follow
-			// belong to a cycle it never observed begin.
-			return outboxAdmission{disposition: outboxViolation, violation: "pi opened a second cycle over an open one"}
-		}
-
+		// pi brackets every continuation of one run with its own opener, so a
+		// cycle that compacts, retries, or drains a queued message states several
+		// openers inside the single scope its settle marker ends. Each belongs to
+		// the cycle already open, exactly as the foreground reads them.
 		return outboxAdmission{disposition: outboxSession, cycle: o.cycle}
 	case outboxPromptPending, outboxReserved, outboxSettling, outboxAgentSettling, outboxRestoring, outboxConfiguring, outboxClosing:
 	}
@@ -994,25 +999,50 @@ func (o *sessionOutbox) classifyLocked(event pi.Event) outboxAdmission {
 
 // classifyVacantLocked judges a record that arrived with nothing to own it.
 // agent_start is the sole native record that honestly says work began, so it is
-// the only opener; the queue report bears no work and opens nothing. Everything
-// else fails closed, because a fabricated opener would give the host a turn
-// whose beginning this adapter never observed and attaching the record to the
-// next prompt would attribute it to a submission that did not cause it.
+// the only opener. Between runs pi still reports its queue, echoes a
+// configuration change, journals what an extension appended, and names types
+// this package does not model; none of that bears work, so it is recorded and
+// nothing is opened for it. A record that does bear work fails closed, because a
+// fabricated opener would give the host a turn whose beginning this adapter
+// never observed and attaching the record to the next prompt would attribute it
+// to a submission that did not cause it.
 func (o *sessionOutbox) classifyVacantLocked(event pi.Event) outboxAdmission {
-	switch event.(type) {
-	case pi.AgentStartEvent:
+	if _, opens := event.(pi.AgentStartEvent); opens {
 		cycle := &agentCycle{generation: o.generation, state: &promptTurnState{}}
 		o.state = outboxAgentCycle
 		o.cycle = cycle
 
 		return outboxAdmission{disposition: outboxOpenCycle, cycle: cycle}
-	case pi.QueueUpdateEvent:
-		// The queue report states what is pending, never what is running. Its
-		// depth is structural session state; its entries are never read.
-		return outboxAdmission{disposition: outboxNoted}
 	}
 
-	return outboxAdmission{disposition: outboxViolation, violation: orphanRecordViolation(event)}
+	if bearsCycleWork(event) {
+		return outboxAdmission{disposition: outboxViolation, violation: orphanRecordViolation(event)}
+	}
+
+	return outboxAdmission{disposition: outboxNoted}
+}
+
+// bearsCycleWork reports whether a record says pi's agent loop is running
+// something a cycle must own. The rest is session-scoped: the queue report,
+// which states what is pending and never what is running; the compaction and
+// retry pairs, which pi runs around a turn rather than inside one; the custom
+// message and journal entry an extension writes; and every type this package
+// does not model, which by definition names no entity ACP or the lifecycle
+// extension could carry.
+func bearsCycleWork(event pi.Event) bool {
+	switch typed := event.(type) {
+	case pi.MessageStartEvent:
+		return typed.Message.Role != messageRoleCustom
+	case pi.MessageEndEvent:
+		return typed.Message.Role != messageRoleCustom
+	case pi.AgentStartEvent, pi.AgentEndEvent, pi.AgentSettledEvent,
+		pi.TurnStartEvent, pi.TurnEndEvent, pi.MessageUpdateEvent,
+		pi.ToolExecutionStartEvent, pi.ToolExecutionUpdateEvent, pi.ToolExecutionEndEvent,
+		pi.ExtensionErrorEvent:
+		return true
+	}
+
+	return false
 }
 
 // orphanRecordViolation names the invariant an unowned record broke, in

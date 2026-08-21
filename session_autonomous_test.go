@@ -644,20 +644,18 @@ func TestAgentStartAndPromptReserveAreOneTransition(t *testing.T) {
 	require.Equal(t, running["turnId"], admitted.cycle.turnID)
 }
 
-// TestPromptReservationFailsClosedOnPreAckWork pins the causal side of prompt
-// acceptance. The command response is the first record that can make later work
-// belong to the prompt; every work-bearing record before it is ambiguous and
-// contains the generation instead of being replayed with the prompt's route,
-// action authority, or lifecycle identity.
-func TestPromptReservationFailsClosedOnPreAckWork(t *testing.T) {
+// TestPromptReservationFailsClosedOnPreAckCycleWork pins the causal side of
+// prompt acceptance. The command response is the first record that can make
+// later work belong to the prompt; a record that says the agent loop is already
+// running is ambiguous before it and contains the generation instead of being
+// replayed with the prompt's route, action authority, or lifecycle identity.
+func TestPromptReservationFailsClosedOnPreAckCycleWork(t *testing.T) {
 	preAck := map[string]pi.Event{
 		"agent opener":      pi.AgentStartEvent{},
 		"message":           pi.MessageStartEvent{Message: pi.AgentMessage{Role: messageRoleAssistant}},
 		"tool":              pi.ToolExecutionStartEvent{ToolCallID: "pre-ack", ToolName: toolNameRead},
 		"turn bracket":      pi.TurnStartEvent{},
 		"agent bracket":     pi.AgentEndEvent{},
-		"retry":             pi.AutoRetryStartEvent{},
-		"compaction":        pi.CompactionStartEvent{},
 		"settlement":        pi.AgentSettledEvent{},
 		"extension failure": pi.ExtensionErrorEvent{ExtensionPath: "/private/ext.ts", Error: "secret"},
 	}
@@ -691,6 +689,55 @@ func TestPromptReservationFailsClosedOnPreAckWork(t *testing.T) {
 					"pre-ack work receives no lifecycle identity")
 			}
 		})
+	}
+}
+
+// TestPromptReservationHoldsPiOwnPreAcceptanceWork pins the other side. pi
+// decides whether the transcript must be compacted before it answers the prompt
+// command, so an auto-compaction pass, its summarization retries, the queue
+// report, and whatever an extension journals from the compaction hooks all
+// arrive while the reservation stands. None of it says the agent loop is
+// running, so it is held for the acceptance boundary rather than ending the
+// incarnation the prompt is about to use.
+func TestPromptReservationHoldsPiOwnPreAcceptanceWork(t *testing.T) {
+	preAck := []pi.Event{
+		pi.QueueUpdateEvent{},
+		pi.CompactionStartEvent{Reason: "threshold"},
+		pi.UnknownEvent{EventType: "summarization_retry_scheduled"},
+		pi.UnknownEvent{EventType: "summarization_retry_attempt_start"},
+		pi.UnknownEvent{EventType: "summarization_retry_finished"},
+		pi.CompactionEndEvent{Reason: "threshold"},
+		pi.UnknownEvent{EventType: "entry_appended"},
+		pi.MessageStartEvent{Message: pi.AgentMessage{Role: messageRoleCustom}},
+		pi.MessageEndEvent{Message: pi.AgentMessage{Role: messageRoleCustom}},
+		pi.UnknownEvent{EventType: "thinking_level_changed"},
+	}
+
+	fixture := newAgentCycleFixture(t)
+	fixture.session.rawMessages = rawMessageConfig{All: true}
+	fixture.session.turnNonce = "not-yet-accepted"
+
+	delivery := newTurnDelivery()
+	require.NoError(t, fixture.session.reservePromptForeground(delivery))
+
+	fixture.route(t, preAck...)
+	fixture.quiesce()
+
+	require.NoError(t, fixture.session.poisonedError())
+	require.False(t, fixture.lifecycleFenced())
+	require.Zero(t, fixture.process.shutdownCalls)
+	require.Nil(t, fixture.outbox.currentCycle(), "pi's own pre-prompt work opens no cycle")
+
+	fixture.outbox.mu.Lock()
+	held := len(fixture.outbox.preAcceptance)
+	fixture.outbox.mu.Unlock()
+	require.Len(t, preAck, held, "every pre-acceptance record waits for the acceptance boundary")
+
+	require.Empty(t, fixture.client.notified, "a held frame reaches no raw subscriber")
+
+	for _, emitted := range fixture.client.lifecycleEvents(t) {
+		require.Equal(t, string(lifecycle.EventSnapshot), emitted["type"],
+			"pi's own pre-prompt work states no lifecycle identity")
 	}
 }
 
@@ -1054,28 +1101,22 @@ func TestSettleWithANonEmptyQueueFencesTheGeneration(t *testing.T) {
 	}
 }
 
-// TestOrphanRecordsFailClosed pins the invariant across every record class: work
-// with no cycle behind it is never given an invented opener and never attached
-// to a later prompt, and a second opener over an open cycle is refused rather
-// than folded into the cycle already running.
-func TestOrphanRecordsFailClosed(t *testing.T) {
+// TestOrphanCycleWorkFailsClosed pins the invariant across every record that
+// says pi's agent loop is running: work with no cycle behind it is never given
+// an invented opener and never attached to a later prompt.
+func TestOrphanCycleWorkFailsClosed(t *testing.T) {
 	orphans := map[string]pi.Event{
-		"assistant start":  pi.MessageStartEvent{Message: pi.AgentMessage{Role: messageRoleAssistant}},
-		"assistant delta":  pi.MessageUpdateEvent{},
-		"assistant end":    pi.MessageEndEvent{Message: pi.AgentMessage{Role: messageRoleAssistant}},
-		"tool start":       pi.ToolExecutionStartEvent{ToolCallID: "t", ToolName: toolNameRead},
-		"tool update":      pi.ToolExecutionUpdateEvent{ToolCallID: "t"},
-		"tool end":         pi.ToolExecutionEndEvent{ToolCallID: "t"},
-		"turn start":       pi.TurnStartEvent{},
-		"turn end":         pi.TurnEndEvent{},
-		"agent end":        pi.AgentEndEvent{},
-		"settle marker":    pi.AgentSettledEvent{},
-		"retry start":      pi.AutoRetryStartEvent{},
-		"retry end":        pi.AutoRetryEndEvent{},
-		"compaction start": pi.CompactionStartEvent{},
-		"compaction end":   pi.CompactionEndEvent{},
-		"extension error":  pi.ExtensionErrorEvent{ExtensionPath: "/private/ext.ts", Error: "boom"},
-		"unmodelled":       pi.UnknownEvent{EventType: "something_new"},
+		"assistant start": pi.MessageStartEvent{Message: pi.AgentMessage{Role: messageRoleAssistant}},
+		"assistant delta": pi.MessageUpdateEvent{},
+		"assistant end":   pi.MessageEndEvent{Message: pi.AgentMessage{Role: messageRoleAssistant}},
+		"tool start":      pi.ToolExecutionStartEvent{ToolCallID: "t", ToolName: toolNameRead},
+		"tool update":     pi.ToolExecutionUpdateEvent{ToolCallID: "t"},
+		"tool end":        pi.ToolExecutionEndEvent{ToolCallID: "t"},
+		"turn start":      pi.TurnStartEvent{},
+		"turn end":        pi.TurnEndEvent{},
+		"agent end":       pi.AgentEndEvent{},
+		"settle marker":   pi.AgentSettledEvent{},
+		"extension error": pi.ExtensionErrorEvent{ExtensionPath: "/private/ext.ts", Error: "boom"},
 	}
 
 	for name, event := range orphans {
@@ -1096,23 +1137,90 @@ func TestOrphanRecordsFailClosed(t *testing.T) {
 			}
 		})
 	}
+}
 
-	t.Run("duplicate opener", func(t *testing.T) {
-		fixture := newAgentCycleFixture(t)
-		fixture.route(t, pi.AgentStartEvent{})
-		require.NotNil(t, fixture.outbox.currentCycle())
+// TestBetweenRunRecordsOpenNothingAndKeepTheSession pins the vocabulary pi emits
+// with no run in flight: the queue report, the compaction pair it runs around a
+// turn, the level echo a configuration change produces, the journal entry and
+// bare custom message an extension writes, and a type this package does not
+// model. None of them bears work, so each is recorded, none invents a cycle, and
+// the session still admits the next prompt.
+func TestBetweenRunRecordsOpenNothingAndKeepTheSession(t *testing.T) {
+	fixture := newAgentCycleFixture(t)
 
-		fixture.route(t, pi.AgentStartEvent{})
-		fixture.quiesce()
+	between := []pi.Event{
+		pi.QueueUpdateEvent{},
+		pi.CompactionStartEvent{Reason: "threshold"},
+		pi.CompactionEndEvent{Reason: "threshold"},
+		pi.AutoRetryStartEvent{Attempt: 1},
+		pi.AutoRetryEndEvent{Success: true, Attempt: 1},
+		pi.UnknownEvent{EventType: "thinking_level_changed"},
+		pi.UnknownEvent{EventType: "entry_appended"},
+		pi.UnknownEvent{EventType: "session_info_changed"},
+		pi.MessageStartEvent{Message: pi.AgentMessage{Role: messageRoleCustom}},
+		pi.MessageEndEvent{Message: pi.AgentMessage{Role: messageRoleCustom}},
+	}
 
-		require.Error(t, fixture.session.poisonedError())
-		require.True(t, fixture.lifecycleFenced())
-		require.Empty(t, fixture.boundaries(t), "a refused opener settles nothing")
+	fixture.route(t, between...)
+	fixture.quiesce()
 
-		for _, emitted := range fixture.client.lifecycleEvents(t) {
-			require.NotEqual(t, string(lifecycle.ForegroundIdle), emitted["state"])
-		}
-	})
+	require.NoError(t, fixture.session.poisonedError())
+	require.False(t, fixture.lifecycleFenced())
+	require.Zero(t, fixture.process.shutdownCalls)
+	require.Nil(t, fixture.outbox.currentCycle(), "a record that bears no work opens no cycle")
+
+	for _, emitted := range fixture.client.lifecycleEvents(t) {
+		require.Equal(t, string(lifecycle.EventSnapshot), emitted["type"],
+			"a record that opens nothing states no lifecycle identity")
+	}
+
+	require.NoError(t, reserveOutboxPrompt(fixture.outbox, newTurnDelivery()),
+		"the session still admits the next prompt")
+}
+
+// TestConfigurationDrainKeepsTheSession pins the same rule across a host
+// configuration command. pi emits thinking_level_changed before the response to
+// the command that caused it, so the echo is retained for the whole write and
+// replayed into an idle router, which must record it rather than treat it as
+// work nothing owns.
+func TestConfigurationDrainKeepsTheSession(t *testing.T) {
+	fixture := newAgentCycleFixture(t)
+
+	require.True(t, fixture.outbox.beginConfiguration())
+
+	admitted := fixture.outbox.admit(pi.UnknownEvent{EventType: "thinking_level_changed"})
+	require.Equal(t, outboxQueued, admitted.disposition)
+
+	fixture.outbox.finishConfiguration()
+	fixture.session.drainOutbox(t.Context(), fixture.outbox)
+	fixture.quiesce()
+
+	require.NoError(t, fixture.session.poisonedError())
+	require.False(t, fixture.lifecycleFenced())
+	require.Zero(t, fixture.process.shutdownCalls)
+}
+
+// TestASecondOpenerJoinsTheRunningAgentCycle pins pi's own bracketing. One
+// settled scope runs the agent loop as often as compaction, a retry, or a queued
+// message demands, and each continuation states its own opener; the cycle the
+// first opener began is the one the settle marker ends.
+func TestASecondOpenerJoinsTheRunningAgentCycle(t *testing.T) {
+	fixture := newAgentCycleFixture(t)
+
+	fixture.route(t, pi.AgentStartEvent{})
+	cycle := fixture.outbox.currentCycle()
+	require.NotNil(t, cycle)
+
+	fixture.route(t, pi.AgentEndEvent{}, pi.AgentStartEvent{})
+	require.Same(t, cycle, fixture.outbox.currentCycle(), "the continuation joined the open cycle")
+
+	fixture.settle(t)
+
+	require.NoError(t, fixture.session.poisonedError())
+	require.Len(t, fixture.boundaries(t), 1, "one scope committed exactly one boundary")
+
+	events := fixture.client.lifecycleEvents(t)
+	require.Equal(t, string(lifecycle.ForegroundIdle), events[len(events)-1]["state"])
 }
 
 // TestUnownedRecordFenceKeepsTheNativePathSecret pins that the extension
@@ -2193,6 +2301,80 @@ func TestQueueUpdateBeforeSuccessDefersEveryFrameUntilAcceptance(t *testing.T) {
 	require.NotEqual(t, -1, accepted)
 	require.NotEqual(t, -1, raw)
 	require.Less(t, accepted, raw)
+}
+
+// TestCompactionBeforeSuccessStillAcceptsThePrompt runs pi's real pre-prompt
+// order through the production JSONL reader: auto-compaction is checked before
+// the prompt command is answered, so its whole pass — the start marker, the
+// summarization retries the compaction request makes, the extension journal
+// entry, and the end marker — crosses the reader ahead of the response. The
+// prompt is accepted, every held frame is released as raw diagnostics behind the
+// acceptance, and the turn runs on the same incarnation.
+func TestCompactionBeforeSuccessStillAcceptsThePrompt(t *testing.T) {
+	fixture := newRealClientPumpFixture(t)
+	fixture.session.rawMessages = rawMessageConfig{All: true}
+
+	delivery := newTurnDelivery()
+	require.NoError(t, fixture.session.reservePromptForeground(delivery))
+	fixture.session.mu.Lock()
+	fixture.session.turnNonce = "compacted-route"
+	fixture.session.mu.Unlock()
+
+	promptDone := make(chan error, 1)
+	go func() {
+		promptDone <- fixture.native.PromptWithBoundary(t.Context(), "hi", nil, pi.CallBoundary{
+			BeforeDispatch: func() (func(), error) {
+				return fixture.session.beginPromptDispatch(t.Context(), fixture.outbox, delivery)
+			},
+			Accepted: func(acceptCtx context.Context) error {
+				return fixture.session.acceptPromptResponse(acceptCtx, fixture.outbox, delivery, testSubmission())
+			},
+		})
+	}()
+
+	command := fixture.nextCommand(t)
+	id, ok := command["id"].(string)
+	require.True(t, ok)
+
+	fixture.client.mu.Lock()
+	baseline := append([]string(nil), fixture.client.trace...)
+	fixture.client.mu.Unlock()
+
+	compaction := []string{
+		`{"type":"compaction_start","reason":"threshold"}`,
+		`{"type":"summarization_retry_scheduled","attempt":1,"maxAttempts":3,"delayMs":1000,"errorMessage":"stream closed"}`,
+		`{"type":"summarization_retry_attempt_start","source":"compaction","reason":"threshold"}`,
+		`{"type":"summarization_retry_finished"}`,
+		`{"type":"entry_appended","entry":{"type":"custom","customType":"note"}}`,
+		`{"type":"compaction_end","reason":"threshold","result":{"summary":"s","tokensBefore":100,"estimatedTokensAfter":10},"aborted":false,"willRetry":false}`,
+	}
+	require.NoError(t, <-fixture.emit(t, compaction...))
+
+	fixture.client.mu.Lock()
+	require.Equal(t, baseline, fixture.client.trace, "a pre-acceptance compaction escaped as raw or typed output")
+	fixture.client.mu.Unlock()
+	require.NoError(t, fixture.session.poisonedError(), "pi's own pre-prompt compaction is not an invariant failure")
+
+	require.NoError(t, <-fixture.emit(t, `{"id":"`+id+`","type":"response","command":"prompt","success":true}`))
+	require.NoError(t, <-promptDone)
+
+	fixture.client.mu.Lock()
+	trace := append([]string(nil), fixture.client.trace...)
+	fixture.client.mu.Unlock()
+	accepted := slices.Index(trace, "lifecycle:prompt_accepted")
+	require.NotEqual(t, -1, accepted)
+	require.Equal(t, slices.Repeat([]string{"raw"}, len(compaction)), trace[len(trace)-len(compaction):],
+		"every held frame is released behind the acceptance")
+	require.Less(t, accepted, len(trace)-len(compaction))
+
+	work := fixture.emit(t,
+		`{"type":"message_update","message":{"role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"after compaction"}}`,
+		`{"type":"agent_settled"}`,
+	)
+	for range 2 {
+		<-delivery.events
+	}
+	require.NoError(t, <-work)
 }
 
 // TestRealClientPreResponseWorkContainsBeforeAcknowledgement proves the other
