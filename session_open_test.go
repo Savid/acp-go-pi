@@ -224,6 +224,28 @@ func TestPublishSessionOpenCancellationAndLifecycleFailureBoundaries(t *testing.
 		require.Equal(t, 1, process.closeCalls)
 	})
 
+	// A host may close a session at any point, including while the snapshot
+	// deferred behind its own establishing response is still landing. That
+	// sequence is legal, so the opening stops without poisoning the session or
+	// raising a containment the close ladder already owns.
+	t.Run("close claimed mid-open retires the opening", func(t *testing.T) {
+		logs := &strings.Builder{}
+		session, _ := lifecycleSession(t, false)
+		process := newStubProcess(false)
+		outbox := bindTestEstablishingOutbox(session, 1, process, newStubPiClient())
+		session.agent.log = slog.New(slog.NewTextHandler(logs, nil))
+
+		outbox.mu.Lock()
+		outbox.claimForCloseLocked()
+		outbox.mu.Unlock()
+
+		require.ErrorIs(t, session.publishSessionOpen(t.Context()), errGenerationRetired)
+		require.NoError(t, session.poisonedError(), "a closed session is not a poisoned one")
+		require.Zero(t, process.shutdownCalls, "the close ladder owns this generation's containment")
+		require.Zero(t, process.closeCalls)
+		require.Empty(t, logs.String(), "a legal close is not an invariant violation")
+	})
+
 	t.Run("already released establishment gate contains", func(t *testing.T) {
 		session, _ := lifecycleSession(t, false)
 		process := newStubProcess(false)
@@ -232,7 +254,8 @@ func TestPublishSessionOpenCancellationAndLifecycleFailureBoundaries(t *testing.
 		bindTestRuntime(outbox, process, native, nil, nil, nil)
 		session.proc, session.client, session.outbox = process, native, outbox
 		session.pumpGeneration = 1
-		require.Error(t, session.publishSessionOpen(t.Context()))
+		require.ErrorIs(t, session.publishSessionOpen(t.Context()), pi.ErrTransportClosed)
+		require.Error(t, session.poisonedError())
 		require.Equal(t, 1, process.shutdownCalls)
 		require.Equal(t, 1, process.closeCalls)
 	})

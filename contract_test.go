@@ -804,6 +804,59 @@ func TestConformanceLifecycleSessionResumesAfterItsCloseBoundary(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// lockedLogBuffer collects log records written from the agent's own goroutines.
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedLogBuffer) Write(record []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(record)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+// TestConformanceSessionClosedImmediatelyAfterOpen pins the sequence a host
+// uses to read an agent's metadata and nothing else: open a session, close it,
+// keep the connection. Closing is legal at any point, including while the
+// snapshot this agent defers behind its own establishing response is still
+// landing, so the close reports no fault — and the connection it ran on stays
+// usable for the session that follows.
+func TestConformanceSessionClosedImmediatelyAfterOpen(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	logs := &lockedLogBuffer{}
+	client := &conformanceClient{}
+	conn := connectConformanceAgent(
+		t, ctx, client, lifecycleInitializeRequest(), successfulUnitScenario(),
+		WithLogger(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelError}))),
+	)
+
+	for range 3 {
+		probe, err := conn.NewSession(ctx, NewSessionRequest(t.TempDir()))
+		require.NoError(t, err)
+		_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: probe.SessionId})
+		require.NoError(t, err)
+	}
+
+	session, err := conn.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	_, err = conn.Prompt(ctx, lifecyclePromptRequest(session.SessionId, "after-probe", "hello"))
+	require.NoError(t, err)
+	require.Contains(t, client.text(), "FAKE_PI_REPLY")
+
+	require.Empty(t, logs.String(), "a host close is not an error this agent reports")
+}
+
 func TestConformanceDeleteForkAndUnknownSession(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

@@ -136,6 +136,16 @@ func (s *agentSession) publishSessionOpen(ctx context.Context) error {
 	}
 
 	if err := outbox.acceptEstablishment(); err != nil {
+		// A generation retired while its snapshot was landing owes nothing
+		// further. Both records this open promised are already delivered, the
+		// owner that claimed the generation is running the ladder that ends it,
+		// and a retired outbox replays no startup record — so the opening stops
+		// here rather than poisoning a session whose only fault was being closed
+		// while it was still opening.
+		if errors.Is(err, errGenerationRetired) {
+			return err
+		}
+
 		containmentErr := s.containGenerationSync(
 			context.WithoutCancel(ctx), outbox, "the session-open generation gate could not be released",
 		)

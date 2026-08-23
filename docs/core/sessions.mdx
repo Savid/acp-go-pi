@@ -38,6 +38,12 @@ exact opening snapshot and startup-prefix replay instead of racing them or
 receiving transient backpressure. If establishment fails, the generation is
 contained and none of its buffered raw or lifecycle records is emitted.
 
+A host may close a session at any point, including between the establishing
+response and the opening snapshot that follows it — the sequence a host uses
+when it opens a session only to read the agent's metadata. That close is
+answered as a close: the opening stops where it is, the close ladder owns the
+generation's teardown, and nothing is reported as a failure.
+
 pi creates its session file lazily: a brand-new session has no file (and
 nothing to mirror) until the first conversation entry lands. Listing sessions
 right after `session/new` therefore reflects the store, not a native file.

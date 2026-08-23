@@ -229,12 +229,27 @@ func (c *localAgentConnection) enqueueLifecycleCommandHook(ctx context.Context, 
 		return func() {
 			defer release()
 
-			if err := session.publishSessionOpen(hookCtx); err != nil {
-				c.agent.log.ErrorContext(hookCtx, "post-response session open failed closed",
+			err := session.publishSessionOpen(hookCtx)
+			if err == nil {
+				return
+			}
+
+			// A host that closes a session while this hook is still running gets
+			// the close it asked for, not an error report. The snapshot simply has
+			// no session left to establish.
+			if errors.Is(err, errGenerationRetired) {
+				c.agent.log.DebugContext(hookCtx, "post-response session open overtaken by session close",
 					slog.String(jsonFieldMethod, method),
 					slog.String(acpFieldSessionID, string(sessionID)),
 				)
+
+				return
 			}
+
+			c.agent.log.ErrorContext(hookCtx, "post-response session open failed closed",
+				slog.String(jsonFieldMethod, method),
+				slog.String(acpFieldSessionID, string(sessionID)),
+			)
 		}, true
 	})
 }

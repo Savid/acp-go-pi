@@ -19,6 +19,13 @@ import (
 // than a reason to drop a record, so the generation is contained instead.
 const outboxQueueCapacity = 256
 
+// errGenerationRetired reports that the generation a producer was working on
+// had already been claimed by its owner — a host close, a fence, or a
+// containment that is already running. It is the answer to "who ends this
+// generation", not a fault: the claiming owner installs the cause and runs the
+// ladder, so a producer that reads this stops without contending for either.
+var errGenerationRetired = errors.New("native generation was retired by its owner")
+
 // turnDelivery carries one accepted prompt's foreground work from the session
 // outbox to the prompt loop. events is closed by the outbox when the native
 // generation ends; done is closed by the prompt loop when it stops reading, so
@@ -1140,6 +1147,18 @@ func (o *sessionOutbox) popStartup() (startupRecord, outboxAdmission, bool) {
 	return record, outboxAdmission{}, true
 }
 
+// acceptEstablishment releases the opening gate for the exact generation whose
+// establishing snapshot has landed. It answers its two refusals separately,
+// because they are different facts about who owns the generation.
+//
+// A generation the close ladder, a fence, or a containment has already claimed
+// is retired: a host may close a session at any point, including while the
+// snapshot behind its own establishing response is still being written, and the
+// claiming owner is already running the ladder that ends it. Nothing here is
+// broken, so nothing here is contained.
+//
+// A gate this generation already released is the invariant the single-release
+// rule exists to catch, and it stays fail-closed.
 func (o *sessionOutbox) acceptEstablishment() error {
 	if o == nil {
 		return errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("native generation outbox is missing"))
@@ -1148,7 +1167,11 @@ func (o *sessionOutbox) acceptEstablishment() error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	if o.ended || o.fenced || o.closing || o.established || o.openingAccepted {
+	if o.ended || o.fenced || o.closing {
+		return errGenerationRetired
+	}
+
+	if o.established || o.openingAccepted {
 		return pi.ErrTransportClosed
 	}
 

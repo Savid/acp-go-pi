@@ -388,6 +388,26 @@ func TestOutboxReservationAndEstablishmentFailureEdges(t *testing.T) {
 	require.False(t, overflow)
 	require.ErrorIs(t, missing.acceptEstablishment(), pi.ErrProcessContainmentIncomplete)
 
+	// The gate names who owns the generation. A generation an owner already
+	// claimed is retired; a gate this generation already released is the
+	// single-release invariant, and only that one is fail-closed.
+	for name, claim := range map[string]func(*sessionOutbox){
+		"closing": func(o *sessionOutbox) { o.closing = true },
+		"fenced":  func(o *sessionOutbox) { o.fenced = true },
+		"ended":   func(o *sessionOutbox) { o.ended = true },
+	} {
+		retired := newSessionOutbox(1, newNativeBoundaryTracker())
+		claim(retired)
+		require.ErrorIsf(t, retired.acceptEstablishment(), errGenerationRetired, "claim %s", name)
+		require.False(t, retired.openingAccepted, "a retired generation releases no gate")
+	}
+
+	released := newSessionOutbox(1, newNativeBoundaryTracker())
+	require.NoError(t, released.acceptEstablishment())
+	require.True(t, released.openingAccepted)
+	require.ErrorIs(t, released.acceptEstablishment(), pi.ErrTransportClosed)
+	require.ErrorIs(t, newTestSessionOutbox(1).acceptEstablishment(), pi.ErrTransportClosed)
+
 	outbox := newSessionOutbox(1, newNativeBoundaryTracker())
 	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
