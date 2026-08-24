@@ -2,7 +2,6 @@ package piacp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -90,6 +89,12 @@ func (a *Agent) createSessionRuntime() (sessionDirs, *pi.BrowserShim, error) {
 // distinct-identity sessions refuse it until a proven credential-delivery
 // design exists; ordinary current-identity sessions use it directly and Pi's
 // native cross-process lock serializes auth.json updates.
+//
+// The refusals are option verdicts about a host-supplied value, so they wear the
+// uniform unsupported-field shape rather than a raw Go error: a host that
+// configured a home this adapter cannot honour is told which option it was and
+// on the same terms as every other option refusal, wherever the verdict is
+// delivered.
 func (a *Agent) durableHome() (string, error) {
 	home := a.options.Home
 	if home == "" {
@@ -97,11 +102,11 @@ func (a *Agent) durableHome() (string, error) {
 	}
 
 	if a.options.ProcessIsolation != nil {
-		return "", errors.New("durable pi agent directory is unavailable with explicit process isolation")
+		return "", unsupportedField(optionFieldHome)
 	}
 
 	if !filepath.IsAbs(home) || filepath.Clean(home) != home {
-		return "", errors.New("durable pi agent directory must be a clean absolute path")
+		return "", unsupportedField(optionFieldHome)
 	}
 
 	if err := materializeMkdirAll(home, 0o700); err != nil {

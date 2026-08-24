@@ -30,21 +30,88 @@ therefore reconcile its committed turn checkpoint before publishing the
 restored route. `session/load` replays the stored content and carries the same
 identity on the final assistant updates.
 
+For create, load, resume, and fork, the successful ACP response carrying the
+session id is written before the required command catalog and opening lifecycle
+snapshot. Native startup records are buffered behind that boundary and replayed
+only afterward; a prompt arriving immediately after the response waits for the
+exact opening snapshot and startup-prefix replay instead of racing them or
+receiving transient backpressure. If establishment fails, the generation is
+contained and none of its buffered raw or lifecycle records is emitted.
+
+A host may close a session at any point, including between the establishing
+response and the opening snapshot that follows it — the sequence a host uses
+when it opens a session only to read the agent's metadata. That close is
+answered as a close: the opening stops where it is, the close ladder owns the
+generation's teardown, and nothing is reported as a failure.
+
 pi creates its session file lazily: a brand-new session has no file (and
 nothing to mirror) until the first conversation entry lands. Listing sessions
 right after `session/new` therefore reflects the store, not a native file.
 
 ## Closing
 
-`session/close` and `session/delete` are terminal. Closing first removes the id
-from the active map and marks the session closing, so a concurrent prompt is
-answered with the uniform unknown-session error rather than lazily relaunching
-the process being torn down. Close then waits, up to a bounded interval, for an
-in-flight turn to release the session's single turn admission before it
-contains the native process and removes the session's directories; a turn that
-never releases surrenders its claim and the wait is reported in the close
-error. Close is idempotent: repeated or concurrent calls run teardown once and
-observe the same result.
+`session/close` and `session/delete` are terminal. Closing first marks the
+session closing, so a concurrent prompt is answered with the uniform
+unknown-session error rather than lazily relaunching the process being torn
+down. It first closes interaction admission, answers every queued or in-flight
+native dialog with deny/cancel, cancels the corresponding host requests, and
+joins their dialog/action handlers. Native Abort, Shutdown, Kill, and Close do
+not begin until that interaction barrier completes. A handler that ignores
+cancellation therefore reports containment-incomplete and quarantines the exact
+generation without starting native teardown. Close then contains the captured
+generation and joins any concurrent relaunch, prompt settlement, and the real
+turn/restore/configuration admission holder. If that final join
+exceeds its bound, close reports `ErrProcessContainmentIncomplete`; it does not
+commit a close boundary, publish terminal `idle` or quiescence, remove a
+directory, or release a resource while the holder can still touch the session.
+
+Close has one immutable result: concurrent and later `session/close` calls join
+that exact attempt and observe the same answer. A failed close does not reopen
+admission or start another teardown ladder; the id and every incomplete native
+owner remain addressable for `Agent.Close`, and the session stays terminally
+closed to new admission. If native containment was incomplete, lifecycle state
+is left unchanged in immutable quarantine: no fence, terminal transition,
+notification, or resource release follows the uncertain boundary.
+
+Only after native containment and every settlement/admission join have
+completed does close commit the foreground mirror, publish blocker
+cancellations and terminal `idle`, commit the resumable lifecycle boundary,
+certify quiescence where the active configuration can prove it, fence the
+stream, and release roots. A foreground-mirror failure emits no terminal
+transition. A resumable-boundary failure happens after terminalization, fails
+the close, and fences the stream without emitting quiescence. Every failed or
+timed-out owner retains its exact process, generation root, and release handles
+for `Agent.Close` diagnostics; memoizing close never erases that quarantine.
+The event pump owns one producer-admission root for its exact generation.
+Queued dialogs, lifecycle actions, cycle settlement, and asynchronous
+containment claim descendants of that root; after the pump joins and the root
+reaches zero, no later producer can race the final close join.
+
+`session/delete` writes its durable tombstone first, before it tears anything
+down. From that moment the id is hidden from list, load, and resume, and the
+session store refuses any write that would make its rows readable again — so a
+commit a turn was still making cannot recreate what the tombstone removed. The
+delete then fences persistence, cancels pending interactions, contains the
+exact native generation, and only afterward joins prompt settlement and the
+operation admission before cleanup. A delete issued during a live prompt ends
+that native work; it never treats an admission timeout as permission to remove
+the session underneath its holder. A delete whose
+tombstone the store refuses changes nothing: the session stays yours, stays
+listed, stays promptable, and keeps committing durably. Deleting an unknown or
+already-deleted session succeeds silently.
+
+Hiding an id never orphans the work it was running. A delete that tombstoned
+and hid the id but received a failed close result reports that failure and
+retains the exact session owner. Later deletes and `Agent.Close` observe the
+same immutable result; no second teardown is started.
+
+Relaunch publishes the process, client, provider root, event pump, and outbox as
+one generation under the close election. If close wins before that publication,
+the relaunch path contains the unadopted child and close joins it. If relaunch
+wins, close claims and synchronously joins that exact new generation. A lost
+generation ends its lifecycle stream without a fabricated terminal event; the
+next successful relaunch opens a fresh stream and snapshot for the same logical
+session.
 
 ## Store keys and subpaths
 
@@ -60,6 +127,10 @@ type SessionKey struct {
 The main entry log uses the empty subpath (`SessionStoreMainSubpath`) and
 carries the raw pi session JSONL rows verbatim — the header row first, then
 the tree entries appended after each settled turn.
+The `SessionStoreLifecycleSubpath` log carries adapter-owned durable-boundary
+records. Load, resume, and fork hydrate only through the last strictly
+validated boundary's native-row count; corrupt or incomplete storage fails
+closed.
 
 ## Turn bounds and failures
 

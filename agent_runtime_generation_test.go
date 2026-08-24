@@ -175,6 +175,50 @@ func TestEnsureVersionFinalizesFailedProbeResidence(t *testing.T) {
 	require.Equal(t, 1, released)
 }
 
+func TestEnsureVersionCloseFromReserveHookRefusesEveryLaterNativeStep(t *testing.T) {
+	restoreRuntimeGenerationSeams(t)
+	originalWait := sessionCloseTurnWaitContext
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		bounded, cancel := context.WithCancel(ctx)
+		cancel()
+
+		return bounded, func() {}
+	}
+	t.Cleanup(func() { sessionCloseTurnWaitContext = originalWait })
+
+	var agent *Agent
+	probeCalls := 0
+	mkdirCalls := 0
+	releases := 0
+	runtimeGenerationMkdirTemp = func(string, string) (string, error) {
+		mkdirCalls++
+
+		return "", errors.New("version root creation ran after close")
+	}
+	agent = NewAgent(
+		testContainmentOption(),
+		WithExecutablePath("/fake/pi"),
+		WithRuntimeResourceHooks(RuntimeResourceHooks{
+			ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+				require.ErrorIs(t, agent.Close(), internalpi.ErrProcessContainmentIncomplete)
+
+				return func() { releases++ }, nil
+			},
+		}),
+	)
+	agent.probeVersion = func(context.Context, string, string, internalpi.ContainmentSpec) (string, error) {
+		probeCalls++
+
+		return internalpi.DefaultMinimumVersion, nil
+	}
+
+	err := agent.ensureVersion(t.Context())
+	require.Error(t, err)
+	require.Zero(t, mkdirCalls)
+	require.Zero(t, probeCalls)
+	require.Equal(t, 1, releases)
+}
+
 func TestNativeOwnershipIsolation(t *testing.T) {
 	require.Nil(t, (*Agent)(nil).nativeOwnershipIsolation())
 	require.Nil(t, (&Agent{options: Options{testOnlyNoCredential: true}}).nativeOwnershipIsolation())
@@ -364,4 +408,41 @@ func TestRuntimeGenerationFinalizeBoundaries(t *testing.T) {
 		require.Equal(t, 1, removed)
 		require.Equal(t, 1, released)
 	})
+}
+
+func TestVersionProbeConstructionRetainsRemovalFailureForAgentClose(t *testing.T) {
+	restoreRuntimeGenerationSeams(t)
+	wantErr := errors.New("version probe generation removal failed")
+	releasedScratch, releasedNative := 0, 0
+	runtimeGenerationRemoveAll = func(string) error { return wantErr }
+
+	agent := NewAgent(
+		testContainmentOption(),
+		WithExecutablePath("/fake/pi"),
+		WithScratchDir(t.TempDir()),
+		WithRuntimeResourceHooks(RuntimeResourceHooks{
+			ReserveScratchRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+				return func() { releasedScratch++ }, nil
+			},
+			AcquireNativeRoot: func(context.Context, RuntimeResourceKind) (func(), error) {
+				return func() { releasedNative++ }, nil
+			},
+		}),
+	)
+	agent.probeVersion = func(context.Context, string, string, internalpi.ContainmentSpec) (string, error) {
+		return internalpi.DefaultMinimumVersion, nil
+	}
+
+	require.ErrorIs(t, agent.ensureVersion(t.Context()), wantErr)
+	agent.mu.Lock()
+	require.Len(t, agent.constructions, 1)
+	for owner := range agent.constructions {
+		require.NotEmpty(t, owner.generationRoot)
+		require.NotNil(t, owner.runtime)
+		require.NotNil(t, owner.scratchRelease)
+	}
+	agent.mu.Unlock()
+	require.Equal(t, 1, releasedNative)
+	require.Zero(t, releasedScratch)
+	require.ErrorIs(t, agent.Close(), wantErr)
 }

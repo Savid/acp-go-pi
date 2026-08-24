@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,10 +19,71 @@ import (
 const postResponseHookIDParam = "_acp_go_pi_post_response_hook_id"
 
 type localAgentConnection struct {
-	agent       *Agent
-	conn        *acp.Connection
-	initialized atomic.Bool
-	hooks       *postResponseHooks
+	agent         *Agent
+	conn          *acp.Connection
+	initialized   atomic.Bool
+	hooks         *postResponseHooks
+	requestWrites *actionRequestWrites
+}
+
+type actionRequestWrites struct {
+	mu      sync.Mutex
+	pending map[string]func(error)
+}
+
+func newActionRequestWrites() *actionRequestWrites {
+	return &actionRequestWrites{pending: make(map[string]func(error))}
+}
+
+func (w *actionRequestWrites) register(actionID string, ack func(error)) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if _, exists := w.pending[actionID]; exists {
+		return fmt.Errorf("action request %s already awaits a write", actionID)
+	}
+
+	w.pending[actionID] = ack
+
+	return nil
+}
+
+func (w *actionRequestWrites) resolve(actionID string, err error) {
+	w.mu.Lock()
+	ack := w.pending[actionID]
+	delete(w.pending, actionID)
+	w.mu.Unlock()
+
+	if ack != nil {
+		ack(err)
+	}
+}
+
+type actionRequestWriteWriter struct {
+	writer   io.Writer
+	requests *actionRequestWrites
+}
+
+func (w *actionRequestWriteWriter) Write(data []byte) (n int, err error) {
+	actionID := outboundLifecycleActionID(data)
+
+	defer func() {
+		if recover() != nil {
+			n = 0
+			err = errLifecycleActionRequest
+		}
+
+		if actionID != "" {
+			w.requests.resolve(actionID, err)
+		}
+	}()
+
+	n, err = w.writer.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+
+	return n, err
 }
 
 type localAgentHandler func(context.Context, *Agent, json.RawMessage) (any, *acp.RequestError)
@@ -52,9 +114,11 @@ var (
 
 func newLocalAgentConnection(agent *Agent, output io.Writer, input io.Reader) *localAgentConnection {
 	hooks := &postResponseHooks{log: agent.log}
-	conn := &localAgentConnection{agent: agent, hooks: hooks}
+	requestWrites := newActionRequestWrites()
+	conn := &localAgentConnection{agent: agent, hooks: hooks, requestWrites: requestWrites}
 	inputGate := newConnectionInputGate(newPostResponseHookRequestReader(input))
-	conn.conn = acp.NewConnection(conn.handle, hooks.wrap(output), inputGate)
+	trackedOutput := &actionRequestWriteWriter{writer: output, requests: requestWrites}
+	conn.conn = acp.NewConnection(conn.handle, hooks.wrap(trackedOutput), inputGate)
 	conn.conn.SetLogger(agent.log)
 	inputGate.open()
 
@@ -132,12 +196,12 @@ func (c *localAgentConnection) handle(ctx context.Context, method string, params
 	return result, reqErr
 }
 
-// enqueueLifecycleCommandHook schedules the first available_commands_update
-// for a session lifecycle method to run only after the lifecycle response has
-// been written to the ACP transport.
+// enqueueLifecycleCommandHook schedules the session's establishing snapshot —
+// the explicit command catalog and the opening lifecycle stream — to run only
+// after the session lifecycle response has been written to the ACP transport.
 func (c *localAgentConnection) enqueueLifecycleCommandHook(ctx context.Context, method string, params json.RawMessage, result any) {
 	sessionID, ok := lifecycleCommandSessionID(method, params, result)
-	if !ok || c.hooks == nil {
+	if !ok {
 		return
 	}
 
@@ -146,27 +210,47 @@ func (c *localAgentConnection) enqueueLifecycleCommandHook(ctx context.Context, 
 		return
 	}
 
-	c.hooks.enqueue(responseID, func() {
-		hookCtx := context.WithoutCancel(ctx)
-
+	c.hooks.enqueue(responseID, func() (func(), bool) {
 		session, err := c.agent.session(sessionID)
 		if err != nil {
-			c.agent.log.ErrorContext(hookCtx, "post-response command update session lookup failed",
+			c.agent.log.ErrorContext(ctx, "post-response session open lookup failed",
 				slog.String(jsonFieldMethod, method),
 				slog.String(acpFieldSessionID, string(sessionID)),
-				slog.String(jsonFieldError, err.Error()),
 			)
 
-			return
+			return nil, false
 		}
 
-		if err := session.emitAvailableCommandsUpdate(hookCtx, true); err != nil {
-			c.agent.log.ErrorContext(hookCtx, "post-response command update failed",
+		hookCtx, release, admitted := session.admitPostResponseHook()
+		if !admitted {
+			return nil, false
+		}
+
+		return func() {
+			defer release()
+
+			err := session.publishSessionOpen(hookCtx)
+			if err == nil {
+				return
+			}
+
+			// A host that closes a session while this hook is still running gets
+			// the close it asked for, not an error report. The snapshot simply has
+			// no session left to establish.
+			if errors.Is(err, errGenerationRetired) {
+				c.agent.log.DebugContext(hookCtx, "post-response session open overtaken by session close",
+					slog.String(jsonFieldMethod, method),
+					slog.String(acpFieldSessionID, string(sessionID)),
+				)
+
+				return
+			}
+
+			c.agent.log.ErrorContext(hookCtx, "post-response session open failed closed",
 				slog.String(jsonFieldMethod, method),
 				slog.String(acpFieldSessionID, string(sessionID)),
-				slog.String(jsonFieldError, err.Error()),
 			)
-		}
+		}, true
 	})
 }
 
@@ -280,13 +364,29 @@ func lifecycleCommandMethod(method string) bool {
 	}
 }
 
+// postResponseHookRequestID reads back the tag the request reader stamped. Only
+// the tag is a string: a real establishing request carries the mandatory
+// mcpServers array and an object-valued _meta beside it, so the params are
+// decoded as raw values and only the tag is read as one. Decoding them all as
+// strings would fail on every request this hook exists to serve.
 func postResponseHookRequestID(params json.RawMessage) string {
-	var tagged map[string]string
+	var tagged map[string]json.RawMessage
 	if err := json.Unmarshal(params, &tagged); err != nil {
 		return ""
 	}
 
-	return tagged[postResponseHookIDParam]
+	raw, present := tagged[postResponseHookIDParam]
+	if !present {
+		return ""
+	}
+
+	var id string
+
+	if err := json.Unmarshal(raw, &id); err != nil {
+		return ""
+	}
+
+	return id
 }
 
 type postResponseHooks struct {
@@ -297,20 +397,20 @@ type postResponseHooks struct {
 
 type postResponseHook struct {
 	responseID string
-	run        func()
+	admit      func() (run func(), admitted bool)
 }
 
 func (h *postResponseHooks) wrap(writer io.Writer) io.Writer {
 	return &postResponseWriter{writer: writer, hooks: h}
 }
 
-func (h *postResponseHooks) enqueue(responseID string, run func()) {
+func (h *postResponseHooks) enqueue(responseID string, admit func() (func(), bool)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	h.all = append(h.all, postResponseHook{
 		responseID: responseID,
-		run:        run,
+		admit:      admit,
 	})
 }
 
@@ -321,7 +421,7 @@ func (h *postResponseHooks) runAfterResponseWrite(data []byte) {
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(data), &msg); err != nil {
 		if h.log != nil {
-			h.log.Debug("parse response for post-response hook failed", slog.String(jsonFieldError, err.Error()))
+			h.log.Debug("parse response for post-response hook failed")
 		}
 
 		return
@@ -342,10 +442,15 @@ func (h *postResponseHooks) runAfterResponseWrite(data []byte) {
 		h.all = append(h.all[:index], h.all[index+1:]...)
 		h.mu.Unlock()
 
+		run, admitted := hook.admit()
+		if !admitted {
+			return
+		}
+
 		go func() {
 			defer recoverAgentGoroutine(context.Background(), h.log, "post-response hook")
 
-			hook.run()
+			run()
 		}()
 
 		return
@@ -435,7 +540,17 @@ func (c *localAgentConnection) CreateElicitation(
 	}
 	defer release()
 
-	return acp.SendRequest[acp.UnstableCreateElicitationResponse](c.conn, ctx, acp.ClientMethodElicitationCreate, raw)
+	actionID := lifecycleActionID(elicitationMeta(params))
+	if registerErr := c.registerActionRequestWrite(ctx, actionID); registerErr != nil {
+		return acp.UnstableCreateElicitationResponse{}, registerErr
+	}
+
+	resp, err := acp.SendRequest[acp.UnstableCreateElicitationResponse](c.conn, ctx, acp.ClientMethodElicitationCreate, raw)
+	if err != nil {
+		c.failActionRequestWrite(actionID, err)
+	}
+
+	return resp, err
 }
 
 func (c *localAgentConnection) RequestPermission(
@@ -448,7 +563,109 @@ func (c *localAgentConnection) RequestPermission(
 	}
 	defer release()
 
-	return acp.SendRequest[acp.RequestPermissionResponse](c.conn, ctx, acp.ClientMethodSessionRequestPermission, params)
+	actionID := lifecycleActionID(params.Meta)
+	if registerErr := c.registerActionRequestWrite(ctx, actionID); registerErr != nil {
+		return acp.RequestPermissionResponse{}, registerErr
+	}
+
+	resp, err := acp.SendRequest[acp.RequestPermissionResponse](c.conn, ctx, acp.ClientMethodSessionRequestPermission, params)
+	if err != nil {
+		c.failActionRequestWrite(actionID, err)
+	}
+
+	return resp, err
+}
+
+func (c *localAgentConnection) registerActionRequestWrite(ctx context.Context, actionID string) error {
+	ack := actionRequestWriteAck(ctx)
+	if ack == nil {
+		return nil
+	}
+
+	if actionID == "" {
+		err := errors.New("announced action request is missing its lifecycle action id")
+		ack(err)
+
+		return err
+	}
+
+	if err := c.requestWrites.register(actionID, ack); err != nil {
+		ack(err)
+
+		return err
+	}
+
+	go func() {
+		<-ctx.Done()
+		c.requestWrites.resolve(actionID, errLifecycleActionRequest)
+	}()
+
+	return nil
+}
+
+func (c *localAgentConnection) failActionRequestWrite(actionID string, err error) {
+	if actionID != "" {
+		c.requestWrites.resolve(actionID, err)
+	}
+}
+
+func elicitationMeta(params acp.UnstableCreateElicitationRequest) map[string]any {
+	if params.Form != nil {
+		return params.Form.Meta
+	}
+
+	if params.Url != nil {
+		return params.Url.Meta
+	}
+
+	return nil
+}
+
+func lifecycleActionID(meta map[string]any) string {
+	value, ok := meta[lifecycleMetaKey]
+	if !ok {
+		return ""
+	}
+
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+
+	return lifecycleActionIDFromRaw(raw)
+}
+
+func lifecycleActionIDFromRaw(raw json.RawMessage) string {
+	var value struct {
+		Action struct {
+			ActionID string `json:"actionId"`
+		} `json:"action"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+
+	return value.Action.ActionID
+}
+
+func outboundLifecycleActionID(data []byte) string {
+	var message struct {
+		ID     *json.RawMessage `json:"id"`
+		Method string           `json:"method"`
+		Params struct {
+			Meta map[string]json.RawMessage `json:"_meta"` //nolint:tagliatelle // ACP reserves the leading underscore.
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(data), &message); err != nil || message.ID == nil {
+		return ""
+	}
+
+	switch message.Method {
+	case acp.ClientMethodSessionRequestPermission, acp.ClientMethodElicitationCreate:
+		return lifecycleActionIDFromRaw(message.Params.Meta[lifecycleMetaKey])
+	default:
+		return ""
+	}
 }
 
 func (c *localAgentConnection) SessionUpdate(ctx context.Context, params acp.SessionNotification) error {

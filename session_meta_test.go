@@ -63,7 +63,7 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{"type": "object"}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaThinkingLevelKey: true}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaThinkingLevelKey: "bad"}}},
+		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaThinkingLevelKey: ""}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: true}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: "bad"}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaAutoRetryKey: "yes"}}},
@@ -78,6 +78,21 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 	for _, value := range invalid {
 		_, err := piOptionsFromMeta(value)
 		require.Error(t, err)
+	}
+}
+
+// TestPiOptionsThinkingLevelPassesThrough pins that establishment metadata
+// judges the member's shape and nothing else. Only the empty string names no
+// level; whitespace names one pi may not know, which is pi's to answer for.
+func TestPiOptionsThinkingLevelPassesThrough(t *testing.T) {
+	for _, level := range []string{"registry-unknown", " high ", "\t"} {
+		options, err := piOptionsFromMeta(map[string]any{
+			piMetaKey: map[string]any{
+				metaOptionsKey: map[string]any{metaThinkingLevelKey: level},
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, level, options.ThinkingLevel)
 	}
 }
 

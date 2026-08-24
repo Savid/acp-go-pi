@@ -13,12 +13,26 @@ import (
 // SetSessionMode exists only because github.com/coder/acp-go-sdk's generated
 // Agent interface still requires it. Remove this when the upstream SDK drops
 // session/set_mode; the local ACP dispatcher intentionally does not route it.
-func (a *Agent) SetSessionMode(context.Context, acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+//
+// The reserved family literal is refused before the method-not-found verdict.
+// This surface is unreachable from the wire but reachable from an embedding Go
+// host, and the placement rule is about where the literal may appear rather than
+// about which methods this adapter answers: a surface that never carries the
+// extension refuses the key rather than ignoring it.
+func (a *Agent) SetSessionMode(_ context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+	if refusal := refuseLifecycleMeta(params.Meta); refusal != nil {
+		return acp.SetSessionModeResponse{}, refusal
+	}
+
 	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
 }
 
 // SetSessionConfigOption handles supported configuration changes.
 func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
+	if refusal := refuseLifecycleMeta(setSessionConfigOptionMeta(params)); refusal != nil {
+		return acp.SetSessionConfigOptionResponse{}, refusal
+	}
+
 	switch {
 	case params.ValueId != nil:
 		return a.setSessionConfigValue(ctx, params.ValueId)
@@ -36,6 +50,20 @@ func (a *Agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessio
 	}
 }
 
+// setSessionConfigOptionMeta reads whichever variant of the union carries the
+// request `_meta`, so the reserved family literal is refused on the mode, model,
+// and config surfaces alike.
+func setSessionConfigOptionMeta(params acp.SetSessionConfigOptionRequest) map[string]any {
+	switch {
+	case params.ValueId != nil:
+		return params.ValueId.Meta
+	case params.Boolean != nil:
+		return params.Boolean.Meta
+	default:
+		return nil
+	}
+}
+
 func (a *Agent) setSessionConfigValue(
 	ctx context.Context,
 	params *acp.SetSessionConfigOptionValueId,
@@ -45,7 +73,7 @@ func (a *Agent) setSessionConfigValue(
 		return acp.SetSessionConfigOptionResponse{}, err
 	}
 
-	if poisonErr := session.poisonedError(); poisonErr != nil {
+	if poisonErr := session.admissionFenceError(ctx); poisonErr != nil {
 		return acp.SetSessionConfigOptionResponse{}, poisonErr
 	}
 
@@ -61,17 +89,19 @@ func (a *Agent) setSessionConfigValue(
 	}
 	defer releaseTurn()
 
-	if poisonErr := session.poisonedError(); poisonErr != nil {
-		return acp.SetSessionConfigOptionResponse{}, poisonErr
+	outbox, client, releaseConfiguration, err := session.beginConfiguration(ctx)
+	if err != nil {
+		return acp.SetSessionConfigOptionResponse{}, err
 	}
+	defer releaseConfiguration()
 
 	switch params.ConfigId {
 	case configModel:
-		if err := session.applyModelSelection(ctx, string(params.Value)); err != nil {
+		if err := session.applyModelSelection(ctx, outbox, client, string(params.Value)); err != nil {
 			return acp.SetSessionConfigOptionResponse{}, err
 		}
 	case configThoughtLevel:
-		if err := session.applyThinkingLevelSelection(ctx, string(params.Value)); err != nil {
+		if err := session.applyThinkingLevelSelection(ctx, outbox, client, string(params.Value)); err != nil {
 			return acp.SetSessionConfigOptionResponse{}, err
 		}
 	}
@@ -86,21 +116,89 @@ func (a *Agent) setSessionConfigValue(
 	return acp.SetSessionConfigOptionResponse{ConfigOptions: options}, nil
 }
 
-func (s *agentSession) applyModelSelection(ctx context.Context, value string) error {
+func (s *agentSession) beginConfiguration(ctx context.Context) (*sessionOutbox, piClient, func(), error) {
+	s.mu.Lock()
+
+	outbox := s.outbox
+	if outbox == nil {
+		s.mu.Unlock()
+
+		return nil, nil, nil, pi.ErrTransportClosed
+	}
+
+	if s.poisonCause != "" || s.closing {
+		s.mu.Unlock()
+
+		return nil, nil, nil, s.admissionFenceError(ctx)
+	}
+
+	client := s.client
+	if !outbox.beginConfiguration() {
+		s.mu.Unlock()
+
+		return nil, nil, nil, backpressureError(limitSessionPrompt)
+	}
+	s.mu.Unlock()
+
+	return outbox, client, func() {
+		outbox.finishConfiguration()
+	}, nil
+}
+
+func (s *agentSession) configurationWriteBoundary(ctx context.Context, outbox *sessionOutbox) pi.CallBoundary {
+	if outbox == nil {
+		return pi.CallBoundary{}
+	}
+
+	return pi.CallBoundary{BeforeDispatch: func() (func(), error) {
+		if err := outbox.dispatchMu.lock(ctx); err != nil {
+			return nil, err
+		}
+
+		s.mu.Lock()
+		outbox.mu.Lock()
+		current := s.outbox == outbox && s.poisonCause == "" && !s.closing &&
+			!outbox.ended && !outbox.fenced && !outbox.closing &&
+			outbox.state == outboxConfiguring
+		outbox.mu.Unlock()
+		s.mu.Unlock()
+
+		if !current {
+			outbox.dispatchMu.Unlock()
+
+			return nil, pi.ErrTransportClosed
+		}
+
+		return outbox.dispatchMu.Unlock, nil
+	}}
+}
+
+func (s *agentSession) applyModelSelection(
+	ctx context.Context,
+	outbox *sessionOutbox,
+	client piClient,
+	value string,
+) error {
 	ref, err := pi.ParseModelRef(value)
 	if err != nil {
 		return unsupportedField(acpFieldValue)
 	}
 
-	selected, err := s.currentClient().SetModel(ctx, ref.Provider, ref.ID)
+	selected, err := client.SetModelWithBoundary(ctx, ref.Provider, ref.ID, s.configurationWriteBoundary(ctx, outbox))
 	if err != nil {
 		var commandErr *pi.CommandError
 		if errors.As(err, &commandErr) {
-			s.agent.log.ErrorContext(ctx, "pi rejected the selected model", slog.String("message", commandErr.Message))
+			s.agent.log.ErrorContext(ctx, "pi rejected the selected model",
+				slog.String(acpFieldSessionID, string(s.id)),
+			)
 
 			return unsupportedField(acpFieldValue)
 		}
 
+		return err
+	}
+
+	if err := s.configurationResultAllowed(ctx, outbox); err != nil {
 		return err
 	}
 
@@ -112,22 +210,69 @@ func (s *agentSession) applyModelSelection(ctx context.Context, value string) er
 	return nil
 }
 
-func (s *agentSession) applyThinkingLevelSelection(ctx context.Context, value string) error {
-	// pi accepts invalid levels with success and silently coerces them, so
-	// the wrapper validates the enum itself.
-	if !pi.IsValidThinkingLevel(value) {
+func (s *agentSession) applyThinkingLevelSelection(
+	ctx context.Context,
+	outbox *sessionOutbox,
+	client piClient,
+	value string,
+) error {
+	// Empty is the empty string exactly, never a value trimmed down to it. A
+	// member that carries nothing names no level and is the same shape defect
+	// as no member at all, so it is refused here. Whitespace is not that
+	// defect: it is a level name this adapter has no standing to judge, so it
+	// travels like every other value and the read-back below reports whichever
+	// level pi is left running. Trimming would decide on pi's behalf what a
+	// host meant.
+	if value == "" {
 		return unsupportedField(acpFieldValue)
 	}
 
-	if err := s.currentClient().SetThinkingLevel(ctx, value); err != nil {
+	boundary := s.configurationWriteBoundary(ctx, outbox)
+	if err := client.SetThinkingLevelWithBoundary(ctx, value, boundary); err != nil {
+		return err
+	}
+
+	// pi acknowledges a level it does not apply, so the acknowledgement proves
+	// delivery, never adoption. get_state is the only read that reports the
+	// level pi actually runs, and it decides what the session advertises: a
+	// host that names a value pi declines sees the retained level at once,
+	// rather than its own request read back to it.
+	state, err := client.GetStateWithBoundary(ctx, s.configurationWriteBoundary(ctx, outbox))
+	if err != nil {
+		return err
+	}
+
+	if err := s.configurationResultAllowed(ctx, outbox); err != nil {
 		return err
 	}
 
 	s.mu.Lock()
-	s.thinkingLevel = value
+	s.thinkingLevel = state.ThinkingLevel
 	s.mu.Unlock()
 
 	return nil
+}
+
+func (s *agentSession) configurationResultAllowed(ctx context.Context, outbox *sessionOutbox) error {
+	s.mu.Lock()
+	current := s.outbox == outbox && s.poisonCause == "" && !s.closing
+	s.mu.Unlock()
+
+	if current {
+		outbox.mu.Lock()
+		current = !outbox.ended && !outbox.fenced && !outbox.closing && outbox.state == outboxConfiguring
+		outbox.mu.Unlock()
+	}
+
+	if current {
+		return nil
+	}
+
+	if err := s.admissionFenceError(ctx); err != nil {
+		return err
+	}
+
+	return pi.ErrTransportClosed
 }
 
 func sessionConfigOptions(session *agentSession) []acp.SessionConfigOption {

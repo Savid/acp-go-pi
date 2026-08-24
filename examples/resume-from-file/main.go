@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	piacp "github.com/savid/acp-go-pi"
@@ -161,10 +162,24 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	}
 
 	store := piacp.NewInMemorySessionStore()
-	if err := store.Replace(ctx, piacp.SessionKey{SessionID: *sessionID}, []piacp.SessionStoreReplacement{{
-		Key:     piacp.SessionKey{SessionID: *sessionID},
-		Entries: entries,
-	}}); err != nil {
+	boundary, _ := json.Marshal(struct {
+		Version     int    `json:"version"`
+		StreamID    string `json:"streamId"`
+		NativeRows  int    `json:"nativeRows"`
+		NativeState string `json:"nativeState"`
+		RecordedAt  int64  `json:"recordedAt"`
+	}{
+		Version: 1, NativeRows: len(entries), NativeState: "committed", RecordedAt: time.Now().UnixMilli(),
+	})
+
+	main := piacp.SessionKey{SessionID: *sessionID}
+	if err := store.Replace(ctx, main, []piacp.SessionStoreReplacement{
+		{Key: main, Entries: entries},
+		{
+			Key:     piacp.SessionKey{SessionID: *sessionID, Subpath: piacp.SessionStoreLifecycleSubpath},
+			Entries: []piacp.SessionStoreEntry{boundary},
+		},
+	}); err != nil {
 		return err
 	}
 

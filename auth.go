@@ -135,7 +135,11 @@ func configureProviderAuth(agent *Agent) error {
 	}
 
 	if _, err := agent.durableHome(); err != nil {
-		return fmt.Errorf("prepare provider auth home: %w", err)
+		// The home verdict is the reason here, not the field: what this gate
+		// could not honour is the requested provider-auth residence, so the
+		// refusal it records names providerAuthRoot and carries the home
+		// verdict as its cause rather than passing it through.
+		return errors.New("prepare provider auth home: " + err.Error())
 	}
 
 	ledger, err := newAuthLedger(agent.options)

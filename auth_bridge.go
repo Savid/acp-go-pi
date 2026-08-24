@@ -32,9 +32,11 @@ type authBridgeRequest struct {
 // extension raises names the exchange it belongs to, so a dialog whose id
 // matches nothing this adapter started is cancelled rather than answered.
 type authExchange struct {
-	id     string
-	flow   *authFlow
-	answer chan pi.AuthMessage
+	id         string
+	flow       *authFlow
+	answer     chan pi.AuthMessage
+	client     piClient
+	generation uint64
 }
 
 func (p *providerAuth) registerExchange(id string, flow *authFlow) *authExchange {
@@ -58,6 +60,37 @@ func (p *providerAuth) lookupExchange(id string) *authExchange {
 	defer p.mu.Unlock()
 
 	return p.exchanges[id]
+}
+
+func (p *providerAuth) bindExchange(id string, client piClient, generation uint64) (*authExchange, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	exchange := p.exchanges[id]
+	if exchange == nil {
+		return nil, false
+	}
+
+	if exchange.client != nil && (exchange.client != client || exchange.generation != generation) {
+		return nil, false
+	}
+
+	exchange.client = client
+	exchange.generation = generation
+
+	return exchange, true
+}
+
+func (p *providerAuth) exchangeForGeneration(id string, client piClient, generation uint64) *authExchange {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	exchange := p.exchanges[id]
+	if exchange == nil || exchange.client != client || exchange.generation != generation {
+		return nil
+	}
+
+	return exchange
 }
 
 // exchange runs one bridge command that answers with a single message and
@@ -92,8 +125,13 @@ func (p *providerAuth) exchange(ctx context.Context, session *agentSession, requ
 
 // invoke sends one /acp-auth command to the session's live pi process.
 func (p *providerAuth) invoke(ctx context.Context, session *agentSession, id string, request authBridgeRequest) error {
-	client := session.currentClient()
-	if client == nil {
+	session.mu.Lock()
+	client := session.client
+	outbox := session.outbox
+	closing := session.closing
+	session.mu.Unlock()
+
+	if client == nil || outbox == nil || closing {
 		return errAuthBridge
 	}
 
@@ -105,7 +143,37 @@ func (p *providerAuth) invoke(ctx context.Context, session *agentSession, id str
 		ProviderIDs: request.ProviderIDs,
 	})
 
-	if err := client.Prompt(ctx, text, nil); err != nil {
+	boundary := pi.CallBoundary{BeforeDispatch: func() (func(), error) {
+		if err := outbox.dispatchMu.lock(ctx); err != nil {
+			return nil, errAuthBridge
+		}
+
+		session.mu.Lock()
+
+		current := !session.closing && session.client == client && session.outbox == outbox
+		if current {
+			outbox.mu.Lock()
+			current = !outbox.closing && !outbox.fenced && !outbox.ended
+			outbox.mu.Unlock()
+		}
+		session.mu.Unlock()
+
+		if !current {
+			outbox.dispatchMu.Unlock()
+
+			return nil, errAuthBridge
+		}
+
+		if _, bound := p.bindExchange(id, client, outbox.generation); !bound {
+			outbox.dispatchMu.Unlock()
+
+			return nil, errAuthBridge
+		}
+
+		return outbox.dispatchMu.Unlock, nil
+	}}
+
+	if err := client.PromptWithBoundary(ctx, text, nil, boundary); err != nil {
 		return errAuthBridge
 	}
 
@@ -117,17 +185,24 @@ func (p *providerAuth) invoke(ctx context.Context, session *agentSession, id str
 // turn sink. Exactly one response is always written back so the extension never
 // hangs — except for the parked manual-code prompt, which is the callback leg's
 // to answer.
-func (p *providerAuth) handleAuthDialog(ctx context.Context, session *agentSession, request pi.UIRequest) {
+func (p *providerAuth) handleAuthDialog(
+	ctx context.Context,
+	session *agentSession,
+	outbox *sessionOutbox,
+	request pi.UIRequest,
+) {
+	client := outbox.client
+
 	message, ok := pi.ParseAuthTitle(request.Title)
 	if !ok {
-		session.respondUIDialog(ctx, pi.UICancelResponse(request.ID))
+		session.respondExactClientUIDialog(ctx, client, pi.UICancelResponse(request.ID))
 
 		return
 	}
 
-	exchange := p.lookupExchange(message.ID)
+	exchange := p.exchangeForGeneration(message.ID, client, outbox.generation)
 	if exchange == nil {
-		session.respondUIDialog(ctx, pi.UICancelResponse(request.ID))
+		session.respondExactClientUIDialog(ctx, client, pi.UICancelResponse(request.ID))
 
 		return
 	}
@@ -135,18 +210,18 @@ func (p *providerAuth) handleAuthDialog(ctx context.Context, session *agentSessi
 	switch message.Kind {
 	case pi.AuthKindCatalog, pi.AuthKindProbe:
 		p.deliver(exchange, message)
-		session.respondUIDialog(ctx, pi.UIValueResponse(request.ID, pi.AuthAck))
+		session.respondExactClientUIDialog(ctx, client, pi.UIValueResponse(request.ID, pi.AuthAck))
 	case pi.AuthKindResult:
 		p.deliverResult(exchange, message)
-		session.respondUIDialog(ctx, pi.UIValueResponse(request.ID, pi.AuthAck))
+		session.respondExactClientUIDialog(ctx, client, pi.UIValueResponse(request.ID, pi.AuthAck))
 	case pi.AuthKindEvent:
-		p.recordEvent(ctx, session, exchange, message, request.ID)
+		p.recordEvent(ctx, session, client, exchange, message, request.ID)
 	case pi.AuthKindPrompt:
-		p.answerPrompt(ctx, session, exchange, message, request.ID)
+		p.answerPrompt(ctx, session, client, exchange, message, request.ID)
 	case pi.AuthKindCancel:
-		p.armAbort(ctx, session, exchange, request.ID)
+		p.armAbort(ctx, session, client, exchange, request.ID)
 	default:
-		session.respondUIDialog(ctx, pi.UICancelResponse(request.ID))
+		session.respondExactClientUIDialog(ctx, client, pi.UICancelResponse(request.ID))
 	}
 }
 
@@ -180,13 +255,14 @@ func (p *providerAuth) deliverResult(exchange *authExchange, message pi.AuthMess
 func (p *providerAuth) recordEvent(
 	ctx context.Context,
 	session *agentSession,
+	client piClient,
 	exchange *authExchange,
 	message pi.AuthMessage,
 	dialogID string,
 ) {
 	flow := exchange.flow
 	if flow == nil || message.Event == nil {
-		session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, pi.AuthAck))
+		session.respondExactClientUIDialog(ctx, client, pi.UIValueResponse(dialogID, pi.AuthAck))
 
 		return
 	}
@@ -201,22 +277,22 @@ func (p *providerAuth) recordEvent(
 	// A vetoed presentation cancels the dialog: the native flow aborts rather
 	// than continuing toward a completion nothing will accept.
 	if p.flowVeto(flow) != "" {
-		session.respondUIDialog(ctx, pi.UICancelResponse(dialogID))
+		session.respondExactClientUIDialog(ctx, client, pi.UICancelResponse(dialogID))
 
 		return
 	}
 
-	session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, pi.AuthAck))
+	session.respondExactClientUIDialog(ctx, client, pi.UIValueResponse(dialogID, pi.AuthAck))
 }
 
 // armAbort records the dialog whose answer aborts the native login. It is the
 // one dialog this adapter leaves open: while the flow is pending the login must
 // keep running, and answering it later is what stops a device poll a terminal
 // flow can no longer report on.
-func (p *providerAuth) armAbort(ctx context.Context, session *agentSession, exchange *authExchange, dialogID string) {
+func (p *providerAuth) armAbort(ctx context.Context, session *agentSession, client piClient, exchange *authExchange, dialogID string) {
 	flow := exchange.flow
 	if flow == nil {
-		session.respondUIDialog(ctx, pi.UICancelResponse(dialogID))
+		session.respondExactClientUIDialog(ctx, client, pi.UICancelResponse(dialogID))
 
 		return
 	}
@@ -226,13 +302,15 @@ func (p *providerAuth) armAbort(ctx context.Context, session *agentSession, exch
 
 	if !terminal {
 		flow.abortDialog = dialogID
+		flow.abortClient = client
+		flow.abortGeneration = exchange.generation
 	}
 	p.mu.Unlock()
 
 	// A flow that terminalized before its abort handle arrived would keep the
 	// login running with nothing left to stop it.
 	if terminal {
-		session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, pi.AuthAck))
+		session.respondExactClientUIDialog(ctx, client, pi.UIValueResponse(dialogID, pi.AuthAck))
 	}
 }
 
@@ -260,45 +338,46 @@ func (p *providerAuth) armAbort(ctx context.Context, session *agentSession, exch
 func (p *providerAuth) answerPrompt(
 	ctx context.Context,
 	session *agentSession,
+	client piClient,
 	exchange *authExchange,
 	message pi.AuthMessage,
 	dialogID string,
 ) {
 	flow := exchange.flow
 	if flow == nil {
-		session.respondUIDialog(ctx, pi.UICancelResponse(dialogID))
+		session.respondExactClientUIDialog(ctx, client, pi.UICancelResponse(dialogID))
 
 		return
 	}
 
 	switch message.Prompt {
 	case pi.AuthPromptManualCode:
-		if !p.park(flow, dialogID, message.Message) {
-			session.respondUIDialog(ctx, pi.UICancelResponse(dialogID))
+		if !p.park(flow, client, exchange.generation, dialogID, message.Message) {
+			session.respondExactClientUIDialog(ctx, client, pi.UICancelResponse(dialogID))
 		}
 
 		return
 	case pi.AuthPromptText:
 		answer, _ := p.takeSecret(flow)
-		session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, answer))
+		session.respondExactClientUIDialog(ctx, client, pi.UIValueResponse(dialogID, answer))
 
 		return
 	case pi.AuthPromptSecret:
 		if secret, ok := p.takeSecret(flow); ok {
-			session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, secret))
+			session.respondExactClientUIDialog(ctx, client, pi.UIValueResponse(dialogID, secret))
 
 			return
 		}
 	case pi.AuthPromptSelect:
 		if option, ok := authHeadlessOption(message.Options); ok {
-			session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, option))
+			session.respondExactClientUIDialog(ctx, client, pi.UIValueResponse(dialogID, option))
 
 			return
 		}
 	}
 
 	p.veto(flow, authCauseNativeVeto)
-	session.respondUIDialog(ctx, pi.UICancelResponse(dialogID))
+	session.respondExactClientUIDialog(ctx, client, pi.UICancelResponse(dialogID))
 }
 
 // park records the dialog the callback leg answers and makes the flow's
@@ -306,12 +385,14 @@ func (p *providerAuth) answerPrompt(
 // already terminalized takes none: its release has run, so a prompt recorded
 // now would stay open for the life of the process with nothing left to answer
 // it, and the caller dismisses it instead.
-func (p *providerAuth) park(flow *authFlow, dialogID string, message string) bool {
+func (p *providerAuth) park(flow *authFlow, client piClient, generation uint64, dialogID string, message string) bool {
 	p.mu.Lock()
 
 	taken := !authTerminal(flow.state)
 	if taken {
 		flow.parkedDialog = dialogID
+		flow.parkedClient = client
+		flow.parkedGeneration = generation
 		flow.presentInteraction = authInteractionCallback
 
 		if text, ok := authDisplayText(message, authMaxMessageBytes); ok && !flow.presentMessageNative {
@@ -440,14 +521,17 @@ func (p *providerAuth) awaitResult(ctx context.Context, flow *authFlow) (pi.Auth
 func (p *providerAuth) answerParked(ctx context.Context, session *agentSession, flow *authFlow, value string) bool {
 	p.mu.Lock()
 	dialogID := flow.parkedDialog
+	client := flow.parkedClient
 	flow.parkedDialog = ""
+	flow.parkedClient = nil
+	flow.parkedGeneration = 0
 	p.mu.Unlock()
 
 	if dialogID == "" {
 		return false
 	}
 
-	session.respondUIDialog(ctx, pi.UIValueResponse(dialogID, value))
+	session.respondExactClientUIDialog(ctx, client, pi.UIValueResponse(dialogID, value))
 
 	return true
 }
@@ -458,28 +542,40 @@ func (p *providerAuth) answerParked(ctx context.Context, session *agentSession, 
 // user code would stay approvable, and an approval landing after the flow ended
 // would write a credential into pi's durable agent directory under a ledger
 // entry no leg will ever confirm.
+//
+// The session is the one the flow was published under, not one resolved from the
+// agent's active map: ladder step 4 runs while the boundary is tearing that
+// session down, and close, delete, and Agent.Close all take the id out of the
+// map first. Resolving by id there would silently skip the native cancel on
+// exactly the three paths that owe it.
 func (p *providerAuth) releaseNativeLogin(ctx context.Context, flow *authFlow) {
 	p.mu.Lock()
 	parked := flow.parkedDialog
+	parkedClient := flow.parkedClient
 	abort := flow.abortDialog
+	abortClient := flow.abortClient
+	session := flow.session
 	flow.parkedDialog = ""
+	flow.parkedClient = nil
+	flow.parkedGeneration = 0
 	flow.abortDialog = ""
+	flow.abortClient = nil
+	flow.abortGeneration = 0
 	p.mu.Unlock()
 
 	if parked == "" && abort == "" {
 		return
 	}
 
-	session, err := p.agent.session(flow.sessionID)
-	if err != nil {
+	if session == nil {
 		return
 	}
 
 	if parked != "" {
-		session.respondUIDialog(ctx, pi.UICancelResponse(parked))
+		session.respondExactClientUIDialog(ctx, parkedClient, pi.UICancelResponse(parked))
 	}
 
 	if abort != "" {
-		session.respondUIDialog(ctx, pi.UIValueResponse(abort, pi.AuthAck))
+		session.respondExactClientUIDialog(ctx, abortClient, pi.UIValueResponse(abort, pi.AuthAck))
 	}
 }

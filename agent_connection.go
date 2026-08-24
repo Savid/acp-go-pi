@@ -87,7 +87,7 @@ func requestError(ctx context.Context, log *slog.Logger, err error) *acp.Request
 		return reqErr
 	}
 
-	log.ErrorContext(ctx, "acp request failed", slog.Any("error", err))
+	log.ErrorContext(ctx, "acp request failed")
 
 	return acp.NewInternalError(nil)
 }

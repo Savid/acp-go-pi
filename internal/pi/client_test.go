@@ -2,9 +2,12 @@ package pi
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +19,27 @@ type testHarness struct {
 	client   *Client
 	commands *bufio.Scanner
 	stdout   *io.PipeWriter
+}
+
+type shortWriter struct{}
+
+func (shortWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+
+	return len(data) - 1, nil
+}
+
+type signalingWriter struct {
+	written chan struct{}
+	once    sync.Once
+}
+
+func (w *signalingWriter) Write(data []byte) (int, error) {
+	w.once.Do(func() { close(w.written) })
+
+	return len(data), nil
 }
 
 func newTestHarness(t *testing.T) *testHarness {
@@ -151,6 +175,118 @@ func TestClientEventsBeforeResponseBarrier(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestClientCallBoundaryOrdersDispatchAcceptanceAndLaterEvents(t *testing.T) {
+	t.Parallel()
+
+	harness := newTestHarness(t)
+	callCtx, cancelCall := context.WithCancel(t.Context())
+	dispatchEntered := make(chan struct{})
+	dispatchReleased := make(chan struct{})
+	acceptedEntered := make(chan struct{})
+	releaseAccepted := make(chan struct{})
+	done := make(chan error, 1)
+
+	go func() {
+		done <- harness.client.PromptWithBoundary(callCtx, "hello", nil, CallBoundary{
+			BeforeDispatch: func() (func(), error) {
+				close(dispatchEntered)
+
+				return func() { close(dispatchReleased) }, nil
+			},
+			Accepted: func(context.Context) error {
+				close(acceptedEntered)
+				<-releaseAccepted
+
+				return nil
+			},
+		})
+	}()
+
+	<-dispatchEntered
+	command := harness.nextCommand(t)
+	<-dispatchReleased
+
+	id := commandID(t, command)
+	emitted := make(chan struct{})
+	boundaryDone := make(chan struct{})
+	go func() {
+		boundary := <-harness.client.ResponseBoundaries()
+		boundary.Resolve(t.Context())
+		close(boundaryDone)
+	}()
+	go func() {
+		defer close(emitted)
+		harness.emit(t, `{"id":"`+id+`","type":"response","command":"prompt","success":true}`+"\n"+
+			`{"type":"agent_start"}`)
+	}()
+
+	<-acceptedEntered
+	cancelCall()
+	select {
+	case event := <-harness.client.Events():
+		t.Fatalf("post-response event %T overtook the acceptance hook", event)
+	default:
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("prompt returned before its acceptance hook completed: %v", err)
+	default:
+	}
+
+	close(releaseAccepted)
+	require.NoError(t, <-done, "caller cancellation bypassed a decoded success boundary")
+	event := <-harness.client.Events()
+	require.Equal(t, EventTypeAgentStart, event.Kind())
+	<-boundaryDone
+	<-emitted
+}
+
+func TestDecodedSuccessClaimsPendingCallBeforeCancellation(t *testing.T) {
+	harness := newTestHarness(t)
+	accepted := make(chan struct{})
+	acceptanceCalls := 0
+
+	callCtx, cancelCall := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- harness.client.PromptWithBoundary(callCtx, "hello", nil, CallBoundary{
+			Accepted: func(context.Context) error {
+				acceptanceCalls++
+				close(accepted)
+
+				return nil
+			},
+		})
+	}()
+
+	command := harness.nextCommand(t)
+	id := commandID(t, command)
+	waiter, claimed := harness.client.claimPending(id)
+	require.True(t, claimed)
+
+	cancelCall()
+
+	boundaryDone := make(chan struct{})
+	go func() {
+		boundary := <-harness.client.ResponseBoundaries()
+		boundary.Resolve(t.Context())
+		close(boundaryDone)
+	}()
+
+	resolved := make(chan error, 1)
+	go func() {
+		resolved <- harness.client.resolveClaimed(t.Context(), Response{
+			ID: id, Command: "prompt", Success: true,
+		}, waiter, true)
+	}()
+
+	require.NoError(t, <-done)
+	<-accepted
+	require.Equal(t, 1, acceptanceCalls)
+	require.NoError(t, <-resolved)
+	<-boundaryDone
+}
+
 func TestClientUIRequestRoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -182,19 +318,84 @@ func TestClientUIRequestRoundTrip(t *testing.T) {
 	require.Equal(t, "allow", response["value"])
 }
 
-func TestClientSkipsMalformedLines(t *testing.T) {
+func TestClientMalformedRecordTerminalizesBeforeLaterSuccess(t *testing.T) {
 	t.Parallel()
 
 	harness := newTestHarness(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := harness.client.GetState(t.Context())
+		done <- err
+	}()
+	command := harness.nextCommand(t)
+	secret := "malformed-native-secret"
 
-	harness.emit(t, `{"type":`)
-	harness.emit(t, `not json at all`)
-	harness.emit(t, `   `)
-	harness.emit(t, `{"type":"agent_start"}`)
+	harness.emit(t, `{"type":"`+secret+`"`+"\n"+
+		`{"id":"`+commandID(t, command)+`","type":"response","command":"get_state","success":true,"data":{"sessionId":"later"}}`)
 
-	event := <-harness.client.Events()
-	require.Equal(t, "agent_start", event.Kind())
-	require.Equal(t, uint64(2), harness.client.DecodeFailures())
+	err := <-done
+	require.ErrorIs(t, err, ErrTransportClosed)
+	require.ErrorIs(t, err, ErrJSONLStructural)
+	require.NotContains(t, err.Error(), secret)
+	require.Equal(t, uint64(1), harness.client.DecodeFailures())
+}
+
+func TestResponseBoundaryResolveJoinsAcceptedHook(t *testing.T) {
+	ResponseBoundary{}.Resolve(t.Context())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	result := make(chan error, 1)
+	boundary := ResponseBoundary{owner: &responseBoundaryOwner{
+		accepted: func(context.Context) error {
+			close(entered)
+			<-release
+
+			return nil
+		},
+		result: result,
+	}}
+	resolved := make(chan struct{})
+	go func() {
+		boundary.Resolve(t.Context())
+		close(resolved)
+	}()
+	<-entered
+	select {
+	case <-resolved:
+		t.Fatal("response boundary returned while its accepted hook was live")
+	default:
+	}
+	close(release)
+	<-resolved
+	require.NoError(t, <-result)
+
+	panicResult := make(chan error, 1)
+	ResponseBoundary{owner: &responseBoundaryOwner{
+		accepted: func(context.Context) error { panic("secret") },
+		result:   panicResult,
+	}}.Resolve(t.Context())
+	require.ErrorContains(t, <-panicResult, "hook panicked")
+}
+
+func TestClientUnterminatedResponseIsStructuralFailure(t *testing.T) {
+	t.Parallel()
+
+	harness := newTestHarness(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := harness.client.GetState(t.Context())
+		done <- err
+	}()
+	command := harness.nextCommand(t)
+
+	_, err := harness.stdout.Write([]byte(`{"id":"` + commandID(t, command) +
+		`","type":"response","command":"get_state","success":true,"data":{"sessionId":"never"}}`))
+	require.NoError(t, err)
+	require.NoError(t, harness.stdout.Close())
+
+	err = <-done
+	require.ErrorIs(t, err, ErrTransportClosed)
+	require.ErrorIs(t, err, ErrJSONLStructural)
 }
 
 func TestClientStrayResponsesAreCounted(t *testing.T) {
@@ -323,7 +524,7 @@ func TestClientWriteFailures(t *testing.T) {
 			"type": "prompt",
 			"bad":  func() {},
 		})
-		require.ErrorContains(t, err, "encode jsonl record")
+		require.ErrorContains(t, err, "encode prompt command")
 	})
 
 	t.Run("closed stdin fails the write", func(t *testing.T) {
@@ -353,6 +554,145 @@ func TestClientWriteFailures(t *testing.T) {
 
 		require.ErrorContains(t, client.RespondUI(UICancelResponse("id")), "write extension ui response")
 	})
+}
+
+func TestClientShortWriteNeverPublishesCommandAcceptance(t *testing.T) {
+	client := NewClient(shortWriter{}, nil)
+	accepted := false
+	released := false
+
+	_, err := client.CallWithBoundary(t.Context(), map[string]any{"type": "prompt"}, CallBoundary{
+		BeforeDispatch: func() (func(), error) {
+			return func() { released = true }, nil
+		},
+		Accepted: func(context.Context) error {
+			accepted = true
+
+			return nil
+		},
+	})
+	require.ErrorIs(t, err, io.ErrShortWrite)
+	require.False(t, accepted)
+	require.True(t, released)
+	require.Empty(t, client.pending)
+}
+
+func TestClientBeforeDispatchFailureWritesNothing(t *testing.T) {
+	var stdin bytes.Buffer
+	client := NewClient(&stdin, nil)
+	want := errors.New("dispatch refused")
+	_, err := client.CallWithBoundary(t.Context(), map[string]any{"type": "prompt"}, CallBoundary{
+		BeforeDispatch: func() (func(), error) { return nil, want },
+	})
+	require.ErrorIs(t, err, want)
+	require.Empty(t, stdin.Bytes())
+	require.Empty(t, client.pending)
+}
+
+func TestClaimedResponseSettlementIsBounded(t *testing.T) {
+	originalTimeout := responseBoundarySettlementTimeout
+	responseBoundarySettlementTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { responseBoundarySettlementTimeout = originalTimeout })
+
+	writer := &signalingWriter{written: make(chan struct{})}
+	client := NewClient(writer, nil)
+	callCtx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Call(callCtx, map[string]any{"type": "get_state"})
+		done <- err
+	}()
+	<-writer.written
+	_, claimed := client.claimPending("acp-1")
+	require.True(t, claimed)
+	cancel()
+	require.ErrorIs(t, <-done, ErrTransportClosed)
+}
+
+func TestClaimedResponseRetainsAcceptanceError(t *testing.T) {
+	client := NewClient(io.Discard, nil)
+	want := errors.New("acceptance failed")
+	response := make(chan callResult, 1)
+	response <- callResult{boundary: want}
+	_, err := client.awaitClaimedResponse(t.Context(), response)
+	require.ErrorIs(t, err, want)
+}
+
+func TestPendingWriteAndClaimFailuresAreOwned(t *testing.T) {
+	waiter := &pendingCall{response: make(chan callResult, 1), writeDone: make(chan struct{})}
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, waiter.awaitWrite(cancelled), context.Canceled)
+
+	waiter.finishWrite(io.ErrShortWrite)
+	client := NewClient(io.Discard, nil)
+	require.ErrorIs(t, client.resolveClaimed(t.Context(), Response{ID: "id", Success: true}, waiter, true), io.ErrShortWrite)
+	require.ErrorIs(t, (<-waiter.response).boundary, io.ErrShortWrite)
+}
+
+func TestBoundaryHandoffAndAcceptedErrorFailureModes(t *testing.T) {
+	originalTimeout := responseBoundarySettlementTimeout
+	responseBoundarySettlementTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { responseBoundarySettlementTimeout = originalTimeout })
+
+	t.Run("handoff is bounded", func(t *testing.T) {
+		client := NewClient(io.Discard, nil)
+		client.boundaries <- ResponseBoundary{}
+		waiter := &pendingCall{
+			response: make(chan callResult, 1), accepted: func(context.Context) error { return nil }, writeDone: make(chan struct{}),
+		}
+		waiter.finishWrite(nil)
+		err := client.resolveClaimed(t.Context(), Response{ID: "id", Success: true}, waiter, true)
+		require.ErrorIs(t, err, ErrTransportClosed)
+		require.ErrorIs(t, (<-waiter.response).boundary, ErrTransportClosed)
+	})
+
+	t.Run("accepted error belongs to call not transport", func(t *testing.T) {
+		client := NewClient(io.Discard, nil)
+		want := errors.New("acceptance refused")
+		waiter := &pendingCall{
+			response: make(chan callResult, 1), accepted: func(context.Context) error { return want }, writeDone: make(chan struct{}),
+		}
+		waiter.finishWrite(nil)
+		go func() {
+			boundary := <-client.boundaries
+			boundary.Resolve(t.Context())
+		}()
+		require.NoError(t, client.resolveClaimed(t.Context(), Response{ID: "id", Success: true}, waiter, true))
+		require.ErrorIs(t, (<-waiter.response).boundary, want)
+	})
+}
+
+func TestBlankJSONLClassification(t *testing.T) {
+	require.True(t, isBlank([]byte(" \t\r\n")))
+	require.False(t, isBlank([]byte(" \t{}")))
+}
+
+func TestClientMissingBoundaryConsumerFailsWithoutFallbackAcceptance(t *testing.T) {
+	originalTimeout := responseBoundarySettlementTimeout
+	responseBoundarySettlementTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { responseBoundarySettlementTimeout = originalTimeout })
+
+	harness := newTestHarness(t)
+	accepted := false
+	done := make(chan error, 1)
+	go func() {
+		_, err := harness.client.CallWithBoundary(t.Context(), map[string]any{"type": "prompt"}, CallBoundary{
+			Accepted: func(context.Context) error {
+				accepted = true
+
+				return nil
+			},
+		})
+		done <- err
+	}()
+
+	command := harness.nextCommand(t)
+	harness.respond(t, commandID(t, command), "prompt", "")
+
+	require.ErrorIs(t, <-done, ErrTransportClosed)
+	require.False(t, accepted, "stdout reader ran the event consumer's acceptance hook")
+	<-harness.client.Done()
 }
 
 func TestClientClosedErrorCarriesReadFailure(t *testing.T) {

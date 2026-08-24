@@ -2,11 +2,16 @@ package piacp
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/savid/acp-go-pi/internal/observer"
+	"github.com/savid/acp-go-pi/internal/pi"
 )
+
+var errRuntimeObservationPanic = errors.New("runtime observation callback panicked")
 
 func instrumentRuntimeResourceHooks(
 	hooks RuntimeResourceHooks,
@@ -113,8 +118,50 @@ func observeRuntimeStartupStage(
 	stage RuntimeStartupStage,
 	started time.Time,
 	err error,
-) {
-	if hooks.ObserveStartupStage != nil {
-		hooks.ObserveStartupStage(ctx, lifecycle, stage, time.Since(started), err)
+) error {
+	if hooks.ObserveStartupStage == nil {
+		return nil
+	}
+
+	observeCtx, cancelObserve := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
+	defer cancelObserve()
+
+	return runBoundedHook(observeCtx, "runtime startup observation", func() error {
+		hooks.ObserveStartupStage(observeCtx, lifecycle, stage, time.Since(started), err)
+
+		return nil
+	})
+}
+
+func runBoundedHook(ctx context.Context, stage string, hook func() error) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %s did not start: %w", pi.ErrProcessContainmentIncomplete, stage, err)
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		var err error
+
+		defer func() {
+			if recover() != nil {
+				err = errRuntimeObservationPanic
+			}
+
+			done <- err
+		}()
+
+		err = hook()
+	}()
+
+	select {
+	case err := <-done:
+		if contextErr := ctx.Err(); contextErr != nil {
+			return fmt.Errorf("%w: %s did not complete: %w", pi.ErrProcessContainmentIncomplete, stage, contextErr)
+		}
+
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %s did not complete: %w", pi.ErrProcessContainmentIncomplete, stage, ctx.Err())
 	}
 }

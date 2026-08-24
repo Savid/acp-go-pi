@@ -18,6 +18,9 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
+
+	"github.com/savid/acp-go-pi/internal/lifecycle"
+	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 type unitFakeModel struct {
@@ -455,7 +458,7 @@ func TestConformanceTurnFailuresT1ThroughT6(t *testing.T) {
 		}
 	})
 
-	t.Run("T4 malformed records are skipped", func(t *testing.T) {
+	t.Run("T4 malformed record terminalizes generation", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		scenario := successfulUnitScenario()
@@ -463,9 +466,10 @@ func TestConformanceTurnFailuresT1ThroughT6(t *testing.T) {
 		scenario.GarbageLines = 3
 		conn := connectConformanceAgent(t, ctx, &conformanceClient{}, defaultInitializeRequest(), scenario)
 		sessionID := newConformanceSession(t, ctx, conn)
-		response, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "garbage"))
-		require.NoError(t, err)
-		require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+		_, err := conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "garbage"))
+		requirePiTurnFailure(t, err, failureCauseTransport)
+		_, err = conn.Prompt(ctx, TextPromptRequest(sessionID, "test-turn", "later"))
+		require.Error(t, err)
 	})
 
 	t.Run("T5 cancel guard", func(t *testing.T) {
@@ -617,8 +621,6 @@ func TestConformanceConfigOptions(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, response.ConfigOptions, 2)
 
-	_, err = conn.SetSessionConfigOption(ctx, SetConfigOptionRequest(sessionID, configThoughtLevel, "invalid"))
-	requireInvalidParams(t, err)
 	_, err = conn.SetSessionConfigOption(ctx, SetModelRequest(sessionID, "invalid"))
 	requireInvalidParams(t, err)
 	_, err = conn.SetSessionConfigOption(ctx, SetModelRequest(sessionID, "fake/missing"))
@@ -641,6 +643,39 @@ func TestConformanceConfigOptions(t *testing.T) {
 	var requestError *acp.RequestError
 	require.ErrorAs(t, err, &requestError)
 	require.Equal(t, -32601, requestError.Code)
+}
+
+// TestConformanceThinkingLevelPassesThrough drives the read-back over the real
+// wire against a pi that acknowledges every level and applies only the ones it
+// knows. What the host reads back is the level pi runs, so a value pi declined
+// reports the level pi kept instead of the host's own request.
+func TestConformanceThinkingLevelPassesThrough(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn := connectConformanceAgent(t, ctx, &conformanceClient{}, defaultInitializeRequest(), successfulUnitScenario())
+	sessionID := newConformanceSession(t, ctx, conn)
+
+	currentThoughtLevel := func(response acp.SetSessionConfigOptionResponse) acp.SessionConfigValueId {
+		t.Helper()
+		require.Len(t, response.ConfigOptions, 2)
+		require.NotNil(t, response.ConfigOptions[1].Select)
+		require.Equal(t, configThoughtLevel, response.ConfigOptions[1].Select.Id)
+
+		return response.ConfigOptions[1].Select.CurrentValue
+	}
+
+	response, err := conn.SetSessionConfigOption(ctx,
+		SetConfigOptionRequest(sessionID, configThoughtLevel, pi.ThinkingLevelHigh))
+	require.NoError(t, err)
+	require.Equal(t, acp.SessionConfigValueId(pi.ThinkingLevelHigh), currentThoughtLevel(response))
+
+	for _, declined := range []acp.SessionConfigValueId{"registry-unknown", acp.SessionConfigValueId(" " + pi.ThinkingLevelMax + " ")} {
+		response, err = conn.SetSessionConfigOption(ctx,
+			SetConfigOptionRequest(sessionID, configThoughtLevel, declined))
+		require.NoError(t, err, "a value pi acknowledges is not a refusal")
+		require.Equal(t, acp.SessionConfigValueId(pi.ThinkingLevelHigh), currentThoughtLevel(response),
+			"pi kept the level it was already running, and that is what the host reads back")
+	}
 }
 
 func TestConformanceStoreResumeLoadAndPagination(t *testing.T) {
@@ -673,8 +708,153 @@ func TestConformanceStoreResumeLoadAndPagination(t *testing.T) {
 	list, err := resumeConn.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd(cwd)))
 	require.NoError(t, err)
 	require.NotEmpty(t, list.Sessions)
+	// An empty cwd is an absent filter, never a filter that matches nothing.
+	list, err = resumeConn.ListSessions(ctx, ListSessionsRequest(WithListSessionsCwd("")))
+	require.NoError(t, err)
+	require.NotEmpty(t, list.Sessions)
 	list, err = resumeConn.ListSessions(ctx, ListSessionsRequest(WithListSessionsCursor("bad")))
 	requireInvalidParams(t, err)
+}
+
+// lifecycleInitializeRequest offers the session lifecycle extension, which is
+// what makes the sessions on that connection open a real incarnation. The
+// default handshake offers nothing, so a session under it mints no stream, no
+// cycle, and commits its boundaries with an empty identity — which is why a
+// resume across the extension has to be exercised through its own handshake.
+func lifecycleInitializeRequest() acp.InitializeRequest {
+	return acp.InitializeRequest{
+		ProtocolVersion: acp.ProtocolVersionNumber,
+		Meta: map[string]any{lifecycleMetaKey: map[string]any{
+			"versions": []any{lifecycle.Version},
+		}},
+	}
+}
+
+// lifecyclePromptRequest carries the submission correlation a negotiated prompt
+// owes alongside the route nonce every prompt carries.
+func lifecyclePromptRequest(sessionID acp.SessionId, turnNonce, text string) acp.PromptRequest {
+	request := TextPromptRequest(sessionID, turnNonce, text)
+	request.Meta[lifecycleMetaKey] = map[string]any{
+		"version": lifecycle.Version,
+		"submission": map[string]any{
+			"submissionId": turnNonce + "-submission",
+			"clientNonce":  turnNonce + "-nonce",
+		},
+	}
+
+	return request
+}
+
+// TestConformanceLifecycleSessionResumesAfterItsCloseBoundary pins the durable
+// half of the lifecycle extension across a real rotation, over the wire and
+// through a fresh connection.
+//
+// A negotiated session opens its incarnation on the establishing response, so
+// every boundary it commits names the cycle that stream minted. The turn that
+// ran under it is finished by the time the close boundary is written — the
+// terminal idle already cleared the turn, and turn identity is present only
+// while a turn is open — so the close records a cycle and no turn. The next
+// incarnation must read that boundary back and resume from it. A reader that
+// refused the shape its own writer produces would strand every session on its
+// first rotation, which is the whole session rather than an edge of it.
+func TestConformanceLifecycleSessionResumesAfterItsCloseBoundary(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	store := NewInMemorySessionStore()
+	scenario := successfulUnitScenario()
+	cwd := t.TempDir()
+
+	conn := connectConformanceAgent(
+		t, ctx, &conformanceClient{}, lifecycleInitializeRequest(), scenario, WithSessionStore(store))
+	session, err := conn.NewSession(ctx, NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	_, err = conn.Prompt(ctx, lifecyclePromptRequest(session.SessionId, "first-turn", "history"))
+	require.NoError(t, err)
+	_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+
+	journal, err := store.Load(ctx, SessionKey{
+		SessionID: string(session.SessionId), Subpath: SessionStoreLifecycleSubpath,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, journal, "a negotiated close commits the boundary its resume stands on")
+
+	var boundary lifecycleBoundaryRecord
+
+	require.NoError(t, json.Unmarshal(journal[len(journal)-1], &boundary))
+	require.NotEmpty(t, boundary.StreamID)
+	require.NotEmpty(t, boundary.CycleID, "the incarnation names the cycle its stream minted")
+	require.Empty(t, boundary.TurnID, "the settled turn is over before the close boundary is written")
+
+	// The rotation: a fresh connection resumes the same id from that boundary.
+	loadClient := &conformanceClient{}
+	loadConn := connectConformanceAgent(
+		t, ctx, loadClient, lifecycleInitializeRequest(), scenario, WithSessionStore(store))
+	_, err = loadConn.LoadSession(ctx, LoadSessionRequest(session.SessionId, cwd))
+	require.NoError(t, err)
+	require.Contains(t, loadClient.text(), "FAKE_PI_REPLY", "the resumed session replayed its history")
+
+	// A resumed session is a working one, not merely a load that returned: it
+	// takes a second turn and closes on a boundary of its own.
+	_, err = loadConn.Prompt(ctx, lifecyclePromptRequest(session.SessionId, "second-turn", "again"))
+	require.NoError(t, err)
+	_, err = loadConn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+}
+
+// lockedLogBuffer collects log records written from the agent's own goroutines.
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedLogBuffer) Write(record []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(record)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+// TestConformanceSessionClosedImmediatelyAfterOpen pins the sequence a host
+// uses to read an agent's metadata and nothing else: open a session, close it,
+// keep the connection. Closing is legal at any point, including while the
+// snapshot this agent defers behind its own establishing response is still
+// landing, so the close reports no fault — and the connection it ran on stays
+// usable for the session that follows.
+func TestConformanceSessionClosedImmediatelyAfterOpen(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	logs := &lockedLogBuffer{}
+	client := &conformanceClient{}
+	conn := connectConformanceAgent(
+		t, ctx, client, lifecycleInitializeRequest(), successfulUnitScenario(),
+		WithLogger(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelError}))),
+	)
+
+	for range 3 {
+		probe, err := conn.NewSession(ctx, NewSessionRequest(t.TempDir()))
+		require.NoError(t, err)
+		_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: probe.SessionId})
+		require.NoError(t, err)
+	}
+
+	session, err := conn.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	_, err = conn.Prompt(ctx, lifecyclePromptRequest(session.SessionId, "after-probe", "hello"))
+	require.NoError(t, err)
+	require.Contains(t, client.text(), "FAKE_PI_REPLY")
+
+	require.Empty(t, logs.String(), "a host close is not an error this agent reports")
 }
 
 func TestConformanceDeleteForkAndUnknownSession(t *testing.T) {

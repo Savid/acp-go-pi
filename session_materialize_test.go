@@ -236,7 +236,7 @@ func TestDurableHomeMaterialization(t *testing.T) {
 
 	t.Run("relative path", func(t *testing.T) {
 		err := NewAgent(WithHome("relative/home")).applyGenerationAgentDir(&sessionDirs{})
-		require.ErrorContains(t, err, "clean absolute path")
+		requireRefusedField(t, optionFieldHome, err)
 	})
 
 	t.Run("create failure", func(t *testing.T) {

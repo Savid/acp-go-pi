@@ -17,6 +17,11 @@ const (
 	SessionStoreFormat = "pi-session-jsonl-v1"
 	// SessionStoreMainSubpath addresses a session's main entry log.
 	SessionStoreMainSubpath = ""
+	// SessionStoreLifecycleSubpath addresses a session's adapter-owned
+	// lifecycle boundary log. Its rows are wrapper records rather than native
+	// transcript, so the main log stays exactly the bytes pi wrote and no
+	// boundary fact is ever replayed as conversation.
+	SessionStoreLifecycleSubpath = "lifecycle"
 )
 
 // SessionStoreEntry is one raw native JSON row.
@@ -44,6 +49,13 @@ type SessionStoreReplacement struct {
 }
 
 // SessionStore is the host-provided durability boundary for pi sessions.
+//
+// A tombstone is final. Once Delete returns for a session's main key, no later
+// Append or Replace may make that session's rows readable again: an
+// implementation either refuses the write or keeps the tombstone standing
+// through it. The adapter serializes a delete after the settlement that could
+// still be writing, so a store that resurrected a tombstoned row would be
+// answering for a session the host was told is gone.
 type SessionStore interface {
 	Append(ctx context.Context, key SessionKey, entries []SessionStoreEntry) error
 	Load(ctx context.Context, key SessionKey) ([]SessionStoreEntry, error)
@@ -155,6 +167,14 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 			return fmt.Errorf("replacement session id %q does not match main session id %q", replacement.Key.SessionID, main.SessionID)
 		}
 
+		// Two replacements naming one key describe two different generations of
+		// it, and nothing in the call says which one the caller meant. Resolving
+		// that by last-write-wins would silently commit one of them, so the whole
+		// call is refused before any key is written.
+		if _, duplicate := next[replacement.Key]; duplicate {
+			return fmt.Errorf("duplicate replacement key %q subpath %q", replacement.Key.SessionID, replacement.Key.Subpath)
+		}
+
 		if replacement.Key == main {
 			mainCount++
 		}
@@ -170,6 +190,12 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 	defer s.mu.Unlock()
 
 	s.ensure()
+
+	// A tombstone is final: a replacement that landed after a delete would
+	// answer for a session the host was told is gone.
+	if s.isTombstonedLocked(main) {
+		return nil
+	}
 
 	for key := range s.entries {
 		if key.SessionID == main.SessionID {

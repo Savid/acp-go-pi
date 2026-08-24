@@ -17,6 +17,15 @@ const (
 	// second prompt while streaming, so a concurrent prompt is refused with
 	// session_prompt backpressure; the capacity is not configurable.
 	sessionTurnCapacity = 1
+
+	// limitSessionPrompt names the single-foreground admission a prompt was
+	// refused by: another prompt, work the agent began on its own, a native
+	// queue pi has not drained, or a restore holding the session.
+	limitSessionPrompt = "session_prompt"
+	// limitSessionRestore names the gate an active session/load or
+	// session/resume was refused by, which is the same single foreground read
+	// from the other side.
+	limitSessionRestore = "session_restore"
 )
 
 func validateConcurrencyLimits(limits ConcurrencyLimits) error {

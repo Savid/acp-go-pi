@@ -27,11 +27,19 @@ const (
 	failureCauseTransport   = "transport"
 	failureCauseProvider    = "provider"
 	failureCauseTimeout     = "timeout"
+	failureCauseExtension   = "extension"
+
+	// extensionFailureMessage is the whole of what a client is told about an
+	// extension that threw. The wrapper-owned extensions are the permission
+	// bridge and the MCP client: their filesystem paths are adapter-internal
+	// and their thrown text can carry tool input, so the cause is named and the
+	// prose is not.
+	extensionFailureMessage = "a pi extension failed"
 
 	// nativeCauseMaxBytes bounds the native cause text the client is told. The
 	// uniform shape carries the cause, not a transcript: a dying pi can print
-	// anything at all to stderr, and the whole retained tail belongs in the
-	// adapter log where the operator reads it, not on the wire.
+	// anything at all to stderr. The bounded final cause stays on the wire;
+	// native stderr is never copied into the adapter log.
 	nativeCauseMaxBytes = 2048
 )
 
@@ -45,15 +53,27 @@ func turnFailureError(cause string, message string) *acp.RequestError {
 	})
 }
 
+// extensionTurnFailure is the uniform failure a cycle reports when pi's
+// extension surface threw. It fails closed with a fixed message, because the
+// permission bridge is the session's authorization boundary and a cycle that
+// continued past its failure would be running on an admission nobody granted.
+func extensionTurnFailure() *acp.RequestError {
+	return turnFailureError(failureCauseExtension, extensionFailureMessage)
+}
+
 // boundNativeCause is the single gate every native cause text passes through
 // before it reaches a client.
 func boundNativeCause(message string) string {
-	bounded := strings.TrimSpace(message)
+	// The cap applies to the original byte prefix. Trimming first would let an
+	// arbitrarily long run of leading spaces expose a suffix beyond the wire
+	// budget, and repairing before slicing could allocate or scan unbounded
+	// attacker-controlled input.
+	bounded := message
 	if len(bounded) > nativeCauseMaxBytes {
-		bounded = strings.ToValidUTF8(bounded[:nativeCauseMaxBytes], "")
+		bounded = bounded[:nativeCauseMaxBytes]
 	}
 
-	return bounded
+	return strings.TrimSpace(strings.ToValidUTF8(bounded, ""))
 }
 
 // processExitClassifyGrace bounds how long failure classification waits for
@@ -84,7 +104,10 @@ func (s *agentSession) nativeTurnFailure(ctx context.Context, err error) error {
 		return turnFailureError(failureCauseProcessExit, exitMessage)
 	}
 
-	s.agent.log.ErrorContext(ctx, "pi turn transport failed", slog.Any("error", err))
+	s.agent.log.ErrorContext(ctx, "pi turn transport failed",
+		slog.String(acpFieldSessionID, string(s.id)),
+		slog.String(failureFieldCause, failureCauseTransport),
+	)
 
 	return turnFailureError(failureCauseTransport, err.Error())
 }
@@ -107,10 +130,8 @@ func (s *agentSession) processExitCause(ctx context.Context, subject string) (st
 	return nativeExitCause(ctx, s.agent.log, subject, proc), true
 }
 
-// nativeExitCause composes the exit status with the line of the retained
-// stderr tail that names the cause, and logs the whole tail behind it. The
-// tail is an unbounded native transcript: the operator gets all of it, the
-// client gets the cause.
+// nativeExitCause composes the exit status with the final retained stderr line
+// that names the bounded wire cause. No native stderr is logged.
 func nativeExitCause(ctx context.Context, log *slog.Logger, subject string, proc piProcess) string {
 	message := subject
 
@@ -120,10 +141,9 @@ func nativeExitCause(ctx context.Context, log *slog.Logger, subject string, proc
 	}
 
 	tail := strings.TrimSpace(proc.StderrTail())
+
 	log.ErrorContext(ctx, "pi native process exited",
 		slog.String("stage", subject),
-		slog.Any("wait_error", waitErr),
-		slog.String("stderr_tail", tail),
 	)
 
 	if cause := nativeCauseLine(tail); cause != "" {
@@ -185,7 +205,7 @@ func (a *Agent) nativeStartFailure(ctx context.Context, cause string, err error,
 		}
 	}
 
-	a.log.ErrorContext(ctx, "pi session start failed", slog.String(failureFieldCause, cause), slog.Any("error", err))
+	a.log.ErrorContext(ctx, "pi session start failed", slog.String(failureFieldCause, cause))
 
 	// The driving error is joined rather than discarded: the wire answer is
 	// the RequestError the mapper produces, while adapter-internal callers

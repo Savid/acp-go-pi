@@ -170,11 +170,6 @@ func (t *processTree) completeBoundary() error {
 	return t.boundaryErr
 }
 
-func (*processTree) descendantCount() (int, bool) {
-	// This boundary cannot enumerate an authoritative membership count.
-	return 0, false
-}
-
 var syscallGetpgid = syscall.Getpgid
 var syscallKill = syscall.Kill
 

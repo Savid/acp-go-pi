@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -31,6 +32,7 @@ const (
 	optionFieldContainment       = "containment"
 	optionFieldDefaultModel      = "defaultModel"
 	optionFieldEnv               = "env"
+	optionFieldHome              = "home"
 	optionFieldImageLimits       = "imageLimits"
 	optionFieldInputHandoffRoot  = "inputHandoffRoot"
 	optionFieldProviderAuthRoot  = "providerAuthRoot"
@@ -80,32 +82,50 @@ type agentSession struct {
 	proc   piProcess
 	client piClient
 
-	// pumpCtx/pumpDone bound the event pump goroutine that drains the client
-	// event and UI request streams for the life of the process.
+	// pumpCancel/pumpDone bound the event pump goroutine that drains the
+	// client event and UI request streams for the life of the process.
 	pumpCancel context.CancelFunc
 	pumpDone   chan struct{}
-	dialogWG   sync.WaitGroup
-
 	turn       chan struct{}
 	cancelMu   sync.Mutex
 	toolMu     sync.Mutex
 	rawEventMu sync.Mutex
 
-	mu                   sync.Mutex
-	title                string
-	updatedAt            string
-	model                string
-	availableModels      []pi.Model
-	thinkingLevel        string
-	contextWindowSize    int64
-	availableCommands    []pi.SlashCommand
-	advertisedCommands   []acp.AvailableCommand
-	poisonCause          string
-	cancel               context.CancelFunc
-	turnCancelled        bool
-	turnNonce            string
-	turnSink             *turnSink
+	// lcMu serializes the ordered lifecycle stream through delivery, so a
+	// sequence claimed before a send is also delivered in that order.
+	lcMu sync.Mutex
+	lc   lifecycleState
+
+	// commitMu linearizes every durable write against the fence a delete
+	// installs, so no write can recreate a row the delete removed.
+	commitMu      sync.Mutex
+	persistFenced bool
+
+	mu                 sync.Mutex
+	title              string
+	updatedAt          string
+	model              string
+	availableModels    []pi.Model
+	thinkingLevel      string
+	contextWindowSize  int64
+	availableCommands  []pi.SlashCommand
+	advertisedCommands []acp.AvailableCommand
+	poisonCause        string
+	// opened records that the session published its establishing snapshot: the
+	// explicit command catalog and the opening lifecycle stream, exactly once.
+	opened        bool
+	cancel        context.CancelFunc
+	turnCancelled bool
+	turnNonce     string
+	// pumpGeneration counts native process generations. One generation owns
+	// one outbox, one lifecycle incarnation, and every event either produced.
+	pumpGeneration       uint64
+	outbox               *sessionOutbox
+	promptAdmission      *turnDelivery
+	turnEvents           *turnDelivery
+	containmentOutboxes  []*sessionOutbox
 	turnNativeSettled    bool
+	settlement           *turnSettlement
 	turnFenceStarted     bool
 	turnFenceDone        chan struct{}
 	turnFenceErr         error
@@ -121,17 +141,47 @@ type agentSession struct {
 	scratchRootRelease   func()
 	nativeContainmentErr error
 	providerProcessRoot  *providerProcessRoot
+	nativeBoundary       *nativeBoundaryTracker
 	browserShim          *pi.BrowserShim
 	residence            *pi.SessionResidence
 	authClosed           bool
 
-	// closing is the session's terminal state: once the first Close claims it
-	// the session admits no prompt, relaunch, or MCP-tool refresh ever again,
-	// and every later Close waits on closeDone and reports closeErr rather than
-	// tearing the same resources down a second time.
-	closing   bool
-	closeDone chan struct{}
-	closeErr  error
+	// closing is the session's admission fence: from the moment a close is
+	// requested the session admits no prompt, relaunch, or MCP-tool refresh
+	// ever again, whether or not the teardown that requested it succeeded.
+	closing bool
+	// closeAttempt is the immutable teardown result every concurrent and later
+	// Close joins.
+	closeAttempt              *sessionCloseAttempt
+	relaunchAttempt           *sessionRelaunchAttempt
+	lifecycleDeliveryDetached bool
+}
+
+type sessionCloseAttempt struct {
+	done             chan struct{}
+	err              error
+	outbox           *sessionOutbox
+	containment      *generationContainment
+	containmentOwner bool
+	relaunch         *sessionRelaunchAttempt
+	finishOnce       sync.Once
+	settlement       atomic.Uint32
+}
+
+// sessionRelaunchAttempt is the exact in-flight successor construction a
+// close election must join when close wins before publication.
+type sessionRelaunchAttempt struct {
+	mu             sync.Mutex
+	finishOnce     sync.Once
+	done           chan struct{}
+	err            error
+	proc           piProcess
+	client         piClient
+	processRoot    *providerProcessRoot
+	generationRoot string
+	nativeRelease  func()
+	outbox         *sessionOutbox
+	nativeBoundary *nativeBoundaryTracker
 }
 
 // turnToolCall is the exact-ID lifecycle published for one native tool call.
@@ -155,7 +205,7 @@ type turnToolCall struct {
 // dialogCancel tracks one pending extension UI dialog so session/cancel and
 // teardown can resolve it as cancelled.
 type dialogCancel struct {
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 }
 
 // promptTurnState accumulates per-turn results while streaming events.

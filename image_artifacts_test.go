@@ -67,11 +67,60 @@ func TestLoadCurrentStoreEntriesFreshArtifacts(t *testing.T) {
 	store := NewInMemorySessionStore()
 	rows := imageArtifactRows(t, now.Add(-time.Hour))
 	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: validSessionUUID}, rows))
+	appendLifecycleBoundaryForRows(t, store, validSessionUUID, len(rows))
 
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
-	entries, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
+	entries, _, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
 	require.NoError(t, err)
 	require.Len(t, entries, len(rows))
+}
+
+func TestLoadCurrentStoreEntriesRequiresTheLastDurableBoundary(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rejects an unproven suffix", func(t *testing.T) {
+		t.Parallel()
+
+		store := NewInMemorySessionStore()
+		rows := []SessionStoreEntry{
+			json.RawMessage(`{"row":1}`),
+			json.RawMessage(`{"row":2}`),
+			json.RawMessage(`{"row":3}`),
+		}
+		require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: validSessionUUID}, rows))
+		appendLifecycleBoundaryForRows(t, store, validSessionUUID, 2)
+
+		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+		_, _, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
+		require.ErrorContains(t, err, "has 3 native rows but lifecycle boundary records 2")
+	})
+
+	t.Run("rejects a boundary ahead of native storage", func(t *testing.T) {
+		t.Parallel()
+
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: validSessionUUID}, []SessionStoreEntry{
+			json.RawMessage(`{"row":1}`),
+		}))
+		appendLifecycleBoundaryForRows(t, store, validSessionUUID, 2)
+
+		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+		_, _, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
+		require.ErrorContains(t, err, "has 1 native rows but lifecycle boundary records 2")
+	})
+
+	t.Run("rejects a native log without a boundary", func(t *testing.T) {
+		t.Parallel()
+
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: validSessionUUID}, []SessionStoreEntry{
+			json.RawMessage(`{"row":1}`),
+		}))
+
+		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+		_, _, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
+		require.ErrorContains(t, err, "no lifecycle boundary")
+	})
 }
 
 func TestLoadCurrentStoreEntriesReclaimsExpiredArtifacts(t *testing.T) {
@@ -82,9 +131,10 @@ func TestLoadCurrentStoreEntriesReclaimsExpiredArtifacts(t *testing.T) {
 	store := NewInMemorySessionStore()
 	rows := imageArtifactRows(t, now.Add(-imageArtifactTTL-time.Minute))
 	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: validSessionUUID}, rows))
+	appendLifecycleBoundaryForRows(t, store, validSessionUUID, len(rows))
 
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
-	_, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
+	_, _, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
 	requireImageOutputFailure(t, err, imageReasonStorageFailed)
 
 	swept, loadErr := store.Load(t.Context(), SessionKey{SessionID: validSessionUUID})
@@ -98,7 +148,7 @@ func TestLoadCurrentStoreEntriesReclaimsExpiredArtifacts(t *testing.T) {
 
 	// A later restore finds the reclaimed artifact and stays truthfully
 	// unloadable rather than replaying with a hole.
-	_, err = agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
+	_, _, err = agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
 	data := requireImageOutputFailure(t, err, imageReasonStorageFailed)
 	require.Contains(t, data[jsonFieldMessage], "no longer available")
 }
@@ -113,8 +163,10 @@ func TestLoadCurrentStoreEntriesExpiryEdges(t *testing.T) {
 	png := fixtureBase64(t, "valid.png")
 
 	// A row exactly at the TTL boundary has not expired.
-	require.NoError(t, store.Append(t.Context(), key, imageArtifactRows(t, now.Add(-imageArtifactTTL))))
-	_, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
+	exactRows := imageArtifactRows(t, now.Add(-imageArtifactTTL))
+	require.NoError(t, store.Append(t.Context(), key, exactRows))
+	appendLifecycleBoundaryForRows(t, store, key.SessionID, len(exactRows))
+	_, _, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
 	require.NoError(t, err)
 
 	// Output image rows without a timestamp cannot age.
@@ -127,7 +179,8 @@ func TestLoadCurrentStoreEntriesExpiryEdges(t *testing.T) {
 			Content:    json.RawMessage(`[{"type":"image","data":"` + png + `","mimeType":"image/png"}]`),
 		}),
 	}))
-	_, err = agent.loadCurrentStoreEntries(t.Context(), agelessKey.SessionID)
+	appendLifecycleBoundaryForRows(t, store, agelessKey.SessionID, 1)
+	_, _, err = agent.loadCurrentStoreEntries(t.Context(), agelessKey.SessionID)
 	require.NoError(t, err)
 
 	// Expired user prompt images are session input, never reclaimed.
@@ -139,7 +192,8 @@ func TestLoadCurrentStoreEntriesExpiryEdges(t *testing.T) {
 			Content:   json.RawMessage(`[{"type":"image","data":"` + png + `","mimeType":"image/png"}]`),
 		}),
 	}))
-	_, err = agent.loadCurrentStoreEntries(t.Context(), userKey.SessionID)
+	appendLifecycleBoundaryForRows(t, store, userKey.SessionID, 1)
+	_, _, err = agent.loadCurrentStoreEntries(t.Context(), userKey.SessionID)
 	require.NoError(t, err)
 }
 
@@ -152,7 +206,7 @@ func TestLoadCurrentStoreEntriesErrorBranches(t *testing.T) {
 		WithLogger(slog.New(slog.DiscardHandler)),
 		WithSessionStore(&errorSessionStore{loadErr: loadFailure}),
 	)
-	_, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
+	_, _, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
 	require.ErrorIs(t, err, loadFailure)
 
 	store := &replaceControlledStore{SessionStore: NewInMemorySessionStore(), replaceErr: errors.New("replace")}
@@ -161,9 +215,10 @@ func TestLoadCurrentStoreEntriesErrorBranches(t *testing.T) {
 		SessionKey{SessionID: validSessionUUID},
 		imageArtifactRows(t, now.Add(-imageArtifactTTL-time.Minute)),
 	))
+	appendLifecycleBoundaryForRows(t, store, validSessionUUID, 3)
 
 	agent = NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
-	_, err = agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
+	_, _, err = agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
 	data := requireImageOutputFailure(t, err, imageReasonStorageFailed)
 	require.Contains(t, data[jsonFieldMessage], "reclaim expired image artifacts")
 }
@@ -263,6 +318,7 @@ func TestLoadSessionFailsOnExpiredImageArtifacts(t *testing.T) {
 		SessionKey{SessionID: validSessionUUID},
 		imageArtifactRows(t, now.Add(-imageArtifactTTL-time.Minute)),
 	))
+	appendLifecycleBoundaryForRows(t, store, validSessionUUID, 3)
 
 	client := newStubPiClient()
 	agent := newStubClientAgent(t, client, WithSessionStore(store))
@@ -286,4 +342,78 @@ func TestForkSessionFailsOnExpiredImageArtifacts(t *testing.T) {
 
 	_, err := agent.HandleExtensionMethod(t.Context(), ForkSessionMethod, forkRaw(t, forkParams(t)))
 	requireImageOutputFailure(t, err, imageReasonStorageFailed)
+}
+
+// lifecycleLoadFailingStore fails loads of the adapter-owned lifecycle
+// boundary subpath while every other key loads normally.
+type lifecycleLoadFailingStore struct {
+	SessionStore
+	err       error
+	failAfter int
+	loads     int
+}
+
+func (s *lifecycleLoadFailingStore) Load(ctx context.Context, key SessionKey) ([]SessionStoreEntry, error) {
+	if key.Subpath == SessionStoreLifecycleSubpath {
+		s.loads++
+		if s.loads > s.failAfter {
+			return nil, s.err
+		}
+	}
+
+	return s.SessionStore.Load(ctx, key)
+}
+
+// TestReclaimExpiredImageRowsCarriesTheLifecycleBoundaryLog pins that the
+// reclaim's wholesale replacement keeps the adapter-owned boundary record: it
+// is the only record of how the last incarnation ended, and the next
+// incarnation opens its snapshot from it.
+func TestReclaimExpiredImageRowsCarriesTheLifecycleBoundaryLog(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	freezeImageArtifactClock(t, now)
+
+	store := NewInMemorySessionStore()
+	lifecycleKey := SessionKey{SessionID: validSessionUUID, Subpath: SessionStoreLifecycleSubpath}
+	rows := imageArtifactRows(t, now.Add(-imageArtifactTTL-time.Minute))
+	require.NoError(t, store.Append(
+		t.Context(),
+		SessionKey{SessionID: validSessionUUID},
+		rows,
+	))
+	boundary := appendLifecycleBoundaryForRows(t, store, validSessionUUID, len(rows))
+
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+	_, _, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
+	requireImageOutputFailure(t, err, imageReasonStorageFailed)
+
+	carried, loadErr := store.Load(t.Context(), lifecycleKey)
+	require.NoError(t, loadErr)
+	require.Len(t, carried, 1)
+	require.JSONEq(t, string(boundary), string(carried[0]))
+}
+
+// TestReclaimExpiredImageRowsBoundaryLoadFailure pins that a store that cannot
+// read the boundary log fails the reclaim closed rather than replacing the
+// generation without it.
+func TestReclaimExpiredImageRowsBoundaryLoadFailure(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	freezeImageArtifactClock(t, now)
+
+	base := NewInMemorySessionStore()
+	store := &lifecycleLoadFailingStore{
+		SessionStore: base,
+		err:          errors.New("boundary log unreadable"),
+		failAfter:    1,
+	}
+	require.NoError(t, store.Append(
+		t.Context(),
+		SessionKey{SessionID: validSessionUUID},
+		imageArtifactRows(t, now.Add(-imageArtifactTTL-time.Minute)),
+	))
+	appendLifecycleBoundaryForRows(t, store, validSessionUUID, 3)
+
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+	_, _, err := agent.loadCurrentStoreEntries(t.Context(), validSessionUUID)
+	data := requireImageOutputFailure(t, err, imageReasonStorageFailed)
+	require.Contains(t, data[jsonFieldMessage], "boundary log unreadable")
 }

@@ -3,13 +3,133 @@ package piacp
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
 	"github.com/savid/acp-go-pi/internal/pi"
 )
+
+type observedDoneContext struct {
+	context.Context //nolint:containedctx // The test wrapper exposes when dispatch first observes cancellation.
+	entered         chan struct{}
+	once            sync.Once
+}
+
+func (c *observedDoneContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+
+	return c.Context.Done()
+}
+
+func TestAuthExchangeBindingRejectsStaleGenerationUnderRace(t *testing.T) {
+	harness := newAuthHarness(t)
+	exchange := harness.broker.registerExchange("atomic-binding", nil)
+	currentClient := newStubPiClient()
+	staleClient := newStubPiClient()
+	const currentGeneration uint64 = 41
+
+	bound, ok := harness.broker.bindExchange(exchange.id, currentClient, currentGeneration)
+	require.True(t, ok)
+	require.Same(t, exchange, bound)
+
+	start := make(chan struct{})
+	var failures atomic.Int64
+	var workers sync.WaitGroup
+	for range 8 {
+		workers.Add(2)
+		go func() {
+			defer workers.Done()
+			<-start
+			for range 1_000 {
+				if got := harness.broker.exchangeForGeneration(exchange.id, currentClient, currentGeneration); got != exchange {
+					failures.Add(1)
+				}
+			}
+		}()
+		go func() {
+			defer workers.Done()
+			<-start
+			for range 1_000 {
+				if _, rebound := harness.broker.bindExchange(exchange.id, staleClient, currentGeneration+1); rebound {
+					failures.Add(1)
+				}
+				if got := harness.broker.exchangeForGeneration(exchange.id, staleClient, currentGeneration+1); got != nil {
+					failures.Add(1)
+				}
+			}
+		}()
+	}
+	close(start)
+	workers.Wait()
+
+	require.Zero(t, failures.Load())
+	require.Same(t, exchange, harness.broker.exchangeForGeneration(exchange.id, currentClient, currentGeneration))
+}
+
+func TestAuthExchangeAndDispatchRejectMissingOrBoundedOwners(t *testing.T) {
+	harness := newAuthHarness(t)
+	_, bound := harness.broker.bindExchange("missing", harness.client, 1)
+	require.False(t, bound)
+
+	exchange := harness.broker.registerExchange("blocked-dispatch", nil)
+	require.NoError(t, harness.session.outbox.dispatchMu.lock(t.Context()))
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, harness.broker.invoke(cancelled, harness.session, exchange.id, authBridgeRequest{Op: authOpCatalog}), errAuthBridge)
+	harness.session.outbox.dispatchMu.Unlock()
+
+	require.ErrorIs(t, harness.broker.invoke(t.Context(), harness.session, "unregistered", authBridgeRequest{Op: authOpCatalog}), errAuthBridge)
+}
+
+func TestAuthInvokeRevalidatesGenerationAfterWaitingForDispatch(t *testing.T) {
+	harness := newAuthHarness(t)
+	oldClient := harness.client
+	oldOutbox := harness.session.outbox
+	require.NoError(t, oldOutbox.dispatchMu.lock(t.Context()))
+
+	var oldWrites, successorWrites atomic.Int64
+	oldClient.promptWriteFunc = func(context.Context, string) error {
+		oldWrites.Add(1)
+
+		return nil
+	}
+	successorClient := newStubPiClient()
+	successorClient.promptWriteFunc = func(context.Context, string) error {
+		successorWrites.Add(1)
+
+		return nil
+	}
+	successor := newTestSessionOutbox(oldOutbox.generation + 1)
+	bindTestRuntime(successor, harness.session.proc, successorClient, nil, nil, nil)
+
+	exchange := harness.broker.registerExchange("stale-dispatch", nil)
+	t.Cleanup(func() { harness.broker.releaseExchange(exchange.id) })
+	observed := &observedDoneContext{Context: t.Context(), entered: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		done <- harness.broker.invoke(observed, harness.session, exchange.id, authBridgeRequest{Op: authOpCatalog})
+	}()
+	<-observed.entered
+
+	harness.session.mu.Lock()
+	harness.session.client = successorClient
+	harness.session.outbox = successor
+	harness.session.pumpGeneration = successor.generation
+	harness.session.registerContainmentOutboxLocked(oldOutbox)
+	harness.session.mu.Unlock()
+	oldOutbox.dispatchMu.Unlock()
+
+	require.ErrorIs(t, <-done, errAuthBridge)
+	require.Zero(t, oldWrites.Load(), "stale generation wrote after dispatch wait")
+	require.Zero(t, successorWrites.Load(), "auth command fell through to successor")
+	require.Nil(t, exchange.client)
+	require.Zero(t, exchange.generation)
+}
 
 // TestAuthDialogCancelsUnrecognizedTitles pins that a dialog this adapter did
 // not start is dismissed rather than answered: the bridge command is reachable
@@ -25,7 +145,7 @@ func TestAuthDialogCancelsUnrecognizedTitles(t *testing.T) {
 		pi.AuthTitleMarker + `{"id":"x"}`,
 		pi.AuthTitleMarker + `{"id":"unknown-exchange","kind":"result"}`,
 	} {
-		harness.broker.handleAuthDialog(t.Context(), harness.session, pi.UIRequest{
+		harness.broker.handleAuthDialog(t.Context(), harness.session, harness.session.outbox, pi.UIRequest{
 			ID:     "dialog-x",
 			Method: uiMethodSelect,
 			Title:  title,
@@ -46,13 +166,41 @@ func TestAuthDialogCancelsUnknownKind(t *testing.T) {
 	require.True(t, harness.lastResponse().Cancelled)
 }
 
+func TestBoundAuthDialogCancelsUnknownKind(t *testing.T) {
+	harness := newAuthHarness(t)
+	exchange := harness.broker.registerExchange("bound-unknown", nil)
+	bindTestAuthExchange(t, harness, exchange)
+	harness.deliver(t.Context(), pi.AuthMessage{ID: exchange.id, Kind: "invented"})
+	require.True(t, harness.lastResponse().Cancelled)
+}
+
+func TestAuthPromptAndAbortWithoutLiveFlowCancelExactly(t *testing.T) {
+	harness := newAuthHarness(t)
+	exchange := &authExchange{generation: harness.session.outbox.generation}
+
+	promptID := harness.dialogRequest(pi.AuthMessage{}).ID
+	harness.broker.answerPrompt(t.Context(), harness.session, harness.client, exchange, pi.AuthMessage{Prompt: pi.AuthPromptManualCode}, promptID)
+	require.True(t, harness.awaitAnswer(promptID).Cancelled)
+
+	abortID := harness.dialogRequest(pi.AuthMessage{}).ID
+	harness.broker.armAbort(t.Context(), harness.session, harness.client, exchange, abortID)
+	require.True(t, harness.awaitAnswer(abortID).Cancelled)
+
+	terminal := &authFlow{state: authStateCancelled, decidable: make(chan struct{})}
+	exchange.flow = terminal
+	parkID := harness.dialogRequest(pi.AuthMessage{}).ID
+	harness.broker.answerPrompt(t.Context(), harness.session, harness.client, exchange, pi.AuthMessage{Prompt: pi.AuthPromptManualCode}, parkID)
+	require.True(t, harness.awaitAnswer(parkID).Cancelled)
+}
+
 // TestAuthDialogWithoutFlowAcknowledges pins that a flow-shaped message on a
 // plain command exchange is acknowledged rather than left hanging.
 func TestAuthDialogWithoutFlowAcknowledges(t *testing.T) {
 	t.Parallel()
 
 	harness := newAuthHarness(t)
-	harness.broker.registerExchange("ex-1", nil)
+	exchange := harness.broker.registerExchange("ex-1", nil)
+	bindTestAuthExchange(t, harness, exchange)
 
 	harness.deliver(t.Context(), pi.AuthMessage{
 		ID:    "ex-1",
@@ -469,12 +617,13 @@ func TestAuthPumpRoutesDialogsOutsideAnyTurn(t *testing.T) {
 	t.Parallel()
 
 	harness := newAuthHarness(t)
-	harness.broker.registerExchange("ex-1", nil)
+	exchange := harness.broker.registerExchange("ex-1", nil)
+	bindTestAuthExchange(t, harness, exchange)
 
 	request := harness.dialogRequest(pi.AuthMessage{ID: "ex-1", Kind: pi.AuthKindProbe})
 
-	require.Nil(t, harness.session.activeTurnSink())
-	harness.session.dispatchUIRequest(t.Context(), request)
+	require.Nil(t, harness.session.activeTurnDelivery())
+	harness.session.routeUIRequest(t.Context(), harness.session.outbox, request)
 
 	require.Equal(t, pi.AuthAck, *harness.awaitAnswer(request.ID).Value)
 }
@@ -487,7 +636,7 @@ func TestAuthPumpLeavesForeignDialogsToTheTurn(t *testing.T) {
 
 	harness := newAuthHarness(t)
 
-	harness.session.dispatchUIRequest(t.Context(), pi.UIRequest{
+	harness.session.routeUIRequest(t.Context(), harness.session.outbox, pi.UIRequest{
 		ID:     "dialog-foreign",
 		Method: uiMethodSelect,
 		Title:  "an ordinary question",
@@ -543,11 +692,11 @@ func TestParkKeepsNativePresentationText(t *testing.T) {
 	harness := newAuthHarness(t)
 
 	flow := &authFlow{state: authStatePending, decidable: make(chan struct{}), presentMessage: "label"}
-	harness.broker.park(flow, "dialog-1", "line\nbreak")
+	harness.broker.park(flow, harness.client, 1, "dialog-1", "line\nbreak")
 	require.Equal(t, "label", flow.presentMessage)
 
 	native := &authFlow{state: authStatePending, decidable: make(chan struct{}), presentMessage: "instructions", presentMessageNative: true}
-	harness.broker.park(native, "dialog-2", "paste the code")
+	harness.broker.park(native, harness.client, 1, "dialog-2", "paste the code")
 	require.Equal(t, "instructions", native.presentMessage)
 }
 
@@ -560,9 +709,173 @@ func TestParkAdoptsPromptTextWhenNoneWasSupplied(t *testing.T) {
 	harness := newAuthHarness(t)
 
 	flow := &authFlow{state: authStatePending, decidable: make(chan struct{}), presentMessage: "label"}
-	harness.broker.park(flow, "dialog-1", "Paste the authorization code here")
+	harness.broker.park(flow, harness.client, 1, "dialog-1", "Paste the authorization code here")
 
 	require.Equal(t, "Paste the authorization code here", flow.presentMessage)
 	require.True(t, flow.presentMessageNative)
 	require.Equal(t, authInteractionCallback, flow.presentInteraction)
+}
+
+// armPendingAuthFlow installs one pending provider-auth flow whose native login
+// is still parked on a pi dialog, with the abort dialog the bridge holds open
+// for the life of that login.
+func armPendingAuthFlow(h *authHarness) *authFlow {
+	flow := &authFlow{
+		id:           "flow-1",
+		session:      h.session,
+		sessionID:    h.session.id,
+		providerID:   "prov",
+		state:        authStatePending,
+		parkedDialog: "dialog-parked",
+		parkedClient: h.client,
+		abortDialog:  "dialog-abort",
+		abortClient:  h.client,
+		disarm:       make(chan struct{}),
+		decidable:    make(chan struct{}),
+		ready:        make(chan struct{}),
+		result:       make(chan pi.AuthMessage, 1),
+	}
+
+	h.broker.mu.Lock()
+	h.broker.flows[authFlowKey{sessionID: h.session.id, providerID: "prov"}] = flow
+	h.broker.byID[flow.id] = flow
+	h.broker.mu.Unlock()
+
+	return flow
+}
+
+// dialogAnswers reports every native dialog the wrapper answered.
+func dialogAnswers(h *authHarness) []string {
+	h.client.mu.Lock()
+	defer h.client.mu.Unlock()
+
+	ids := make([]string, 0, len(h.client.responses))
+	for _, response := range h.client.responses {
+		ids = append(ids, response.ID)
+	}
+
+	return ids
+}
+
+// TestShutdownLadderStepFourReachesTheNativeCancelOnEveryTeardown pins step 4's
+// "invoke native cancel where one exists" on all three boundaries the ladder
+// applies to. The native cancel answers dialogs through the flow's own session
+// rather than one resolved from the agent's active map: close, delete, and
+// Agent.Close all take the id out of that map before step 4 runs, so a lookup
+// would leave every parked login unanswered on exactly the paths that owe an
+// answer.
+func TestShutdownLadderStepFourReachesTheNativeCancelOnEveryTeardown(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		boundary func(*authHarness) error
+	}{
+		{
+			name: "the broker called directly",
+			boundary: func(h *authHarness) error {
+				h.broker.closeSession(context.Background(), h.session)
+
+				return nil
+			},
+		},
+		{
+			name: "session/close",
+			boundary: func(h *authHarness) error {
+				_, err := h.agent.CloseSession(context.Background(),
+					acp.CloseSessionRequest{SessionId: h.session.id})
+
+				return err
+			},
+		},
+		{
+			name: "session/delete",
+			boundary: func(h *authHarness) error {
+				_, err := h.agent.UnstableDeleteSession(context.Background(),
+					acp.UnstableDeleteSessionRequest{SessionId: h.session.id})
+
+				return err
+			},
+		},
+		{
+			name:     "Agent.Close",
+			boundary: func(h *authHarness) error { return h.agent.Close() },
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newAuthHarness(t)
+			flow := armPendingAuthFlow(h)
+
+			require.NoError(t, test.boundary(h))
+
+			h.broker.mu.Lock()
+			state := flow.state
+			reason := flow.reason
+			h.broker.mu.Unlock()
+
+			require.Equal(t, authStateCancelled, state, "the record terminalizes")
+			require.Equal(t, authReasonSessionClosed, reason)
+			require.Subset(t, dialogAnswers(h), []string{"dialog-parked", "dialog-abort"},
+				"the parked native login and its abort dialog are both answered")
+		})
+	}
+}
+
+// TestShutdownLadderStepFourPrecedesTheNativeInterrupt pins step 4's fixed
+// position. It runs after pending interactions are resolved and before the
+// native interrupt on every boundary, so a flow is never abandoned to a process
+// already being torn down. The abort observed here is the interrupt itself, and
+// the session's auth admission is already closed when it arrives.
+//
+// Agent.Close is absent because it sends no native interrupt at all: embedded
+// shutdown takes the graceful process exit directly, so there is no interrupt
+// for step 4 to precede there. That it still reaches the native cancel is
+// pinned above.
+func TestShutdownLadderStepFourPrecedesTheNativeInterrupt(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		boundary func(*authHarness) error
+	}{
+		{
+			name: "session/close",
+			boundary: func(h *authHarness) error {
+				_, err := h.agent.CloseSession(context.Background(),
+					acp.CloseSessionRequest{SessionId: h.session.id})
+
+				return err
+			},
+		},
+		{
+			name: "session/delete",
+			boundary: func(h *authHarness) error {
+				_, err := h.agent.UnstableDeleteSession(context.Background(),
+					acp.UnstableDeleteSessionRequest{SessionId: h.session.id})
+
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newAuthHarness(t)
+			armPendingAuthFlow(h)
+
+			var (
+				aborted       bool
+				closedAtAbort bool
+			)
+
+			h.client.abortFunc = func(context.Context) error {
+				aborted = true
+
+				h.broker.mu.Lock()
+				closedAtAbort = h.session.authClosed
+				h.broker.mu.Unlock()
+
+				return nil
+			}
+
+			require.NoError(t, test.boundary(h))
+			require.True(t, aborted, "the boundary reaches the native interrupt")
+			require.True(t, closedAtAbort,
+				"provider-auth flows are cancelled before the native interrupt")
+		})
+	}
 }

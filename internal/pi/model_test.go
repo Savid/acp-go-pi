@@ -58,12 +58,4 @@ func TestThinkingLevels(t *testing.T) {
 	// The returned slice is a copy.
 	levels[0] = "mutated"
 	require.Equal(t, "off", ThinkingLevels()[0])
-
-	for _, level := range ThinkingLevels() {
-		require.True(t, IsValidThinkingLevel(level), level)
-	}
-
-	require.False(t, IsValidThinkingLevel(""))
-	require.False(t, IsValidThinkingLevel("extreme"))
-	require.False(t, IsValidThinkingLevel("Off"))
 }

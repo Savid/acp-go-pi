@@ -67,7 +67,13 @@ var (
 // replay lives here and nowhere else: it carries url, message, and userCode,
 // which are code-bearing for the flow's life.
 type authFlow struct {
-	id                 string
+	id string
+	// session is the session that owns this flow, held directly rather than
+	// looked up by id. Ladder step 4 runs while the boundary is tearing the
+	// session down, and every teardown path takes the id out of the agent's
+	// active map before the native cancel would resolve it — so a lookup is
+	// exactly the thing that cannot answer at the moment the answer is owed.
+	session            *agentSession
 	sessionID          acp.SessionId
 	providerID         string
 	connectionID       string
@@ -99,11 +105,15 @@ type authFlow struct {
 	presentPollMs        int64
 	nativeCause          string
 
-	parkedDialog string
+	parkedDialog     string
+	parkedClient     piClient
+	parkedGeneration uint64
 	// abortDialog is the dialog the bridge leaves open for the life of one
 	// native login. Answering it aborts that login.
-	abortDialog   string
-	pendingSecret string
+	abortDialog     string
+	abortClient     piClient
+	abortGeneration uint64
+	pendingSecret   string
 
 	// mintErr records why the native mint never produced a presentation, so a
 	// repeated idempotency key is answered with the same failure rather than
@@ -296,6 +306,7 @@ func (p *providerAuth) authorize(ctx context.Context, params json.RawMessage) (a
 
 	flow := &authFlow{
 		id:                 flowID,
+		session:            session,
 		sessionID:          session.id,
 		providerID:         request.providerID,
 		connectionID:       request.connectionID,

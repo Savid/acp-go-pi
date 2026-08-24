@@ -38,7 +38,8 @@ const (
 	ThinkingLevelMax     = "max"
 )
 
-// thinkingLevels are pi's reasoning levels in ascending order.
+// thinkingLevels are the reasoning levels advertised to hosts, in ascending
+// order. They are a menu, not the set of values pi accepts.
 var thinkingLevels = []string{
 	ThinkingLevelOff,
 	ThinkingLevelMinimal,
@@ -49,20 +50,7 @@ var thinkingLevels = []string{
 	ThinkingLevelMax,
 }
 
-// ThinkingLevels returns pi's reasoning levels in ascending order.
+// ThinkingLevels returns pi's advertised reasoning-level menu.
 func ThinkingLevels() []string {
 	return append([]string(nil), thinkingLevels...)
-}
-
-// IsValidThinkingLevel reports whether level is one of pi's reasoning levels.
-// The wrapper validates levels itself because pi accepts invalid levels with
-// success and silently coerces them.
-func IsValidThinkingLevel(level string) bool {
-	for _, candidate := range thinkingLevels {
-		if level == candidate {
-			return true
-		}
-	}
-
-	return false
 }

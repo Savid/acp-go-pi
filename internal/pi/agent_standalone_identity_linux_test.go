@@ -747,7 +747,13 @@ func TestAgentStandaloneAuthorityPathRejectsDeletedDescriptor(t *testing.T) {
 	require.ErrorContains(t, err, "deleted directory")
 }
 
-func TestAgentStandaloneOwnerlessMarkerRequiresLegacyAffinityLock(t *testing.T) {
+// TestAgentStandaloneOwnerlessMarkerRequiresItsPermanentAffinityLock pins the
+// coordination-inode rule: a durable marker whose owner is gone is only
+// readable as a real reservation while the permanent affinity lock naming its
+// owner digest still exists. Without that inode the marker names a reservation
+// nothing coordinates on, and the audit refuses the root rather than trusting
+// it.
+func TestAgentStandaloneOwnerlessMarkerRequiresItsPermanentAffinityLock(t *testing.T) {
 	directory := openAgentStandaloneTestDirectory(t)
 	ownerUID, ownerGID := agentStandaloneTestAuthorityIDs()
 	owners := createAgentStandaloneTestLock(t, directory, "owners.lock", ownerUID, ownerGID)

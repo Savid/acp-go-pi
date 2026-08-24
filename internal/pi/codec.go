@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -16,6 +17,10 @@ import (
 // payloads inside events), so the cap is generous; beyond it the stream is
 // considered broken.
 const maxLineBytes = 64 << 20
+
+// ErrJSONLStructural reports a malformed or non-LF-terminated native record.
+// It deliberately carries no record bytes or decoder detail.
+var ErrJSONLStructural = errors.New("pi jsonl stream structural error")
 
 // LineReader reads strict JSONL records: LF is the only record delimiter and
 // an optional trailing CR is stripped. It never splits on Unicode separators
@@ -29,8 +34,8 @@ func NewLineReader(r io.Reader) *LineReader {
 	return &LineReader{reader: bufio.NewReaderSize(r, 64<<10)}
 }
 
-// Next returns the next record without its delimiter. A final unterminated
-// record is returned with a nil error; the subsequent call returns io.EOF.
+// Next returns the next record without its delimiter. Any unterminated record
+// is a structural stream failure and is never returned as a record.
 func (l *LineReader) Next() ([]byte, error) {
 	var line []byte
 
@@ -39,7 +44,7 @@ func (l *LineReader) Next() ([]byte, error) {
 		line = append(line, chunk...)
 
 		if len(line) > maxLineBytes {
-			return nil, fmt.Errorf("jsonl record exceeds %d bytes", maxLineBytes)
+			return nil, ErrJSONLStructural
 		}
 
 		switch {
@@ -48,7 +53,7 @@ func (l *LineReader) Next() ([]byte, error) {
 		case err == bufio.ErrBufferFull:
 			continue
 		case err == io.EOF && len(line) > 0:
-			return trimRecord(line), nil
+			return nil, ErrJSONLStructural
 		default:
 			return nil, err
 		}

@@ -49,8 +49,8 @@ type PiOptions struct {
 	// OutputSchema requests JSON Schema structured output. pi has no native
 	// structured-output surface, so setting it fails closed at session start.
 	OutputSchema map[string]any `json:"outputSchema,omitempty"`
-	// ThinkingLevel selects the pi reasoning level for this session:
-	// off, minimal, low, medium, high, xhigh, or max.
+	// ThinkingLevel is a non-empty reasoning-level value passed unchanged to
+	// pi. The advertised levels are a host menu, not a whitelist.
 	ThinkingLevel string `json:"thinkingLevel,omitempty"`
 	// Permission selects the adapter permission mode for this session:
 	// "ask" (deny-by-default dialog, the default) or "allow" (auto-allow).
@@ -106,6 +106,12 @@ func (options PiOptions) Meta() map[string]any {
 // namespaces are ignored.
 func piOptionsFromMeta(meta map[string]any) (PiOptions, error) {
 	options := PiOptions{}
+
+	// The session lifecycle extension rides no session lifecycle request: the
+	// family literal is never a foreign namespace here and never a no-op.
+	if refusal := refuseLifecycleMeta(meta); refusal != nil {
+		return PiOptions{}, refusal
+	}
 
 	piMeta, ok := meta[piMetaKey].(map[string]any)
 	if !ok {
@@ -211,8 +217,15 @@ func parsePiOptions(value any) (PiOptions, error) {
 
 			options.OutputSchema = cloneAnyMap(schema)
 		case metaThinkingLevelKey:
+			// Absence and presence-with-nothing are different requests, and
+			// only this arm can tell them apart: an absent key states no
+			// selection and the session takes whatever pi starts on, while a
+			// key that arrived states one and names none. Empty is the empty
+			// string exactly — whitespace names a level this adapter does not
+			// judge, so it travels and the level pi reports back is what the
+			// session advertises.
 			level, ok := item.(string)
-			if !ok {
+			if !ok || level == "" {
 				return PiOptions{}, unsupportedField(metaOptionPath(key))
 			}
 
@@ -248,10 +261,6 @@ func validatePiOptions(options PiOptions) (PiOptions, error) {
 		if _, err := pi.ParseModelRef(options.Model); err != nil {
 			return PiOptions{}, unsupportedField(metaOptionPath(metaModelKey))
 		}
-	}
-
-	if options.ThinkingLevel != "" && !pi.IsValidThinkingLevel(options.ThinkingLevel) {
-		return PiOptions{}, unsupportedField(metaOptionPath(metaThinkingLevelKey))
 	}
 
 	if options.Permission != "" && options.Permission != pi.PermissionModeAsk && options.Permission != pi.PermissionModeAllow {

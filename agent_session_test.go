@@ -15,31 +15,138 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
+type closeOnErrContext struct {
+	context.Context //nolint:containedctx // The test wrapper deliberately intercepts Err at an exact admission edge.
+	onErr           func()
+	returnErr       func() error
+}
+
+type commandCatalogFailClient struct {
+	*directAgentClient
+	want error
+}
+
+func (c *commandCatalogFailClient) SessionUpdate(ctx context.Context, notification acp.SessionNotification) error {
+	if notification.Update.AvailableCommandsUpdate != nil {
+		return c.want
+	}
+
+	return c.directAgentClient.SessionUpdate(ctx, notification)
+}
+
+func (c *closeOnErrContext) Err() error {
+	if c.onErr != nil {
+		c.onErr()
+	}
+
+	if c.returnErr != nil {
+		return c.returnErr()
+	}
+
+	return nil
+}
+
 func TestStoreStartedSessionCloseErrorBranches(t *testing.T) {
 	closedAgent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	closedAgent.closed = true
-	rejected := &agentSession{agent: closedAgent, id: "rejected", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
+	rejected := attachTestNativeBoundary(&agentSession{agent: closedAgent, id: "rejected", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)})
 	require.ErrorIs(t, closedAgent.storeStartedSession(t.Context(), rejected), errAgentClosed)
 
 	fullAgent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))
 	fullAgent.sessions["filler"] = &agentSession{agent: fullAgent, id: "filler", turn: make(chan struct{}, sessionTurnCapacity)}
-	backpressured := &agentSession{agent: fullAgent, id: "backpressured", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
+	backpressured := attachTestNativeBoundary(&agentSession{agent: fullAgent, id: "backpressured", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)})
 	requireInvalidRequest(t, fullAgent.storeStartedSession(t.Context(), backpressured))
 
 	replaceAgent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	replaceAgent.sessions["shared"] = &agentSession{agent: replaceAgent, id: "shared", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
+	replaceAgent.sessions["shared"] = attachTestNativeBoundary(&agentSession{agent: replaceAgent, id: "shared", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)})
 	replacement := &agentSession{agent: replaceAgent, id: "shared", turn: make(chan struct{}, sessionTurnCapacity)}
 	require.NoError(t, replaceAgent.storeStartedSession(t.Context(), replacement))
 }
 
 func TestRemoveSessionCloseError(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	session := &agentSession{agent: agent, id: "id", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)}
-	agent.removeSession(t.Context(), "unmapped", session)
+	session := attachTestNativeBoundary(&agentSession{agent: agent, id: "id", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)})
+	require.Error(t, agent.removeSession(t.Context(), "unmapped", session))
+}
+
+func TestContainmentIncompleteInstallAndRemovalOwnersSurviveUntilAgentClose(t *testing.T) {
+	newIncomplete := func(agent *Agent, id acp.SessionId) (*agentSession, *stubProcess) {
+		process := newStubProcess(false)
+		process.close = pi.ErrProcessContainmentIncomplete
+
+		return attachTestNativeBoundary(&agentSession{
+			agent:       agent,
+			id:          id,
+			proc:        process,
+			turn:        make(chan struct{}, sessionTurnCapacity),
+			sessionRoot: t.TempDir(),
+		}), process
+	}
+	requireRetained := func(t *testing.T, agent *Agent, session *agentSession) {
+		t.Helper()
+		agent.mu.Lock()
+		_, retained := agent.retainedSessions[session]
+		agent.mu.Unlock()
+		require.True(t, retained, "the exact incomplete session lost addressable ownership")
+	}
+
+	t.Run("rejected install", func(t *testing.T) {
+		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+		session, process := newIncomplete(agent, "rejected")
+		agent.deleted[session.id] = struct{}{}
+
+		err := agent.storeStartedSession(t.Context(), session)
+		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+		requireRetained(t, agent, session)
+		require.Equal(t, 1, process.closeCalls)
+
+		require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+		requireRetained(t, agent, session)
+		require.Equal(t, 1, process.closeCalls, "Agent.Close reran rather than joined the immutable close")
+	})
+
+	t.Run("replaced install", func(t *testing.T) {
+		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+		previous, previousProcess := newIncomplete(agent, "shared")
+		replacementProcess := newStubProcess(false)
+		replacement := &agentSession{
+			agent: agent, id: "shared", proc: replacementProcess, turn: make(chan struct{}, sessionTurnCapacity),
+			sessionRoot: t.TempDir(),
+		}
+		attachTestNativeBoundary(replacement)
+		agent.sessions[previous.id] = previous
+
+		require.ErrorIs(t, agent.storeStartedSession(t.Context(), replacement), pi.ErrProcessContainmentIncomplete)
+		requireRetained(t, agent, previous)
+		require.Same(t, replacement, agent.sessions["shared"])
+
+		require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+		requireRetained(t, agent, previous)
+		require.Equal(t, 1, previousProcess.closeCalls)
+		require.Equal(t, 1, replacementProcess.closeCalls)
+	})
+
+	for _, path := range []string{"replay cleanup", "removal cleanup"} {
+		t.Run(path, func(t *testing.T) {
+			agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+			session, process := newIncomplete(agent, acp.SessionId(path))
+			agent.sessions[session.id] = session
+
+			require.ErrorIs(t, agent.removeSession(t.Context(), session.id, session), pi.ErrProcessContainmentIncomplete)
+			requireRetained(t, agent, session)
+			require.NotContains(t, agent.sessions, session.id)
+
+			require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+			requireRetained(t, agent, session)
+			require.Equal(t, 1, process.closeCalls)
+		})
+	}
 }
 
 // TestSameSessionIDKeepsOneLinearizedOwner proves the close-versus-same-id
@@ -51,6 +158,7 @@ func TestSameSessionIDKeepsOneLinearizedOwner(t *testing.T) {
 	superseded := &agentSession{
 		agent: agent, id: "id", proc: newStubProcess(false), sessionRoot: t.TempDir(),
 	}
+	attachTestNativeBoundary(superseded)
 
 	agent.mu.Lock()
 	agent.sessions[superseded.id] = superseded
@@ -59,6 +167,7 @@ func TestSameSessionIDKeepsOneLinearizedOwner(t *testing.T) {
 	replacement := &agentSession{
 		agent: agent, id: "id", proc: newStubProcess(false), sessionRoot: t.TempDir(),
 	}
+	attachTestNativeBoundary(replacement)
 	require.NoError(t, agent.storeStartedSession(t.Context(), replacement))
 
 	supersededProcess, ok := superseded.proc.(*stubProcess)
@@ -70,7 +179,7 @@ func TestSameSessionIDKeepsOneLinearizedOwner(t *testing.T) {
 	agent.mu.Unlock()
 
 	require.False(t, agent.detachSession("id", superseded))
-	agent.removeSession(t.Context(), "id", superseded)
+	require.NoError(t, agent.removeSession(t.Context(), "id", superseded))
 
 	agent.mu.Lock()
 	require.Same(t, replacement, agent.sessions["id"], "a superseded closer evicted the replacement")
@@ -89,6 +198,49 @@ func TestSameSessionIDKeepsOneLinearizedOwner(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, 1, replacementProcess.closeCalls)
 	require.Empty(t, replacement.turn, "close left the replacement's turn admission unbalanced")
+}
+
+func TestFailedCloseRetainsOneImmutableResult(t *testing.T) {
+	refused := errors.New("durability unavailable")
+	// The commit exhausts its own retries before the close reports the refusal.
+	store := &appendControlledStore{SessionStore: NewInMemorySessionStore(), failures: len(mirrorAppendDelays), err: refused}
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+	agent.conn = newDirectAgentClient()
+
+	session := &agentSession{
+		agent:       agent,
+		id:          "retained",
+		proc:        newStubProcess(false),
+		sessionRoot: t.TempDir(),
+		turn:        make(chan struct{}, sessionTurnCapacity),
+	}
+	attachTestNativeBoundary(session)
+	agent.sessions[session.id] = session
+
+	t.Cleanup(func() { _ = agent.Close() })
+
+	_, err := agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: session.id})
+	require.ErrorIs(t, err, refused)
+
+	resolved, err := agent.session(session.id)
+	require.NoError(t, err, "a failed close lost the id carrying its immutable result")
+	require.Same(t, session, resolved)
+
+	_, err = agent.Prompt(t.Context(), acp.PromptRequest{SessionId: session.id})
+	requireInvalidParams(t, err)
+	require.Equal(t, len(mirrorAppendDelays), store.calls, "a prompt slipped in behind the close and drove the session")
+
+	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: session.id})
+	require.ErrorIs(t, err, refused)
+	require.Equal(t, len(mirrorAppendDelays), store.calls, "a second close re-ran an immutable teardown")
+
+	journal, err := store.Load(t.Context(), SessionKey{SessionID: string(session.id), Subpath: SessionStoreLifecycleSubpath})
+	require.NoError(t, err)
+	require.Empty(t, journal)
+
+	agent.mu.Lock()
+	require.Contains(t, agent.sessions, session.id)
+	agent.mu.Unlock()
 }
 
 func TestNewSessionBackpressure(t *testing.T) {
@@ -127,6 +279,7 @@ func TestRestoreSessionAdditionalBranches(t *testing.T) {
 	newStore := func() SessionStore {
 		store := NewInMemorySessionStore()
 		require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: "resume-id"}, entries))
+		appendLifecycleBoundaryForRows(t, store, "resume-id", len(entries))
 
 		return store
 	}
@@ -162,6 +315,7 @@ func TestResumeSessionPublishesTerminalNativeIdentityWithoutHistory(t *testing.T
 	}
 	store := NewInMemorySessionStore()
 	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: "resume-id"}, entries))
+	appendLifecycleBoundaryForRows(t, store, "resume-id", len(entries))
 
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "resume-id"}
@@ -172,10 +326,15 @@ func TestResumeSessionPublishesTerminalNativeIdentityWithoutHistory(t *testing.T
 
 	_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest("resume-id", "/cwd"))
 	require.NoError(t, err)
-	require.Len(t, connection.notifications, 1)
+	require.Len(t, connection.notifications, 2)
 	require.NotNil(t, connection.notifications[0].Update.SessionInfoUpdate)
 	require.Equal(t, messageID,
 		anyMap(t, connection.notifications[0].Meta[piMetaKey])[jsonFieldMessageID])
+
+	// The establishing snapshot is an answer rather than a silence: a session
+	// whose harness discovered no commands says so explicitly.
+	require.NotNil(t, connection.notifications[1].Update.AvailableCommandsUpdate)
+	require.Empty(t, connection.notifications[1].Update.AvailableCommandsUpdate.AvailableCommands)
 
 	connection.updateErr = errors.New("identity")
 	_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("resume-id", "/cwd"))
@@ -193,6 +352,45 @@ func TestResumeSessionPublishesTerminalNativeIdentityWithoutHistory(t *testing.T
 	require.NotContains(t, failingAgent.sessions, acp.SessionId("resume-id"))
 }
 
+func TestEstablishingMethodsFailClosedWhenOpeningCatalogIsRejected(t *testing.T) {
+	want := errors.New("opening catalog rejected")
+	entries := []SessionStoreEntry{
+		json.RawMessage(`{"type":"session","id":"resume-open","cwd":"/cwd"}`),
+		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`[{"type":"text","text":"hi"}]`)}),
+	}
+	newStore := func() SessionStore {
+		store := NewInMemorySessionStore()
+		require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: "resume-open"}, entries))
+		appendLifecycleBoundaryForRows(t, store, "resume-open", len(entries))
+
+		return store
+	}
+
+	for _, method := range []string{"new", "resume", "load"} {
+		t.Run(method, func(t *testing.T) {
+			client := newStubPiClient()
+			client.state = pi.SessionState{SessionID: "resume-open"}
+			opts := []Option{}
+			if method != "new" {
+				opts = append(opts, WithSessionStore(newStore()))
+			}
+			agent := newStubClientAgent(t, client, opts...)
+			agent.setConnection(&commandCatalogFailClient{directAgentClient: newDirectAgentClient(), want: want})
+
+			var err error
+			switch method {
+			case "new":
+				_, err = agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+			case "resume":
+				_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest("resume-open", "/cwd"))
+			case "load":
+				_, err = agent.LoadSession(t.Context(), LoadSessionRequest("resume-open", "/cwd"))
+			}
+			require.ErrorIs(t, err, want)
+		})
+	}
+}
+
 func TestLoadSessionRemovesStartedSessionOnReplayFailure(t *testing.T) {
 	entries := []SessionStoreEntry{
 		json.RawMessage(`{"type":"session","id":"resume-load","cwd":"/cwd"}`),
@@ -200,17 +398,38 @@ func TestLoadSessionRemovesStartedSessionOnReplayFailure(t *testing.T) {
 	}
 	store := NewInMemorySessionStore()
 	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: "resume-load"}, entries))
+	appendLifecycleBoundaryForRows(t, store, "resume-load", len(entries))
 
 	client := newStubPiClient()
 	client.state = pi.SessionState{SessionID: "resume-load"}
 	agent := newStubClientAgent(t, client, WithSessionStore(store))
+	process := newStubProcess(false)
+	process.close = pi.ErrProcessContainmentIncomplete
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		return process, client, nil
+	}
 	connection := newDirectAgentClient()
 	connection.updateErr = errors.New("replay")
 	agent.setConnection(connection)
 
 	_, err := agent.LoadSession(t.Context(), LoadSessionRequest("resume-load", "/cwd"))
-	require.Error(t, err)
+	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
 	require.NotContains(t, agent.sessions, acp.SessionId("resume-load"))
+	agent.mu.Lock()
+	require.Len(t, agent.retainedSessions, 1)
+	var retained *agentSession
+	for session := range agent.retainedSessions {
+		retained = session
+	}
+	agent.mu.Unlock()
+	require.Same(t, process, retained.proc)
+	require.Equal(t, 1, process.closeCalls)
+	require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+	agent.mu.Lock()
+	_, stillRetained := agent.retainedSessions[retained]
+	agent.mu.Unlock()
+	require.True(t, stillRetained, "memoized Agent.Close erased replay quarantine")
+	require.Equal(t, 1, process.closeCalls, "Agent.Close did not join the replay cleanup's immutable result")
 }
 
 func TestListSessionsFilterAndDedupBranches(t *testing.T) {
@@ -276,6 +495,267 @@ func TestStartSessionEarlyFailureBranches(t *testing.T) {
 	badScratch.versionChecked = true
 	_, err = badScratch.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	require.Error(t, err)
+}
+
+func TestSessionConstructionPanicAndOwnershipHelperEdges(t *testing.T) {
+	originalMkdirTemp := materializeMkdirTemp
+	t.Cleanup(func() { materializeMkdirTemp = originalMkdirTemp })
+	materializeMkdirTemp = func(string, string) (string, error) { panic("constructor panic") }
+	agent := newStubClientAgent(t, nil)
+	agent.versionChecked = true
+	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	require.ErrorContains(t, err, "construction callback panicked")
+
+	bare := &Agent{retainedSessions: nil}
+	session := &agentSession{id: "retained"}
+	bare.retainIncompleteSession(session, errors.New("retain"))
+	require.Contains(t, bare.retainedSessions, session)
+
+	bare = &Agent{constructions: make(map[*nativeConstruction]struct{})}
+	owner := &nativeConstruction{done: make(chan struct{}), nativeBoundary: newNativeBoundaryTracker()}
+	bare.constructions[owner] = struct{}{}
+	closed, transferred := bare.transferConstructionToSession(owner, session)
+	require.False(t, closed)
+	require.True(t, transferred)
+	require.Contains(t, bare.retainedSessions, session)
+}
+
+func TestRestoreActiveSessionReleasesGateOnStoreFailure(t *testing.T) {
+	store := newFaultySessionStore()
+	store.loadErr = errors.New("load active prefix")
+	agent := NewAgent(WithSessionStore(store), WithLogger(slog.New(slog.DiscardHandler)))
+	session := &agentSession{agent: agent, id: "active", outbox: newTestSessionOutbox(1)}
+	_, err := agent.restoreActiveSession(t.Context(), session.id, session)
+	require.ErrorIs(t, err, store.loadErr)
+	release, err := session.beginRestore(t.Context())
+	require.NoError(t, err, "failed load retained the restore gate")
+	release()
+}
+
+func TestStartSessionStartupGateFailureMatrix(t *testing.T) {
+	type testCase struct {
+		name  string
+		setup func(*Agent, *stubPiClient, *context.Context)
+	}
+	tests := []testCase{
+		{
+			name: "discovery readiness observer panics",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceDiscovery && stage == RuntimeStartupReadiness {
+						panic("readiness observer")
+					}
+				}
+			},
+		},
+		{
+			name: "close wins after discovery readiness",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceDiscovery && stage == RuntimeStartupReadiness {
+						_, _ = agent.beginClose()
+					}
+				}
+			},
+		},
+		{
+			name: "close wins after scratch reservation",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ReserveScratchRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					_, _ = agent.beginClose()
+
+					return func() {}, nil
+				}
+			},
+		},
+		{
+			name: "configuration observer panics",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceSession && stage == RuntimeStartupConfiguration {
+						panic("configuration observer")
+					}
+				}
+			},
+		},
+		{
+			name: "close wins after configuration observer",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceSession && stage == RuntimeStartupConfiguration {
+						_, _ = agent.beginClose()
+					}
+				}
+			},
+		},
+		{
+			name: "close wins after native root acquisition",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					_, _ = agent.beginClose()
+
+					return func() {}, nil
+				}
+			},
+		},
+		{
+			name: "context cancels after native root acquisition",
+			setup: func(agent *Agent, _ *stubPiClient, ctx *context.Context) {
+				armed := false
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					armed = true
+
+					return func() {}, nil
+				}
+				*ctx = &closeOnErrContext{Context: *ctx, returnErr: func() error {
+					if armed {
+						return context.Canceled
+					}
+
+					return nil
+				}}
+			},
+		},
+		{
+			name: "close wins during final context check",
+			setup: func(agent *Agent, _ *stubPiClient, ctx *context.Context) {
+				armed := false
+				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
+					armed = true
+
+					return func() {}, nil
+				}
+				*ctx = &closeOnErrContext{Context: *ctx, onErr: func() {
+					if armed {
+						_, _ = agent.beginClose()
+					}
+				}}
+			},
+		},
+		{
+			name: "close wins during client start",
+			setup: func(agent *Agent, client *stubPiClient, _ *context.Context) {
+				client.startFunc = func(context.Context) error {
+					_, _ = agent.beginClose()
+
+					return nil
+				}
+			},
+		},
+		{
+			name: "native readiness observer panics",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceSession && stage == RuntimeStartupReadiness {
+						panic("native readiness observer")
+					}
+				}
+			},
+		},
+		{
+			name: "immutable construction refuses final transfer",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind != RuntimeResourceSession || stage != RuntimeStartupSession {
+						return
+					}
+					agent.mu.Lock()
+					for owner := range agent.constructions {
+						owner.immutable = true
+						owner.err = errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("waiter quarantine"))
+					}
+					agent.mu.Unlock()
+				}
+			},
+		},
+		{
+			name: "missing tracker refuses pump publication",
+			setup: func(agent *Agent, client *stubPiClient, _ *context.Context) {
+				client.startFunc = func(context.Context) error {
+					agent.mu.Lock()
+					for owner := range agent.constructions {
+						owner.nativeBoundary = nil
+					}
+					agent.mu.Unlock()
+
+					return nil
+				}
+			},
+		},
+		{
+			name: "session observer panics",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceSession && stage == RuntimeStartupSession {
+						panic("session observer")
+					}
+				}
+			},
+		},
+		{
+			name: "close wins during session observer",
+			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
+				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
+					if kind == RuntimeResourceSession && stage == RuntimeStartupSession {
+						_, _ = agent.beginClose()
+					}
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := newStubPiClient()
+			client.state = pi.SessionState{SessionID: "startup-gate"}
+			agent := newStubClientAgent(t, client)
+			agent.versionChecked = true
+			ctx := t.Context()
+			test.setup(agent, client, &ctx)
+			_, err := agent.startSession(ctx, sessionStart{Cwd: "/cwd"})
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestStartSessionPostTransferObservationFailures(t *testing.T) {
+	originalTimeout := sessionSettleTimeout
+	t.Cleanup(func() { sessionSettleTimeout = originalTimeout })
+
+	t.Run("bounded process observation", func(t *testing.T) {
+		sessionSettleTimeout = originalTimeout
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "observed"}
+		agent := newStubClientAgent(t, client, WithRuntimeResourceHooks(RuntimeResourceHooks{
+			ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) { panic("observer") },
+		}))
+		agent.versionChecked = true
+		process := inventoryPiProcess{stubProcess: newStubProcess(false), count: 1}
+		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+			return process, client, nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	})
+
+	t.Run("close reenters process observation", func(t *testing.T) {
+		sessionSettleTimeout = originalTimeout
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "observed-close"}
+		var agent *Agent
+		agent = newStubClientAgent(t, client, WithRuntimeResourceHooks(RuntimeResourceHooks{
+			ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) {
+				_, _ = agent.beginClose()
+			},
+		}))
+		agent.versionChecked = true
+		process := inventoryPiProcess{stubProcess: newStubProcess(false), count: 1}
+		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+			return process, client, nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
 }
 
 func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
@@ -505,6 +985,42 @@ func TestStartSessionManagedModelAndSetupFailure(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestNewSessionPassesThinkingLevelThroughToNative pins both halves of the
+// establishment door: the level named in `_meta.pi.options` travels to pi
+// unchanged, and the session advertises the level pi reports afterwards — the
+// one it retained when it acknowledged the request without adopting it.
+func TestNewSessionPassesThinkingLevelThroughToNative(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		requested string
+		effective string
+	}{
+		{name: "unapplied value leaves the retained level advertised", requested: "registry-unknown", effective: pi.ThinkingLevelOff},
+		{name: "whitespace is a value pi does not know, not an empty one", requested: " high ", effective: pi.ThinkingLevelOff},
+		{name: "an adopted value is advertised because pi reports it", requested: pi.ThinkingLevelMax, effective: pi.ThinkingLevelMax},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newStubPiClient()
+			client.state = pi.SessionState{SessionID: "id", SessionFile: "/session", ThinkingLevel: pi.ThinkingLevelOff}
+			var sent string
+			client.thinkingFunc = func(value string) { sent = value }
+			agent := newStubClientAgent(t, client)
+
+			response, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd",
+				WithSessionPiOptions(NewPiOptions(WithPiThinkingLevel(test.requested)))))
+			require.NoError(t, err)
+			require.Equal(t, test.requested, sent, "the value still travels to pi unchanged")
+			require.Len(t, response.ConfigOptions, 1)
+			require.NotNil(t, response.ConfigOptions[0].Select)
+			require.Equal(t, acp.SessionConfigValueId(test.effective), response.ConfigOptions[0].Select.CurrentValue)
+			require.Len(t, *response.ConfigOptions[0].Select.Options.Ungrouped, len(pi.ThinkingLevels()))
+
+			_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: response.SessionId})
+			require.NoError(t, err)
+		})
+	}
+}
+
 func TestSetUpNativeSessionForkCommitMirrorFailure(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := newStubPiClient()
@@ -539,8 +1055,8 @@ func TestSessionInfoAndAgentBookkeeping(t *testing.T) {
 	err := agent.storeStartedSession(t.Context(), other)
 	requireInvalidRequest(t, err)
 	require.NoError(t, agent.storeStartedSession(t.Context(), session))
-	agent.removeSession(t.Context(), "missing", nil)
-	agent.removeSession(t.Context(), "id", session)
+	require.NoError(t, agent.removeSession(t.Context(), "missing", nil))
+	require.NoError(t, agent.removeSession(t.Context(), "id", session))
 	require.Nil(t, agent.sessions["id"])
 
 	agent.closed = true
@@ -606,6 +1122,14 @@ func TestNativeSessionSetupBranches(t *testing.T) {
 		}
 		require.Error(t, agent.setUpNativeSession(t.Context(), newSession(client), start, pi.ModelRef{}, false))
 	}
+
+	// A set whose effective level cannot be read back fails the start rather
+	// than establishing a session that advertises a level pi never confirmed.
+	client = baseClient()
+	client.stateErr = errors.New("read back")
+	client.stateErrAfter = 1
+	require.Error(t, agent.setUpNativeSession(t.Context(), newSession(client),
+		sessionStart{MetaOptions: PiOptions{ThinkingLevel: "high"}}, pi.ModelRef{}, false))
 
 	client = baseClient()
 	client.state.SessionID = "different"
@@ -818,16 +1342,19 @@ func TestRestoreActiveAndCleanupBranches(t *testing.T) {
 		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`[{"type":"text","text":"history"}]`)}),
 	}
 	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: string(id)}, entries))
+	appendLifecycleBoundaryForRows(t, store, string(id), len(entries))
 	agent := NewAgent(WithSessionStore(store), WithLogger(slog.New(slog.DiscardHandler)))
 	start := sessionStart{Cwd: "/cwd", ResumeID: string(id)}
 	active := &agentSession{agent: agent, id: id, cwd: "/cwd", fingerprint: sessionStartFingerprint(start), turn: make(chan struct{}, 1)}
 	agent.sessions[id] = active
 
-	session, loaded, started, err := agent.restoreSession(t.Context(), id, start, nil)
+	restored, err := agent.restoreSession(t.Context(), id, start, nil)
 	require.NoError(t, err)
-	require.Same(t, active, session)
-	require.Equal(t, entries, loaded)
-	require.False(t, started)
+	require.Same(t, active, restored.session)
+	require.Equal(t, entries, restored.entries)
+	require.False(t, restored.started)
+
+	restored.finish()
 
 	connection := newDirectAgentClient()
 	connection.updateErr = errors.New("replay")
@@ -841,7 +1368,7 @@ func TestRestoreActiveAndCleanupBranches(t *testing.T) {
 	active.proc = process
 	_, err = agent.CloseSession(t.Context(), acp.CloseSessionRequest{SessionId: id})
 	require.Error(t, err)
-	require.NotContains(t, agent.sessions, id)
+	require.Contains(t, agent.sessions, id, "a failed close orphaned the session it did not finish")
 
 	cleanup := &agentSession{agent: agent, id: id, proc: process, turn: make(chan struct{}, 1)}
 	agent.sessions[id] = cleanup
@@ -1151,4 +1678,502 @@ func TestConcurrentSessionsUnderOneHomeKeepTheirOwnModel(t *testing.T) {
 		require.Equal(t, test.model, session.currentModel(),
 			"session %s did not keep its own model", test.cwd)
 	}
+}
+
+// newPartialDeleteAgent stages a session whose first teardown fails, so a
+// delete tombstones and hides the id and then leaves its cleanup unfinished.
+func newPartialDeleteAgent(t *testing.T, refused error) (*Agent, *stubProcess, acp.SessionId) {
+	t.Helper()
+
+	store := NewInMemorySessionStore()
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+	agent.conn = newDirectAgentClient()
+
+	id := acp.SessionId(validSessionUUID)
+	require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: string(id)},
+		[]SessionStoreEntry{json.RawMessage(`{"type":"session","cwd":"/cwd"}`)}))
+
+	process := newStubProcess(false)
+	process.closeFunc = func() error {
+		if process.closeCalls == 1 {
+			return refused
+		}
+
+		return nil
+	}
+
+	agent.sessions[id] = attachTestNativeBoundary(&agentSession{
+		agent:       agent,
+		id:          id,
+		proc:        process,
+		sessionRoot: t.TempDir(),
+		turn:        make(chan struct{}, sessionTurnCapacity),
+	})
+
+	return agent, process, id
+}
+
+func TestFailedDeleteTeardownKeepsOneImmutableResult(t *testing.T) {
+	refused := errors.New("close the contained tree")
+	agent, process, id := newPartialDeleteAgent(t, refused)
+
+	t.Cleanup(func() { _ = agent.Close() })
+
+	_, err := agent.UnstableDeleteSession(t.Context(), DeleteSessionRequest(id))
+	require.ErrorIs(t, err, refused)
+	require.Equal(t, 1, process.closeCalls)
+
+	_, err = agent.LoadSession(t.Context(), LoadSessionRequest(id, "/cwd"))
+	requireInvalidParams(t, err)
+
+	listed, err := agent.ListSessions(t.Context(), ListSessionsRequest())
+	require.NoError(t, err)
+	require.Empty(t, listed.Sessions, "a tombstoned id stayed visible after its teardown failed")
+
+	_, err = agent.UnstableDeleteSession(t.Context(), DeleteSessionRequest(id))
+	require.ErrorIs(t, err, refused)
+	require.Equal(t, 1, process.closeCalls)
+
+	agent.mu.Lock()
+	require.Contains(t, agent.sessions, id)
+	agent.mu.Unlock()
+}
+
+func TestAgentCloseJoinsAPartiallyDeletedSessionResult(t *testing.T) {
+	refused := errors.New("close the contained tree")
+	agent, process, id := newPartialDeleteAgent(t, refused)
+
+	_, err := agent.UnstableDeleteSession(t.Context(), DeleteSessionRequest(id))
+	require.ErrorIs(t, err, refused)
+
+	agent.mu.Lock()
+	require.Contains(t, agent.sessions, id)
+	agent.mu.Unlock()
+
+	require.ErrorIs(t, agent.Close(), refused)
+	require.Equal(t, 1, process.closeCalls)
+}
+
+type settlementDeleteStore struct {
+	SessionStore
+	session *agentSession
+	deleted chan bool
+}
+
+func (s *settlementDeleteStore) Delete(ctx context.Context, key SessionKey) error {
+	s.session.commitMu.Lock()
+	fenced := s.session.persistFenced
+	s.session.commitMu.Unlock()
+	s.deleted <- fenced
+
+	return s.SessionStore.Delete(ctx, key)
+}
+
+// TestDeleteTombstonesBeforeItFencesOrWaitsForSettlement pins the fixed delete
+// order. The tombstone is the first rung: it reaches the store
+// while a settlement is still running and while the session's persistence is
+// still unfenced, because store tombstone finality — not a wait — is what stops
+// a commit in flight from recreating the row. Only then is the incarnation
+// fenced, and the settlement's own failure is reported after the tombstone is
+// durable and the id already hidden.
+func TestDeleteTombstonesBeforeItFencesOrWaitsForSettlement(t *testing.T) {
+	base := NewInMemorySessionStore()
+	store := &settlementDeleteStore{SessionStore: base, deleted: make(chan bool, 1)}
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+	session := &agentSession{
+		agent:       agent,
+		id:          "id",
+		proc:        newStubProcess(false),
+		sessionRoot: t.TempDir(),
+	}
+	attachTestNativeBoundary(session)
+	agent.sessions["id"] = session
+	session.openSettlement()
+	store.session = session
+
+	settleErr := errors.New("settlement commit failed")
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := agent.UnstableDeleteSession(context.Background(), acp.UnstableDeleteSessionRequest{SessionId: "id"})
+		done <- err
+	}()
+
+	// The tombstone lands with the settlement still open and the session still
+	// unfenced: nothing about the delete waits on the turn it is deleting.
+	require.False(t, <-store.deleted, "the tombstone is written before the fence, not after it")
+
+	session.mu.Lock()
+	settlement := session.settlement
+	session.mu.Unlock()
+	<-settlement.waiting
+
+	require.True(t, agent.isDeleted("id"), "the id is hidden from the moment the tombstone lands")
+
+	session.commitMu.Lock()
+	fenced := session.persistFenced
+	session.commitMu.Unlock()
+	require.True(t, fenced, "the durable tombstone ends the incarnation with it")
+
+	session.completeSettlement(settleErr)
+
+	require.ErrorIs(t, <-done, settleErr, "partial cleanup is reported after the tombstone is durable")
+	require.Contains(t, agent.sessions, acp.SessionId("id"),
+		"the hidden id retains the exact immutable close owner")
+}
+
+// TestDeleteNeverWedgesBehindALivePrompt pins the reason the tombstone comes
+// first. The close-and-cancel rung is what ends a live turn, and it runs after
+// the tombstone: a delete issued during a live prompt cancels that prompt rather
+// than waiting for it. With TurnTimeout defaulting to zero, a delete that waited
+// first would have nothing inside the wrapper to bound it.
+func TestDeleteNeverWedgesBehindALivePrompt(t *testing.T) {
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: "wedge-id"}
+	agent := newStubClientAgent(t, client)
+	agent.setConnection(newDirectAgentClient())
+
+	response, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+	require.NoError(t, err)
+
+	session, err := agent.session(response.SessionId)
+	require.NoError(t, err)
+
+	promptDone := make(chan struct{})
+
+	go func() {
+		defer close(promptDone)
+
+		_, _ = agent.Prompt(context.Background(), acp.PromptRequest{
+			SessionId: response.SessionId,
+			Prompt:    []acp.ContentBlock{acp.TextBlock("hi")},
+			Meta:      map[string]any{routeMetaKey: map[string]any{routeFieldVer: 1, routeFieldTurn: "n1"}},
+		})
+	}()
+
+	require.Eventually(t, func() bool {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+
+		return session.settlement != nil
+	}, 5*time.Second, time.Millisecond, "the turn armed its settlement latch")
+
+	deleted := make(chan error, 1)
+
+	go func() {
+		_, delErr := agent.UnstableDeleteSession(context.Background(),
+			acp.UnstableDeleteSessionRequest{SessionId: response.SessionId})
+		deleted <- delErr
+	}()
+
+	select {
+	case <-deleted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("delete wedged behind the live prompt it never cancelled")
+	}
+
+	<-promptDone
+
+	require.True(t, agent.isDeleted(response.SessionId))
+	require.NotContains(t, agent.sessions, response.SessionId)
+}
+
+// refusingDeleteStore refuses the tombstone write and serves every other
+// operation from the store it wraps.
+type refusingDeleteStore struct {
+	SessionStore
+	deleteErr error
+}
+
+func (s *refusingDeleteStore) Delete(ctx context.Context, key SessionKey) error {
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+
+	return s.SessionStore.Delete(ctx, key)
+}
+
+// TestRefusedDeleteLeavesTheSessionTheHostsAndUnfenced pins the delete that did
+// not tombstone: it changes nothing. The session stays in the active map, stays
+// listed, stays promptable, and — the part that is not merely cosmetic — keeps
+// its persistence unfenced, so every later commit it makes is durable rather
+// than silently dropped behind a success the wrapper reported anyway. A caller
+// that cancels its own delete request is the same case: the tombstone write is
+// caller-context-bound, so it is refused, and refusing changes nothing.
+func TestRefusedDeleteLeavesTheSessionTheHostsAndUnfenced(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		request func(*Agent, *refusingDeleteStore) error
+	}{
+		{
+			name: "the store refuses the tombstone",
+			request: func(agent *Agent, store *refusingDeleteStore) error {
+				store.deleteErr = errors.New("store refused the tombstone")
+
+				_, err := agent.UnstableDeleteSession(context.Background(),
+					acp.UnstableDeleteSessionRequest{SessionId: "id"})
+
+				return err
+			},
+		},
+		{
+			name: "the caller cancels its own delete",
+			request: func(agent *Agent, _ *refusingDeleteStore) error {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+
+				_, err := agent.UnstableDeleteSession(ctx,
+					acp.UnstableDeleteSessionRequest{SessionId: "id"})
+
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := NewInMemorySessionStore()
+			store := &refusingDeleteStore{SessionStore: base}
+			agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+
+			root := t.TempDir()
+			sessionFile := filepath.Join(root, "session.jsonl")
+			require.NoError(t, os.WriteFile(sessionFile, []byte("{\"row\":1}\n"), 0o600))
+
+			session := &agentSession{
+				agent:           agent,
+				id:              "id",
+				proc:            newStubProcess(false),
+				sessionRoot:     root,
+				sessionFilePath: sessionFile,
+			}
+			agent.sessions["id"] = session
+
+			require.Error(t, test.request(agent, store), "a refused tombstone fails the delete")
+
+			// The session is still the host's.
+			require.Contains(t, agent.sessions, acp.SessionId("id"))
+			require.False(t, agent.isDeleted("id"))
+
+			resolved, sessErr := agent.session("id")
+			require.NoError(t, sessErr)
+			require.Same(t, session, resolved)
+
+			listed, listErr := agent.ListSessions(context.Background(), acp.ListSessionsRequest{})
+			require.NoError(t, listErr)
+			require.Condition(t, func() bool {
+				for _, info := range listed.Sessions {
+					if info.SessionId == "id" {
+						return true
+					}
+				}
+
+				return false
+			}, "the refused delete leaves the id visible to list")
+
+			// And its persistence still works: a later commit is durable.
+			session.commitMu.Lock()
+			fenced := session.persistFenced
+			session.commitMu.Unlock()
+			require.False(t, fenced, "a delete that did not tombstone fences nothing")
+
+			require.NoError(t, session.commitMirror(context.Background()))
+			require.NoError(t, session.commitLifecycleBoundary(context.Background(), lifecycleBoundaryRecord{
+				StreamID:    "s",
+				NativeRows:  1,
+				NativeState: nativeStateCommitted,
+			}))
+
+			rows, loadErr := base.Load(context.Background(), SessionKey{SessionID: "id"})
+			require.NoError(t, loadErr)
+			require.NotEmpty(t, rows, "the live session's native rows are still committed")
+
+			journal, journalErr := base.Load(context.Background(),
+				SessionKey{SessionID: "id", Subpath: SessionStoreLifecycleSubpath})
+			require.NoError(t, journalErr)
+			require.NotEmpty(t, journal, "the live session's boundary records are still committed")
+		})
+	}
+}
+
+// gatedLoadStore blocks the first lifecycle-subpath Load after the underlying
+// read returns, which parks a restore inside its own preparation window.
+type gatedLoadStore struct {
+	SessionStore
+	gate    chan struct{}
+	release chan struct{}
+	armed   bool
+	mu      sync.Mutex
+}
+
+func (s *gatedLoadStore) Load(ctx context.Context, key SessionKey) ([]SessionStoreEntry, error) {
+	entries, err := s.SessionStore.Load(ctx, key)
+
+	s.mu.Lock()
+	armed := s.armed && key.Subpath == SessionStoreLifecycleSubpath
+	if armed {
+		s.armed = false
+	}
+	s.mu.Unlock()
+
+	if armed {
+		close(s.gate)
+		<-s.release
+	}
+
+	return entries, err
+}
+
+// TestResumeRacingDeleteResurrectsNothing pins the install re-check. A resume
+// that passed its entry check and prepared a whole replacement still loses to a
+// delete that completed while it was preparing: the tombstone is re-read under
+// the same lock that installs, the prepared replacement is torn down, the resume
+// answers unknown-session, and nothing — the active map, session/list,
+// session-scoped resolution, or a durable row — reports the id as alive again.
+func TestResumeRacingDeleteResurrectsNothing(t *testing.T) {
+	entries := []SessionStoreEntry{
+		json.RawMessage(`{"type":"session","id":"resume-id","cwd":"/cwd"}`),
+		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`[{"type":"text","text":"hi"}]`)}),
+	}
+	base := NewInMemorySessionStore()
+	require.NoError(t, base.Append(t.Context(), SessionKey{SessionID: "resume-id"}, entries))
+	appendLifecycleBoundaryForRows(t, base, "resume-id", len(entries))
+
+	store := &gatedLoadStore{
+		SessionStore: base,
+		gate:         make(chan struct{}),
+		release:      make(chan struct{}),
+		armed:        true,
+	}
+
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: "resume-id"}
+	agent := newStubClientAgent(t, client, WithSessionStore(store))
+	agent.setConnection(newDirectAgentClient())
+
+	resumed := make(chan error, 1)
+
+	go func() {
+		_, err := agent.ResumeSession(context.Background(), ResumeSessionRequest("resume-id", "/cwd"))
+		resumed <- err
+	}()
+
+	<-store.gate
+
+	_, delErr := agent.UnstableDeleteSession(context.Background(),
+		acp.UnstableDeleteSessionRequest{SessionId: "resume-id"})
+	require.NoError(t, delErr, "the delete completes while the resume is mid-flight")
+	require.True(t, agent.isDeleted("resume-id"))
+
+	close(store.release)
+
+	requireUnknownSession(t, <-resumed)
+
+	agent.mu.Lock()
+	installed := agent.sessions["resume-id"]
+	agent.mu.Unlock()
+	require.Nil(t, installed, "no live session is installed under a tombstoned id")
+
+	_, sessErr := agent.session("resume-id")
+	requireUnknownSession(t, sessErr)
+
+	listed, listErr := agent.ListSessions(context.Background(), acp.ListSessionsRequest{})
+	require.NoError(t, listErr)
+
+	for _, info := range listed.Sessions {
+		require.NotEqual(t, acp.SessionId("resume-id"), info.SessionId, "a deleted id is invisible to list")
+	}
+
+	rows, loadErr := base.Load(context.Background(), SessionKey{SessionID: "resume-id"})
+	require.NoError(t, loadErr)
+	require.Empty(t, rows, "no durable row survives under the deleted key")
+}
+
+// TestInstallUnderATombstoneTearsDownThePreparedReplacement pins the
+// install-lock verdict directly, without the timing the race above needs: a
+// fully prepared session offered for an id a delete already tombstoned is closed
+// rather than installed, and the deletion marker is not cleared by the attempt.
+func TestInstallUnderATombstoneTearsDownThePreparedReplacement(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+
+	agent.mu.Lock()
+	agent.deleted["gone"] = struct{}{}
+	agent.mu.Unlock()
+
+	proc := newStubProcess(false)
+	prepared := &agentSession{agent: agent, id: "gone", proc: proc, sessionRoot: t.TempDir()}
+	attachTestNativeBoundary(prepared)
+
+	requireUnknownSession(t, agent.storeStartedSession(t.Context(), prepared))
+
+	agent.mu.Lock()
+	_, installed := agent.sessions["gone"]
+	_, stillDeleted := agent.deleted["gone"]
+	agent.mu.Unlock()
+
+	require.False(t, installed, "the prepared replacement is never installed")
+	require.True(t, stillDeleted, "installing never clears the deletion marker")
+	require.Positive(t, proc.closeCalls, "the prepared replacement is torn down")
+
+	// A teardown that itself fails is logged and still refuses the install:
+	// the verdict about the id is the tombstone's, not the teardown's.
+	failing := &agentSession{
+		agent: agent, id: "gone", proc: newFailingCloseProcess(), sessionRoot: t.TempDir(),
+		turn: make(chan struct{}, sessionTurnCapacity),
+	}
+	attachTestNativeBoundary(failing)
+	requireUnknownSession(t, agent.storeStartedSession(t.Context(), failing))
+}
+
+// TestListHidesATombstonedIDStillHeldInTheActiveMap pins the active half of the
+// hiding rule. The store half filters tombstoned keys on its own; the active
+// half must answer on the same terms, so an id something still holds in the map
+// after a delete is invisible to session/list rather than listed as live.
+func TestListHidesATombstonedIDStillHeldInTheActiveMap(t *testing.T) {
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+	t.Cleanup(func() { _ = agent.Close() })
+
+	held := &agentSession{agent: agent, id: "held", cwd: "/cwd"}
+	live := &agentSession{agent: agent, id: "live", cwd: "/cwd"}
+
+	agent.mu.Lock()
+	agent.sessions["held"] = held
+	agent.sessions["live"] = live
+	agent.deleted["held"] = struct{}{}
+	agent.mu.Unlock()
+
+	listed, err := agent.ListSessions(t.Context(), acp.ListSessionsRequest{})
+	require.NoError(t, err)
+
+	ids := make([]acp.SessionId, 0, len(listed.Sessions))
+	for _, info := range listed.Sessions {
+		ids = append(ids, info.SessionId)
+	}
+
+	require.Equal(t, []acp.SessionId{"live"}, ids)
+}
+
+// TestDeleteBoundaryIsObserved pins the observer span every other boundary
+// handler opens. session/delete is a boundary like close: a host tracing its
+// lifecycle must see the delete it issued, with its own outcome, rather than a
+// hole between the last update and the id disappearing.
+func TestDeleteBoundaryIsObserved(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	agent := NewAgent(
+		WithLogger(slog.New(slog.DiscardHandler)),
+		WithTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))),
+	)
+
+	_, err := agent.UnstableDeleteSession(t.Context(), acp.UnstableDeleteSessionRequest{SessionId: "missing"})
+	require.NoError(t, err, "deleting an unknown session silently succeeds")
+
+	methods := make([]string, 0, len(recorder.Ended()))
+
+	for _, span := range recorder.Ended() {
+		for _, attr := range span.Attributes() {
+			if attr.Key == "acp.method" {
+				methods = append(methods, attr.Value.AsString())
+			}
+		}
+	}
+
+	require.Contains(t, methods, "session/delete")
 }

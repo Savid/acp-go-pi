@@ -59,6 +59,12 @@ func (a *Agent) createRuntimeGeneration(
 		return internalpi.ContainmentSpec{}, nil, err
 	}
 
+	if closedErr := a.ensureOpen(); closedErr != nil {
+		release()
+
+		return internalpi.ContainmentSpec{}, nil, closedErr
+	}
+
 	parent, err := runtimeGenerationEnsureScratchParent(a.options.ScratchDir)
 	if err != nil {
 		release()

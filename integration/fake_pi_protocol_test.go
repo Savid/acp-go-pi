@@ -232,7 +232,7 @@ func TestFakePiMatchesRealPi(t *testing.T) {
 		requireCommandError(t, err, "set_model", "Model not found: nope/missing")
 	}
 
-	for _, h := range pair {
+	for index, h := range pair {
 		_, err := h.client.Clone(ctx)
 		requireCommandError(t, err, "clone", "This session has not been saved yet. Wait for the first assistant response before cloning or forking it.")
 
@@ -242,7 +242,11 @@ func TestFakePiMatchesRealPi(t *testing.T) {
 		require.Equal(t, "Unknown command: bogus_command", response.Error)
 
 		require.NoError(t, h.client.SetThinkingLevel(ctx, "bogus"),
-			"pi accepts invalid thinking levels with success and coerces them")
+			"pi acknowledges an unknown thinking level")
+		state, err := h.client.GetState(ctx)
+		require.NoError(t, err)
+		require.Equal(t, states[index].ThinkingLevel, state.ThinkingLevel,
+			"an unknown thinking level leaves native state unchanged")
 		require.NoError(t, h.client.SetAutoRetry(ctx, false))
 		require.NoError(t, h.client.Abort(ctx), "abort while idle acks immediately")
 	}

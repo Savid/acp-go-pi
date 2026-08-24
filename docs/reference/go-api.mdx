@@ -89,7 +89,7 @@ processes receive neither capability nor descriptor.
 | `WithPiModel` | Session model as `"provider/id"`. |
 | `WithPiEnv` | Extra environment variables for this session's pi process. `PATH` is rejected; `WithPiExtraPathDirs` is the only session `PATH` authority. |
 | `WithPiExtraPathDirs` | Prepend absolute directories, in the order given, to this session's child `PATH`, ahead of the static base `PATH` from `WithEnv` and everything inherited. Order and duplicates are preserved. This launch-only value does not select the pi executable. |
-| `WithPiThinkingLevel` | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
+| `WithPiThinkingLevel` | Non-empty reasoning-level value passed unchanged to pi. `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max` are the advertised host menu, not an accepted-value set. |
 | `WithPiPermission` | Permission mode: `ask` (default) or `allow`. |
 | `WithPiAutoRetry` | Opt in to pi's native automatic retry of transient provider errors (5xx, timeouts). Default `false`: a native failure surfaces once, immediately, with the real cause. |
 | `WithPiOutputSchema` | Reserved for API symmetry; pi has no native structured-output surface, so setting it fails closed at session start. |
@@ -113,12 +113,20 @@ Request builders: `NewSessionRequest`, `LoadSessionRequest`,
 `WithListSessionsCwd`, `WithListSessionsCursor`, `WithListSessionsMeta`,
 `StdioMCPServer`, `HTTPMCPServer`.
 
+`WithSessionMeta` and `WithListSessionsMeta` take host-supplied metadata. A
+caller key naming a reserved `acp-go.dev/*` literal — `route`, `lifecycle`,
+`handoff`, or `mediaEnvelope` — is refused rather than merged or overwritten:
+those values are minted by the adapter on the surfaces that carry them, so a
+collision is a defect in the calling code and the builder panics rather than
+putting an unvalidated reserved value on the wire. Everything outside the
+closed set is ordinary host metadata and rides untouched.
+
 `PromptRequest(sessionID, turnNonce, blocks...)` and
 `TextPromptRequest(sessionID, turnNonce, text)` require a fresh, unguessable
 nonce per turn. `CancelRequest(sessionID, turnNonce)` must reuse the active
 turn's nonce. A route nonce must be non-empty and at most 4096 bytes. These
 builders fail closed for an invalid nonce by omitting route metadata, so the
-agent rejects the resulting prompt or active-turn cancellation.
+agent rejects the resulting prompt or cancellation.
 
 `RuntimeResourceHooks` exposes `AcquireNativeRoot`, `ReserveScratchRoot`,
 `ObserveProcess`, `ObserveProcessSnapshot`, `ObserveStartupStage`, and
@@ -149,4 +157,5 @@ values. See [Authentication](/docs/features/authentication).
 
 Session-store surface: `SessionStore`, `SessionKey`, `SessionSummary`,
 `SessionStoreReplacement`, `InMemorySessionStore`, and the constants
-`SessionStoreFormat` and `SessionStoreMainSubpath`.
+`SessionStoreFormat`, `SessionStoreMainSubpath`, and
+`SessionStoreLifecycleSubpath`.

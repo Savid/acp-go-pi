@@ -47,3 +47,22 @@ func TestMirrorCommitAndRetryBranches(t *testing.T) {
 	require.Error(t, appendMirrorEntries(t.Context(), controlled, SessionKey{SessionID: "id"}, []SessionStoreEntry{json.RawMessage(`{}`)}))
 	require.Len(t, splitJSONLRows([]byte("\n a \n\n b\n")), 2)
 }
+
+// TestCommitMirrorWritesNothingAfterPersistenceIsFenced pins that a session
+// whose delete fenced persistence commits no late rows: nothing a settlement
+// still in flight writes can recreate what the tombstone removed.
+func TestCommitMirrorWritesNothingAfterPersistenceIsFenced(t *testing.T) {
+	store := NewInMemorySessionStore()
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("{\"one\":1}\n"), 0o600))
+
+	session := &agentSession{agent: agent, id: "id", sessionFilePath: path}
+	session.fencePersistence()
+	require.NoError(t, session.commitMirror(t.Context()))
+
+	entries, err := store.Load(t.Context(), SessionKey{SessionID: "id"})
+	require.NoError(t, err)
+	require.Empty(t, entries)
+	require.Zero(t, session.mirroredRows)
+}

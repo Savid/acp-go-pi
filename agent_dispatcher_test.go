@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,31 @@ import (
 
 type dispatcherParams struct {
 	Value string `json:"value"`
+}
+
+type actionWriteFailureWriter struct {
+	err   error
+	short bool
+}
+
+type actionPanicWriter struct {
+	written *[]byte
+}
+
+func (w actionPanicWriter) Write(data []byte) (int, error) {
+	if w.written != nil {
+		*w.written = append(*w.written, data...)
+	}
+
+	panic("transport writer secret")
+}
+
+func (w actionWriteFailureWriter) Write(data []byte) (int, error) {
+	if w.short {
+		return len(data) - 1, nil
+	}
+
+	return 0, w.err
 }
 
 func (p *dispatcherParams) Validate() error {
@@ -35,22 +61,51 @@ type dispatcherClient struct {
 	updateCtxErr error
 }
 
+type blockingOpeningClient struct {
+	*directAgentClient
+	entered  chan struct{}
+	release  chan struct{}
+	returned chan struct{}
+	once     sync.Once
+}
+
+func (c *blockingOpeningClient) SessionUpdate(ctx context.Context, notification acp.SessionNotification) error {
+	blocked := false
+	c.once.Do(func() {
+		blocked = true
+		close(c.entered)
+	})
+	if blocked {
+		<-c.release
+		close(c.returned)
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+
+	return c.directAgentClient.SessionUpdate(ctx, notification)
+}
+
 func (c *dispatcherClient) Done() <-chan struct{} {
 	return c.done
 }
 
 func (*dispatcherClient) CreateElicitation(
-	context.Context,
-	acp.UnstableCreateElicitationRequest,
-	elicitationScope,
+	ctx context.Context,
+	_ acp.UnstableCreateElicitationRequest,
+	_ elicitationScope,
 ) (acp.UnstableCreateElicitationResponse, error) {
+	acknowledgeActionRequestWrite(ctx, nil)
+
 	return acp.UnstableCreateElicitationResponse{}, nil
 }
 
 func (*dispatcherClient) RequestPermission(
-	context.Context,
-	acp.RequestPermissionRequest,
+	ctx context.Context,
+	_ acp.RequestPermissionRequest,
 ) (acp.RequestPermissionResponse, error) {
+	acknowledgeActionRequestWrite(ctx, nil)
+
 	return acp.RequestPermissionResponse{}, nil
 }
 
@@ -242,6 +297,31 @@ func TestTagPostResponseHookRequestEdges(t *testing.T) {
 	}
 }
 
+// TestPostResponseHookRequestIDSurvivesARealRequestsParams pins the tag against
+// the params an establishing request actually carries. mcpServers is mandatory
+// and _meta is an object, so a reader that expected every value to be a string
+// recovered no tag at all — and a session whose hook never ran emitted no
+// opening snapshot, leaving its host waiting on an incarnation nobody would
+// ever name.
+func TestPostResponseHookRequestIDSurvivesARealRequestsParams(t *testing.T) {
+	tagged := tagPostResponseHookRequest([]byte(
+		`{"jsonrpc":"2.0","id":9,"method":"session/new","params":` +
+			`{"cwd":"/tmp/work","mcpServers":[],"_meta":{"lifecycle":{"versions":[1]}}}}`,
+	))
+
+	var msg struct {
+		Params json.RawMessage `json:"params"`
+	}
+	require.NoError(t, json.Unmarshal(tagged, &msg))
+	require.Equal(t, "9", postResponseHookRequestID(msg.Params))
+
+	require.Empty(t, postResponseHookRequestID(json.RawMessage(`{"cwd":"/tmp/work"}`)))
+	require.Empty(t, postResponseHookRequestID(json.RawMessage(
+		`{"`+postResponseHookIDParam+`":7}`,
+	)))
+	require.Empty(t, postResponseHookRequestID(json.RawMessage(`[]`)))
+}
+
 func TestPostResponseHooksMatchSuccessfulResponses(t *testing.T) {
 	hooks := &postResponseHooks{log: slog.New(slog.DiscardHandler)}
 	hooks.runAfterResponseWrite([]byte(`{`))
@@ -249,8 +329,8 @@ func TestPostResponseHooksMatchSuccessfulResponses(t *testing.T) {
 
 	firstRan := make(chan struct{})
 	secondRan := make(chan struct{})
-	hooks.enqueue("1", func() { close(firstRan) })
-	hooks.enqueue("2", func() { close(secondRan) })
+	hooks.enqueue("1", func() (func(), bool) { return func() { close(firstRan) }, true })
+	hooks.enqueue("2", func() (func(), bool) { return func() { close(secondRan) }, true })
 
 	hooks.runAfterResponseWrite([]byte(`{"jsonrpc":"2.0","id":2,"error":{"code":-32603}}`))
 	hooks.runAfterResponseWrite([]byte(`{"jsonrpc":"2.0","result":{}}`))
@@ -279,6 +359,12 @@ func TestPostResponseHooksMatchSuccessfulResponses(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first hook did not run")
 	}
+
+	hooks.enqueue("4", func() (func(), bool) { return nil, false })
+	hooks.runAfterResponseWrite([]byte(`{"jsonrpc":"2.0","id":4,"result":{}}`))
+	hooks.mu.Lock()
+	require.Empty(t, hooks.all)
+	hooks.mu.Unlock()
 }
 
 func TestLifecycleCommandHookErrors(t *testing.T) {
@@ -290,13 +376,20 @@ func TestLifecycleCommandHookErrors(t *testing.T) {
 		`{"sessionId":"missing","_acp_go_pi_post_response_hook_id":"response"}`,
 	), nil)
 	require.Len(t, missing.hooks.all, 1)
-	missing.hooks.all[0].run()
+	_, admitted := missing.hooks.all[0].admit()
+	require.False(t, admitted)
+
+	untagged := &localAgentConnection{agent: missingAgent, hooks: &postResponseHooks{}}
+	untagged.enqueueLifecycleCommandHook(t.Context(), acp.AgentMethodSessionLoad, json.RawMessage(
+		`{"sessionId":"untagged"}`,
+	), nil)
+	require.Empty(t, untagged.hooks.all)
 
 	updateErr := errors.New("update failed")
 	client := &dispatcherClient{done: make(chan struct{}), updateErr: updateErr}
 	agent := NewAgent(WithLogger(logger))
 	agent.conn = client
-	agent.sessions["session"] = &agentSession{
+	session := &agentSession{
 		agent: agent,
 		id:    "session",
 		availableCommands: []pi.SlashCommand{{
@@ -304,6 +397,9 @@ func TestLifecycleCommandHookErrors(t *testing.T) {
 			Description: "Show help",
 		}},
 	}
+	session.outbox = newTestSessionOutbox(1)
+	session.outbox.generationDone = t.Context().Done()
+	agent.sessions["session"] = session
 	conn := &localAgentConnection{agent: agent, hooks: &postResponseHooks{}}
 	canceledCtx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -311,8 +407,65 @@ func TestLifecycleCommandHookErrors(t *testing.T) {
 		`{"sessionId":"session","_acp_go_pi_post_response_hook_id":"response"}`,
 	), nil)
 	require.Len(t, conn.hooks.all, 1)
-	conn.hooks.all[0].run()
+	run, admitted := conn.hooks.all[0].admit()
+	require.True(t, admitted)
+	run()
 	require.NoError(t, client.updateCtxErr)
+
+	closedSession := &agentSession{agent: agent, id: "closed-session", closing: true}
+	closedSession.outbox = newTestSessionOutbox(2)
+	agent.sessions[closedSession.id] = closedSession
+	closedConn := &localAgentConnection{agent: agent, hooks: &postResponseHooks{}}
+	closedConn.enqueueLifecycleCommandHook(t.Context(), acp.AgentMethodSessionLoad, json.RawMessage(
+		`{"sessionId":"closed-session","_acp_go_pi_post_response_hook_id":"closed"}`,
+	), nil)
+	require.Len(t, closedConn.hooks.all, 1)
+	_, admitted = closedConn.hooks.all[0].admit()
+	require.False(t, admitted)
+}
+
+func TestBlockedPostResponseHookCannotVetoCloseOrContinueAfterRelease(t *testing.T) {
+	originalWait := sessionCloseTurnWaitContext
+	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		bounded, cancel := context.WithCancel(ctx)
+		cancel()
+
+		return bounded, func() {}
+	}
+	t.Cleanup(func() { sessionCloseTurnWaitContext = originalWait })
+
+	host := &blockingOpeningClient{
+		directAgentClient: newDirectAgentClient(),
+		entered:           make(chan struct{}),
+		release:           make(chan struct{}),
+		returned:          make(chan struct{}),
+	}
+	agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
+	agent.conn = host
+	process := newStubProcess(false)
+	native := newStubPiClient()
+	session := &agentSession{agent: agent, id: "session", proc: process, client: native}
+	outbox := bindTestEstablishingOutbox(session, 1, process, native)
+	generationCtx, cancelGeneration := context.WithCancel(context.Background())
+	outbox.generationDone = generationCtx.Done()
+	outbox.pumpCancel = cancelGeneration
+	agent.sessions[session.id] = session
+
+	conn := &localAgentConnection{agent: agent, hooks: &postResponseHooks{log: agent.log}}
+	conn.enqueueLifecycleCommandHook(t.Context(), acp.AgentMethodSessionLoad, json.RawMessage(
+		`{"sessionId":"session","_acp_go_pi_post_response_hook_id":"1"}`,
+	), nil)
+	conn.hooks.runAfterResponseWrite([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	<-host.entered
+
+	require.ErrorIs(t, session.Close(t.Context()), pi.ErrProcessContainmentIncomplete)
+	require.Equal(t, 1, process.shutdownCalls)
+	require.Equal(t, 1, process.closeCalls)
+	require.Nil(t, session.lc.stream)
+	close(host.release)
+	<-host.returned
+	require.NoError(t, outbox.producers.waitChildren(t.Context()))
+	require.Nil(t, session.lc.stream, "late hook release opened lifecycle state")
 }
 
 func TestLocalAgentConnectionClientCallErrors(t *testing.T) {
@@ -362,4 +515,138 @@ func TestLocalAgentConnectionClientCallErrors(t *testing.T) {
 
 	require.NoError(t, conn.NotifyExtension(t.Context(), "_pi/test", map[string]any{"ok": true}))
 	require.Contains(t, output.String(), `"method":"_pi/test"`)
+}
+
+func TestActionRequestWriteTracking(t *testing.T) {
+	meta := map[string]any{lifecycleMetaKey: map[string]any{
+		"action": map[string]any{"actionId": "action"},
+	}}
+	require.Equal(t, "action", lifecycleActionID(meta))
+	require.Empty(t, lifecycleActionID(nil))
+	require.Empty(t, lifecycleActionID(map[string]any{lifecycleMetaKey: func() {}}))
+	require.Empty(t, lifecycleActionIDFromRaw(json.RawMessage(`not-json`)))
+	require.Equal(t, meta, elicitationMeta(acp.UnstableCreateElicitationRequest{
+		Form: &acp.UnstableCreateElicitationForm{Meta: meta},
+	}))
+	require.Equal(t, meta, elicitationMeta(acp.UnstableCreateElicitationRequest{
+		Url: &acp.UnstableCreateElicitationUrl{Meta: meta},
+	}))
+	require.Nil(t, elicitationMeta(acp.UnstableCreateElicitationRequest{}))
+
+	requests := newActionRequestWrites()
+	ack := make(chan error, 1)
+	require.NoError(t, requests.register("action", func(err error) { ack <- err }))
+	require.Error(t, requests.register("action", func(error) {}))
+
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  acp.ClientMethodSessionRequestPermission,
+		"params":  map[string]any{"_meta": meta},
+	})
+	require.NoError(t, err)
+	writer := &actionRequestWriteWriter{
+		writer:   actionWriteFailureWriter{short: true},
+		requests: requests,
+	}
+	_, err = writer.Write(payload)
+	require.ErrorIs(t, err, io.ErrShortWrite)
+	require.ErrorIs(t, <-ack, io.ErrShortWrite)
+	requests.resolve("unknown", nil)
+
+	for _, test := range []struct {
+		name        string
+		fullWrite   bool
+		wantWritten bool
+	}{
+		{name: "panic before request bytes"},
+		{name: "panic after full request", fullWrite: true, wantWritten: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := newActionRequestWrites()
+			acked := make(chan error, 1)
+			require.NoError(t, requests.register("action", func(err error) { acked <- err }))
+			var written []byte
+			var sink *[]byte
+			if test.fullWrite {
+				sink = &written
+			}
+			writer := &actionRequestWriteWriter{writer: actionPanicWriter{written: sink}, requests: requests}
+
+			n, panicErr := writer.Write(payload)
+			require.Zero(t, n)
+			require.ErrorIs(t, panicErr, errLifecycleActionRequest)
+			require.ErrorIs(t, <-acked, errLifecycleActionRequest)
+			require.NotContains(t, panicErr.Error(), "transport writer secret")
+			if test.wantWritten {
+				require.Equal(t, payload, written)
+			} else {
+				require.Empty(t, written)
+			}
+		})
+	}
+
+	require.Empty(t, outboundLifecycleActionID(json.RawMessage(`not-json`)))
+	require.Empty(t, outboundLifecycleActionID(json.RawMessage(`{"id":1,"method":"other"}`)))
+}
+
+func TestLocalActionRequestsFailClosedAtTheWriteBarrier(t *testing.T) {
+	meta := map[string]any{lifecycleMetaKey: map[string]any{
+		"action": map[string]any{"actionId": "action"},
+	}}
+
+	t.Run("invalid registrations", func(t *testing.T) {
+		acked := make(chan error, 3)
+		ctx := context.WithValue(t.Context(), actionRequestWriteAckKey{}, func(err error) { acked <- err })
+
+		connection := &localAgentConnection{agent: NewAgent(), requestWrites: newActionRequestWrites()}
+		_, err := connection.RequestPermission(ctx, acp.RequestPermissionRequest{})
+		require.ErrorContains(t, err, "missing its lifecycle action id")
+		require.ErrorContains(t, <-acked, "missing its lifecycle action id")
+
+		require.NoError(t, connection.requestWrites.register("action", func(error) {}))
+		_, err = connection.RequestPermission(ctx, acp.RequestPermissionRequest{Meta: meta})
+		require.ErrorContains(t, err, "already awaits a write")
+		require.ErrorContains(t, <-acked, "already awaits a write")
+
+		_, err = connection.CreateElicitation(ctx, acp.UnstableCreateElicitationRequest{
+			Form: &acp.UnstableCreateElicitationForm{Meta: meta, Mode: elicitationModeForm},
+		}, elicitationScope{SessionID: "session", TurnNonce: "turn"})
+		require.ErrorContains(t, err, "already awaits a write")
+		require.ErrorContains(t, <-acked, "already awaits a write")
+	})
+
+	for name, call := range map[string]func(context.Context, *localAgentConnection) error{
+		"permission": func(ctx context.Context, connection *localAgentConnection) error {
+			_, err := connection.RequestPermission(ctx, acp.RequestPermissionRequest{Meta: meta})
+
+			return err
+		},
+		"elicitation": func(ctx context.Context, connection *localAgentConnection) error {
+			_, err := connection.CreateElicitation(ctx, acp.UnstableCreateElicitationRequest{
+				Form: &acp.UnstableCreateElicitationForm{Meta: meta, Mode: elicitationModeForm},
+			}, elicitationScope{SessionID: "session", TurnNonce: "turn", RequestID: "request"})
+
+			return err
+		},
+	} {
+		t.Run(name+" write failure", func(t *testing.T) {
+			input, peer := io.Pipe()
+			writeErr := errors.New("write failed")
+			connection := newLocalAgentConnection(NewAgent(), actionWriteFailureWriter{err: writeErr}, input)
+			t.Cleanup(func() {
+				require.NoError(t, peer.Close())
+				select {
+				case <-connection.Done():
+				case <-time.After(time.Second):
+					t.Fatal("connection did not stop")
+				}
+			})
+
+			acked := make(chan error, 1)
+			ctx := context.WithValue(t.Context(), actionRequestWriteAckKey{}, func(err error) { acked <- err })
+			require.Error(t, call(ctx, connection))
+			require.ErrorIs(t, <-acked, writeErr)
+		})
+	}
 }

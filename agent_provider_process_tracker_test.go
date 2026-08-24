@@ -186,11 +186,11 @@ func TestPiProductionProcessSnapshotLifecycle(t *testing.T) {
 		closeErr      error
 		wantSnapshots []int
 	}{
-		{name: "complete close resets zero", wantSnapshots: []int{4, 4, 0}},
+		{name: "complete close resets zero", wantSnapshots: []int{4, 0}},
 		{
 			name:          "incomplete close preserves nonzero",
 			closeErr:      internalpi.ErrProcessContainmentIncomplete,
-			wantSnapshots: []int{4, 4},
+			wantSnapshots: []int{4},
 		},
 	}
 

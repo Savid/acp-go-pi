@@ -1,10 +1,51 @@
 package pi
 
 import (
+	"context"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestBoundaryTypedCommandsAndPromptFailure(t *testing.T) {
+	t.Run("get state dispatch boundary", func(t *testing.T) {
+		harness := newTestHarness(t)
+		released := false
+		done := make(chan error, 1)
+		go func() {
+			state, err := harness.client.GetStateWithBoundary(t.Context(), CallBoundary{
+				BeforeDispatch: func() (func(), error) {
+					return func() { released = true }, nil
+				},
+			})
+			require.Equal(t, "bounded", state.SessionID)
+			done <- err
+		}()
+		command := harness.nextCommand(t)
+		harness.respond(t, commandID(t, command), "get_state", `,"data":{"sessionId":"bounded"}`)
+		require.NoError(t, <-done)
+		require.True(t, released)
+	})
+
+	t.Run("prompt native failure", func(t *testing.T) {
+		err := scriptCall(t, func(t *testing.T, harness *testHarness) {
+			t.Helper()
+
+			command := harness.nextCommand(t)
+			harness.emit(t, `{"id":"`+commandID(t, command)+`","type":"response","command":"prompt","success":false,"error":"refused"}`)
+		}, func(client *Client) error {
+			return client.Prompt(context.Background(), "hello", nil)
+		})
+		var commandErr *CommandError
+		require.ErrorAs(t, err, &commandErr)
+	})
+
+	t.Run("prompt transport failure", func(t *testing.T) {
+		client := NewClient(shortWriter{}, nil)
+		require.ErrorIs(t, client.Prompt(t.Context(), "hello", nil), io.ErrShortWrite)
+	})
+}
 
 // call runs one typed client call against scripted command handling.
 func scriptCall(t *testing.T, handle func(t *testing.T, harness *testHarness), invoke func(client *Client) error) error {
