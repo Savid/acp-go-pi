@@ -25,7 +25,7 @@ func TestPiACPAgentBinaryClosedInput(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	cmd := standaloneAgentCommand(t, ctx,
+	cmd := agentCommand(t, ctx,
 		"-path", fakePiExecutable(t, fakeScenario{}),
 		"-scratch-dir", integrationScratchDir(t),
 	)

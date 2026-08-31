@@ -85,7 +85,7 @@ func (s *agentSession) awaitSettlementContext(ctx context.Context) error {
 	select {
 	case <-settlement.done:
 	case <-ctx.Done():
-		return fmt.Errorf("%w: join prompt settlement: %v", pi.ErrProcessContainmentIncomplete, ctx.Err())
+		return fmt.Errorf("%w: join prompt settlement: %v", ErrContainmentIncomplete, ctx.Err())
 	}
 
 	return settlement.err
@@ -134,7 +134,7 @@ func (s *agentSession) settlePrompt(
 				outbox,
 				"prompt settlement failed",
 			)
-			if pi.ProcessContainmentComplete(containmentErr) {
+			if nativeContainmentComplete(containmentErr) {
 				s.fenceLifecycleStream()
 			}
 
@@ -149,7 +149,7 @@ func (s *agentSession) settlePrompt(
 		// Durability outranks the terminal event: a containment boundary that
 		// did not complete emits no terminal idle, and the incarnation ends
 		// unsettled so the next snapshot states the truth.
-		if pi.ProcessContainmentComplete(boundaryErr) {
+		if nativeContainmentComplete(boundaryErr) {
 			s.fenceLifecycleStream()
 		}
 

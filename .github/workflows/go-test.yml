@@ -27,7 +27,7 @@ jobs:
         run: go build ./...
 
       - name: Test and coverage gate
-        run: .github/scripts/run-privileged-suite.sh coverage-check
+        run: make coverage-check
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tee coverage-summary.txt
@@ -51,18 +51,6 @@ jobs:
             coverage.out
             coverage-summary.txt
 
-  trusted-supervisor:
-    runs-on: [self-hosted]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Setup Go
-        uses: ./.github/workflows/go-setup
-
-      - name: Trusted supervisor security suite
-        run: .github/scripts/run-privileged-suite.sh test-trusted-supervisor
-
   native-browser:
     runs-on: [self-hosted]
     steps:
@@ -73,7 +61,7 @@ jobs:
         uses: ./.github/workflows/go-setup
 
       - name: Native browser containment canary
-        run: .github/scripts/with-privileged-lock.sh make test-integration-native-browser
+        run: make test-integration-native-browser
 
   # Pi is the only sibling whose ordinary launch path resolves an executable
   # from a supplied Windows environment, so it is the only one whose Windows

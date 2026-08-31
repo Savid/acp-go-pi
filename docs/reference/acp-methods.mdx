@@ -18,7 +18,7 @@ release. `session/delete` first commits its tombstone and persistence fence,
 then runs that same interaction-barrier, containment, and join contract. An
 incomplete interaction, containment, or holder join is retained under exact
 Agent ownership and returned as
-`ErrProcessContainmentIncomplete`; it is never logged and discarded.
+`ErrContainmentIncomplete`; it is never logged and discarded.
 
 ## Extensions
 
@@ -67,7 +67,7 @@ The `cause` vocabulary:
 | `process_exit` | The pi process died, or the version probe would not run; `message` carries the real exit status and the stderr line naming the cause. |
 | `transport` | pi's stdout closed or the event stream broke mid-turn. |
 | `provider` | pi reported a provider error for the turn (bad key, quota, upstream failure); `message` carries pi's error text. |
-| `timeout` | A `WithTurnTimeout` deadline expired; the native turn was aborted and reached its selected containment boundary before return. On Darwin best-effort this means direct-child reap plus original-group absence, not escaped-descendant absence. |
+| `timeout` | A `WithTurnTimeout` deadline expired; the native turn was aborted and reached its native boundary before return. In managed mode the host authority's `Wait` result must settle before the error is returned. |
 | `extension` | A pi extension threw. The wrapper-owned extensions are the permission bridge and the MCP client, so the cycle fails closed rather than running on under an admission nobody granted. `message` is the fixed string `a pi extension failed`; the extension path and the thrown text are withheld from the wire and from the log, because thrown text can carry tool input. |
 
 Except for the fixed redacted `extension` message, `message` is bounded at 2048

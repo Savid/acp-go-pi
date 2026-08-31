@@ -42,32 +42,30 @@ var sessionRelaunchWaitContext = func(ctx context.Context) (context.Context, con
 }
 
 // finalizeSessionRuntimeResources releases each admission only after its
-// selected containment boundary completes. An incomplete native boundary
+// native boundary completes. An incomplete native boundary
 // retains its admission and private session root because descendants may
 // still use them.
 func finalizeSessionRuntimeResources(
+	agent *Agent,
 	runtimeErr error,
-	nativeRelease func(),
+	generationRoot string,
 	sessionRoot string,
-	scratchRelease func(),
 	browserShim *pi.BrowserShim,
 	residence *pi.SessionResidence,
 ) error {
-	if !pi.ProcessContainmentComplete(runtimeErr) {
+	if !nativeContainmentComplete(runtimeErr) {
 		return runtimeErr
 	}
 
-	if nativeRelease != nil {
-		nativeRelease()
+	if agent != nil && generationRoot != "" {
+		if disposeErr := agent.disposeNativeTree(context.Background(), generationRoot); disposeErr != nil {
+			return errors.Join(runtimeErr, disposeErr)
+		}
 	}
 
 	removeErr := errors.Join(browserShim.Remove(), residence.Remove())
 	if sessionRoot != "" {
 		removeErr = errors.Join(removeErr, materializeRemoveAll(sessionRoot))
-	}
-
-	if removeErr == nil && scratchRelease != nil {
-		scratchRelease()
 	}
 
 	return errors.Join(runtimeErr, removeErr)
@@ -234,7 +232,7 @@ func (s *agentSession) finishRelaunch(attempt *sessionRelaunchAttempt, err error
 
 	attempt.finishOnce.Do(func() {
 		attempt.mu.Lock()
-		if !pi.ProcessContainmentComplete(err) {
+		if !nativeContainmentComplete(err) {
 			attempt.err = err
 		}
 
@@ -257,7 +255,7 @@ func awaitRelaunch(ctx context.Context, attempt *sessionRelaunchAttempt) error {
 		attempt.finishOnce.Do(func() {
 			attempt.mu.Lock()
 			attempt.err = fmt.Errorf("%w: join native relaunch owner: %v",
-				pi.ErrProcessContainmentIncomplete, waitCtx.Err())
+				ErrContainmentIncomplete, waitCtx.Err())
 			close(attempt.done)
 			attempt.mu.Unlock()
 		})
@@ -327,7 +325,7 @@ func (s *agentSession) awaitClose(attempt *sessionCloseAttempt) error {
 	case <-attempt.done:
 	case <-waitCtx.Done():
 		if !s.quarantineCloseAttempt(fmt.Errorf("%w: join session close attempt: %v",
-			pi.ErrProcessContainmentIncomplete, waitCtx.Err())) {
+			ErrContainmentIncomplete, waitCtx.Err())) {
 			// The owner crossed the final-settlement CAS first. It has no live
 			// producer or native owner left, so join its publication rather than
 			// racing an unsynchronized read of the result.
@@ -373,7 +371,7 @@ func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
 	s.mu.Unlock()
 
 	if boundary == nil {
-		return errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("pi session has no native boundary owner"))
+		return errors.Join(ErrContainmentIncomplete, errors.New("pi session has no native boundary owner"))
 	}
 
 	if proc == nil {
@@ -400,13 +398,10 @@ func (s *agentSession) ensureProcessAlive(ctx context.Context) error {
 
 	closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
 	closeErr := boundary.run(closeCtx, "close", proc.Close)
-	retireErr := s.retireProviderProcess(closeCtx, closeErr)
 
 	cancelClose()
 
-	containmentErr := errors.Join(closeErr, retireErr)
-	s.releaseNativeRootAfterCompletion(containmentErr)
-
+	containmentErr := closeErr
 	if containmentErr != nil {
 		s.recordNativeContainment(containmentErr)
 
@@ -459,13 +454,11 @@ func (s *agentSession) refreshMCPTools(ctx context.Context) error {
 	closeErr := boundary.run(shutdownCtx, "close", proc.Close)
 
 	containmentErr := errors.Join(shutdownErr, closeErr)
-	containmentErr = errors.Join(containmentErr, s.retireProviderProcess(shutdownCtx, containmentErr))
 
 	cancelShutdown()
 	s.recordNativeContainment(containmentErr)
-	s.releaseNativeRootAfterCompletion(containmentErr)
 
-	if !pi.ProcessContainmentComplete(containmentErr) {
+	if !nativeContainmentComplete(containmentErr) {
 		return containmentErr
 	}
 
@@ -481,10 +474,8 @@ func (s *agentSession) refreshMCPTools(ctx context.Context) error {
 }
 
 // relaunchProcess starts the same logical pi session after the previous
-// process reaches its selected containment boundary. Its extension factories run again, so
+// process reaches its native boundary. Its extension factories run again, so
 // their fixed tool registry is rebuilt from the MCP server's current view.
-//
-//nolint:gocyclo // Relaunch keeps every ownership transfer and refusal gate in one ordered ladder.
 func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
 	attempt, err := s.beginRelaunch()
 	if err != nil {
@@ -538,14 +529,14 @@ func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
 	}
 
 	s.agent.updateNativeConstruction(construction, func(owner *nativeConstruction) {
-		owner.generationRoot = spec.Containment.GenerationRoot
-		owner.sessionRoot = spec.Containment.GenerationRoot
+		owner.generationRoot = spec.NativeRoot
+		owner.sessionRoot = spec.NativeRoot
 	})
 
 	keepGeneration := false
 	defer func() {
-		if !keepGeneration && pi.ProcessContainmentComplete(err) {
-			removeErr := materializeRemoveAll(spec.Containment.GenerationRoot)
+		if !keepGeneration && nativeContainmentComplete(err) {
+			removeErr := s.agent.disposeNativeTree(context.WithoutCancel(ctx), spec.NativeRoot)
 			if removeErr != nil {
 				attempt.mu.Lock()
 				attempt.err = errors.Join(attempt.err, removeErr)
@@ -560,36 +551,17 @@ func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
 	// past the prompt request that triggered it.
 	startCtx, finishStart := s.agent.observe.StartPiProcess(context.WithoutCancel(ctx), "relaunch")
 
-	nativeRelease, err := acquireNativeRoot(ctx, s.agent.options.RuntimeResourceHooks, RuntimeResourceSession)
-	if err != nil {
-		finishStart(err)
-
-		return err
-	}
-
-	s.agent.updateNativeConstruction(construction, func(owner *nativeConstruction) {
-		owner.nativeRelease = nativeRelease
-	})
-
 	s.mu.Lock()
 	closing := s.closing
 	s.mu.Unlock()
 
 	if closing {
-		nativeRelease()
-		s.agent.updateNativeConstruction(construction, func(owner *nativeConstruction) {
-			owner.nativeRelease = nil
-		})
 		finishStart(unknownSessionError())
 
 		return unknownSessionError()
 	}
 
 	if closedErr := s.agent.ensureOpen(); closedErr != nil {
-		nativeRelease()
-		s.agent.updateNativeConstruction(construction, func(owner *nativeConstruction) {
-			owner.nativeRelease = nil
-		})
 		finishStart(closedErr)
 
 		return closedErr
@@ -613,20 +585,17 @@ func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
 		s.recordNativeContainment(containmentErr)
 	}()
 
-	spawnStarted := time.Now()
-
 	if contextErr := ctx.Err(); contextErr != nil {
 		finishStart(contextErr)
 
 		return contextErr
 	}
 
-	relaunched, client, processRoot, err := s.agent.startTrackedPiProcess(startCtx, spec)
+	relaunched, client, err := s.agent.startTrackedPiProcess(startCtx, spec)
 	s.agent.updateNativeConstruction(construction, func(owner *nativeConstruction) {
 		owner.proc = relaunched
 		owner.client = client
 
-		owner.processRoot = processRoot
 		if owner.err == nil {
 			owner.err = err
 		}
@@ -640,17 +609,7 @@ func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
 		constructionOwned = false
 	}
 
-	observationErr := observeRuntimeStartupStage(
-		startCtx, s.agent.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSpawn, spawnStarted, err,
-	)
-
 	finishStart(err)
-
-	if observationErr != nil {
-		containmentErr := s.containHoistedRelaunch(context.WithoutCancel(ctx), attempt)
-
-		return errors.Join(err, observationErr, containmentErr)
-	}
 
 	if err != nil {
 		s.recordNativeContainment(err)
@@ -664,15 +623,9 @@ func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
 		return errors.Join(closedErr, containmentErr)
 	}
 
-	readinessStarted := time.Now()
-
 	generationCtx, generationCancel := context.WithCancel(context.Background())
 	if startErr := client.Start(generationCtx); startErr != nil {
 		generationCancel()
-
-		observationErr := observeRuntimeStartupStage(
-			ctx, s.agent.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupReadiness, readinessStarted, startErr,
-		)
 
 		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
 		killErr := attempt.nativeBoundary.run(cleanupCtx, "kill", relaunched.Kill)
@@ -680,26 +633,15 @@ func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
 		closeErr := attempt.nativeBoundary.run(cleanupCtx, "close", relaunched.Close)
 
 		cleanupErr := errors.Join(killErr, closeErr)
-		cleanupErr = errors.Join(cleanupErr, s.retireProviderRoot(cleanupCtx, processRoot, cleanupErr))
 
 		cancelCleanup()
 		s.recordNativeContainment(cleanupErr)
 
-		return errors.Join(startErr, observationErr, cleanupErr)
-	}
-
-	if observationErr := observeRuntimeStartupStage(
-		ctx, s.agent.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupReadiness, readinessStarted, nil,
-	); observationErr != nil {
-		generationCancel()
-
-		containmentErr := s.containHoistedRelaunch(context.WithoutCancel(ctx), attempt)
-
-		return errors.Join(observationErr, containmentErr)
+		return errors.Join(startErr, cleanupErr)
 	}
 
 	generation, outbox, published := s.publishRuntimeGeneration(
-		generationCtx, generationCancel, relaunched, client, processRoot, nativeRelease, attempt.nativeBoundary,
+		generationCtx, generationCancel, relaunched, client, attempt.nativeBoundary,
 	)
 	if !published {
 		return s.containUnadoptedRelaunch(ctx, attempt)
@@ -712,7 +654,6 @@ func (s *agentSession) relaunchProcess(ctx context.Context) (err error) {
 	if publishedAttempt {
 		attempt.mu.Lock()
 		attempt.outbox = outbox
-		attempt.nativeRelease = nil
 		attempt.mu.Unlock()
 	}
 
@@ -779,8 +720,6 @@ func (s *agentSession) containHoistedRelaunch(ctx context.Context, attempt *sess
 	attempt.mu.Lock()
 	outbox := attempt.outbox
 	proc := attempt.proc
-	root := attempt.processRoot
-	nativeRelease := attempt.nativeRelease
 	attempt.mu.Unlock()
 
 	if outbox != nil {
@@ -803,18 +742,22 @@ func (s *agentSession) containHoistedRelaunch(ctx context.Context, attempt *sess
 
 	containmentErr := errors.Join(killErr, closeErr)
 
-	containmentErr = errors.Join(containmentErr, s.retireProviderRoot(cleanupCtx, root, containmentErr))
-	if pi.ProcessContainmentComplete(containmentErr) && nativeRelease != nil {
-		nativeRelease()
-		attempt.mu.Lock()
-		attempt.nativeRelease = nil
-		attempt.mu.Unlock()
-	}
-
 	return containmentErr
 }
 
 func (s *agentSession) nextRuntimeLaunch(previous pi.LaunchSpec, lastSessionFile string) (pi.LaunchSpec, error) {
+	if previous.NativeRoot != "" && s.agent.options.hostAuthoritySupplied {
+		if err := s.agent.reclaimNativeTree(context.Background(), previous.NativeRoot); err != nil {
+			return pi.LaunchSpec{}, err
+		}
+
+		s.mu.Lock()
+		if s.launch.NativeRoot == previous.NativeRoot {
+			s.launch.NativeRoot = ""
+		}
+		s.mu.Unlock()
+	}
+
 	dirs, err := createSessionGeneration(s.sessionRoot)
 	if err != nil {
 		return pi.LaunchSpec{}, err
@@ -850,6 +793,8 @@ func (s *agentSession) nextRuntimeLaunch(previous pi.LaunchSpec, lastSessionFile
 	spec.ExtraPathDirs = slices.Clone(previous.ExtraPathDirs)
 	spec.AgentDir = dirs.AgentDir
 	spec.SessionDir = dirs.SessionDir
+	spec.NativeRoot = dirs.Root
+	spec.BaseEnvironment = s.agent.nativeBaseEnvironment()
 
 	rebasePaths := func(paths []string) ([]string, error) {
 		rebased := make([]string, len(paths))
@@ -898,19 +843,14 @@ func (s *agentSession) nextRuntimeLaunch(previous pi.LaunchSpec, lastSessionFile
 		spec.SessionID = string(s.id)
 	}
 
-	spec.Containment, err = s.agent.containmentSpecForRoot(
-		scratchParent(s.agent.options.ScratchDir),
-		dirs.Root,
-		RuntimeResourceSession,
-	)
-	if err != nil {
-		return fail(err)
-	}
-
-	if previous.Containment.GenerationRoot != "" {
-		if err := materializeRemoveAll(previous.Containment.GenerationRoot); err != nil {
+	if previous.NativeRoot != "" {
+		if err := materializeRemoveAll(previous.NativeRoot); err != nil {
 			return fail(fmt.Errorf("remove prior runtime generation: %w", err))
 		}
+	}
+
+	if err := s.agent.prepareNativeTree(context.Background(), dirs.Root); err != nil {
+		return pi.LaunchSpec{}, err
 	}
 
 	return spec, nil
@@ -926,8 +866,6 @@ func (s *agentSession) containUnadoptedRelaunch(
 ) error {
 	attempt.mu.Lock()
 	relaunched := attempt.proc
-	processRoot := attempt.processRoot
-	nativeRelease := attempt.nativeRelease
 	attempt.mu.Unlock()
 
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
@@ -938,14 +876,6 @@ func (s *agentSession) containUnadoptedRelaunch(
 	closeErr := attempt.nativeBoundary.run(cleanupCtx, "close", relaunched.Close)
 
 	cleanupErr := errors.Join(killErr, closeErr)
-
-	cleanupErr = errors.Join(cleanupErr, s.retireProviderRoot(cleanupCtx, processRoot, cleanupErr))
-	if pi.ProcessContainmentComplete(cleanupErr) && nativeRelease != nil {
-		nativeRelease()
-		attempt.mu.Lock()
-		attempt.nativeRelease = nil
-		attempt.mu.Unlock()
-	}
 
 	s.recordNativeContainment(cleanupErr)
 
@@ -971,7 +901,7 @@ func (s *agentSession) cleanupFailedRelaunch(ctx context.Context, outbox *sessio
 
 // Cancel cancels the active pi turn. Pending dialogs are resolved cancelled
 // first, then native abort is attempted and the complete per-session process
-// tree is closed and reaches its selected containment boundary before either
+// tree is closed and reaches its native boundary before either
 // Cancel or Prompt settles.
 func (s *agentSession) Cancel(ctx context.Context) (err error) {
 	s.cancelMu.Lock()
@@ -1045,7 +975,7 @@ func (s *agentSession) cancelNativeLocked(ctx context.Context, commitSettled boo
 	s.mu.Unlock()
 
 	if boundary == nil {
-		return errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("pi session has no native boundary owner"))
+		return errors.Join(ErrContainmentIncomplete, errors.New("pi session has no native boundary owner"))
 	}
 
 	joinCtx, cancelJoin := sessionCloseTurnWaitContext(context.WithoutCancel(ctx))
@@ -1174,7 +1104,7 @@ func (s *agentSession) fenceActiveTurnLocked(ctx context.Context) (err error) {
 
 	switch {
 	case containment == nil:
-		err = errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("active pi turn has no native generation"))
+		err = errors.Join(ErrContainmentIncomplete, errors.New("active pi turn has no native generation"))
 		s.recordNativeContainment(err)
 
 		turnCancel()
@@ -1228,7 +1158,7 @@ func (s *agentSession) claimTurnContainment(outbox *sessionOutbox) (*generationC
 // claimTurnSettlement linearizes a native AgentSettled event against cancel
 // and timeout. Once claimed, the turn has no active native work to contain;
 // a fence that won the race is already complete because it holds cancelMu for
-// its entire selected containment boundary.
+// its entire native boundary.
 func (s *agentSession) claimTurnSettlement() error {
 	s.cancelMu.Lock()
 	defer s.cancelMu.Unlock()
@@ -1268,7 +1198,7 @@ func (s *agentSession) awaitTurnFence() error {
 
 func (s *agentSession) stopTurnGeneration(ctx context.Context, outbox *sessionOutbox) error {
 	if outbox == nil || outbox.proc == nil {
-		return errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("active pi turn has no contained process root"))
+		return errors.Join(ErrContainmentIncomplete, errors.New("active pi turn has no contained process root"))
 	}
 
 	var abortErr error
@@ -1290,7 +1220,7 @@ func (s *agentSession) stopTurnGeneration(ctx context.Context, outbox *sessionOu
 		select {
 		case <-outbox.pumpDone:
 		case <-ctx.Done():
-			return fmt.Errorf("%w: wait for native generation pump: %v", pi.ErrProcessContainmentIncomplete, ctx.Err())
+			return fmt.Errorf("%w: wait for native generation pump: %v", ErrContainmentIncomplete, ctx.Err())
 		}
 	}
 
@@ -1299,29 +1229,9 @@ func (s *agentSession) stopTurnGeneration(ctx context.Context, outbox *sessionOu
 	closeErr := outbox.nativeBoundary.run(ctx, "close", outbox.proc.Close)
 
 	containmentErr := errors.Join(killErr, closeErr)
-	if !pi.ProcessContainmentComplete(abortErr) {
+	if !nativeContainmentComplete(abortErr) {
 		containmentErr = errors.Join(containmentErr, abortErr)
 	}
-
-	if outbox.processRoot != nil {
-		complete := providerProcessTreeComplete(containmentErr)
-		retireErr := runNativeBoundaryStep(ctx, "retirement", func() error {
-			outbox.processRoot.retire(context.WithoutCancel(ctx), complete)
-
-			return nil
-		})
-		containmentErr = errors.Join(containmentErr, retireErr)
-
-		if complete && retireErr == nil {
-			s.mu.Lock()
-			if s.providerProcessRoot == outbox.processRoot {
-				s.providerProcessRoot = nil
-			}
-			s.mu.Unlock()
-		}
-	}
-
-	s.releaseNativeRootAfterCompletion(containmentErr)
 
 	return containmentErr
 }
@@ -1511,7 +1421,7 @@ func (s *agentSession) closeOwned(ctx context.Context, attempt *sessionCloseAtte
 
 	err = errors.Join(err, awaitRelaunch(closeCtx, attempt.relaunch))
 
-	if !pi.ProcessContainmentComplete(err) {
+	if !nativeContainmentComplete(err) {
 		if attempt.outbox != nil {
 			s.quarantineLifecycleGeneration(attempt.outbox.generation, err)
 		}
@@ -1526,7 +1436,7 @@ func (s *agentSession) closeOwned(ctx context.Context, attempt *sessionCloseAtte
 	}
 
 	err = errors.Join(err, s.awaitPoisonContainment())
-	if !pi.ProcessContainmentComplete(err) {
+	if !nativeContainmentComplete(err) {
 		if attempt.outbox != nil {
 			s.quarantineLifecycleGeneration(attempt.outbox.generation, err)
 		}
@@ -1544,7 +1454,7 @@ func (s *agentSession) closeOwned(ctx context.Context, attempt *sessionCloseAtte
 	} else {
 		if attempt.outbox.pumpDone != nil {
 			err = errors.Join(err, attempt.outbox.producers.wait(joinCtx))
-			if !pi.ProcessContainmentComplete(err) {
+			if !nativeContainmentComplete(err) {
 				s.recordNativeContainment(err)
 
 				return err
@@ -1558,7 +1468,7 @@ func (s *agentSession) closeOwned(ctx context.Context, attempt *sessionCloseAtte
 
 	err = errors.Join(err, s.awaitSettlementContext(joinCtx))
 	if releaseTurn, waitErr := s.awaitTurnIdle(joinCtx); waitErr != nil {
-		err = errors.Join(err, pi.ErrProcessContainmentIncomplete,
+		err = errors.Join(err, ErrContainmentIncomplete,
 			fmt.Errorf("join session operation holder: %w", waitErr))
 	} else {
 		releaseTurn()
@@ -1570,7 +1480,7 @@ func (s *agentSession) closeOwned(ctx context.Context, attempt *sessionCloseAtte
 	}
 
 	err = errors.Join(err, s.nativeContainmentError())
-	if !pi.ProcessContainmentComplete(err) {
+	if !nativeContainmentComplete(err) {
 		// A bounded holder/action/join timeout is retained ownership, not a
 		// lifecycle terminal. Do not acquire lcMu, publish terminal state, close
 		// the emitter, or release any resource while that owner may still touch
@@ -1595,7 +1505,7 @@ func (s *agentSession) closeOwned(ctx context.Context, attempt *sessionCloseAtte
 	s.closeLifecycleSession()
 
 	if err != nil {
-		if !pi.ProcessContainmentComplete(err) {
+		if !nativeContainmentComplete(err) {
 			s.recordNativeContainment(err)
 		}
 
@@ -1607,25 +1517,13 @@ func (s *agentSession) closeOwned(ctx context.Context, attempt *sessionCloseAtte
 	// twice, and an incomplete containment boundary retains it by leaving it
 	// unreleased.
 	s.mu.Lock()
-	nativeRelease := s.nativeRootRelease
-	scratchRelease := s.scratchRootRelease
 	sessionRoot := s.sessionRoot
+	generationRoot := s.launch.NativeRoot
 	browserShim := s.browserShim
 	residence := s.residence
 	s.mu.Unlock()
 
-	err = finalizeSessionRuntimeResources(err, nativeRelease, sessionRoot, scratchRelease, browserShim, residence)
-	if err == nil {
-		s.mu.Lock()
-		if s.nativeRootRelease != nil {
-			s.nativeRootRelease = nil
-		}
-
-		if s.scratchRootRelease != nil {
-			s.scratchRootRelease = nil
-		}
-		s.mu.Unlock()
-	}
+	err = finalizeSessionRuntimeResources(s.agent, err, generationRoot, sessionRoot, browserShim, residence)
 
 	if s.agent != nil {
 		s.agent.observe.RecordPiProcessExit(closeCtx, "closed", err)
@@ -1637,7 +1535,6 @@ func (s *agentSession) closeOwned(ctx context.Context, attempt *sessionCloseAtte
 func (s *agentSession) stopHostGenerationWithoutOutbox(ctx context.Context) error {
 	s.mu.Lock()
 	proc := s.proc
-	root := s.providerProcessRoot
 
 	boundary := s.nativeBoundary
 	s.mu.Unlock()
@@ -1647,7 +1544,7 @@ func (s *agentSession) stopHostGenerationWithoutOutbox(ctx context.Context) erro
 	}
 
 	if boundary == nil {
-		return errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("pi session has no native boundary owner"))
+		return errors.Join(ErrContainmentIncomplete, errors.New("pi session has no native boundary owner"))
 	}
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
@@ -1661,106 +1558,11 @@ func (s *agentSession) stopHostGenerationWithoutOutbox(ctx context.Context) erro
 
 	closeErr := boundary.run(ctx, "close", proc.Close)
 
-	containmentErr := errors.Join(shutdownErr, closeErr)
-
-	if root != nil {
-		complete := providerProcessTreeComplete(containmentErr)
-		retireErr := runNativeBoundaryStep(ctx, "retirement", func() error {
-			root.retire(context.WithoutCancel(ctx), complete)
-
-			return nil
-		})
-
-		containmentErr = errors.Join(containmentErr, retireErr)
-		if complete && retireErr == nil {
-			s.mu.Lock()
-			if s.providerProcessRoot == root {
-				s.providerProcessRoot = nil
-			}
-			s.mu.Unlock()
-		}
-	}
-
-	return containmentErr
-}
-
-func (s *agentSession) retireProviderProcess(ctx context.Context, containmentErr error) error {
-	s.mu.Lock()
-	root := s.providerProcessRoot
-	s.mu.Unlock()
-
-	return s.retireProviderRoot(ctx, root, containmentErr)
-}
-
-func (s *agentSession) retireProviderRoot(
-	ctx context.Context,
-	root *providerProcessRoot,
-	containmentErr error,
-) error {
-	if root == nil {
-		return nil
-	}
-
-	complete := providerProcessTreeComplete(containmentErr)
-
-	retireErr := runNativeBoundaryStep(ctx, "retirement", func() error {
-		root.retire(context.WithoutCancel(ctx), complete)
-
-		return nil
-	})
-	if complete && retireErr == nil {
-		s.mu.Lock()
-		if s.providerProcessRoot == root {
-			s.providerProcessRoot = nil
-		}
-		s.mu.Unlock()
-	}
-
-	return retireErr
-}
-
-func (s *agentSession) releaseNativeRootAfterCompletion(err error) {
-	if !pi.ProcessContainmentComplete(err) {
-		return
-	}
-
-	s.mu.Lock()
-	release := s.nativeRootRelease
-	s.nativeRootRelease = nil
-	s.mu.Unlock()
-
-	if release != nil {
-		release()
-	}
-}
-
-func (s *agentSession) observeProviderProcessBounded(ctx context.Context, outbox *sessionOutbox) error {
-	if outbox == nil || outbox.processRoot == nil {
-		return nil
-	}
-
-	observeCtx, cancelObserve := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
-	defer cancelObserve()
-
-	err := runNativeBoundaryStep(observeCtx, "provider process observation", func() error {
-		outbox.processRoot.observe(observeCtx, outbox.proc)
-
-		return nil
-	})
-	if err == nil {
-		return nil
-	}
-
-	containmentErr := s.containGenerationSync(
-		context.WithoutCancel(ctx), outbox, "the provider process observer failed",
-	)
-	s.recordNativeContainment(errors.Join(err, containmentErr))
-
-	return errors.Join(err, containmentErr)
+	return errors.Join(shutdownErr, closeErr)
 }
 
 func (s *agentSession) recordNativeContainment(err error) {
-	if pi.ProcessContainmentComplete(err) {
+	if nativeContainmentComplete(err) {
 		return
 	}
 

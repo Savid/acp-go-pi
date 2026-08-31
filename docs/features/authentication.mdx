@@ -29,14 +29,13 @@ native messages.
 When both roots are usable, `initialize` advertises `providerAuth` with all
 seven method names. No credential needs to exist first: an empty durable home
 still advertises the broker so a host can show Connect. Omitting the ledger root
-leaves the surface unadvertised. Supplying a ledger root without a durable home,
-an unusable path, or explicit process isolation fails initialization.
+leaves the surface unadvertised. Supplying a ledger root without a durable home
+or with an unusable path fails initialization.
 
-Provider auth is intentionally limited to ordinary nil/default execution.
-Supplying `WithProcessIsolation` selects a distinct trusted-root identity whose
-safe credential-delivery path has not been proven, so the broker is not
-advertised and a durable broker home is refused. Explicit isolation never
-downgrades to ordinary execution to make login available.
+Provider auth is available only in ordinary execution. Supplying
+`WithHostAuthority` omits the capability and every `_pi/auth/*` request follows
+the method-not-found path. Managed execution never falls back to a direct Pi
+login process.
 
 ## The seven legs
 

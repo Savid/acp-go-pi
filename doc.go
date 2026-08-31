@@ -25,11 +25,8 @@
 // exporter setup for command-line use. Caller-supplied providers remain
 // owned by the caller, including ForceFlush and Shutdown.
 //
-// Omitting [WithProcessIsolation] runs Pi portably as the adapter's current
-// root or non-root identity and reports shared_identity. This ordinary mode
-// proves direct-process liveness but claims no descendant inventory or
-// whole-tree quiescence. Supplying [WithProcessIsolation] selects a distinct,
-// trusted-root Linux-only boundary and fails closed if it cannot be established.
-// [WithDarwinBestEffortContainment] is a separate embedded opt-in and is never
-// a fallback for an explicit isolation policy.
+// Omitting [WithHostAuthority] runs Pi ordinarily as the adapter identity.
+// Supplying [WithHostAuthority] routes every native launch and private native
+// tree through the borrowed host boundary and fails closed if that authority
+// becomes unavailable.
 package piacp

@@ -15,6 +15,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func writeScript(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-pi")
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o700))
+
+	return path
+}
+
+func startScriptProcess(t *testing.T, spec LaunchSpec) *Process {
+	t.Helper()
+	process, err := StartOrdinaryProcess(t.Context(), spec)
+	require.NoError(t, err)
+
+	return process
+}
+
 func TestNewBrowserShimWritesExecutableNoOps(t *testing.T) {
 	t.Parallel()
 
@@ -151,6 +167,17 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 	})
 
 	t.Cleanup(func() { _ = process.Close() })
+	resolvedResult := make(chan struct {
+		data []byte
+		err  error
+	}, 1)
+	go func() {
+		data, readErr := io.ReadAll(process.Stdout())
+		resolvedResult <- struct {
+			data []byte
+			err  error
+		}{data: data, err: readErr}
+	}()
 
 	select {
 	case <-process.Exited():
@@ -164,8 +191,8 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 
 	// The launchers the child did resolve were the shim's, not something further
 	// along PATH that simply happened to be missing.
-	resolved, err := io.ReadAll(process.Stdout())
-	require.NoError(t, err)
+	resolved := <-resolvedResult
+	require.NoError(t, resolved.err)
 
 	dir := browserShimDirIn(t, parent)
 
@@ -174,7 +201,7 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 		want = append(want, filepath.Join(dir, name))
 	}
 
-	require.Equal(t, want, strings.Fields(string(resolved)))
+	require.Equal(t, want, strings.Fields(string(resolved.data)))
 
 	require.NoError(t, shim.Remove())
 }

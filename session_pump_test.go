@@ -350,9 +350,6 @@ func TestGenerationProducerAndObservationClosedEdges(t *testing.T) {
 	producers.releaseRoot()
 	_, admitted = producers.acquire(1)
 	require.False(t, admitted)
-
-	var outbox *sessionOutbox
-	require.False(t, outbox.claimProviderObservation())
 }
 
 func TestStopPumpJoinsProducerRootAfterPumpExit(t *testing.T) {
@@ -365,7 +362,7 @@ func TestStopPumpJoinsProducerRootAfterPumpExit(t *testing.T) {
 	ctx := &secondWaitCancelledContext{Context: t.Context(), open: make(chan struct{}), done: closed}
 
 	err := session.stopPumpBounded(ctx)
-	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 	outbox.producers.releaseRoot()
 	require.NoError(t, outbox.producers.wait(t.Context()))
 }
@@ -386,7 +383,7 @@ func TestOutboxReservationAndEstablishmentFailureEdges(t *testing.T) {
 	deferred, overflow := missing.deferStartupUI(pi.UIRequest{})
 	require.False(t, deferred)
 	require.False(t, overflow)
-	require.ErrorIs(t, missing.acceptEstablishment(), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, missing.acceptEstablishment(), ErrContainmentIncomplete)
 
 	// The gate names who owns the generation. A generation an owner already
 	// claimed is retired; a gate this generation already released is the
@@ -493,7 +490,7 @@ func TestPumpPublicationFailsClosedWithoutExactBoundary(t *testing.T) {
 	session := &agentSession{agent: NewAgent(WithLogger(slog.New(slog.DiscardHandler)))}
 	cancelled := false
 	_, err := session.startPumpContext(t.Context(), func() { cancelled = true }, newStubPiClient(), nil)
-	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 	require.True(t, cancelled)
 
 	boundary := newNativeBoundaryTracker()
@@ -507,11 +504,11 @@ func TestPumpPublicationFailsClosedWithoutExactBoundary(t *testing.T) {
 	session.closing = false
 	cancelled = false
 	_, err = session.startPumpContext(t.Context(), func() { cancelled = true }, newStubPiClient(), newNativeBoundaryTracker())
-	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 	require.True(t, cancelled)
 
 	cancelled = false
-	_, outbox, published := session.publishRuntimeGeneration(t.Context(), func() { cancelled = true }, nil, nil, nil, nil, nil)
+	_, outbox, published := session.publishRuntimeGeneration(t.Context(), func() { cancelled = true }, nil, nil, nil)
 	require.False(t, published)
 	require.Nil(t, outbox)
 	require.True(t, cancelled)
@@ -542,20 +539,20 @@ func TestExistingIncompleteContainmentIsRetainedByFirstPoison(t *testing.T) {
 	outbox := newTestSessionOutbox(1)
 	containment, _ := outbox.claimContainmentLocked(containmentOwnerClose)
 	session.containGeneration(t.Context(), outbox, "first poison")
-	want := errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("owner incomplete"))
+	want := errors.Join(ErrContainmentIncomplete, errors.New("owner incomplete"))
 	outbox.finishContainment(containment, want)
 	require.NoError(t, outbox.producers.waitChildren(t.Context()))
-	require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, session.nativeContainmentError(), ErrContainmentIncomplete)
 }
 
 func TestContainmentAndNativeBoundaryFailureEdges(t *testing.T) {
 	session := &agentSession{agent: NewAgent(WithLogger(slog.New(slog.DiscardHandler)))}
 	session.containGeneration(t.Context(), nil, "missing")
-	require.ErrorIs(t, session.containGenerationSync(t.Context(), nil, "missing"), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, session.containGenerationSync(t.Context(), nil, "missing"), ErrContainmentIncomplete)
 
 	outbox := newTestSessionOutbox(1)
 	outbox.producers.releaseRoot()
-	require.ErrorIs(t, session.containGenerationSync(t.Context(), outbox, "closed admission"), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, session.containGenerationSync(t.Context(), outbox, "closed admission"), ErrContainmentIncomplete)
 
 	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -586,8 +583,8 @@ func TestContainmentAndNativeBoundaryFailureEdges(t *testing.T) {
 	close(release)
 
 	var tracker *nativeBoundaryTracker
-	require.ErrorIs(t, tracker.run(t.Context(), "missing", func() error { return nil }), pi.ErrProcessContainmentIncomplete)
-	require.ErrorIs(t, tracker.retainedIncomplete(), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, tracker.run(t.Context(), "missing", func() error { return nil }), ErrContainmentIncomplete)
+	require.ErrorIs(t, tracker.retainedIncomplete(), ErrContainmentIncomplete)
 	require.Contains(t, generationContainmentPanicError("panic").Error(), "panic")
 }
 
@@ -618,7 +615,7 @@ func TestNativeBoundaryPriorAndRetainedIncompleteEdges(t *testing.T) {
 	blocked := &nativeBoundaryCall{stage: "abort", done: make(chan struct{})}
 	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
-	require.ErrorIs(t, tracker.awaitPrior(cancelled, "close", blocked), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, tracker.awaitPrior(cancelled, "close", blocked), ErrContainmentIncomplete)
 	first := tracker.retainedIncomplete()
 	tracker.retainIncomplete(errors.New("later"))
 	require.Equal(t, first, tracker.retainedIncomplete())
@@ -654,7 +651,7 @@ func TestNativeBoundaryRunSerializesPriorOwnerAndLateCancellation(t *testing.T) 
 		go func() { done <- tracker.run(observed, "close", func() error { return nil }) }()
 		<-observed.entered
 		cancel()
-		require.ErrorIs(t, <-done, pi.ErrProcessContainmentIncomplete)
+		require.ErrorIs(t, <-done, ErrContainmentIncomplete)
 	})
 
 	t.Run("completed call observes late cancellation", func(t *testing.T) {
@@ -756,7 +753,7 @@ func TestStopPumpBoundedJoinsExactProducerRoot(t *testing.T) {
 		session := &agentSession{pumpDone: make(chan struct{})}
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		require.ErrorIs(t, session.stopPumpBounded(ctx), pi.ErrProcessContainmentIncomplete)
+		require.ErrorIs(t, session.stopPumpBounded(ctx), ErrContainmentIncomplete)
 	})
 
 	t.Run("producer misses bound after pump", func(t *testing.T) {
@@ -766,7 +763,7 @@ func TestStopPumpBoundedJoinsExactProducerRoot(t *testing.T) {
 		session := &agentSession{pumpDone: done, outbox: outbox}
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		require.ErrorIs(t, session.stopPumpBounded(ctx), pi.ErrProcessContainmentIncomplete)
+		require.ErrorIs(t, session.stopPumpBounded(ctx), ErrContainmentIncomplete)
 	})
 }
 
@@ -899,7 +896,7 @@ func TestContainmentPanicPublishesImmutableFailure(t *testing.T) {
 	session.containGeneration(t.Context(), outbox, "panic after containment")
 	err, ok := outbox.awaitContainment()
 	require.True(t, ok)
-	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 }
 
 func TestPromptAcceptanceReturnsExistingGenerationQuarantine(t *testing.T) {
@@ -909,10 +906,10 @@ func TestPromptAcceptanceReturnsExistingGenerationQuarantine(t *testing.T) {
 	session.outbox = outbox
 	session.turnEvents = delivery
 	session.lc.generation = outbox.generation
-	session.lc.quarantineErr = errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("retained"))
+	session.lc.quarantineErr = errors.Join(ErrContainmentIncomplete, errors.New("retained"))
 
 	err := session.acceptPromptResponse(t.Context(), outbox, delivery, testSubmission())
-	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 }
 
 func TestPromptDispatchRefusesEveryStaleOwner(t *testing.T) {

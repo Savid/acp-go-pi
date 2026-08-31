@@ -120,14 +120,6 @@ func (s *BrowserShim) Environ(env []string) []string {
 	return s.shim.environ(env)
 }
 
-func (s *BrowserShim) Handoff(isolation *ProcessIsolation) error {
-	if s == nil || s.shim == nil {
-		return nil
-	}
-
-	return handoffGeneratedNativeTree(s.shim.dir, isolation)
-}
-
 // Remove deletes the shim directory. A nil shim owns nothing to delete.
 func (s *BrowserShim) Remove() error {
 	if s == nil {

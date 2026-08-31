@@ -13,18 +13,15 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/savid/acp-go-pi/internal/lifecycle"
-	"github.com/savid/acp-go-pi/internal/pi"
 )
 
-// vacantStubProcess is a contained process that can enumerate its own tree,
-// so a close boundary behind it proves whole-tree vacancy.
+// vacantStubProcess stands in for a process whose host authority completed
+// Wait, which proves the managed native boundary settled.
 type vacantStubProcess struct {
 	*stubProcess
-	descendants int
-	available   bool
 }
 
-func (p *vacantStubProcess) ProviderDescendantCount() (int, bool) { return p.descendants, p.available }
+func (*vacantStubProcess) managedByHostAuthority() {}
 
 // TestSettleCloseBoundary pins the close-fenced settlement order: containment
 // completes, owned entities terminalize, the resumable snapshot commits, and
@@ -34,7 +31,7 @@ func TestSettleCloseBoundary(t *testing.T) {
 		s, client := lifecycleSession(t, true)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 
-		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+		proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
 		require.NoError(t, s.settleCloseBoundary(t.Context(), proc, nil))
 		require.True(t, s.lc.vacancyProven)
 
@@ -68,8 +65,8 @@ func TestSettleCloseBoundary(t *testing.T) {
 	t.Run("incomplete containment settles nothing", func(t *testing.T) {
 		s, _ := lifecycleSession(t, true)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
-		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
-		require.NoError(t, s.settleCloseBoundary(t.Context(), proc, pi.ErrProcessContainmentIncomplete))
+		proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
+		require.NoError(t, s.settleCloseBoundary(t.Context(), proc, ErrContainmentIncomplete))
 		require.False(t, s.lc.vacancyProven)
 	})
 
@@ -78,7 +75,7 @@ func TestSettleCloseBoundary(t *testing.T) {
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 		require.NoError(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()))
 		client.updateErr = errors.New("delivery")
-		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+		proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
 		require.ErrorContains(t, s.settleCloseBoundary(t.Context(), proc, nil), "delivery")
 	})
 
@@ -88,7 +85,7 @@ func TestSettleCloseBoundary(t *testing.T) {
 		s.agent.options.SessionStore = store
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 		store.appendErr = errors.New("durability unavailable")
-		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+		proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
 		require.ErrorIs(t, s.settleCloseBoundary(t.Context(), proc, nil), errLifecycleBoundaryCommit)
 		require.False(t, s.lc.vacancyProven, "no quiescence fact stands behind an uncommitted snapshot")
 	})
@@ -97,7 +94,7 @@ func TestSettleCloseBoundary(t *testing.T) {
 		s, _ := lifecycleSession(t, true)
 		require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 		s.sessionFilePath = t.TempDir()
-		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+		proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
 		require.Error(t, s.settleCloseBoundary(t.Context(), proc, nil))
 		require.False(t, s.lc.vacancyProven)
 	})
@@ -110,7 +107,7 @@ func TestCloseBoundaryExactTerminalOwnershipEdges(t *testing.T) {
 		session, client := lifecycleSession(t, true)
 		require.NoError(t, session.openLifecycleStream(t.Context(), 1))
 		client.updateErr = want
-		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+		proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
 		require.ErrorIs(t, session.settleCloseBoundary(t.Context(), proc, nil), want)
 	})
 
@@ -182,7 +179,7 @@ func TestCloseSettlesOnAFencedOrNeverOpenedIncarnation(t *testing.T) {
 		s.fenceLifecycleStream()
 
 		emitted := len(client.notifications)
-		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+		proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
 		require.NoError(t, s.settleCloseBoundary(t.Context(), proc, nil))
 		require.Len(t, client.notifications, emitted, "a fenced stream carries no close emission")
 
@@ -192,7 +189,7 @@ func TestCloseSettlesOnAFencedOrNeverOpenedIncarnation(t *testing.T) {
 	t.Run("never opened", func(t *testing.T) {
 		s, client := lifecycleSession(t, true)
 
-		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+		proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
 		require.NoError(t, s.settleCloseBoundary(t.Context(), proc, nil))
 		require.Empty(t, client.notifications, "an incarnation that never opened has no stream to emit on")
 
@@ -209,7 +206,7 @@ func TestCloseSettlesOnAFencedOrNeverOpenedIncarnation(t *testing.T) {
 		// The fence lands after the boundary captured the generation it is about
 		// and before it would have certified, which is the race the unconditional
 		// rungs have to survive: the commit still names what was captured.
-		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+		proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
 		s.fenceLifecycleStream()
 		require.NoError(t, s.settleCloseBoundary(t.Context(), proc, nil))
 		require.Len(t, client.notifications, emitted)
@@ -230,7 +227,7 @@ func TestCloseSettlesOnAFencedOrNeverOpenedIncarnation(t *testing.T) {
 		s.fenceLifecycleStream()
 		s.sessionFilePath = t.TempDir()
 
-		proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+		proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
 		require.Error(t, s.settleCloseBoundary(t.Context(), proc, nil),
 			"a fenced stream skips the emissions, never the durability")
 		require.False(t, s.lc.vacancyProven)
@@ -256,7 +253,7 @@ func TestCloseCertifiesNothingAfterPersistenceIsFenced(t *testing.T) {
 	s.fencePersistence()
 
 	emitted := len(client.notifications)
-	proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+	proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
 	require.NoError(t, s.settleCloseBoundary(t.Context(), proc, nil))
 
 	require.Len(t, client.notifications, emitted,
@@ -287,7 +284,7 @@ func TestCloseNeverRewritesALossTerminalizedFailure(t *testing.T) {
 	}))
 	require.NoError(t, s.recordGenerationLoss(t.Context()))
 
-	proc := &vacantStubProcess{stubProcess: newStubProcess(true), available: true}
+	proc := &vacantStubProcess{stubProcess: newStubProcess(true)}
 	require.NoError(t, s.settleCloseBoundary(t.Context(), proc, nil))
 
 	terminal := map[string]string{}
@@ -375,7 +372,7 @@ func TestAgentCloseOwesTheSameDurableRungAsAWireClose(t *testing.T) {
 		session := &agentSession{
 			agent:           agent,
 			id:              "embedded",
-			proc:            &vacantStubProcess{stubProcess: newStubProcess(true), available: true},
+			proc:            &vacantStubProcess{stubProcess: newStubProcess(true)},
 			sessionRoot:     root,
 			sessionFilePath: sessionFile,
 		}

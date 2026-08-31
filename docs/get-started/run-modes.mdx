@@ -1,82 +1,52 @@
 ---
 title: "Run Modes"
-description: "Choose ordinary execution or explicit Linux isolation from the CLI or an embedded host"
+description: "Run Pi ordinarily or borrow a host-owned native authority"
 ---
 
-The adapter offers the same ACP behavior through two entry points. Use the
-standalone binary when an editor or host spawns a subprocess and pipes JSON-RPC
-over stdio; embed `Serve` when your Go host owns the streams directly.
+The adapter exposes the same ACP behavior as a standalone subprocess and as an
+embedded Go service. The execution boundary differs by configuration.
 
-## Ordinary execution is the default
+## Ordinary execution
 
-With no process-isolation option, the adapter runs Pi as its current root or
-non-root identity. This is the portable default on Linux, Darwin, FreeBSD,
-OpenBSD, and Windows. It needs no privileged setup, identity authority, or
-descendant inventory. `Agent.ContainmentMode()` reports `shared_identity`:
-direct-process liveness is managed, but descendant absence and whole-tree
-quiescence are not claimed.
+The CLI and an embedded agent with no <code>WithHostAuthority</code> run Pi as
+the adapter's own account. No privileged setup is required.
 
-```sh
+~~~sh
 acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt-4o
-```
+~~~
 
-The adapter captures a narrow environment once at construction, removes
-provider credentials and loader hooks, then applies explicit agent/session
-overlays. Ordinary executable and PATH values may be relative; the stricter
-absolute-PATH rules belong only to an explicit isolation policy.
+The adapter captures a small environment at construction, removes ambient
+provider secrets and loader hooks, and applies only explicit agent and session
+overlays. It probes the configured Pi executable before the first session.
 
-## Explicit Linux isolation
+## Host-authority execution
 
-`-process-isolation-config=/absolute/path/process-isolation.json` opts into the
-trusted-root Linux boundary. The policy is strict and fail-closed: it must name
-a distinct non-root identity and valid authority, environment, home, and state
-roots. A missing, malformed, untrusted, same-identity, or non-Linux policy
-fails before `Serve`; there is no ordinary or Darwin fallback.
+An embedded host can supply <code>WithHostAuthority(authority)</code>. Every Pi
+process, including version probes, session generations, relaunches, and
+browser-shimmed work, then starts through that authority. The adapter
+materializes a complete runtime tree, calls <code>PrepareNativeTree</code>, and
+does not access the tree again until the process has settled and
+<code>ReclaimNativeTree</code> succeeds.
 
-```sh
-sudo acp-go-pi \
-  -process-isolation-config /etc/acp-go/pi-isolation.json \
-  -path /usr/local/bin/pi \
-  -scratch-dir /tmp/pi-scratch
-```
+A supplied nil or unusable authority fails initialization before filesystem
+mutation or process launch. Authority failure never retries by launching Pi
+directly.
 
-The durable Pi home used by the provider-auth broker is intentionally not
-available in this distinct-identity posture until a safe credential-delivery
-design is proven. Configure provider auth only in ordinary mode.
-
-## Embedded
-
-```go
-err := piacp.Serve(ctx, input, output,
-	piacp.WithExecutablePath("/usr/local/bin/pi"),
-	piacp.WithScratchDir("/tmp/pi-scratch"),
-	piacp.WithDefaultModel("openai/gpt-4o"),
+~~~go
+agent := piacp.NewAgent(
+    piacp.WithHostAuthority(authority),
+    piacp.WithExecutablePath("pi"),
+    piacp.WithScratchDir("/var/lib/my-host/pi-scratch"),
 )
-```
+~~~
 
-To opt into Linux hardening, add an explicit `WithProcessIsolation` policy:
+<code>HostAuthority</code> is an embedded capability and has no CLI flag.
 
-```go
-piacp.WithProcessIsolation(piacp.ProcessIsolation{
-	UID: 20001,
-	GID: 20001,
-	BaseEnvironment: isolationEnvironment,
-})
-```
+## Embedded options
 
-Every serve-mode flag has an option equivalent:
-
-| Flag | Option |
-| --- | --- |
-| `-path` | `WithExecutablePath` |
-| `-home` | `WithHome` |
-| `-scratch-dir` | `WithScratchDir` |
-| `-provider-auth-root` | `WithProviderAuthRoot` |
-| `-model` | `WithDefaultModel` |
-| `-seed-file` | `WithSeedFiles` |
-| `-process-isolation-config` | constructs `WithProcessIsolation` |
-
-`WithSessionStore`, `WithEnv`, `WithTurnTimeout`, concurrency limits, and
-OpenTelemetry providers remain embed-only. Embedded Darwin hosts may separately
-select `WithDarwinBestEffortContainment`; it never accepts or replaces an
-explicit `ProcessIsolation` policy. See the [Go API](/docs/reference/go-api).
+CLI flags map to <code>WithExecutablePath</code>, <code>WithHome</code>,
+<code>WithScratchDir</code>, <code>WithProviderAuthRoot</code>,
+<code>WithDefaultModel</code>, and <code>WithSeedFiles</code>. Session stores,
+turn timeouts, concurrency limits, telemetry providers, explicit environment
+overlays, and host authority are Go-only options. See the
+[Go API](/docs/reference/go-api).

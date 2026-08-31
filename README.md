@@ -109,9 +109,9 @@ session storage, permissions, raw events, and OpenTelemetry providers.
 - Deliberate provider credential injection through the child environment or a
   seeded `auth.json`, plus an optional seven-leg provider-auth brokerage over
   Pi's durable native credential home and a values-free ownership ledger.
-- Ordinary same-identity execution by default, with fail-closed opt-in to
-  hardened trusted-root Linux isolation or Darwin best-effort cleanup, reported
-  by `Agent.ContainmentMode` — see [security](docs/operations/security.mdx).
+- Ordinary same-account execution by default, or embedded host-authority
+  execution with prepare/start/wait/reclaim ownership and no direct fallback —
+  see [security](docs/operations/security.mdx).
 - Optional durable mirroring through a host-provided `SessionStore` and
   optional raw pi event extension notifications.
 - OpenTelemetry spans, metrics, trace propagation, and structured logs

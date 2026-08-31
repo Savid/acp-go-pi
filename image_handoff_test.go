@@ -44,6 +44,19 @@ func handoffEnvelopeFor(data []byte) map[string]any {
 	}
 }
 
+func TestHandoffCapabilityScalar(t *testing.T) {
+	withoutRoot, err := NewAgent().Initialize(t.Context(), defaultInitializeRequest())
+	require.NoError(t, err)
+	require.NotContains(t, withoutRoot.AgentCapabilities.Meta, handoffMetaKey)
+
+	withRoot, err := NewAgent(WithInputHandoffRoot(t.TempDir())).Initialize(t.Context(), defaultInitializeRequest())
+	require.NoError(t, err)
+	require.Equal(t,
+		map[string]any{"version": 1},
+		withRoot.AgentCapabilities.Meta["acp-go.dev/handoff"],
+	)
+}
+
 // handoffImageBlock builds one handoff-form image block: empty data, a file
 // uri, and the handoff envelope.
 func handoffImageBlock(uri string, mimeType string, envelope map[string]any) acp.ContentBlock {

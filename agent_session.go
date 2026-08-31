@@ -27,8 +27,6 @@ var agentDirExplicitResources = func(dir pi.AgentDir) (pi.ExplicitResources, err
 	return dir.ExplicitResources()
 }
 
-var agentSessionHandoffNativeTree = handoffGeneratedNativeTree
-
 const modelFieldUnknown = "unknown"
 
 // NewSession creates and starts a pi RPC session.
@@ -640,7 +638,7 @@ func (a *Agent) storeStartedSession(ctx context.Context, session *agentSession) 
 		closeErr := previous.Close(ctx)
 		a.retainIncompleteSession(previous, closeErr)
 
-		if pi.ProcessContainmentComplete(closeErr) {
+		if nativeContainmentComplete(closeErr) {
 			return nil
 		}
 
@@ -743,9 +741,7 @@ func (a *Agent) transferConstructionToRelaunch(
 	attempt.mu.Lock()
 	attempt.proc = construction.proc
 	attempt.client = construction.client
-	attempt.processRoot = construction.processRoot
 	attempt.generationRoot = construction.generationRoot
-	attempt.nativeRelease = construction.nativeRelease
 	attempt.nativeBoundary = construction.nativeBoundary
 
 	if construction.err == nil {
@@ -783,16 +779,13 @@ func (a *Agent) cleanupNativeConstructionOwned(
 	a.mu.Lock()
 	immutable := construction.immutable
 	proc := construction.proc
-	root := construction.processRoot
 	session := construction.session
-	nativeRelease := construction.nativeRelease
-	scratchRelease := construction.scratchRelease
 	sessionRoot := construction.sessionRoot
 	browserShim := construction.browserShim
 	residence := construction.residence
 	a.mu.Unlock()
 
-	if !immutable && !pi.ProcessContainmentComplete(cause) {
+	if !immutable && !nativeContainmentComplete(cause) {
 		return cause
 	}
 
@@ -822,29 +815,12 @@ func (a *Agent) cleanupNativeConstructionOwned(
 		containmentErr = errors.Join(containmentErr, shutdownErr, killErr, closeErr)
 	}
 
-	if root != nil {
-		complete := providerProcessTreeComplete(containmentErr)
-		retireErr := runNativeBoundaryStep(cleanupCtx, "construction retirement", func() error {
-			root.retire(context.WithoutCancel(cleanupCtx), complete)
-
-			return nil
-		})
-		containmentErr = errors.Join(containmentErr, retireErr)
-	}
-
-	if !pi.ProcessContainmentComplete(containmentErr) {
+	if !nativeContainmentComplete(containmentErr) {
 		return containmentErr
 	}
 
 	resourceErr := runNativeBoundaryStep(cleanupCtx, "construction resource cleanup", func() error {
-		return finalizeSessionRuntimeResources(
-			containmentErr,
-			nativeRelease,
-			sessionRoot,
-			scratchRelease,
-			browserShim,
-			residence,
-		)
+		return finalizeSessionRuntimeResources(a, containmentErr, construction.generationRoot, sessionRoot, browserShim, residence)
 	})
 
 	if immutable {
@@ -993,17 +969,6 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 
 			return
 		}
-		// The process observer is external and may synchronously reenter
-		// Agent.Close. Construction ownership has already transferred to the
-		// claimable session, so that reentry never waits on its own callback.
-		observeErr := session.observeProviderProcessBounded(context.WithoutCancel(ctx), session.outboxRouter())
-		if observeErr != nil {
-			a.retainIncompleteSession(session, observeErr)
-			session = nil
-			err = observeErr
-
-			return
-		}
 
 		a.mu.Lock()
 		closed = closed || a.closed
@@ -1034,15 +999,7 @@ func (a *Agent) startSessionConstruction(
 		return nil, configErr
 	}
 
-	readinessStarted := time.Now()
 	versionErr := a.ensureVersion(ctx)
-
-	observationErr := observeRuntimeStartupStage(
-		ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery, RuntimeStartupReadiness, readinessStarted, versionErr,
-	)
-	if observationErr != nil {
-		return nil, errors.Join(versionErr, observationErr)
-	}
 
 	if closedErr := a.ensureOpen(); closedErr != nil {
 		return nil, closedErr
@@ -1066,24 +1023,14 @@ func (a *Agent) startSessionConstruction(
 		return nil, err
 	}
 
-	scratchRelease, err := reserveScratchRoot(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession)
-	if err != nil {
-		return nil, err
-	}
-
-	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
-		owner.scratchRelease = scratchRelease
-	})
-
 	if closedErr := a.ensureOpen(); closedErr != nil {
 		return nil, closedErr
 	}
 
 	var (
-		dirs          sessionDirs
-		nativeRelease func()
-		browserShim   *pi.BrowserShim
-		residence     *pi.SessionResidence
+		dirs        sessionDirs
+		browserShim *pi.BrowserShim
+		residence   *pi.SessionResidence
 	)
 
 	dirs, browserShim, err = a.createSessionRuntime()
@@ -1109,8 +1056,6 @@ func (a *Agent) startSessionConstruction(
 			return nil, err
 		}
 	}
-
-	configurationStarted := time.Now()
 
 	var mcpConfig *pi.MCPConfig
 
@@ -1168,26 +1113,18 @@ func (a *Agent) startSessionConstruction(
 		SeedFiles: a.options.SeedFiles,
 	}
 	if writeErr := agentDir.Write(); writeErr != nil {
-		writeObservationErr := observeRuntimeStartupStage(
-			ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, writeErr,
-		)
-
 		var seedErr *pi.SeedFileError
 		if errors.As(writeErr, &seedErr) {
-			return nil, errors.Join(unsupportedField("seedFiles."+seedErr.Name), writeObservationErr)
+			return nil, unsupportedField("seedFiles." + seedErr.Name)
 		}
 
-		return nil, errors.Join(writeErr, writeObservationErr)
+		return nil, writeErr
 	}
 
 	// Reconciled after the seed write, so an operator-seeded settings.json is
 	// the baseline this and every later launch starts from.
 	if reconcileErr := a.reconcileHomeStartupDefaults(dirs.AgentDir); reconcileErr != nil {
-		reconcileObservationErr := observeRuntimeStartupStage(
-			ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, reconcileErr,
-		)
-
-		return nil, errors.Join(reconcileErr, reconcileObservationErr)
+		return nil, reconcileErr
 	}
 
 	seededResources, err := agentDirExplicitResources(agentDir)
@@ -1195,8 +1132,8 @@ func (a *Agent) startSessionConstruction(
 		return nil, err
 	}
 
-	if handoffErr := agentSessionHandoffNativeTree(dirs.Root, a.nativeOwnershipIsolation()); handoffErr != nil {
-		return nil, handoffErr
+	if prepareErr := a.prepareNativeTree(ctx, dirs.Root); prepareErr != nil {
+		return nil, prepareErr
 	}
 
 	// Load operator-seeded extensions before wrapper-owned extensions so the
@@ -1204,18 +1141,13 @@ func (a *Agent) startSessionConstruction(
 	// replaced by a seed with the same registration name.
 	extensionPaths = append(seededResources.Extensions, extensionPaths...)
 
-	if configurationObservationErr := observeRuntimeStartupStage(
-		ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupConfiguration, configurationStarted, nil,
-	); configurationObservationErr != nil {
-		return nil, configurationObservationErr
-	}
-
 	if closedErr := a.ensureOpen(); closedErr != nil {
 		return nil, closedErr
 	}
 
 	spec := pi.LaunchSpec{
 		ExecutablePath:      executable,
+		NativeRoot:          dirs.Root,
 		AgentDir:            dirs.AgentDir,
 		SessionDir:          dirs.SessionDir,
 		SessionPath:         hydratedPath,
@@ -1226,26 +1158,13 @@ func (a *Agent) startSessionConstruction(
 		ExtraPathDirs:       extraPathDirs,
 		Cwd:                 start.Cwd,
 		BrowserShim:         browserShim,
-	}
-
-	spec.Containment, err = a.containmentSpecForRoot(scratchParent(a.options.ScratchDir), dirs.Root, RuntimeResourceSession)
-	if err != nil {
-		return nil, err
+		BaseEnvironment:     a.nativeBaseEnvironment(),
 	}
 
 	// The pi child must outlive the lifecycle request that spawns it: its
 	// launch context is detached so the request-scoped cancel cannot kill the
 	// session's long-lived process. Teardown is owned by the shutdown ladder.
 	startCtx, finishStart := a.observe.StartPiProcess(context.WithoutCancel(ctx), "start")
-
-	nativeRelease, err = acquireNativeRoot(ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession)
-	if err != nil {
-		return nil, err
-	}
-
-	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
-		owner.nativeRelease = nativeRelease
-	})
 
 	if closedErr := a.ensureOpen(); closedErr != nil {
 		return nil, closedErr
@@ -1261,31 +1180,17 @@ func (a *Agent) startSessionConstruction(
 		return nil, closedErr
 	}
 
-	spawnStarted := time.Now()
-	proc, client, processRoot, err := a.startTrackedPiProcess(startCtx, spec)
+	proc, client, err := a.startTrackedPiProcess(startCtx, spec)
 	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
 		owner.proc = proc
 		owner.client = client
 
-		owner.processRoot = processRoot
 		if owner.err == nil {
 			owner.err = err
 		}
 	})
 
-	observationErr = observeRuntimeStartupStage(
-		startCtx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSpawn, spawnStarted, err,
-	)
-
 	finishStart(err)
-
-	if observationErr != nil {
-		if errors.Is(observationErr, errRuntimeObservationPanic) {
-			observationErr = errors.Join(errors.New("pi session construction callback panicked"), observationErr)
-		}
-
-		return nil, errors.Join(err, observationErr)
-	}
 
 	if closedErr := a.ensureOpen(); closedErr != nil {
 		return nil, errors.Join(err, closedErr)
@@ -1311,32 +1216,19 @@ func (a *Agent) startSessionConstruction(
 		client:                client,
 		turn:                  make(chan struct{}, sessionTurnCapacity),
 		rawMessages:           start.RawMessages,
-		nativeRootRelease:     nativeRelease,
-		scratchRootRelease:    scratchRelease,
-		providerProcessRoot:   processRoot,
 		nativeBoundary:        construction.nativeBoundary,
 	}
 	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
 		owner.session = session
 	})
 
-	readinessStarted = time.Now()
 	generationCtx, generationCancel := context.WithCancel(context.Background())
-	err = client.Start(generationCtx)
-	observationErr = observeRuntimeStartupStage(
-		ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupReadiness, readinessStarted, err,
-	)
 
+	err = client.Start(generationCtx)
 	if err != nil {
 		generationCancel()
 
 		return nil, err
-	}
-
-	if observationErr != nil {
-		generationCancel()
-
-		return nil, observationErr
 	}
 
 	if closedErr := a.ensureOpen(); closedErr != nil {
@@ -1351,15 +1243,7 @@ func (a *Agent) startSessionConstruction(
 		return nil, pumpErr
 	}
 
-	sessionStarted := time.Now()
 	err = a.setUpNativeSession(ctx, session, start, modelRef, hasModel)
-
-	observationErr = observeRuntimeStartupStage(
-		ctx, a.options.RuntimeResourceHooks, RuntimeResourceSession, RuntimeStartupSession, sessionStarted, err,
-	)
-	if observationErr != nil {
-		return nil, errors.Join(err, observationErr)
-	}
 
 	if closedErr := a.ensureOpen(); closedErr != nil {
 		return nil, errors.Join(err, closedErr)

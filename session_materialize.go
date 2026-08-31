@@ -39,7 +39,7 @@ type sessionDirs struct {
 // scratch parent. A configured Home replaces only the generated agent
 // directory; session storage and generations remain removable scratch.
 func (a *Agent) createSessionDirs() (sessionDirs, error) {
-	parent, err := ensureScratchParent(a.options.ScratchDir)
+	parent, err := ensureScratchParent(a.scratchParent)
 	if err != nil {
 		return sessionDirs{}, err
 	}
@@ -79,16 +79,13 @@ func (a *Agent) createSessionRuntime() (sessionDirs, *pi.BrowserShim, error) {
 		return sessionDirs{}, nil, err
 	}
 
-	shim, err := a.newOwnedSessionBrowserShim()
+	shim, err := a.newOwnedSessionBrowserShim(dirs.Root)
 
 	return dirs, shim, err
 }
 
 // durableHome materializes Pi's stable native auth residence and reports its
-// path, or the empty string when no durable home is configured. Hardened
-// distinct-identity sessions refuse it until a proven credential-delivery
-// design exists; ordinary current-identity sessions use it directly and Pi's
-// native cross-process lock serializes auth.json updates.
+// path, or the empty string when no durable home is configured.
 //
 // The refusals are option verdicts about a host-supplied value, so they wear the
 // uniform unsupported-field shape rather than a raw Go error: a host that
@@ -99,10 +96,6 @@ func (a *Agent) durableHome() (string, error) {
 	home := a.options.Home
 	if home == "" {
 		return "", nil
-	}
-
-	if a.options.ProcessIsolation != nil {
-		return "", unsupportedField(optionFieldHome)
 	}
 
 	if !filepath.IsAbs(home) || filepath.Clean(home) != home {

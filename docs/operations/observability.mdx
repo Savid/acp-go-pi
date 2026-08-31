@@ -16,28 +16,19 @@ logging with `-debug` (`WithLogger` for a custom logger). Telemetry records
 lifecycle timing, request outcomes, and counters, and by default avoids
 recording prompt text, tool inputs, tool outputs, and raw pi event bodies.
 
-## Containment signal
+## Native-boundary failures
 
-`acp_go_pi.runtime.containment` is recorded as `1` with the exact
-`containment` attribute `authoritative`, `shared_identity`, `best_effort`, or
-`unavailable`.
-Embedded hosts receive the same value once through
-`RuntimeResourceHooks.ObserveContainment`; `Agent.ContainmentMode` exposes it
-directly.
+Managed hosts should classify errors with `errors.Is`. An
+`ErrHostAuthorityUnavailable` result stops further managed native admission;
+`ErrContainmentIncomplete` means terminality or tree ownership is uncertain;
+and `ErrNativeTreeBusy` means reclaim was refused before mutation because a
+process handle is still live. The adapter logs operation context without
+recording authority environment values, prompt text, tool data, or provider
+messages.
 
-An agent with no explicit process-isolation policy reports
-`containment=shared_identity` on every supported platform. It runs as the
-current root or non-root identity and manages direct-process liveness, but it
-does not install identity authority, inventory descendants, or claim
-whole-tree quiescence. Consequently it emits no `provider_descendant`
-snapshot, including zero.
-
-Darwin opt-in logs a structured warning with `containment=best_effort`, and the
-standalone binary prints a plain warning even without `-debug`. Best-effort
-mode likewise emits no `provider_descendant` process snapshot, including zero, because
-the process group cannot inventory escaped descendants. Resource admissions
-still describe wrapper-managed native roots and scratch roots; they must not
-be interpreted as a bound on escaped provider work.
+Ordinary execution reports no whole-containment proof. With a host authority,
+the lifecycle capability advertises process containment, and terminal events
+are published only after the authority's `Wait` result settles the generation.
 
 ## Diagnosing turn failures
 

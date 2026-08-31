@@ -108,7 +108,7 @@ func TestEnvironmentValidation(t *testing.T) {
 		require.False(t, validEnvName(name))
 	}
 
-	for _, name := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_DARWIN_LAUNCH", "acp_go_pi_internal_turn_supervisor", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
+	for _, name := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_CONTROL", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
 		require.True(t, blockedAgentEnvKey(name))
 		require.True(t, blockedSessionEnvKey(name))
 	}
@@ -124,15 +124,6 @@ func TestEnvironmentValidation(t *testing.T) {
 	requireUnsupportedField(t, validateEnvironment(map[string]string{"PATH": "/raw/bin"}, metaOptionPath(metaEnvKey), blockedSessionEnvKey), metaOptionPath(metaEnvKey)+".PATH")
 	requireUnsupportedField(t, validateEnvironment(map[string]string{pi.EnvExtraPathDirs: "/attacker/bin"}, metaOptionPath(metaEnvKey), blockedSessionEnvKey), metaOptionPath(metaEnvKey)+"."+pi.EnvExtraPathDirs)
 	requireUnsupportedField(t, validateEnvironment(map[string]string{"1A": "x"}, optionFieldEnv, blockedAgentEnvKey), optionFieldEnv+".1A")
-
-	originalPlatform := agentRuntimePlatform
-	agentRuntimePlatform = windowsPlatform
-	t.Cleanup(func() { agentRuntimePlatform = originalPlatform })
-	requireUnsupportedField(
-		t,
-		validateEnvironment(map[string]string{"Provider_Key": "session", "PROVIDER_KEY": "agent"}, metaOptionPath(metaEnvKey), blockedSessionEnvKey),
-		metaOptionPath(metaEnvKey)+".Provider_Key",
-	)
 }
 
 func TestExtraPathDirsValidation(t *testing.T) {

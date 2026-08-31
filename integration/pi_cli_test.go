@@ -21,11 +21,14 @@ func TestPiCLIVersionProbe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	agentDir, containment := integrationVersionProbeSpec(t)
+	runtime := newIntegrationRuntime(t)
+	agentDir := filepath.Join(runtime.root, "probe-agent")
+	require.NoError(t, (pi.AgentDir{Root: agentDir}).Write())
 	policyHome := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(policyHome, "sentinel"), []byte("unchanged"), 0o600))
-	integrationContainmentEnvironment(containment)["HOME"] = policyHome
-	version, err := pi.ProbeVersion(ctx, path, agentDir, containment)
+	runtime.baseEnvironment["HOME"] = policyHome
+	environment := (pi.LaunchSpec{AgentDir: agentDir, BaseEnvironment: runtime.baseEnvironment}).Environ()
+	version, err := pi.ProbeOrdinaryVersion(ctx, path, environment)
 	require.NoError(t, err)
 	require.NotEmpty(t, version)
 	require.NoError(t, pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion),
@@ -48,8 +51,8 @@ func TestPiCLIExplicitSeedResources(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	containment := integrationContainmentSpec(t)
-	root := containment.GenerationRoot
+	runtime := newIntegrationRuntime(t)
+	root := runtime.root
 	agentDir := filepath.Join(root, "agent")
 	sessionDir := filepath.Join(root, "sessions")
 	require.NoError(t, os.MkdirAll(sessionDir, 0o700))
@@ -73,7 +76,7 @@ Use the deterministic seeded skill.
 	_, wrapper, err := pi.CreateSessionResidence(agentDir, nil)
 	require.NoError(t, err)
 
-	process, err := pi.StartProcess(ctx, pi.LaunchSpec{
+	process, err := pi.StartOrdinaryProcess(ctx, pi.LaunchSpec{
 		ExecutablePath:      path,
 		AgentDir:            agentDir,
 		SessionDir:          sessionDir,
@@ -81,7 +84,8 @@ Use the deterministic seeded skill.
 		SkillPaths:          resources.Skills,
 		PromptTemplatePaths: resources.PromptTemplates,
 		Cwd:                 root,
-		Containment:         containment,
+		NativeRoot:          root,
+		BaseEnvironment:     runtime.baseEnvironment,
 	})
 	require.NoError(t, err)
 	client := pi.NewClient(process.Stdin(), process.Stdout())

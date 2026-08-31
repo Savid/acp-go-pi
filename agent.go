@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -24,14 +23,6 @@ const (
 
 	metaFieldVersion = "version"
 )
-
-const (
-	darwinPlatform  = "darwin"
-	linuxPlatform   = "linux"
-	windowsPlatform = "windows"
-)
-
-var agentRuntimePlatform = runtime.GOOS
 
 var newServeAgent = NewAgent
 
@@ -82,6 +73,8 @@ type Agent struct {
 	// ordinaryEnvironment is captured and sanitized once at construction so
 	// later ambient changes cannot cross into an existing agent generation.
 	ordinaryEnvironment map[string]string
+	nativeEnvironment   map[string]string
+	scratchParent       string
 
 	// Lock order: acquire mu before any session lock. Do not call session
 	// close methods while holding mu.
@@ -100,7 +93,6 @@ type Agent struct {
 	// answer leaves the extension dormant for every session on it.
 	lifecycle            lifecycle.Negotiated
 	optionErr            error
-	processes            *providerProcessTracker
 	nativeContainmentErr error
 	closeAttempt         *agentCloseAttempt
 
@@ -121,7 +113,7 @@ type Agent struct {
 	providerAuth *providerAuth
 
 	startPiProcess func(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error)
-	probeVersion   func(ctx context.Context, executablePath string, agentDir string, containment pi.ContainmentSpec) (string, error)
+	probeVersion   func(ctx context.Context, executablePath string, agentDir string, generationRoot string) (string, error)
 	lookPath       func(file string) (string, error)
 }
 
@@ -146,15 +138,23 @@ func NewAgent(opts ...Option) *Agent {
 		TracerProvider: options.TracerProvider,
 		Version:        options.AgentVersion,
 	})
-	mode := containmentMode(options)
-	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe, mode)
 	ordinaryEnvironment := pi.CaptureOrdinaryEnvironment()
+
+	var nativeEnvironment map[string]string
+
+	var authorityErr error
+
+	if options.hostAuthoritySupplied {
+		nativeEnvironment, authorityErr = readHostEnvironment(options.HostAuthority)
+	}
 
 	agent := &Agent{
 		options:             options,
 		log:                 log,
 		observe:             observe,
 		ordinaryEnvironment: ordinaryEnvironment,
+		nativeEnvironment:   nativeEnvironment,
+		scratchParent:       scratchParentForOptions(options),
 		sessions:            make(map[acp.SessionId]*agentSession),
 		retainedSessions:    make(map[*agentSession]struct{}),
 		constructions:       make(map[*nativeConstruction]struct{}),
@@ -162,106 +162,47 @@ func NewAgent(opts ...Option) *Agent {
 		deleted:             make(map[acp.SessionId]struct{}),
 		positionEncoding:    acp.PositionEncodingKindUtf16,
 		optionErr: errors.Join(
+			authorityErr,
 			optionFailure(log, optionFieldEnv, validateEnvironment(options.Env, optionFieldEnv, blockedAgentEnvKey)),
 			optionFailure(log, optionFieldConcurrencyLimits, validateConcurrencyLimits(options.ConcurrencyLimits)),
-			optionFailure(log, optionFieldContainment, validateContainmentOption(options)),
 			optionFailure(log, optionFieldImageLimits, validateImageLimits(options.ImageLimits)),
 			optionFailure(log, optionFieldInputHandoffRoot, validateInputHandoffRoot(options.InputHandoffRoot)),
 		),
-		startPiProcess: startRealPiProcess,
-		probeVersion:   pi.ProbeVersion,
 		lookPath: func(file string) (string, error) {
-			return pi.ResolveExecutable(file, internalProcessIsolation(options.ProcessIsolation, options.testOnlyNoCredential, options.testOnlyIdentityLockRoot), ordinaryEnvironment, options.Env)
+			return pi.ResolveExecutable(file, ordinaryEnvironment, options.Env)
 		},
 	}
-	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
+	agent.startPiProcess = agent.startRealPiProcess
+	agent.probeVersion = agent.probeNativeVersion
 
 	agent.optionErr = errors.Join(
 		agent.optionErr,
 		optionFailure(log, optionFieldProviderAuthRoot, configureProviderAuth(agent)),
 	)
 
-	observeRuntimeContainment(context.Background(), options.RuntimeResourceHooks, mode)
-
-	if mode == RuntimeContainmentBestEffort {
-		log.WarnContext(
-			context.Background(),
-			"Darwin process containment is best effort; escaped descendants may survive, marker correlation is not ownership and markers can be scrubbed, numeric process-group reuse can cause collateral signalling, and native-root permits do not bound escaped provider work",
-			slog.String("containment", string(mode)),
-		)
-	}
-
 	return agent
-}
-
-// ContainmentMode reports the effective native process boundary.
-func (a *Agent) ContainmentMode() RuntimeContainmentMode {
-	if a == nil {
-		return RuntimeContainmentUnavailable
-	}
-
-	return containmentMode(a.options)
-}
-
-func containmentMode(options Options) RuntimeContainmentMode {
-	if options.DarwinBestEffortContainment && agentRuntimePlatform != darwinPlatform {
-		return RuntimeContainmentUnavailable
-	}
-
-	if options.ProcessIsolation != nil && options.DarwinBestEffortContainment {
-		return RuntimeContainmentUnavailable
-	}
-
-	if options.ProcessIsolation == nil {
-		if options.DarwinBestEffortContainment {
-			return RuntimeContainmentBestEffort
-		}
-
-		return RuntimeContainmentSharedIdentity
-	}
-
-	if agentRuntimePlatform == linuxPlatform {
-		return RuntimeContainmentAuthoritative
-	}
-
-	return RuntimeContainmentUnavailable
-}
-
-func validateContainmentOption(options Options) error {
-	if options.ProcessIsolation != nil && options.DarwinBestEffortContainment {
-		return errors.New("explicit process isolation cannot be combined with darwin best-effort containment")
-	}
-
-	if options.DarwinBestEffortContainment && agentRuntimePlatform != darwinPlatform {
-		return errors.New("darwin best-effort containment is only valid on darwin")
-	}
-
-	return nil
 }
 
 func (a *Agent) startTrackedPiProcess(
 	ctx context.Context,
 	spec pi.LaunchSpec,
-) (piProcess, piClient, *providerProcessRoot, error) {
+) (piProcess, piClient, error) {
 	process, client, err := a.startPiProcess(ctx, spec)
 	if err != nil {
-		if !providerProcessTreeComplete(err) {
-			root := a.processes.registerDeferred()
-			a.recordNativeContainment(err)
+		a.recordNativeContainment(err)
 
-			return process, client, root, err
-		}
-
-		return nil, nil, nil, err
+		return process, client, err
 	}
 
-	root := a.processes.registerDeferred()
-
-	return process, client, root, nil
+	return process, client, nil
 }
 
-func startRealPiProcess(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
-	process, err := pi.StartProcess(ctx, spec)
+func (a *Agent) startRealPiProcess(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
+	if a.options.hostAuthoritySupplied {
+		return a.startAuthorityPiProcess(ctx, spec)
+	}
+
+	process, err := pi.StartOrdinaryProcess(ctx, spec)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -393,7 +334,7 @@ func (a *Agent) awaitClose(attempt *agentCloseAttempt) error {
 	case <-attempt.done:
 	case <-waitCtx.Done():
 		if !a.quarantineClose(attempt, fmt.Errorf("%w: join agent close attempt: %v",
-			pi.ErrProcessContainmentIncomplete, waitCtx.Err())) {
+			ErrContainmentIncomplete, waitCtx.Err())) {
 			<-attempt.done
 		}
 	}
@@ -403,7 +344,7 @@ func (a *Agent) awaitClose(attempt *agentCloseAttempt) error {
 
 func (a *Agent) close(attempt *agentCloseAttempt) error {
 	constructionErr := a.awaitNativeConstructions()
-	if !pi.ProcessContainmentComplete(constructionErr) {
+	if !nativeContainmentComplete(constructionErr) {
 		a.recordNativeContainment(constructionErr)
 
 		return constructionErr
@@ -487,7 +428,7 @@ func (a *Agent) close(attempt *agentCloseAttempt) error {
 	a.mu.Unlock()
 
 	closeErr := errors.Join(closeErrs...)
-	if !pi.ProcessContainmentComplete(closeErr) {
+	if !nativeContainmentComplete(closeErr) {
 		a.recordNativeContainment(closeErr)
 
 		return closeErr
@@ -508,11 +449,8 @@ type nativeConstruction struct {
 
 	proc           piProcess
 	client         piClient
-	processRoot    *providerProcessRoot
 	generationRoot string
 	sessionRoot    string
-	nativeRelease  func()
-	scratchRelease func()
 	browserShim    *pi.BrowserShim
 	residence      *pi.SessionResidence
 	runtime        *runtimeGeneration
@@ -583,7 +521,7 @@ func (a *Agent) finishNativeConstruction(construction *nativeConstruction, retai
 		construction.err = err
 	}
 
-	if construction.err != nil && !pi.ProcessContainmentComplete(construction.err) {
+	if construction.err != nil && !nativeContainmentComplete(construction.err) {
 		retain = true
 	}
 
@@ -619,7 +557,7 @@ func (a *Agent) awaitNativeConstructions() error {
 		case <-construction.done:
 		case <-joinCtx.Done():
 			incomplete := fmt.Errorf("%w: join native construction owner: %v",
-				pi.ErrProcessContainmentIncomplete, joinCtx.Err())
+				ErrContainmentIncomplete, joinCtx.Err())
 
 			a.mu.Lock()
 			if !construction.immutable {
@@ -638,7 +576,7 @@ func (a *Agent) awaitNativeConstructions() error {
 }
 
 func (a *Agent) recordNativeContainment(err error) {
-	if pi.ProcessContainmentComplete(err) {
+	if nativeContainmentComplete(err) {
 		return
 	}
 
@@ -672,6 +610,10 @@ func (a *Agent) setConnection(conn agentClient) {
 // prompt without ever calling initialize, and options that never validated
 // must not reach a native process.
 func (a *Agent) optionsError() error {
+	if errors.Is(a.optionErr, ErrHostAuthorityUnavailable) {
+		return ErrHostAuthorityUnavailable
+	}
+
 	var reqErr *acp.RequestError
 	if !errors.As(a.optionErr, &reqErr) {
 		return nil
@@ -872,7 +814,7 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 		ownerErr := construction.err
 		a.mu.Unlock()
 
-		retain := !pi.ProcessContainmentComplete(returnErr)
+		retain := !nativeContainmentComplete(returnErr)
 
 		if generationOwner != nil && generationOwner.err != nil {
 			ownerErr = errors.Join(ownerErr, generationOwner.err)
@@ -886,14 +828,6 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 		a.finishNativeConstruction(construction, retain, ownerErr)
 	}()
 
-	if validationErr := validateProcessIsolationOption(a.options.ProcessIsolation); validationErr != nil {
-		return validationErr
-	}
-
-	if a.options.ProcessIsolation != nil && a.ContainmentMode() == RuntimeContainmentUnavailable {
-		return fmt.Errorf("%w: native process containment is unavailable", ErrProcessContainmentIncomplete)
-	}
-
 	executable, err := a.resolveExecutablePath()
 	if err != nil {
 		return err
@@ -903,7 +837,7 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 		return closedErr
 	}
 
-	containment, generation, err := a.createRuntimeGeneration(ctx, RuntimeResourceDiscovery)
+	generation, err := a.createRuntimeGeneration(ctx)
 	if err != nil {
 		return err
 	}
@@ -912,64 +846,37 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 		owner.runtime = generation
 		owner.generationRoot = generation.root
 		owner.sessionRoot = generation.root
-		owner.scratchRelease = generation.release
 	})
 
 	if closedErr := a.ensureOpen(); closedErr != nil {
-		return generation.finalize(closedErr)
+		return generation.finalize(context.WithoutCancel(ctx), closedErr)
 	}
 
-	probeAgentDir, err := generation.prepareVersionProbeAgentDir(a.nativeOwnershipIsolation())
+	probeAgentDir, err := generation.prepareVersionProbeAgentDir(ctx)
 	if err != nil {
-		return generation.finalize(err)
-	}
-
-	nativeRelease, err := acquireNativeRoot(ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery)
-	if err != nil {
-		return generation.finalize(err)
-	}
-
-	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
-		owner.nativeRelease = nativeRelease
-	})
-
-	if closedErr := a.ensureOpen(); closedErr != nil {
-		finalErr := generation.finalize(closedErr)
-		releaseNativeRootWhenComplete(nativeRelease, finalErr)
-
-		return finalErr
+		return generation.finalize(context.WithoutCancel(ctx), err)
 	}
 
 	// This is the final launch gate. Nothing between it and probeVersion invokes
 	// external code or drops the Agent close fence.
 	if contextErr := ctx.Err(); contextErr != nil {
-		finalErr := generation.finalize(contextErr)
-		releaseNativeRootWhenComplete(nativeRelease, finalErr)
-
-		return finalErr
+		return generation.finalize(context.WithoutCancel(ctx), contextErr)
 	}
 
 	if closedErr := a.ensureOpen(); closedErr != nil {
-		finalErr := generation.finalize(closedErr)
-		releaseNativeRootWhenComplete(nativeRelease, finalErr)
-
-		return finalErr
+		return generation.finalize(context.WithoutCancel(ctx), closedErr)
 	}
 
-	version, err := a.probeVersion(ctx, executable, probeAgentDir, containment)
+	version, err := a.probeVersion(ctx, executable, probeAgentDir, generation.root)
 	if closedErr := a.ensureOpen(); closedErr != nil {
 		err = errors.Join(err, closedErr)
 	}
 
-	err = generation.finalize(err)
-	releaseNativeRootWhenComplete(nativeRelease, err)
+	err = generation.finalize(context.WithoutCancel(ctx), err)
 
-	if pi.ProcessContainmentComplete(err) {
+	if nativeContainmentComplete(err) {
 		a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
-			owner.nativeRelease = nil
-			if generation.err == nil {
-				owner.scratchRelease = nil
-			}
+			owner.runtime = nil
 		})
 	}
 
@@ -992,6 +899,10 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 func (a *Agent) resolveExecutablePath() (string, error) {
 	if a.options.ExecutablePath != "" {
 		return a.options.ExecutablePath, nil
+	}
+
+	if a.options.hostAuthoritySupplied {
+		return rawEventSourceValue, nil
 	}
 
 	path, err := a.lookPath("pi")

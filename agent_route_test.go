@@ -103,10 +103,13 @@ func TestTurnScopedNotificationsCarryExactRoute(t *testing.T) {
 	require.Equal(t, turnRouteMeta("turn-old"), client.notified[0]["_meta"])
 }
 
-func TestInitializeAdvertisesRouteV1(t *testing.T) {
+func TestRouteCapabilityScalar(t *testing.T) {
 	resp, err := NewAgent().Initialize(context.Background(), acp.InitializeRequest{})
 	require.NoError(t, err)
 	require.Equal(t, map[string]any{"version": 1}, resp.AgentCapabilities.Meta[routeMetaKey])
+	route, ok := resp.AgentCapabilities.Meta["acp-go.dev/route"].(map[string]any)
+	require.True(t, ok)
+	require.NotContains(t, route, "versions")
 
 	piMeta, ok := resp.AgentCapabilities.Meta[piMetaKey].(map[string]any)
 	require.True(t, ok)

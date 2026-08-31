@@ -21,12 +21,6 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
-type closeOnErrContext struct {
-	context.Context //nolint:containedctx // The test wrapper deliberately intercepts Err at an exact admission edge.
-	onErr           func()
-	returnErr       func() error
-}
-
 type commandCatalogFailClient struct {
 	*directAgentClient
 	want error
@@ -38,18 +32,6 @@ func (c *commandCatalogFailClient) SessionUpdate(ctx context.Context, notificati
 	}
 
 	return c.directAgentClient.SessionUpdate(ctx, notification)
-}
-
-func (c *closeOnErrContext) Err() error {
-	if c.onErr != nil {
-		c.onErr()
-	}
-
-	if c.returnErr != nil {
-		return c.returnErr()
-	}
-
-	return nil
 }
 
 func TestStoreStartedSessionCloseErrorBranches(t *testing.T) {
@@ -78,7 +60,7 @@ func TestRemoveSessionCloseError(t *testing.T) {
 func TestContainmentIncompleteInstallAndRemovalOwnersSurviveUntilAgentClose(t *testing.T) {
 	newIncomplete := func(agent *Agent, id acp.SessionId) (*agentSession, *stubProcess) {
 		process := newStubProcess(false)
-		process.close = pi.ErrProcessContainmentIncomplete
+		process.close = ErrContainmentIncomplete
 
 		return attachTestNativeBoundary(&agentSession{
 			agent:       agent,
@@ -102,11 +84,11 @@ func TestContainmentIncompleteInstallAndRemovalOwnersSurviveUntilAgentClose(t *t
 		agent.deleted[session.id] = struct{}{}
 
 		err := agent.storeStartedSession(t.Context(), session)
-		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+		require.ErrorIs(t, err, ErrContainmentIncomplete)
 		requireRetained(t, agent, session)
 		require.Equal(t, 1, process.closeCalls)
 
-		require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+		require.ErrorIs(t, agent.Close(), ErrContainmentIncomplete)
 		requireRetained(t, agent, session)
 		require.Equal(t, 1, process.closeCalls, "Agent.Close reran rather than joined the immutable close")
 	})
@@ -122,11 +104,11 @@ func TestContainmentIncompleteInstallAndRemovalOwnersSurviveUntilAgentClose(t *t
 		attachTestNativeBoundary(replacement)
 		agent.sessions[previous.id] = previous
 
-		require.ErrorIs(t, agent.storeStartedSession(t.Context(), replacement), pi.ErrProcessContainmentIncomplete)
+		require.ErrorIs(t, agent.storeStartedSession(t.Context(), replacement), ErrContainmentIncomplete)
 		requireRetained(t, agent, previous)
 		require.Same(t, replacement, agent.sessions["shared"])
 
-		require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+		require.ErrorIs(t, agent.Close(), ErrContainmentIncomplete)
 		requireRetained(t, agent, previous)
 		require.Equal(t, 1, previousProcess.closeCalls)
 		require.Equal(t, 1, replacementProcess.closeCalls)
@@ -138,11 +120,11 @@ func TestContainmentIncompleteInstallAndRemovalOwnersSurviveUntilAgentClose(t *t
 			session, process := newIncomplete(agent, acp.SessionId(path))
 			agent.sessions[session.id] = session
 
-			require.ErrorIs(t, agent.removeSession(t.Context(), session.id, session), pi.ErrProcessContainmentIncomplete)
+			require.ErrorIs(t, agent.removeSession(t.Context(), session.id, session), ErrContainmentIncomplete)
 			requireRetained(t, agent, session)
 			require.NotContains(t, agent.sessions, session.id)
 
-			require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+			require.ErrorIs(t, agent.Close(), ErrContainmentIncomplete)
 			requireRetained(t, agent, session)
 			require.Equal(t, 1, process.closeCalls)
 		})
@@ -404,7 +386,7 @@ func TestLoadSessionRemovesStartedSessionOnReplayFailure(t *testing.T) {
 	client.state = pi.SessionState{SessionID: "resume-load"}
 	agent := newStubClientAgent(t, client, WithSessionStore(store))
 	process := newStubProcess(false)
-	process.close = pi.ErrProcessContainmentIncomplete
+	process.close = ErrContainmentIncomplete
 	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
 		return process, client, nil
 	}
@@ -413,7 +395,7 @@ func TestLoadSessionRemovesStartedSessionOnReplayFailure(t *testing.T) {
 	agent.setConnection(connection)
 
 	_, err := agent.LoadSession(t.Context(), LoadSessionRequest("resume-load", "/cwd"))
-	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 	require.NotContains(t, agent.sessions, acp.SessionId("resume-load"))
 	agent.mu.Lock()
 	require.Len(t, agent.retainedSessions, 1)
@@ -424,7 +406,7 @@ func TestLoadSessionRemovesStartedSessionOnReplayFailure(t *testing.T) {
 	agent.mu.Unlock()
 	require.Same(t, process, retained.proc)
 	require.Equal(t, 1, process.closeCalls)
-	require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, agent.Close(), ErrContainmentIncomplete)
 	agent.mu.Lock()
 	_, stillRetained := agent.retainedSessions[retained]
 	agent.mu.Unlock()
@@ -530,232 +512,6 @@ func TestRestoreActiveSessionReleasesGateOnStoreFailure(t *testing.T) {
 	release, err := session.beginRestore(t.Context())
 	require.NoError(t, err, "failed load retained the restore gate")
 	release()
-}
-
-func TestStartSessionStartupGateFailureMatrix(t *testing.T) {
-	type testCase struct {
-		name  string
-		setup func(*Agent, *stubPiClient, *context.Context)
-	}
-	tests := []testCase{
-		{
-			name: "discovery readiness observer panics",
-			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
-				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
-					if kind == RuntimeResourceDiscovery && stage == RuntimeStartupReadiness {
-						panic("readiness observer")
-					}
-				}
-			},
-		},
-		{
-			name: "close wins after discovery readiness",
-			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
-				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
-					if kind == RuntimeResourceDiscovery && stage == RuntimeStartupReadiness {
-						_, _ = agent.beginClose()
-					}
-				}
-			},
-		},
-		{
-			name: "close wins after scratch reservation",
-			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
-				agent.options.RuntimeResourceHooks.ReserveScratchRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
-					_, _ = agent.beginClose()
-
-					return func() {}, nil
-				}
-			},
-		},
-		{
-			name: "configuration observer panics",
-			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
-				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
-					if kind == RuntimeResourceSession && stage == RuntimeStartupConfiguration {
-						panic("configuration observer")
-					}
-				}
-			},
-		},
-		{
-			name: "close wins after configuration observer",
-			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
-				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
-					if kind == RuntimeResourceSession && stage == RuntimeStartupConfiguration {
-						_, _ = agent.beginClose()
-					}
-				}
-			},
-		},
-		{
-			name: "close wins after native root acquisition",
-			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
-				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
-					_, _ = agent.beginClose()
-
-					return func() {}, nil
-				}
-			},
-		},
-		{
-			name: "context cancels after native root acquisition",
-			setup: func(agent *Agent, _ *stubPiClient, ctx *context.Context) {
-				armed := false
-				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
-					armed = true
-
-					return func() {}, nil
-				}
-				*ctx = &closeOnErrContext{Context: *ctx, returnErr: func() error {
-					if armed {
-						return context.Canceled
-					}
-
-					return nil
-				}}
-			},
-		},
-		{
-			name: "close wins during final context check",
-			setup: func(agent *Agent, _ *stubPiClient, ctx *context.Context) {
-				armed := false
-				agent.options.RuntimeResourceHooks.AcquireNativeRoot = func(context.Context, RuntimeResourceKind) (func(), error) {
-					armed = true
-
-					return func() {}, nil
-				}
-				*ctx = &closeOnErrContext{Context: *ctx, onErr: func() {
-					if armed {
-						_, _ = agent.beginClose()
-					}
-				}}
-			},
-		},
-		{
-			name: "close wins during client start",
-			setup: func(agent *Agent, client *stubPiClient, _ *context.Context) {
-				client.startFunc = func(context.Context) error {
-					_, _ = agent.beginClose()
-
-					return nil
-				}
-			},
-		},
-		{
-			name: "native readiness observer panics",
-			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
-				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
-					if kind == RuntimeResourceSession && stage == RuntimeStartupReadiness {
-						panic("native readiness observer")
-					}
-				}
-			},
-		},
-		{
-			name: "immutable construction refuses final transfer",
-			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
-				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
-					if kind != RuntimeResourceSession || stage != RuntimeStartupSession {
-						return
-					}
-					agent.mu.Lock()
-					for owner := range agent.constructions {
-						owner.immutable = true
-						owner.err = errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("waiter quarantine"))
-					}
-					agent.mu.Unlock()
-				}
-			},
-		},
-		{
-			name: "missing tracker refuses pump publication",
-			setup: func(agent *Agent, client *stubPiClient, _ *context.Context) {
-				client.startFunc = func(context.Context) error {
-					agent.mu.Lock()
-					for owner := range agent.constructions {
-						owner.nativeBoundary = nil
-					}
-					agent.mu.Unlock()
-
-					return nil
-				}
-			},
-		},
-		{
-			name: "session observer panics",
-			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
-				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
-					if kind == RuntimeResourceSession && stage == RuntimeStartupSession {
-						panic("session observer")
-					}
-				}
-			},
-		},
-		{
-			name: "close wins during session observer",
-			setup: func(agent *Agent, _ *stubPiClient, _ *context.Context) {
-				agent.options.RuntimeResourceHooks.ObserveStartupStage = func(_ context.Context, kind RuntimeResourceKind, stage RuntimeStartupStage, _ time.Duration, _ error) {
-					if kind == RuntimeResourceSession && stage == RuntimeStartupSession {
-						_, _ = agent.beginClose()
-					}
-				}
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			client := newStubPiClient()
-			client.state = pi.SessionState{SessionID: "startup-gate"}
-			agent := newStubClientAgent(t, client)
-			agent.versionChecked = true
-			ctx := t.Context()
-			test.setup(agent, client, &ctx)
-			_, err := agent.startSession(ctx, sessionStart{Cwd: "/cwd"})
-			require.Error(t, err)
-		})
-	}
-}
-
-func TestStartSessionPostTransferObservationFailures(t *testing.T) {
-	originalTimeout := sessionSettleTimeout
-	t.Cleanup(func() { sessionSettleTimeout = originalTimeout })
-
-	t.Run("bounded process observation", func(t *testing.T) {
-		sessionSettleTimeout = originalTimeout
-		client := newStubPiClient()
-		client.state = pi.SessionState{SessionID: "observed"}
-		agent := newStubClientAgent(t, client, WithRuntimeResourceHooks(RuntimeResourceHooks{
-			ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) { panic("observer") },
-		}))
-		agent.versionChecked = true
-		process := inventoryPiProcess{stubProcess: newStubProcess(false), count: 1}
-		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
-			return process, client, nil
-		}
-		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-		require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
-	})
-
-	t.Run("close reenters process observation", func(t *testing.T) {
-		sessionSettleTimeout = originalTimeout
-		client := newStubPiClient()
-		client.state = pi.SessionState{SessionID: "observed-close"}
-		var agent *Agent
-		agent = newStubClientAgent(t, client, WithRuntimeResourceHooks(RuntimeResourceHooks{
-			ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) {
-				_, _ = agent.beginClose()
-			},
-		}))
-		agent.versionChecked = true
-		process := inventoryPiProcess{stubProcess: newStubProcess(false), count: 1}
-		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
-			return process, client, nil
-		}
-		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-		require.ErrorIs(t, err, errAgentClosed)
-	})
 }
 
 func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
@@ -916,10 +672,6 @@ func TestStartSessionHydrateWriteFailure(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestStartSessionRefusesAnUnusableSessionResidence proves a session that
-// cannot get a private residence inside its agent directory never launches: the
-// residence root is blocked by a file, so no session can fall back to writing
-// its MCP servers and headers at a path another session also addresses.
 func TestStartSessionRefusesAnUnusableSessionResidence(t *testing.T) {
 	original := materializeMkdirAll
 	t.Cleanup(func() { materializeMkdirAll = original })
@@ -928,7 +680,6 @@ func TestStartSessionRefusesAnUnusableSessionResidence(t *testing.T) {
 		if mkErr := original(path, mode); mkErr != nil {
 			return mkErr
 		}
-
 		if filepath.Base(path) != "agent" {
 			return nil
 		}
@@ -1220,7 +971,7 @@ func TestCurrentUsageAndListPaginationHelpers(t *testing.T) {
 func TestStartSessionFailureBranches(t *testing.T) {
 	baseAgent := func() *Agent {
 		agent := NewAgent(testContainmentOption(), WithExecutablePath("/fake/pi"), WithScratchDir(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
-		agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
+		agent.probeVersion = func(context.Context, string, string, string) (string, error) {
 			return pi.DefaultMinimumVersion, nil
 		}
 
@@ -1228,22 +979,14 @@ func TestStartSessionFailureBranches(t *testing.T) {
 	}
 
 	originalMkdirTemp := materializeMkdirTemp
-	originalHandoff := agentSessionHandoffNativeTree
 	t.Cleanup(func() {
 		materializeMkdirTemp = originalMkdirTemp
-		agentSessionHandoffNativeTree = originalHandoff
 	})
 	agent := baseAgent()
 	materializeMkdirTemp = func(string, string) (string, error) { return "", errors.New("session root") }
 	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 	require.Error(t, err)
 	materializeMkdirTemp = originalMkdirTemp
-
-	agent = baseAgent()
-	agentSessionHandoffNativeTree = func(string, *ProcessIsolation) error { return errors.New("handoff") }
-	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-	require.ErrorContains(t, err, "handoff")
-	agentSessionHandoffNativeTree = originalHandoff
 
 	agent = baseAgent()
 	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd", ResumeID: "id"})
@@ -1272,7 +1015,7 @@ func TestStartSessionFailureBranches(t *testing.T) {
 	requireInvalidParams(t, err)
 
 	agent = NewAgent(
-		testProcessIsolationOption(), WithExecutablePath("/fake/pi"),
+		testContainmentOption(), WithExecutablePath("/fake/pi"),
 		WithScratchDir(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)),
 	)
 	_, err = agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})

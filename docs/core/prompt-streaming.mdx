@@ -167,13 +167,10 @@ A turn resolves one of three ways:
 - **Cancelled** — the host cancels; the adapter aborts the native turn and the
   prompt resolves as a successful `cancelled` response, never an error. A user
   cancel wins even if a turn timeout fires at the same instant. Abort
-  acknowledgement does not complete the selected containment boundary: the
-  adapter always drives that boundary before cancellation settles. Ordinary
-  mode portably waits for the direct child and does not claim descendant
-  absence. Explicit Linux isolation uses its embedded subreaper and reaps
-  session-detached descendants. The separate Darwin best-effort opt-in observes
-  only the captured original process group; it never establishes that escaped
-  descendants are absent. The
+  acknowledgement does not complete the native boundary: the adapter always
+  drives that boundary before cancellation settles. Ordinary mode waits for
+  the direct child and does not claim descendant absence. Managed mode calls
+  `Revoke` and waits for the host authority's terminal `Wait` result. The
   normal native abort ladder ends at `agent_settled`; after containment, the
   adapter synchronously mirrors that durable aborted generation before the
   cancelled response. If escalation stops the runtime before
@@ -183,7 +180,7 @@ A turn resolves one of three ways:
   opens a fresh stream and snapshot, and no missing output is reconstructed.
 - **Failure** — a process exit, transport break, provider error, or
   `WithTurnTimeout` expiry ends the prompt with a `pi_turn_failed` JSON-RPC
-  error. Timeout uses the same selected containment boundary before returning. Failures
+  error. Timeout uses the same native boundary before returning. Failures
   are never reported as a stop reason. The
   [ACP methods](/docs/reference/acp-methods) reference documents the error
   code and cause vocabulary.

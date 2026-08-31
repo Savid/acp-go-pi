@@ -29,7 +29,6 @@ const (
 	acpFieldValue     = "value"
 
 	optionFieldConcurrencyLimits = "concurrencyLimits"
-	optionFieldContainment       = "containment"
 	optionFieldDefaultModel      = "defaultModel"
 	optionFieldEnv               = "env"
 	optionFieldHome              = "home"
@@ -137,10 +136,7 @@ type agentSession struct {
 	rawEventSequence     int64
 	mirroredRows         int
 	turnImagesEmitted    bool
-	nativeRootRelease    func()
-	scratchRootRelease   func()
 	nativeContainmentErr error
-	providerProcessRoot  *providerProcessRoot
 	nativeBoundary       *nativeBoundaryTracker
 	browserShim          *pi.BrowserShim
 	residence            *pi.SessionResidence
@@ -177,9 +173,7 @@ type sessionRelaunchAttempt struct {
 	err            error
 	proc           piProcess
 	client         piClient
-	processRoot    *providerProcessRoot
 	generationRoot string
-	nativeRelease  func()
 	outbox         *sessionOutbox
 	nativeBoundary *nativeBoundaryTracker
 }

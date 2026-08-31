@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -41,7 +40,7 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
 	agent := NewAgent(append(base, opts...)...)
-	agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
+	agent.probeVersion = func(context.Context, string, string, string) (string, error) {
 		return pi.DefaultMinimumVersion, nil
 	}
 
@@ -53,7 +52,7 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 	return agent
 }
 
-// testNativeDialog binds legacy unit-test entry points to the exact native
+// testNativeDialog binds concise unit-test entry points to the exact native
 // generation they arrange. Production dialog delivery has no unbound adapter.
 func testNativeDialog(session *agentSession, request pi.UIRequest) *nativeDialog {
 	session.mu.Lock()
@@ -108,36 +107,6 @@ func announcedActionRequest[T any](
 
 func testContainmentOption() Option {
 	return func(*Options) {}
-}
-
-// testProcessIsolationOption installs the isolated shape: a native identity
-// that is never the identity running the test, so the fixture keeps describing
-// a launch with a privilege boundary to cross whoever runs it.
-func testProcessIsolationOption() Option {
-	return func(options *Options) {
-		uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
-		if uid == 0 {
-			uid, gid = 11, 22
-		} else {
-			uid, gid = uid+1, gid+1
-		}
-		WithProcessIsolation(ProcessIsolation{
-			UID: uid, GID: gid,
-			BaseEnvironment:   map[string]string{"PATH": os.Getenv("PATH"), "HOME": os.Getenv("HOME")},
-			StandaloneOwnerID: "acp-go-pi-tests", StandaloneStateRoot: os.TempDir(),
-		})(options)
-		options.testOnlyNoCredential = true
-		options.testOnlyIdentityLockRoot = testIdentityLockRoot()
-	}
-}
-
-func testIdentityLockRoot() string {
-	root := filepath.Join(os.TempDir(), "acp-go-pi-agent-identities-"+strconv.Itoa(os.Getpid()))
-	if err := os.Mkdir(root, 0o700); err != nil && !os.IsExist(err) {
-		panic(err)
-	}
-
-	return root
 }
 
 // newFailingCloseProcess returns a stub process whose shutdown and close
@@ -376,7 +345,7 @@ func reserveOutboxPrompt(outbox *sessionOutbox, delivery *turnDelivery) error {
 
 func bindTestOutbox(session *agentSession) *sessionOutbox {
 	outbox := newTestSessionOutbox(1)
-	if err := outbox.bindRuntime(session.proc, session.client, nil, nil, session.providerProcessRoot, outbox.nativeBoundary); err != nil {
+	if err := outbox.bindRuntime(session.proc, session.client, nil, nil, outbox.nativeBoundary); err != nil {
 		panic(err)
 	}
 	session.outbox = outbox
@@ -388,7 +357,7 @@ func bindTestOutbox(session *agentSession) *sessionOutbox {
 	return outbox
 }
 
-// attachTestNativeBoundary gives manually assembled legacy fixtures an exact
+// attachTestNativeBoundary gives manually assembled fixtures an exact
 // construction-owned native boundary. Production constructors must never mint
 // this owner implicitly.
 func attachTestNativeBoundary(session *agentSession) *agentSession {
@@ -418,9 +387,9 @@ func bindTestRuntime(
 	client piClient,
 	cancel context.CancelFunc,
 	done chan struct{},
-	root *providerProcessRoot,
+	_ any,
 ) {
-	if err := outbox.bindRuntime(process, client, cancel, done, root, outbox.nativeBoundary); err != nil {
+	if err := outbox.bindRuntime(process, client, cancel, done, outbox.nativeBoundary); err != nil {
 		panic(err)
 	}
 }
@@ -428,7 +397,7 @@ func bindTestRuntime(
 func bindTestEstablishingOutbox(session *agentSession, generation uint64, process piProcess, client piClient) *sessionOutbox {
 	boundary := newNativeBoundaryTracker()
 	outbox := newSessionOutbox(generation, boundary)
-	if err := outbox.bindRuntime(process, client, nil, nil, nil, boundary); err != nil {
+	if err := outbox.bindRuntime(process, client, nil, nil, boundary); err != nil {
 		panic(err)
 	}
 	session.proc = process

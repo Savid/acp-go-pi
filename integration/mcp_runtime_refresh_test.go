@@ -360,7 +360,7 @@ func connectControlledAgent(
 	a2cR, a2cW := io.Pipe()
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	baseOptions := []piacp.Option{
-		piacp.WithLogger(integrationLogger), integrationContainmentOption(), integrationProcessIsolationOption(t),
+		piacp.WithLogger(integrationLogger),
 	}
 	serveErr := make(chan error, 1)
 	go func() {

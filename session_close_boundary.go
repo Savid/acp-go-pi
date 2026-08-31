@@ -6,7 +6,6 @@ import (
 	"slices"
 
 	"github.com/savid/acp-go-pi/internal/lifecycle"
-	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 // closeBoundaryBarrier names the proof a completed close produced, so a host
@@ -25,7 +24,7 @@ const closeBoundaryBarrier = "process-containment:close"
 // fact: declaring terminal a set of work the session has just proved it cannot
 // contain would make the next real event about it a post-terminal mutation.
 func (s *agentSession) settleCloseBoundary(ctx context.Context, proc piProcess, containmentErr error) error {
-	if !pi.ProcessContainmentComplete(containmentErr) {
+	if !nativeContainmentComplete(containmentErr) {
 		return nil
 	}
 
@@ -85,14 +84,9 @@ func (s *agentSession) persistenceFenced() bool {
 // reports nothing rather than a floor of zero, so an unproven boundary can never
 // be read as a proven one.
 func nativeBoundaryVacant(proc piProcess) bool {
-	inventory, ok := proc.(providerProcessInventory)
-	if !ok {
-		return false
-	}
+	_, managed := proc.(interface{ managedByHostAuthority() })
 
-	count, available := inventory.ProviderDescendantCount()
-
-	return available && count == 0
+	return managed
 }
 
 // commitCloseBoundary commits the resumable snapshot the quiescence fact stands

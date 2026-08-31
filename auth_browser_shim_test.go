@@ -16,7 +16,19 @@ import (
 func browserShimDirs(t *testing.T, parent string) []string {
 	t.Helper()
 
-	matches, err := filepath.Glob(filepath.Join(parent, "acp-go-pi-browser-shim-*"))
+	var matches []string
+	err := filepath.WalkDir(parent, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "acp-go-pi-browser-shim-") {
+			matches = append(matches, path)
+
+			return filepath.SkipDir
+		}
+
+		return nil
+	})
 	require.NoError(t, err)
 
 	return matches
@@ -67,7 +79,7 @@ func TestSessionBrowserShimIsNilWhenItCannotBeMaterialised(t *testing.T) {
 	scratch := t.TempDir()
 	usable := newStubClientAgent(t, newStubPiClient(), WithScratchDir(scratch))
 
-	shim := usable.newSessionBrowserShim()
+	shim := usable.newSessionBrowserShim(scratch)
 	require.NotNil(t, shim)
 	require.NoError(t, shim.Remove())
 
@@ -76,8 +88,8 @@ func TestSessionBrowserShimIsNilWhenItCannotBeMaterialised(t *testing.T) {
 	require.NoError(t, os.WriteFile(blocked, []byte("x"), 0o600))
 
 	agent := newStubClientAgent(t, newStubPiClient(), WithScratchDir(blocked))
-	require.Nil(t, agent.newSessionBrowserShim())
-	owned, err := agent.newOwnedSessionBrowserShim()
+	require.Nil(t, agent.newSessionBrowserShim(blocked))
+	owned, err := agent.newOwnedSessionBrowserShim(blocked)
 	require.NoError(t, err)
 	require.Nil(t, owned)
 }

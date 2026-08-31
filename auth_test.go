@@ -334,7 +334,6 @@ func TestRequestedProviderAuthResidenceFailsInitializationWhenIncompleteOrUnusab
 		{name: "home is a file", options: []Option{WithHome(homeFile), WithProviderAuthRoot(t.TempDir())}, want: "prepare provider auth home"},
 		{name: "relative ledger", options: []Option{WithHome(t.TempDir()), WithProviderAuthRoot("relative/root")}, want: "prepare provider auth ledger"},
 		{name: "ledger is a file", options: []Option{WithHome(t.TempDir()), WithProviderAuthRoot(rootFile)}, want: "prepare provider auth ledger"},
-		{name: "explicit isolation", options: []Option{testProcessIsolationOption(), WithHome(t.TempDir()), WithProviderAuthRoot(t.TempDir())}, want: "prepare provider auth home"},
 	} {
 		var logs bytes.Buffer
 
@@ -398,6 +397,27 @@ func TestAuthCapabilityAbsentWithoutRoot(t *testing.T) {
 	piMeta, ok := resp.AgentCapabilities.Meta[piMetaKey].(map[string]any)
 	require.True(t, ok)
 	require.NotContains(t, piMeta, providerAuthCapabilityKey)
+}
+
+func TestProviderAuthAbsentWithHostAuthority(t *testing.T) {
+	authority := newDeterministicHostAuthority()
+	t.Cleanup(authority.cleanup)
+	agent := NewAgent(
+		WithHostAuthority(authority),
+		WithHome(t.TempDir()),
+		WithProviderAuthRoot(t.TempDir()),
+	)
+	response, err := agent.Initialize(t.Context(), defaultInitializeRequest())
+	require.NoError(t, err)
+	piMeta, ok := response.AgentCapabilities.Meta[piMetaKey].(map[string]any)
+	require.True(t, ok)
+	require.NotContains(t, piMeta, providerAuthCapabilityKey)
+	for _, method := range authMethodNames() {
+		_, err := agent.HandleExtensionMethod(t.Context(), method, json.RawMessage(`{}`))
+		var requestError *acp.RequestError
+		require.ErrorAs(t, err, &requestError)
+		require.Equal(t, -32601, requestError.Code)
+	}
 }
 
 // TestAuthLegsUnadvertisedReturnMethodNotFound pins that an absent surface
@@ -593,26 +613,6 @@ func TestAuthHarnessUsesGeneratedAgentDir(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, harness.home, spec.AgentDir)
 	require.NotEqual(t, harness.session.launch.AgentDir, spec.AgentDir)
-}
-
-// TestDurableHomeIsRefusedWithProcessIsolation pins both halves of the refusal:
-// explicit isolation never gets the durable home, and the verdict it gives is
-// the uniform option shape naming the option the host set — not a raw Go error
-// a host has to read prose out of.
-func TestDurableHomeIsRefusedWithProcessIsolation(t *testing.T) {
-	originalPlatform := agentRuntimePlatform
-	agentRuntimePlatform = linuxPlatform
-	t.Cleanup(func() { agentRuntimePlatform = originalPlatform })
-
-	capability := processIsolationCapabilityStub{}
-	agent := newStubClientAgent(t, newStubPiClient(), WithProcessIsolation(ProcessIsolation{
-		UID: 11, GID: 22, BaseEnvironment: map[string]string{},
-		IdentityLock: capability, AuthorityDomain: capability,
-	}), WithHome(t.TempDir()))
-	agent.versionChecked = true
-
-	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-	requireRefusedField(t, optionFieldHome, err)
 }
 
 func TestGeneratedAgentDirRelaunchIgnoresLedgerIdentity(t *testing.T) {

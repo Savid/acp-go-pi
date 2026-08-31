@@ -130,6 +130,10 @@ func configureProviderAuth(agent *Agent) error {
 		return nil
 	}
 
+	if agent.options.hostAuthoritySupplied {
+		return nil
+	}
+
 	if agent.options.Home == "" {
 		return errors.New("provider auth requires a durable pi home")
 	}

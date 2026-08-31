@@ -328,7 +328,7 @@ func TestPromptParentCancellationReturnsContainmentFailure(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := newStubPiClient()
 	process := newStubProcess(false)
-	process.close = pi.ErrProcessContainmentIncomplete
+	process.close = ErrContainmentIncomplete
 	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
 	startTestPump(session, client)
 
@@ -341,14 +341,14 @@ func TestPromptParentCancellationReturnsContainmentFailure(t *testing.T) {
 
 	require.Eventually(t, func() bool { return session.activeTurnDelivery() != nil }, time.Second, time.Millisecond)
 	cancel()
-	require.ErrorIs(t, <-promptDone, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, <-promptDone, ErrContainmentIncomplete)
 }
 
 // TestSettlementReportsAnIncompleteContainmentBoundary pins that a boundary
 // which did not complete outranks the terminal event it precedes: every accepted
 // exit reports the containment failure and none of them commits or settles.
 func TestSettlementReportsAnIncompleteContainmentBoundary(t *testing.T) {
-	fenceErr := pi.ErrProcessContainmentIncomplete
+	fenceErr := ErrContainmentIncomplete
 	var timedOut atomic.Bool
 
 	for name, outcome := range map[string]promptOutcome{
@@ -375,7 +375,7 @@ func TestSettlementReportsAnIncompleteContainmentBoundary(t *testing.T) {
 }
 
 func TestPromptTransportEndReturnsContainmentProofFailure(t *testing.T) {
-	fenceErr := pi.ErrProcessContainmentIncomplete
+	fenceErr := ErrContainmentIncomplete
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := newStubPiClient()
 	process := newStubProcess(false)

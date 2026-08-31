@@ -46,20 +46,13 @@ from npm:
 npm install -g @earendil-works/pi-coding-agent
 ```
 
-## Optional Linux hardening
+## Embedded host authority
 
-No privileged setup is needed for ordinary execution: omission runs as the
-current root or non-root identity. A deployment that explicitly selects the
-trusted-root Linux `ProcessIsolation` posture must persist the identity-lock
-root:
+Ordinary execution needs no privileged setup. An embedded service that needs a
+host-enforced native boundary supplies <code>WithHostAuthority</code>; the
+authority itself owns executable validation, tree preparation, process
+containment, and reclaim. It cannot be configured through the CLI.
 
-```sh
-sudo install -d -o root -g root -m 0700 \
-  /var/lib/acp-go /var/lib/acp-go/agent-identities
-```
-
-Mount that exact local-lock volume into every service or container that can use
-the same numeric UID pool, with identical user-namespace UID/GID mappings and
-authoritative PID visibility. Otherwise use disjoint pools. Network, FUSE,
-pseudo, read-only, and unknown authority filesystems are rejected. Files named
-`<uid>.lock` are permanent and must never be unlinked, renamed, or replaced.
+A nil or unusable authority is refused during initialization, before a probe
+tree or Pi process is created. See [Run modes](/docs/get-started/run-modes) for
+the managed lifecycle.

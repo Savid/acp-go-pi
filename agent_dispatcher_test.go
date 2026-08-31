@@ -458,7 +458,7 @@ func TestBlockedPostResponseHookCannotVetoCloseOrContinueAfterRelease(t *testing
 	conn.hooks.runAfterResponseWrite([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
 	<-host.entered
 
-	require.ErrorIs(t, session.Close(t.Context()), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, session.Close(t.Context()), ErrContainmentIncomplete)
 	require.Equal(t, 1, process.shutdownCalls)
 	require.Equal(t, 1, process.closeCalls)
 	require.Nil(t, session.lc.stream)

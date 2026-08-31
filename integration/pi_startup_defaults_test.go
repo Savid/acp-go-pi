@@ -18,18 +18,18 @@ import (
 // real pi processes, the way a configured home is driven by a sequence of
 // sessions.
 type startupDefaultsHome struct {
-	executable  string
-	root        string
-	home        string
-	containment pi.ContainmentSpec
-	launches    int
+	executable      string
+	root            string
+	home            string
+	baseEnvironment map[string]string
+	launches        int
 }
 
 func newStartupDefaultsHome(t *testing.T, executable string) *startupDefaultsHome {
 	t.Helper()
 
-	containment := integrationContainmentSpec(t)
-	root := containment.GenerationRoot
+	runtime := newIntegrationRuntime(t)
+	root := runtime.root
 	home := filepath.Join(root, "home")
 
 	// pi refuses to switch to a model whose provider has no credential, so the
@@ -40,7 +40,7 @@ func newStartupDefaultsHome(t *testing.T, executable string) *startupDefaultsHom
 		AuthJSON: []byte(`{"openai":{"type":"api_key","key":"integration-not-a-real-key"}}`),
 	}).Write())
 
-	return &startupDefaultsHome{executable: executable, root: root, home: home, containment: containment}
+	return &startupDefaultsHome{executable: executable, root: root, home: home, baseEnvironment: runtime.baseEnvironment}
 }
 
 // launch starts one pi process against the home and returns its client.
@@ -51,12 +51,13 @@ func (h *startupDefaultsHome) launch(t *testing.T, ctx context.Context) *pi.Clie
 	sessionDir := filepath.Join(h.root, "sessions", string(rune('a'+h.launches)))
 	require.NoError(t, os.MkdirAll(sessionDir, 0o700))
 
-	process, err := pi.StartProcess(ctx, pi.LaunchSpec{
-		ExecutablePath: h.executable,
-		AgentDir:       h.home,
-		SessionDir:     sessionDir,
-		Cwd:            h.root,
-		Containment:    h.containment,
+	process, err := pi.StartOrdinaryProcess(ctx, pi.LaunchSpec{
+		ExecutablePath:  h.executable,
+		AgentDir:        h.home,
+		SessionDir:      sessionDir,
+		Cwd:             h.root,
+		NativeRoot:      h.root,
+		BaseEnvironment: h.baseEnvironment,
 	})
 	require.NoError(t, err)
 

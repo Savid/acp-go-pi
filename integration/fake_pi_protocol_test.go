@@ -74,19 +74,20 @@ type harness struct {
 func startHarness(t *testing.T, ctx context.Context, executable string, withBridge bool) *harness {
 	t.Helper()
 
-	containment := integrationContainmentSpec(t)
-	root := containment.GenerationRoot
+	runtime := newIntegrationRuntime(t)
+	root := runtime.root
 	agentDir := filepath.Join(root, "agent")
 	sessionDir := filepath.Join(root, "sessions")
 	require.NoError(t, os.MkdirAll(sessionDir, 0o700))
 	require.NoError(t, (pi.AgentDir{Root: agentDir}).Write())
 
 	spec := pi.LaunchSpec{
-		ExecutablePath: executable,
-		AgentDir:       agentDir,
-		SessionDir:     sessionDir,
-		Cwd:            root,
-		Containment:    containment,
+		ExecutablePath:  executable,
+		AgentDir:        agentDir,
+		SessionDir:      sessionDir,
+		Cwd:             root,
+		NativeRoot:      root,
+		BaseEnvironment: runtime.baseEnvironment,
 	}
 
 	if withBridge {
@@ -96,7 +97,7 @@ func startHarness(t *testing.T, ctx context.Context, executable string, withBrid
 		spec.Env = map[string]string{pi.EnvPermissionMode: pi.PermissionModeAsk}
 	}
 
-	process, err := pi.StartProcess(ctx, spec)
+	process, err := pi.StartOrdinaryProcess(ctx, spec)
 	require.NoError(t, err)
 
 	client := pi.NewClient(process.Stdin(), process.Stdout())
@@ -159,8 +160,8 @@ func TestFakePiVersionProbe(t *testing.T) {
 	requireRunIntegration(t)
 	t.Parallel()
 
-	agentDir, containment := integrationVersionProbeSpec(t)
-	version, err := pi.ProbeVersion(t.Context(), fakePiExecutable(t, fakeScenario{}), agentDir, containment)
+	_, environment := integrationVersionProbeSpec(t)
+	version, err := pi.ProbeOrdinaryVersion(t.Context(), fakePiExecutable(t, fakeScenario{}), environment)
 	require.NoError(t, err)
 	require.Equal(t, fakePiVersion, version)
 	require.NoError(t, pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion))

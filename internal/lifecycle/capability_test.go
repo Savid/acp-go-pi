@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNegotiatedJSONExactVersion(t *testing.T) {
+func TestLifecycleCapabilityStrictScalar(t *testing.T) {
 	t.Parallel()
 
 	var decoded Negotiated
@@ -25,6 +25,9 @@ func TestNegotiatedJSONExactVersion(t *testing.T) {
 		{"fractional", `{"version":1.0}`},
 		{"string", `{"version":"1"}`},
 		{"boolean", `{"version":true}`},
+		{"null", `{"version":null}`},
+		{"object", `{"version":{}}`},
+		{"array", `{"version":[]}`},
 		{"duplicate", `{"version":1,"version":1}`},
 		{"unknown", `{"version":1,"unknown":true}`},
 		{"trailing", `{"version":1} {}`},

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -292,7 +293,7 @@ func validateEnvironment(env map[string]string, path string, blocked func(key st
 			return unsupportedField(path + "." + key)
 		}
 
-		if agentRuntimePlatform == windowsPlatform {
+		if runtime.GOOS == "windows" {
 			canonical := strings.ToUpper(key)
 			if _, ok := seen[canonical]; ok {
 				return unsupportedField(path + "." + key)

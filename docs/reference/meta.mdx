@@ -105,10 +105,10 @@ extension, alongside `acp-go.dev/route`, `acp-go.dev/mediaEnvelope`, and
 
 `updatesOutsidePrompt` is `true`: this adapter delivers `session/update`
 notifications whether or not a prompt is in flight. `authoritativeQuiescence`
-is `true` only under the Linux supervised containment boundary, where session
-close proves whole-tree vacancy; that answer adds `quiescenceSource:
-"process-containment"`, and every other boundary answers `false` and certifies
-no quiescence fact. `activityKinds` is empty because no native pi event carries a background
+is `true` only with `WithHostAuthority`, where the authority's terminal `Wait`
+result proves the managed generation settled; that answer adds
+`quiescenceSource: "process-containment"`. Ordinary mode answers `false` and
+certifies no quiescence fact. `activityKinds` is empty because no native pi event carries a background
 activity entity: work the harness begins between prompts is still the
 session's one foreground, so it is reported as a foreground cycle and never as
 an `activity_update`. An absent capability omits the key from the response and

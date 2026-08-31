@@ -1,253 +1,59 @@
 ---
 title: "Security"
-description: "The ordinary and explicitly isolated trust boundaries"
+description: "Ordinary execution and the borrowed host-authority boundary"
 ---
 
-## Ordinary execution
+## Ordinary boundary
 
-Omitting `ProcessIsolation` is the portable default. Pi runs as the adapter's
-current root or non-root UID, GID, and supplementary groups; the adapter never
-consults `SUDO_UID` or silently chooses another account. Ordinary startup needs
-no privileged setup, identity lease, authority directory, owner/disposition
-record, capability duplication, or task-vacancy proof.
+Without <code>WithHostAuthority</code>, Pi runs as the adapter account. The
+adapter owns the direct process lifecycle but does not claim whole-containment
+vacancy. Hosts requiring a stronger boundary must provide one explicitly.
 
-Each child gets its own process handle (and a process group where the platform
-supports one). Session/runtime locks and direct-child waits keep starts,
-cancellation, shutdown, and reaping deterministic across Linux, Darwin,
-FreeBSD, OpenBSD, and Windows. This mode reports `shared_identity`, but the name
-is not an authority claim: the adapter exposes no descendant inventory, emits
-no inferred zero snapshot, and does not claim whole-tree quiescence or
-credential separation. A descendant that escapes the direct boundary can
-survive.
+The environment is captured once. Ambient provider credentials, loader hooks,
+shell hooks, Node hooks, and adapter-private values are removed.
+<code>WithEnv</code> and per-session Pi options are deliberate overlays.
+Session PATH replacement is rejected; absolute
+<code>WithPiExtraPathDirs</code> entries are prepended to the child search path.
 
-Ordinary `shared_identity` execution is non-authoritative. A host that needs
-identity separation or whole-tree quiescence must explicitly select and require
-the authoritative boundary.
+## Borrowed host authority
 
-The environment is captured once when the agent is constructed. Only a narrow
-ordinary set such as PATH, home/user identity, temp, locale, terminal, and
-Windows process variables is retained. Ambient provider credentials, loader
-hooks, shell hooks, Node hooks, and adapter-private re-exec state are removed.
-Explicit `WithEnv` and `WithPiEnv` overlays are the deliberate credential route
-and are cloned before use. A `PATH` in `WithEnv` replaces the captured base as
-the static native search path; session `WithPiEnv` rejects `PATH`, and
-`WithPiExtraPathDirs` prepends absolute directories ahead of that base.
-Captured ordinary PATH entries and configured executables
-may be relative; the absolute-path rules below apply only to explicit isolation.
-Extra path directories affect child launch PATH only and do not select the Pi
-executable; use `WithExecutablePath` or CLI `-path` for that lookup.
-Every Pi child also receives adapter-managed `PI_CODING_AGENT_DIR` and
-`PI_OFFLINE=1`.
+<code>WithHostAuthority</code> borrows four operations from the embedding host:
+<code>NativeEnvironment</code>, <code>PrepareNativeTree</code>,
+<code>StartNative</code>, and <code>ReclaimNativeTree</code>. The adapter never
+selects accounts or changes filesystem ownership itself.
 
-## Explicit trusted-root Linux isolation
+The host supplies the complete base environment and validates executable,
+working-directory, and tree intent independently. The adapter adds its bounded
+session overlay and passes the exact result to <code>StartNative</code>.
 
-Supplying `WithProcessIsolation`, or CLI
-`-process-isolation-config=/absolute/path/process-isolation.json`, selects a
-different boundary. It is Linux-only, requires a trusted root supervisor and a
-distinct non-root UID/GID, clears supplementary groups for Pi, and treats the
-policy's `BaseEnvironment` as a complete replacement. A same-identity request,
-invalid field, absent authority, wrong platform, or launch failure is terminal;
-the request fails closed without fallback to ordinary,
-same-identity-supervisor, or Darwin execution.
+## Tree ownership
 
-The CLI policy must be a root-owned, single-link mode-`0600` regular file
-resolved componentwise from `/` without following symlinks. The configured
-account has a same-name private primary group, no supplementary groups, and a
-target-owned mode-`0700` home below protected root-owned ancestry. PATH entries
-must be existing canonical absolute directories. Inherited variables are a
-closed allowlist and may not include identity, loader, interpreter,
-XDG/native-home, or adapter-private state.
+A runtime tree is fully materialized before <code>PrepareNativeTree</code>.
+After prepare succeeds, the adapter performs no read, write, stat, walk,
+resolution, or removal below that tree. Natural completion or shutdown must
+settle through <code>NativeProcess.Wait</code>; only then may
+<code>ReclaimNativeTree</code> return it to the adapter. Removal occurs only
+after successful reclaim.
 
-Each isolated Pi tree runs below an independent trusted-root guardian/liveness
-pair. Both processes become subreapers before launch. A descendant that
-double-forks, calls `setsid`, changes process group, or ignores termination is
-still adopted, identity-checked through `/proc`, killed, and reaped. Only kernel
-`ECHILD` proves the tree empty; a process scan can race a fork or reparent.
-Separate inherited descriptors carry immutable launch configuration, shutdown,
-startup readiness, and final quiescence proof, and all are close-on-exec before
-Pi starts.
+<code>ErrNativeTreeBusy</code> means reclaim changed nothing because a process
+handle is still live. Failed or uncertain reclaim wraps
+<code>ErrContainmentIncomplete</code> and leaves host cleanup registered.
 
-Both supervisors remain root with private environments. Only Pi receives the
-configured UID:GID and empty supplementary groups. Before native start both
-supervisors validate and retain duplicates of the identical UID EX and domain
-SH open file descriptions. A primary guardian `SIGKILL` leaves liveness
-authoritative, and a liveness `SIGKILL` leaves the guardian authoritative. The
-survivor retains both capabilities while adopting, killing, and reaping every
-descendant to kernel `ECHILD`; completion and the managed-root permit wait for
-that proof. Pi inherits none of the launch, control, proof, or authority
-descriptors. A dedicated guardian peer-liveness descriptor is fenced
-immediately before native start. Guardian death before readiness refuses native
-launch and permits completion or quarantine only after `ECHILD`.
+## Cancellation and authority loss
 
-The durable authority root is `/var/lib/acp-go/agent-identities`. It must be a
-persistent local-lock volume shared by every participant using the same numeric
-identity pool. Permanent lock inodes are never unlinked, renamed, or replaced.
-Before any identity operation, the adapter joins permanent `domain.lock`
-through matching strict `domain.json`, which binds the boot, PID and user
-namespaces, canonical UID/GID maps, and unrestricted procfs view. The adapter
-and both supervisors retain a shared checked-CLOEXEC lease through containment;
-Pi receives no domain descriptor. The supervisor re-reads matching strict
-`domain.json` immediately before launch.
+Pi protocol shutdown and stdio closure happen before <code>Revoke</code>.
+<code>Revoke</code> initiates host-owned teardown, and <code>Wait</code> proves
+root exit, descendant vacancy, and containment cleanup. Caller cancellation
+bounds only that caller's wait.
 
-Borrowed authority strictly parses `/proc/self/fdinfo/<fd>` and requires each
-supplied open file description's matching whole-file `FLOCK`: UID `WRITE` and
-domain `READ`. Missing, unreadable, malformed, ambiguous, wrong-inode,
-partial-range, or wrong-mode state refuses. The adapter never calls
-mode-converting `flock` on the supplied descriptor; separate-open contention is
-an independent proof.
+<code>ErrHostAuthorityUnavailable</code> stops further managed native
+admission. Containment uncertainty fails closed and never falls back to
+ordinary process creation.
 
-Contended pristine same-domain bootstrap uses a bounded shared-lock rejoin; a
-retained shared lease protecting a live mismatch refuses. Rebind requires an
-exclusive lease, a boot-aware whole-root audit, durable atomic record
-replacement, and a shared-lock re-read. A contender that sees a peer's matching
-record after obtaining EX performs a real EX-to-SH conversion and shared
-re-read. The full local-durable-noncloned filesystem probe reruns immediately
-before every initial publish, rebind, or replacement. Failure preserves the old
-record and blocks launch.
+## Provider authentication
 
-Same-boot exact-owner `ACTIVE` may rebind only while this provider holds that
-UID lock exclusively and proves task vacancy; a live UID-lock holder blocks
-rebind, and every other owner or `ACTIVE` refuses. A changed boot carries every
-valid standalone owner+`ACTIVE` unchanged and excluded; ownerless
-`CLEAN_READY` may be carried. A provider never recovers ownerless `ACTIVE`: it
-performs no kill, path deletion, disposition rewrite, or CLEAN publish, and
-fails the launch — the posture is `Host recovery required`, meaning an
-authoritative host, not this provider, owns the recovery. The refusal names the
-UID and states that requirement; it is not a fixed error string to match on.
-Only the exact standalone owner may roll
-retained `ACTIVE` after publication and two consecutive vacancy scans. Missing
-domain state plus any owner or disposition fails closed. Authorized cleanup
-requires the exact persisted state-root device and inode; device renumber or
-filesystem substitution refuses.
-
-Canonical crash temps are metadata-checked and never parsed. Domain temps are
-removed and directory-synced only under domain EX; marker temps only under
-their UID EX lock. A live-writer conflict is untouched, and malformed temp
-names or metadata fail closed. A matching-domain participant still joins SH
-while a valid canonical marker temp is protected by a live UID lock; cleanup
-needs UID EX, not domain EX. A matching-domain provider audit tolerates a
-canonical unrelated marker temp, then under target UID EX cleans target marker
-temps and re-reads the final disposition. A domain-rebind audit under domain EX
-drains all canonical marker temps under their UID EX locks.
-
-Pre-join filesystem probes hold a checked-CLOEXEC inode EX lease through unlink
-and directory sync across `.authority-probe-<24-lowercase-hex>` and
-`.authority-probe-<24-lowercase-hex>.renamed`. The probe validates the named
-inode and metadata, takes `LOCK_EX|LOCK_NB`, unlinks, and directory-syncs. The
-domain EX alone is insufficient for that cleanup. A live conflict remains untouched,
-matching shared join proceeds, and bootstrap cleanup is bounded. An authority
-`/proc/self/fd/<fd>` path ending in the kernel ` (deleted)` suffix fails closed.
-
-Permanent coordination inodes are never reconstructed beside durable state.
-`domain.lock` creation requires a truly empty authority root; `owners.lock`
-creation requires an established domain with no owner, disposition, UID-lock,
-or affinity-lock state. A missing UID lock beside an owner, disposition, or
-temp refuses, as does a missing affinity lock for a marker mapped to its shard.
-This prevents split-brain authority. An exact-owner restart still validates the
-named owners-lock metadata even though it skips that flock.
-
-With both host capabilities nil, standalone acquisition strictly validates the
-explicit owner ID, state root, `<uid>.owner`, and `<uid>.quarantine`. A new
-claim takes domain SH, permanent checked-CLOEXEC `owners.lock` EX, then
-nonblocking UID EX, retaining all three through owner and `ACTIVE` publication.
-It audits every owner and disposition globally and refuses duplicate UID, GID,
-provider plus owner ID, state-root path, or state-root device and inode. Both
-owner and disposition must be absent; it never claims ownerless `CLEAN_READY`.
-No provider waits for UID while holding owners EX: a busy candidate releases
-owners and retries the complete global scan. An exact-owner restart skips
-owners and may wait for UID with cancellation. The permanent owner kind is
-`standalone-provider` and permanently binds UID:GID, fixed provider module
-`github.com/savid/acp-go-pi`, canonical owner ID, and the exact no-symlink
-state-root path, device, and inode.
-
-Before an audit passes, the provider drains every canonical owner temp,
-including temps for unrelated UIDs, under owners EX and that temp's
-nonblocking UID EX lock. A busy temp UID releases owners and retries the whole
-scan. An exact-owner fast path that encounters a temp releases its target UID
-and joins owners-before-UID cleanup; unknown temp names refuse.
-
-The state root is dedicated, never `/`, and outside and not beneath the
-authority root. This provider resolves it componentwise from `/` without
-symlinks or magic links; every ancestor except the final directory is
-root-owned and not group- or world-writable; the final directory belongs to the
-configured UID:GID with mode `0700`. The adapter revalidates the path,
-ownership, mode, device, and inode immediately before `ACTIVE` publication and
-native launch. Host authority and foreign providers validate the tuple but
-carry or refuse it without requiring the path in their mount namespace.
-
-Publication writes and syncs `<uid>.owner.next-<24-lowercase-hex>`, installs it
-with `RENAME_NOREPLACE`, revalidates the named inode, and syncs the directory.
-Two consecutive full task scans require every task to expose four `Uid`, four
-`Gid`, and supplementary `Groups` values before owner and `ACTIVE` publication.
-Every status has exactly one `Uid`, one `Gid`, and one `Groups`; missing,
-duplicate, or malformed fields refuse, while empty `Groups` is valid. `ACTIVE`
-has a fresh lease, empty paths, and `standalone:` plus lowercase SHA-256 of the
-compact canonical owner JSON without its file newline. Only the exact owner may
-restart matching retained `ACTIVE`, or finish an absent-disposition owner-sync
-crash marker, after two new consecutive scans. `CLEAN_READY`, hidden
-credentials, survivors, and every tuple or state-root mismatch fail closed.
-Standalone never becomes `CLEAN_READY`, including on clean exit. With host
-capabilities, the adapter rejects any owner and never rewrites the ownerless
-host record.
-
-Participants sharing an identity pool must share identical user-namespace UID/GID
-mappings and authoritative PID visibility or use disjoint pools. The
-authority root rejects network, FUSE, pseudo, read-only, overlay, tmpfs, and
-unknown filesystems. Only probed ext2/3/4-magic, XFS, btrfs, f2fs, ZFS, and
-bcachefs filesystems are accepted. The adapter probes separate-open lock
-exclusion, file sync, same-directory atomic rename, and directory sync. Every
-new directory level is parent-synced before a lock becomes authoritative.
-
-An `ErrProcessContainmentIncomplete` result requires the host to retain or
-quarantine resources that native work may still reach.
-
-## Durable provider authentication
-
-Provider auth is available only in ordinary mode with both `WithHome` and
-`WithProviderAuthRoot`. The durable home is service-owned Pi state; it must
-never be the operator's real `~/.pi`. Pi's native `AuthStorage` and
-cross-process credential lock own the credential file. The adapter ledger is a
-separate mode-`0700` tree of mode-`0600` values-free records and is scoped by
-the durable home.
-
-The seven broker legs never return a credential value. Catalog text and URLs
-are normalized and bounded; loopback-only browser flows, executable shell-key
-variants, stale connection generations, and late completions are refused.
-Browser shims prevent native launchers from opening a local desktop behind the
-host's login UX. Per-flow and per-provider gates serialize callback,
-disconnect, cancellation, and session-close races. Session-store mirroring
-excludes credentials and agent configuration.
-
-An explicit distinct-identity policy with a durable provider-auth home is
-refused because a safe cross-identity credential-delivery design is not proven.
-The adapter never weakens isolation to expose Connect.
-
-## Darwin best effort
-
-`WithDarwinBestEffortContainment` is a separate embedded-only opt-in, not the
-ordinary default and never a fallback for explicit isolation. It reaps the
-direct child and sends a bounded TERM-to-KILL ladder to the captured original
-process group. A descendant can call `setsid`, leave that group, and survive;
-numeric PGID reuse can also affect unrelated work. The mode therefore emits a
-warning, reports `best_effort`, and exposes no descendant inventory.
-
-Best-effort launches retain strict runtime records and generation roots for
-operator diagnosis. Only `group_absent` records expire, after 30 days; `running`
-and `cleanup_incomplete` records stay in the registry because they remain
-actionable. `acp-go-pi containment diagnose` is read-only. Forced
-cleanup revalidates same-UID process markers before signalling, but PID reuse
-still creates a collateral-signalling race and even successful cleanup is not
-proof that an unmarked escaped descendant is absent.
-
-## Permission and input boundaries
-
-The wrapper-owned bridge is Pi's permission system. In default `ask` mode every
-gated tool call requires an ACP permission decision and cancelled dialogs deny;
-`allow` must be explicit per session. MCP declarations and seed paths are
-validated before launch.
-
-Local prompt-image reads exist only when a host configures
-`WithInputHandoffRoot`. Files are opened relative to that directory without
-following escapes, must be regular, are byte-bounded, and must match the
-declared SHA-256. The adapter never writes, moves, or removes host handoff
-files, and never fetches a remote URI.
+Pi's seven provider-auth extension methods are available only in ordinary mode
+with both <code>WithHome</code> and <code>WithProviderAuthRoot</code>. Under
+<code>WithHostAuthority</code> the capability is omitted and those methods
+follow the ordinary method-not-found path. Browser launchers remain shadowed by
+the session browser shim.

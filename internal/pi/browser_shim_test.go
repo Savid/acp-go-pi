@@ -55,6 +55,4 @@ func TestBrowserShimNilHandleOwnsNothing(t *testing.T) {
 	require.NoError(t, inner.remove())
 	require.NoError(t, handle.Remove())
 	require.Equal(t, []string{"PATH=/usr/bin"}, handle.Environ([]string{"PATH=/usr/bin"}))
-	require.NoError(t, handle.Handoff(nil))
-	require.NoError(t, (&BrowserShim{}).Handoff(nil))
 }
