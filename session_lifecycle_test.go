@@ -2,6 +2,7 @@ package piacp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -374,7 +375,7 @@ func TestTurnContainmentAndCloseFailureEdges(t *testing.T) {
 		cancelled, cancel := context.WithCancel(t.Context())
 		cancel()
 		require.ErrorIs(t, (&agentSession{}).stopTurnGeneration(cancelled, outbox), ErrContainmentIncomplete)
-		require.Zero(t, process.killCalls)
+		require.Equal(t, 1, process.killCalls)
 	})
 
 	t.Run("close panic finishes native boundary", func(t *testing.T) {
@@ -928,12 +929,12 @@ func TestSessionCancelEscalatesUnacknowledgedAbort(t *testing.T) {
 	}
 	bindTestOutbox(session)
 
-	require.ErrorIs(t, session.Cancel(t.Context()), ErrContainmentIncomplete)
+	require.NoError(t, session.Cancel(t.Context()))
 	<-abortEntered
 	require.ErrorIs(t, turnCtx.Err(), context.Canceled)
 	require.Equal(t, 1, process.killCalls, "a timed-out abort must escalate to kill")
 	require.Equal(t, 1, process.closeCalls, "a timed-out abort must still reach close")
-	require.ErrorIs(t, session.nativeContainmentError(), ErrContainmentIncomplete)
+	require.NoError(t, session.nativeContainmentError())
 	close(releaseAbort)
 	<-abortReturned
 }
@@ -1482,6 +1483,9 @@ func TestRefreshMCPToolsRebuildsRegistryOnFirstTurn(t *testing.T) {
 
 	sessionFile := filepath.Join(t.TempDir(), "session.jsonl")
 	require.NoError(t, os.WriteFile(sessionFile, []byte(`{}`), 0o600))
+	require.NoError(t, agent.sessionStore().Append(
+		t.Context(), SessionKey{SessionID: "id"}, []SessionStoreEntry{json.RawMessage(`{}`)},
+	))
 
 	var launched pi.LaunchSpec
 	starts := 0
@@ -1577,6 +1581,7 @@ func TestNextRuntimeLaunchFailureBranches(t *testing.T) {
 			AgentDir:   oldAgent,
 			NativeRoot: oldRoot,
 		}
+		session.launch = previous
 
 		return session, previous, oldRoot
 	}
@@ -1585,7 +1590,7 @@ func TestNextRuntimeLaunchFailureBranches(t *testing.T) {
 		restoreMaterializeSeams(t)
 		session, previous, _ := fixture(t)
 		materializeMkdirTemp = func(string, string) (string, error) { return "", wantErr }
-		_, err := session.nextRuntimeLaunch(previous, "")
+		_, err := session.nextRuntimeLaunch(t.Context(), previous)
 		require.ErrorIs(t, err, wantErr)
 	})
 
@@ -1596,7 +1601,7 @@ func TestNextRuntimeLaunchFailureBranches(t *testing.T) {
 		require.NoError(t, os.MkdirAll(home, 0o700))
 		require.NoError(t, os.WriteFile(filepath.Join(home, pi.SettingsFileName), []byte(`{"defaultModel":`), 0o600))
 		session.agent.options.Home = home
-		_, err := session.nextRuntimeLaunch(previous, "")
+		_, err := session.nextRuntimeLaunch(t.Context(), previous)
 		require.ErrorContains(t, err, "decode pi settings")
 	})
 
@@ -1610,61 +1615,29 @@ func TestNextRuntimeLaunchFailureBranches(t *testing.T) {
 		session.agent.options.Home = home
 		previous.AgentDir = home
 
-		_, err := session.nextRuntimeLaunch(previous, "")
+		replacement, err := session.nextRuntimeLaunch(t.Context(), previous)
 		require.NoError(t, err)
 
 		settings := filepath.Join(home, pi.SettingsFileName)
 		require.NoError(t, os.WriteFile(settings, []byte(`{"defaultModel":"gpt-4o"}`), 0o600))
 
-		spec, err := session.nextRuntimeLaunch(previous, "")
+		replacement, err = session.nextRuntimeLaunch(t.Context(), replacement.spec)
 		require.NoError(t, err)
-		require.Equal(t, home, spec.AgentDir)
+		require.Equal(t, home, replacement.spec.AgentDir)
 		contents, err := os.ReadFile(settings) // #nosec G304 -- the path is this test's own temp dir.
 		require.NoError(t, err)
 		require.NotContains(t, string(contents), "gpt-4o")
 	})
 
-	t.Run("copy agent", func(t *testing.T) {
-		restoreMaterializeSeams(t)
-		session, previous, _ := fixture(t)
-		previous.AgentDir = filepath.Join(t.TempDir(), "missing")
-		_, err := session.nextRuntimeLaunch(previous, "")
-		require.ErrorContains(t, err, "copy pi agent generation")
-	})
-
-	for _, test := range []struct {
-		name  string
-		apply func(*pi.LaunchSpec, string)
-	}{
-		{name: "extension", apply: func(spec *pi.LaunchSpec, outside string) { spec.ExtensionPaths = []string{outside} }},
-		{name: "skill", apply: func(spec *pi.LaunchSpec, outside string) { spec.SkillPaths = []string{outside} }},
-		{name: "prompt template", apply: func(spec *pi.LaunchSpec, outside string) { spec.PromptTemplatePaths = []string{outside} }},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			restoreMaterializeSeams(t)
-			session, previous, _ := fixture(t)
-			test.apply(&previous, filepath.Join(t.TempDir(), "outside"))
-			_, err := session.nextRuntimeLaunch(previous, "")
-			require.ErrorContains(t, err, "outside")
-		})
-	}
-
 	t.Run("hydrate write", func(t *testing.T) {
 		restoreMaterializeSeams(t)
 		session, previous, _ := fixture(t)
-		last := filepath.Join(t.TempDir(), "session.jsonl")
-		require.NoError(t, os.WriteFile(last, []byte("{}\n"), 0o600))
+		require.NoError(t, session.agent.sessionStore().Append(
+			t.Context(), SessionKey{SessionID: string(session.id)}, []SessionStoreEntry{json.RawMessage(`{}`)},
+		))
 		materializeWriteFile = func(string, []byte, os.FileMode) error { return wantErr }
-		_, err := session.nextRuntimeLaunch(previous, last)
-		require.ErrorContains(t, err, "hydrate relaunched pi session")
-	})
-
-	t.Run("hydrate read", func(t *testing.T) {
-		restoreMaterializeSeams(t)
-		session, previous, _ := fixture(t)
-		materializeReadFile = func(string) ([]byte, error) { return nil, wantErr }
-		_, err := session.nextRuntimeLaunch(previous, "/prior/session.jsonl")
-		require.ErrorContains(t, err, "read prior pi session")
+		_, err := session.nextRuntimeLaunch(t.Context(), previous)
+		require.ErrorContains(t, err, "write hydrated session file")
 	})
 
 	t.Run("remove previous", func(t *testing.T) {
@@ -1677,19 +1650,21 @@ func TestNextRuntimeLaunchFailureBranches(t *testing.T) {
 
 			return os.RemoveAll(path)
 		}
-		_, err := session.nextRuntimeLaunch(previous, "")
+		_, err := session.nextRuntimeLaunch(t.Context(), previous)
 		require.ErrorContains(t, err, "remove prior runtime generation")
 	})
 
-	t.Run("rebases environment", func(t *testing.T) {
+	t.Run("rebuilds private resources", func(t *testing.T) {
 		restoreMaterializeSeams(t)
-		session, previous, _ := fixture(t)
-		previous.Env = map[string]string{"RESOURCE": filepath.Join(previous.AgentDir, "resource"), "OTHER": "/outside"}
-		spec, err := session.nextRuntimeLaunch(previous, "")
+		session, previous, oldRoot := fixture(t)
+		session.mcpServers = []acp.McpServer{StdioMCPServer("stdio", "/bin/true", nil, nil)}
+		replacement, err := session.nextRuntimeLaunch(t.Context(), previous)
 		require.NoError(t, err)
-		require.Equal(t, filepath.Join(spec.AgentDir, "resource"), spec.Env["RESOURCE"])
-		require.Equal(t, "/outside", spec.Env["OTHER"])
-		require.Equal(t, string(session.id), spec.SessionID)
+		require.NoDirExists(t, oldRoot)
+		require.NotNil(t, replacement.browserShim)
+		require.NotNil(t, replacement.residence)
+		require.Equal(t, filepath.Dir(replacement.spec.Env[pi.EnvMCPConfig]), replacement.residence.Root())
+		require.Equal(t, string(session.id), replacement.spec.SessionID)
 	})
 }
 

@@ -143,7 +143,7 @@ func (s *agentSession) publishSessionOpen(ctx context.Context) error {
 		// here rather than poisoning a session whose only fault was being closed
 		// while it was still opening.
 		if errors.Is(err, errGenerationRetired) {
-			return err
+			return nil
 		}
 
 		containmentErr := s.containGenerationSync(

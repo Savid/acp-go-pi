@@ -30,7 +30,7 @@ func ordinaryEnvironmentKey(key string) bool {
 	}
 
 	switch upper {
-	case envPath, "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "FORCE_COLOR", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "__CF_USER_TEXT_ENCODING":
+	case envPath, envHome, "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "FORCE_COLOR", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "__CF_USER_TEXT_ENCODING":
 		return true
 	default:
 		return strings.HasPrefix(upper, "LC_")

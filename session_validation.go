@@ -1,9 +1,18 @@
 package piacp
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 )
+
+func validateManagedHome(options Options) error {
+	if options.hostAuthoritySupplied && options.Home != "" {
+		return unsupportedField(optionFieldHome)
+	}
+
+	return nil
+}
 
 func validateRequiredAbsolutePath(field string, path string) error {
 	if !filepath.IsAbs(path) {
@@ -48,5 +57,5 @@ func validateSessionStartPaths(cwd string, additionalDirectories []string) error
 // host can open a session and prompt without ever calling initialize, so
 // unvalidated options must not survive as far as a native process.
 func (a *Agent) sessionStartConfigurationError() error {
-	return a.optionsError()
+	return errors.Join(a.optionsError(), a.nativeContainmentError(), a.nativeAdmissionError())
 }

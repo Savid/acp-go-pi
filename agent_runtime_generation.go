@@ -91,12 +91,17 @@ func (g *runtimeGeneration) finalize(ctx context.Context, processErr error) erro
 
 		if g.prepared {
 			if err := g.agent.reclaimNativeTree(ctx, g.root); err != nil {
+				if errors.Is(err, ErrNativeTreeBusy) {
+					g.agent.markNativeTreeBusy(g.root)
+				}
+
 				g.err = err
 
 				return
 			}
 
 			g.prepared = false
+			g.agent.clearNativeTreeBusy(g.root)
 		}
 
 		g.err = runtimeGenerationRemoveAll(g.root)

@@ -19,14 +19,16 @@ type authorityPiProcess struct {
 	stderr  io.ReadCloser
 	tail    *nativeStderrTail
 
-	stdinOnce sync.Once
-	stdinErr  error
-	waitOnce  sync.Once
-	exited    chan struct{}
-	waitErr   error
-	result    NativeResult
-	closeOnce sync.Once
-	closeErr  error
+	stdinOnce   sync.Once
+	stdinErr    error
+	waitOnce    sync.Once
+	exited      chan struct{}
+	stderrDone  chan struct{}
+	waitErr     error
+	result      NativeResult
+	closeMu     sync.Mutex
+	streamsOnce sync.Once
+	streamsErr  error
 }
 
 func (*authorityPiProcess) managedByHostAuthority() {}
@@ -55,8 +57,6 @@ func (a *Agent) startAuthorityPiProcess(ctx context.Context, spec pi.LaunchSpec)
 	}()
 
 	if err != nil {
-		a.recordNativeContainment(err)
-
 		return nil, nil, err
 	}
 
@@ -67,7 +67,10 @@ func (a *Agent) startAuthorityPiProcess(ctx context.Context, spec pi.LaunchSpec)
 		return nil, nil, err
 	}
 
-	wrapped := &authorityPiProcess{agent: a, process: process, exited: make(chan struct{}), tail: &nativeStderrTail{limit: 8 << 10}}
+	wrapped := &authorityPiProcess{
+		agent: a, process: process, exited: make(chan struct{}), stderrDone: make(chan struct{}),
+		tail: &nativeStderrTail{limit: 8 << 10},
+	}
 
 	func() {
 		defer func() {
@@ -80,9 +83,8 @@ func (a *Agent) startAuthorityPiProcess(ctx context.Context, spec pi.LaunchSpec)
 	}()
 
 	if err != nil {
-		err = errors.Join(err, ErrContainmentIncomplete)
-		_ = revokeNativeProcess(ctx, process)
-		_, _ = waitNativeProcess(context.Background(), process)
+		settleErr := settleStartedNativeProcess(process)
+		err = errors.Join(err, settleErr)
 
 		a.recordNativeContainment(err)
 
@@ -90,15 +92,18 @@ func (a *Agent) startAuthorityPiProcess(ctx context.Context, spec pi.LaunchSpec)
 	}
 
 	if wrapped.stdin == nil || wrapped.stdout == nil || wrapped.stderr == nil {
-		err = errors.Join(ErrHostAuthorityUnavailable, ErrContainmentIncomplete)
-		_ = revokeNativeProcess(ctx, process)
-		_, _ = waitNativeProcess(context.Background(), process)
+		err = errors.Join(ErrHostAuthorityUnavailable, settleStartedNativeProcess(process))
 
 		a.recordNativeContainment(err)
 
 		return nil, nil, err
 	}
-	go func() { _, _ = io.Copy(wrapped.tail, wrapped.stderr) }()
+
+	go func() {
+		defer close(wrapped.stderrDone)
+
+		_, _ = io.Copy(wrapped.tail, wrapped.stderr)
+	}()
 
 	wrapped.startWait()
 
@@ -114,7 +119,7 @@ func (p *authorityPiProcess) startWait() {
 			if err != nil {
 				p.waitErr = errors.Join(err, ErrContainmentIncomplete)
 				p.agent.recordNativeContainment(p.waitErr)
-			} else if result.ExitCode != 0 {
+			} else if result.ExitCode != 0 && !result.Revoked {
 				p.waitErr = fmt.Errorf("exit status %d", result.ExitCode)
 			}
 
@@ -140,30 +145,38 @@ func (p *authorityPiProcess) WaitErr() error {
 func (p *authorityPiProcess) StderrTail() string { return p.tail.String() }
 func (p *authorityPiProcess) Shutdown(ctx context.Context) error {
 	_ = p.CloseStdin()
-	if err := p.revoke(ctx); err != nil {
-		return err
+	revokeErr := p.revoke(ctx)
+
+	select {
+	case <-p.exited:
+		return errors.Join(authorityTerminalRevokeError(revokeErr), p.waitErr)
+	default:
 	}
 
 	select {
 	case <-p.exited:
-		return p.waitErr
+		return errors.Join(authorityTerminalRevokeError(revokeErr), p.waitErr)
 	case <-ctx.Done():
-		return errors.Join(ctx.Err(), ErrContainmentIncomplete)
+		return errors.Join(revokeErr, ctx.Err(), ErrContainmentIncomplete)
 	}
 }
 func (p *authorityPiProcess) Kill() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := p.revoke(ctx); err != nil {
-		return err
+	revokeErr := p.revoke(ctx)
+
+	select {
+	case <-p.exited:
+		return errors.Join(authorityTerminalRevokeError(revokeErr), p.waitErr)
+	default:
 	}
 
 	select {
 	case <-p.exited:
-		return p.waitErr
+		return errors.Join(authorityTerminalRevokeError(revokeErr), p.waitErr)
 	case <-ctx.Done():
-		return errors.Join(ctx.Err(), ErrContainmentIncomplete)
+		return errors.Join(revokeErr, ctx.Err(), ErrContainmentIncomplete)
 	}
 }
 func (p *authorityPiProcess) revoke(ctx context.Context) (err error) {
@@ -172,8 +185,7 @@ func (p *authorityPiProcess) revoke(ctx context.Context) (err error) {
 			err = ErrHostAuthorityUnavailable
 		}
 
-		if err != nil {
-			err = errors.Join(err, ErrContainmentIncomplete)
+		if errors.Is(err, ErrHostAuthorityUnavailable) {
 			p.agent.recordNativeContainment(err)
 		}
 	}()
@@ -181,18 +193,28 @@ func (p *authorityPiProcess) revoke(ctx context.Context) (err error) {
 	return revokeNativeProcess(ctx, p.process)
 }
 func (p *authorityPiProcess) Close() error {
-	p.closeOnce.Do(func() {
-		_ = p.CloseStdin()
-		select {
-		case <-p.exited:
-		default:
-			p.closeErr = p.Kill()
-		}
+	p.closeMu.Lock()
+	defer p.closeMu.Unlock()
 
-		p.closeErr = errors.Join(p.closeErr, p.stdout.Close(), p.stderr.Close())
+	_ = p.CloseStdin()
+	select {
+	case <-p.exited:
+	default:
+		_ = p.Kill()
+	}
+
+	select {
+	case <-p.exited:
+	default:
+		return ErrContainmentIncomplete
+	}
+
+	p.streamsOnce.Do(func() {
+		p.streamsErr = errors.Join(p.stdout.Close(), p.stderr.Close())
+		<-p.stderrDone
 	})
 
-	return p.closeErr
+	return errors.Join(p.waitErr, p.streamsErr)
 }
 
 type nativeStderrTail struct {
@@ -238,4 +260,34 @@ func revokeNativeProcess(ctx context.Context, process NativeProcess) (err error)
 	}()
 
 	return process.Revoke(ctx)
+}
+
+func terminalNativeClose(prior error, closeErr error) error {
+	if nativeContainmentComplete(closeErr) {
+		return closeErr
+	}
+
+	return errors.Join(prior, closeErr)
+}
+
+func authorityTerminalRevokeError(err error) error {
+	if errors.Is(err, ErrHostAuthorityUnavailable) {
+		return err
+	}
+
+	return nil
+}
+
+func settleStartedNativeProcess(process NativeProcess) error {
+	ctx, cancel := context.WithTimeout(context.Background(), sessionShutdownTimeout)
+	defer cancel()
+
+	revokeErr := revokeNativeProcess(ctx, process)
+
+	_, waitErr := waitNativeProcess(ctx, process)
+	if waitErr != nil {
+		return errors.Join(revokeErr, waitErr, ErrContainmentIncomplete)
+	}
+
+	return authorityTerminalRevokeError(revokeErr)
 }

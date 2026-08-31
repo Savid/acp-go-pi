@@ -33,8 +33,6 @@ func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir, _ 
 	}()
 
 	if err != nil {
-		a.recordNativeContainment(err)
-
 		return "", err
 	}
 
@@ -60,9 +58,7 @@ func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir, _ 
 	}()
 
 	if err != nil || stdin == nil || stdoutPipe == nil || stderrPipe == nil {
-		err = errors.Join(ErrHostAuthorityUnavailable, err, ErrContainmentIncomplete)
-		_ = revokeNativeProcess(ctx, process)
-		_, _ = waitNativeProcess(context.Background(), process)
+		err = errors.Join(ErrHostAuthorityUnavailable, err, settleStartedNativeProcess(process))
 
 		a.recordNativeContainment(err)
 
@@ -76,27 +72,54 @@ func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir, _ 
 	go func() { data, _ := io.ReadAll(stdoutPipe); stdout <- data }()
 	go func() { data, _ := io.ReadAll(stderrPipe); stderr <- data }()
 
-	result, waitErr := waitNativeProcess(ctx, process)
-	if waitErr != nil {
-		revokeErr := revokeNativeProcess(ctx, process)
-		_, settleErr := waitNativeProcess(context.Background(), process)
-
-		if revokeErr != nil || settleErr != nil {
-			waitErr = errors.Join(waitErr, revokeErr, settleErr, ErrContainmentIncomplete)
-		}
-
-		a.recordNativeContainment(waitErr)
-
-		return "", waitErr
+	type waitOutcome struct {
+		result NativeResult
+		err    error
 	}
 
-	output := <-stdout
-	diagnostic := <-stderr
+	waitDone := make(chan waitOutcome, 1)
+
+	//nolint:gosec // The sole wait observer must outlive caller cancellation.
+	go func() {
+		result, waitErr := waitNativeProcess(context.Background(), process)
+		waitDone <- waitOutcome{result: result, err: waitErr}
+	}()
+
+	var outcome waitOutcome
+	select {
+	case outcome = <-waitDone:
+	case <-ctx.Done():
+		settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
+		revokeErr := revokeNativeProcess(settleCtx, process)
+
+		select {
+		case outcome = <-waitDone:
+		case <-settleCtx.Done():
+			outcome.err = settleCtx.Err()
+		}
+
+		cancelSettle()
+
+		if outcome.err != nil {
+			outcome.err = errors.Join(ctx.Err(), revokeErr, outcome.err, ErrContainmentIncomplete)
+		} else {
+			outcome.err = errors.Join(ctx.Err(), authorityTerminalRevokeError(revokeErr))
+		}
+	}
+
 	_ = stdoutPipe.Close()
 	_ = stderrPipe.Close()
+	output := <-stdout
+	diagnostic := <-stderr
 
-	if result.ExitCode != 0 {
-		return "", fmt.Errorf("probe pi version: exit status %d: %s", result.ExitCode, strings.TrimSpace(string(diagnostic)))
+	if outcome.err != nil {
+		a.recordNativeContainment(outcome.err)
+
+		return "", outcome.err
+	}
+
+	if outcome.result.ExitCode != 0 {
+		return "", fmt.Errorf("probe pi version: exit status %d: %s", outcome.result.ExitCode, strings.TrimSpace(string(diagnostic)))
 	}
 
 	version := strings.TrimSpace(string(output))

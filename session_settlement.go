@@ -198,7 +198,7 @@ func (s *agentSession) settlePrompt(
 // boundary completes before anything durable is written.
 func (s *agentSession) joinTurnBoundary(ctx context.Context, outcome promptOutcome) error {
 	if outcome.settled {
-		return s.claimTurnSettlement()
+		return s.claimTurnSettlement(ctx)
 	}
 
 	if err := s.fenceTurnAfterFailure(ctx); err != nil {

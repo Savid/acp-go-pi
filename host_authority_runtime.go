@@ -3,7 +3,6 @@ package piacp
 import (
 	"context"
 	"errors"
-	"os"
 	"reflect"
 )
 
@@ -32,7 +31,15 @@ func (a *Agent) disposeNativeTree(ctx context.Context, root string) error {
 		}
 	}
 
-	return os.RemoveAll(root)
+	return materializeRemoveAll(root)
+}
+
+func (a *Agent) removeNativeTree(root string) error {
+	if root == "" {
+		return nil
+	}
+
+	return materializeRemoveAll(root)
 }
 
 func readHostEnvironment(authority HostAuthority) (environment map[string]string, err error) {
@@ -69,7 +76,7 @@ func (a *Agent) prepareNativeTree(ctx context.Context, root string) (err error) 
 	}()
 
 	err = a.options.HostAuthority.PrepareNativeTree(ctx, root)
-	if err != nil && !errors.Is(err, ErrNativeTreeBusy) {
+	if err != nil {
 		err = errors.Join(err, ErrContainmentIncomplete)
 	}
 
@@ -90,7 +97,13 @@ func (a *Agent) reclaimNativeTree(ctx context.Context, root string) (err error) 
 	}()
 
 	err = a.options.HostAuthority.ReclaimNativeTree(ctx, root)
-	if err != nil {
+	if errors.Is(err, ErrNativeTreeBusy) {
+		a.markNativeTreeBusy(root)
+	} else if err == nil {
+		a.clearNativeTreeBusy(root)
+	}
+
+	if err != nil && !errors.Is(err, ErrNativeTreeBusy) {
 		err = errors.Join(err, ErrContainmentIncomplete)
 	}
 

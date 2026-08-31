@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ const (
 	defaultShutdownStepTimeout = 2 * time.Second
 	stderrTailLimit            = 8 << 10
 	envPath                    = "PATH"
+	envHome                    = "HOME"
 	envNodeOptions             = "NODE_OPTIONS"
 	envBashEnv                 = "BASH_ENV"
 	envShellEnv                = "ENV"
@@ -88,7 +90,10 @@ func (spec LaunchSpec) Environ() []string {
 
 	env = ComposeEnvironment(env, map[string]string{"PI_OFFLINE": "1", "PI_CODING_AGENT_DIR": spec.AgentDir})
 
-	return spec.BrowserShim.Environ(environmentEntries(env))
+	environment := spec.BrowserShim.Environ(environmentEntries(env))
+	sort.Strings(environment)
+
+	return environment
 }
 
 func prependPathDirs(search string, dirs []string) string {
@@ -175,27 +180,36 @@ func StartOrdinaryProcess(ctx context.Context, spec LaunchSpec) (*Process, error
 	cmd.Dir = spec.Cwd
 	cmd.Env = environment
 
-	stdin, err := cmd.StdinPipe()
+	stdinRead, stdin, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("create native stdin: %w", err)
 	}
 
-	stdout, err := cmd.StdoutPipe()
+	stdout, stdoutWrite, err := os.Pipe()
 	if err != nil {
+		_ = stdinRead.Close()
 		_ = stdin.Close()
 
 		return nil, fmt.Errorf("create native stdout: %w", err)
 	}
 
+	cmd.Stdin = stdinRead
+	cmd.Stdout = stdoutWrite
+
 	stderr := &tailBuffer{limit: stderrTailLimit}
 
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
+		_ = stdinRead.Close()
 		_ = stdin.Close()
 		_ = stdout.Close()
+		_ = stdoutWrite.Close()
 
 		return nil, fmt.Errorf("start pi process: %w", err)
 	}
+
+	_ = stdinRead.Close()
+	_ = stdoutWrite.Close()
 
 	step := spec.ShutdownStepTimeout
 	if step <= 0 {

@@ -239,7 +239,7 @@ func TestPublishSessionOpenCancellationAndLifecycleFailureBoundaries(t *testing.
 		outbox.claimForCloseLocked()
 		outbox.mu.Unlock()
 
-		require.ErrorIs(t, session.publishSessionOpen(t.Context()), errGenerationRetired)
+		require.NoError(t, session.publishSessionOpen(t.Context()))
 		require.NoError(t, session.poisonedError(), "a closed session is not a poisoned one")
 		require.Zero(t, process.shutdownCalls, "the close ladder owns this generation's containment")
 		require.Zero(t, process.closeCalls)

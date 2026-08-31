@@ -22,7 +22,15 @@ var errSessionMirrorAppend = errors.New("append session mirror entries")
 // file is durable at agent_settled, so reading it after the settle fence
 // captures the full cycle. A session whose delete fenced persistence writes
 // nothing, so no late commit can recreate a row the delete removed.
-func (s *agentSession) commitMirror(ctx context.Context) error {
+func (s *agentSession) commitMirror(ctx context.Context) (returnErr error) {
+	defer func() {
+		if returnErr == nil {
+			s.mu.Lock()
+			s.managedCommitPending = false
+			s.mu.Unlock()
+		}
+	}()
+
 	s.mu.Lock()
 	path := s.sessionFilePath
 	mirrored := s.mirroredRows

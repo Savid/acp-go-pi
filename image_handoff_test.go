@@ -47,14 +47,27 @@ func handoffEnvelopeFor(data []byte) map[string]any {
 func TestHandoffCapabilityScalar(t *testing.T) {
 	withoutRoot, err := NewAgent().Initialize(t.Context(), defaultInitializeRequest())
 	require.NoError(t, err)
-	require.NotContains(t, withoutRoot.AgentCapabilities.Meta, handoffMetaKey)
+	withoutEncoded, err := json.Marshal(withoutRoot)
+	require.NoError(t, err)
 
 	withRoot, err := NewAgent(WithInputHandoffRoot(t.TempDir())).Initialize(t.Context(), defaultInitializeRequest())
 	require.NoError(t, err)
-	require.Equal(t,
-		map[string]any{"version": 1},
-		withRoot.AgentCapabilities.Meta["acp-go.dev/handoff"],
-	)
+	withEncoded, err := json.Marshal(withRoot)
+	require.NoError(t, err)
+
+	decode := func(encoded []byte) map[string]json.RawMessage {
+		var wire struct {
+			AgentCapabilities struct {
+				//nolint:tagliatelle // ACP defines this reserved wire member.
+				Meta map[string]json.RawMessage `json:"_meta"`
+			} `json:"agentCapabilities"`
+		}
+		require.NoError(t, json.Unmarshal(encoded, &wire))
+
+		return wire.AgentCapabilities.Meta
+	}
+	require.NotContains(t, decode(withoutEncoded), "acp-go.dev/handoff")
+	require.Equal(t, `{"version":1}`, string(decode(withEncoded)["acp-go.dev/handoff"]))
 }
 
 // handoffImageBlock builds one handoff-form image block: empty data, a file

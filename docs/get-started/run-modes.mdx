@@ -28,6 +28,10 @@ materializes a complete runtime tree, calls <code>PrepareNativeTree</code>, and
 does not access the tree again until the process has settled and
 <code>ReclaimNativeTree</code> succeeds.
 
+Managed mode rejects <code>WithHome</code> before materialization. Each native
+generation receives a fresh isolated residence reconstructed from the committed
+session store after the prior generation has settled and been reclaimed.
+
 A supplied nil or unusable authority fails initialization before filesystem
 mutation or process launch. Authority failure never retries by launching Pi
 directly.

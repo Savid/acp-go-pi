@@ -56,6 +56,30 @@ func TestNewBrowserShimWritesExecutableNoOps(t *testing.T) {
 	require.NoDirExists(t, dir)
 }
 
+func TestLaunchSpecBrowserShimEnvironmentIsCanonicalAndSubtractive(t *testing.T) {
+	shim, err := NewBrowserShim(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, shim.Remove()) })
+
+	environment := (LaunchSpec{
+		AgentDir:    "/agent",
+		BrowserShim: shim,
+		BaseEnvironment: map[string]string{
+			"PATH": "/usr/bin", "HOME": "/native/home", "BASH_ENV": "/tmp/bash",
+			"ENV": "/tmp/sh", "NODE_OPTIONS": "--require=/tmp/node.js", "LD_PRELOAD": "/tmp/ld.so",
+			"DYLD_INSERT_LIBRARIES": "/tmp/dyld.dylib",
+		},
+	}).Environ()
+
+	require.IsIncreasing(t, environment)
+	joined := strings.Join(environment, "\n")
+	for _, forbidden := range []string{"BASH_ENV=", "ENV=", "NODE_OPTIONS=", "LD_PRELOAD=", "DYLD_INSERT_LIBRARIES="} {
+		require.NotContains(t, joined, forbidden)
+	}
+	require.Contains(t, environment, "BROWSER="+filepath.Join(shim.shim.dir, browserLauncherNames[0]))
+	require.Contains(t, environment, "PATH="+shim.shim.dir+string(os.PathListSeparator)+"/usr/bin")
+}
+
 func TestNewBrowserShimFailures(t *testing.T) {
 	wantErr := errors.New("injected browser shim failure")
 

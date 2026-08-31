@@ -26,9 +26,10 @@ type Options struct {
 	ExecutablePath        string
 	HostAuthority         HostAuthority
 	hostAuthoritySupplied bool
-	// Home is the durable per-instance PI_CODING_AGENT_DIR shared by sessions.
-	// Empty gives each session an ephemeral agent directory. Provider auth is
-	// advertised only with both Home and ProviderAuthRoot configured.
+	// Home is the durable per-instance PI_CODING_AGENT_DIR shared by ordinary-mode
+	// sessions. Managed mode rejects it and always builds isolated generation
+	// residences. Provider auth is advertised only with both Home and
+	// ProviderAuthRoot configured in ordinary mode.
 	Home string
 	// ScratchDir is the parent directory for all ephemeral on-disk
 	// materialization (per-session roots, hydration temp files, and the version
@@ -159,8 +160,9 @@ func WithHostAuthority(authority HostAuthority) Option {
 }
 
 // WithHome sets the durable per-instance PI_CODING_AGENT_DIR shared by all
-// sessions. It is required for provider auth so Pi's native cross-process
-// credential lock and credential residence survive session teardown.
+// ordinary-mode sessions. Managed mode rejects it. It is required for provider
+// auth so Pi's native cross-process credential lock and credential residence
+// survive session teardown.
 func WithHome(path string) Option {
 	return func(options *Options) {
 		options.Home = path
@@ -283,10 +285,10 @@ func WithConcurrencyLimits(limits ConcurrencyLimits) Option {
 // closed, because pi records a load error for unparsable settings and then
 // silently runs its own defaults.
 //
-// The directory written to is per session only when no durable Home is
-// configured. With WithHome, every session launches against that one shared
-// directory and the seed is written there, so a seeded file is agent-scoped
-// operator configuration rather than per-session state.
+// The directory written to is per session unless ordinary mode has a durable
+// Home. With WithHome in ordinary mode, every session launches against that one
+// shared directory and the seed is written there, so a seeded file is
+// agent-scoped operator configuration rather than per-session state.
 //
 // Paths are confined to the agent directory: absolute paths, ".." escapes, and
 // empty keys fail closed at session start.

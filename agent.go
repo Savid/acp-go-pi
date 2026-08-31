@@ -94,6 +94,9 @@ type Agent struct {
 	lifecycle            lifecycle.Negotiated
 	optionErr            error
 	nativeContainmentErr error
+	nativeBusyRoots      map[string]struct{}
+	authorityLossOnce    sync.Once
+	closeAccountingOnce  sync.Once
 	closeAttempt         *agentCloseAttempt
 
 	versionMu      sync.Mutex
@@ -160,9 +163,11 @@ func NewAgent(opts ...Option) *Agent {
 		constructions:       make(map[*nativeConstruction]struct{}),
 		store:               NewInMemorySessionStore(),
 		deleted:             make(map[acp.SessionId]struct{}),
+		nativeBusyRoots:     make(map[string]struct{}),
 		positionEncoding:    acp.PositionEncodingKindUtf16,
 		optionErr: errors.Join(
 			authorityErr,
+			optionFailure(log, optionFieldHome, validateManagedHome(options)),
 			optionFailure(log, optionFieldEnv, validateEnvironment(options.Env, optionFieldEnv, blockedAgentEnvKey)),
 			optionFailure(log, optionFieldConcurrencyLimits, validateConcurrencyLimits(options.ConcurrencyLimits)),
 			optionFailure(log, optionFieldImageLimits, validateImageLimits(options.ImageLimits)),
@@ -263,7 +268,19 @@ func (a *Agent) beginClose() (*agentCloseAttempt, bool) {
 	defer a.mu.Unlock()
 
 	if a.closeAttempt != nil {
-		return a.closeAttempt, false
+		attempt := a.closeAttempt
+		select {
+		case <-attempt.done:
+			if errors.Is(attempt.err, ErrNativeTreeBusy) && nativeContainmentComplete(attempt.err) {
+				retry := &agentCloseAttempt{done: make(chan struct{})}
+				a.closeAttempt = retry
+
+				return retry, true
+			}
+		default:
+		}
+
+		return attempt, false
 	}
 
 	attempt := &agentCloseAttempt{done: make(chan struct{})}
@@ -379,13 +396,17 @@ func (a *Agent) close(attempt *agentCloseAttempt) error {
 	a.conn = nil
 	a.mu.Unlock()
 
-	if active > 0 {
-		a.observe.AddActiveSession(context.Background(), -int64(active))
-	}
+	a.closeAccountingOnce.Do(func() {
+		if active > 0 {
+			a.observe.AddActiveSession(context.Background(), -int64(active))
+		}
+	})
 
 	var closeErrs []error
 
 	completed := make([]*agentSession, 0, len(sessions))
+	busySessions := make([]*agentSession, 0, len(sessions))
+
 	for _, session := range sessions {
 		if attempt.settlement.Load() == closeSettlementQuarantined {
 			return attempt.result()
@@ -397,6 +418,12 @@ func (a *Agent) close(attempt *agentCloseAttempt) error {
 		session.detachLifecycleDelivery()
 
 		if err := session.Close(context.Background()); err != nil {
+			if errors.Is(err, ErrNativeTreeBusy) && nativeContainmentComplete(err) {
+				busySessions = append(busySessions, session)
+
+				continue
+			}
+
 			closeErrs = append(closeErrs, err)
 
 			continue
@@ -410,6 +437,37 @@ func (a *Agent) close(attempt *agentCloseAttempt) error {
 	}
 
 	a.mu.Lock()
+	constructions := make([]*nativeConstruction, 0, len(a.constructions))
+
+	for construction := range a.constructions {
+		constructions = append(constructions, construction)
+	}
+	a.mu.Unlock()
+
+	for _, construction := range constructions {
+		constructionErr := a.cleanupNativeConstruction(context.Background(), construction, construction.err)
+		if constructionErr != nil {
+			closeErrs = append(closeErrs, constructionErr)
+
+			continue
+		}
+
+		a.mu.Lock()
+		delete(a.constructions, construction)
+		a.mu.Unlock()
+	}
+
+	for _, session := range busySessions {
+		if err := session.Close(context.Background()); err != nil {
+			closeErrs = append(closeErrs, err)
+
+			continue
+		}
+
+		completed = append(completed, session)
+	}
+
+	a.mu.Lock()
 	for _, session := range completed {
 		delete(a.retainedSessions, session)
 
@@ -417,12 +475,6 @@ func (a *Agent) close(attempt *agentCloseAttempt) error {
 			if current == session {
 				delete(a.sessions, id)
 			}
-		}
-	}
-
-	for construction := range a.constructions {
-		if construction.err != nil {
-			closeErrs = append(closeErrs, construction.err)
 		}
 	}
 	a.mu.Unlock()
@@ -444,19 +496,21 @@ type nativeConstruction struct {
 	// must still publish every handle it acquires so its late-result quarantine
 	// can synchronously contain and release those exact resources.
 	immutable   bool
-	cleanupOnce sync.Once
+	cleanupMu   sync.Mutex
+	cleanupDone bool
 	cleanupErr  error
 
-	proc           piProcess
-	client         piClient
-	generationRoot string
-	sessionRoot    string
-	browserShim    *pi.BrowserShim
-	residence      *pi.SessionResidence
-	runtime        *runtimeGeneration
-	session        *agentSession
-	nativeBoundary *nativeBoundaryTracker
-	err            error
+	proc               piProcess
+	client             piClient
+	generationRoot     string
+	generationPrepared bool
+	sessionRoot        string
+	browserShim        *pi.BrowserShim
+	residence          *pi.SessionResidence
+	runtime            *runtimeGeneration
+	session            *agentSession
+	nativeBoundary     *nativeBoundaryTracker
+	err                error
 }
 
 type agentCloseAttempt struct {
@@ -585,6 +639,69 @@ func (a *Agent) recordNativeContainment(err error) {
 		a.nativeContainmentErr = err
 	}
 	a.mu.Unlock()
+
+	if errors.Is(err, ErrHostAuthorityUnavailable) {
+		a.authorityLossOnce.Do(func() {
+			go a.fenceSessionsAfterAuthorityLoss(err)
+		})
+	}
+}
+
+func (a *Agent) fenceSessionsAfterAuthorityLoss(err error) {
+	a.mu.Lock()
+	sessions := make([]*agentSession, 0, len(a.sessions)+len(a.retainedSessions))
+	seen := make(map[*agentSession]struct{}, len(a.sessions)+len(a.retainedSessions))
+
+	for _, session := range a.sessions {
+		if _, ok := seen[session]; ok {
+			continue
+		}
+
+		sessions = append(sessions, session)
+		seen[session] = struct{}{}
+	}
+
+	for session := range a.retainedSessions {
+		if _, ok := seen[session]; ok {
+			continue
+		}
+
+		sessions = append(sessions, session)
+		seen[session] = struct{}{}
+	}
+	a.mu.Unlock()
+
+	for _, session := range sessions {
+		session.recordNativeContainment(err)
+		_ = session.Close(context.Background())
+	}
+}
+
+func (a *Agent) markNativeTreeBusy(root string) {
+	if root == "" {
+		return
+	}
+
+	a.mu.Lock()
+	a.nativeBusyRoots[root] = struct{}{}
+	a.mu.Unlock()
+}
+
+func (a *Agent) clearNativeTreeBusy(root string) {
+	a.mu.Lock()
+	delete(a.nativeBusyRoots, root)
+	a.mu.Unlock()
+}
+
+func (a *Agent) nativeAdmissionError() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if len(a.nativeBusyRoots) == 0 {
+		return nil
+	}
+
+	return ErrNativeTreeBusy
 }
 
 func (a *Agent) nativeContainmentError() error {
@@ -800,6 +917,14 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 	a.versionMu.Lock()
 	defer a.versionMu.Unlock()
 
+	if retryErr := a.retryBusyNativeConstructions(ctx); retryErr != nil {
+		return retryErr
+	}
+
+	if admissionErr := errors.Join(a.nativeContainmentError(), a.nativeAdmissionError()); admissionErr != nil {
+		return admissionErr
+	}
+
 	if a.versionChecked {
 		return a.ensureOpen()
 	}
@@ -857,6 +982,10 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 		return generation.finalize(context.WithoutCancel(ctx), err)
 	}
 
+	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
+		owner.generationPrepared = a.options.hostAuthoritySupplied
+	})
+
 	// This is the final launch gate. Nothing between it and probeVersion invokes
 	// external code or drops the Agent close fence.
 	if contextErr := ctx.Err(); contextErr != nil {
@@ -872,9 +1001,15 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 		err = errors.Join(err, closedErr)
 	}
 
+	if err == nil {
+		err = pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion)
+	}
+
+	versionValidated := err == nil
+
 	err = generation.finalize(context.WithoutCancel(ctx), err)
 
-	if nativeContainmentComplete(err) {
+	if nativeContainmentComplete(err) && !errors.Is(err, ErrNativeTreeBusy) {
 		a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
 			owner.runtime = nil
 		})
@@ -884,16 +1019,50 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 	// or reported an unsupported version is the readiness stage of a native
 	// start and carries the uniform failure shape.
 	if err != nil {
-		return a.nativeStartFailure(ctx, failureCauseProcessExit, err, nil)
-	}
+		if versionValidated && errors.Is(err, ErrNativeTreeBusy) {
+			a.versionChecked = true
+		}
 
-	if err := pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion); err != nil {
 		return a.nativeStartFailure(ctx, failureCauseProcessExit, err, nil)
 	}
 
 	a.versionChecked = true
 
 	return nil
+}
+
+func (a *Agent) retryBusyNativeConstructions(ctx context.Context) error {
+	a.mu.Lock()
+	constructions := make([]*nativeConstruction, 0)
+
+	for construction := range a.constructions {
+		select {
+		case <-construction.done:
+			if errors.Is(construction.err, ErrNativeTreeBusy) ||
+				(construction.runtime != nil && errors.Is(construction.runtime.err, ErrNativeTreeBusy)) {
+				constructions = append(constructions, construction)
+			}
+		default:
+		}
+	}
+	a.mu.Unlock()
+
+	var retryErr error
+
+	for _, construction := range constructions {
+		err := a.cleanupNativeConstruction(context.WithoutCancel(ctx), construction, construction.err)
+		if err != nil {
+			retryErr = errors.Join(retryErr, err)
+
+			continue
+		}
+
+		a.mu.Lock()
+		delete(a.constructions, construction)
+		a.mu.Unlock()
+	}
+
+	return retryErr
 }
 
 func (a *Agent) resolveExecutablePath() (string, error) {

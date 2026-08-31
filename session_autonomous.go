@@ -131,6 +131,12 @@ func (s *agentSession) completeAgentCycle(ctx context.Context, outbox *sessionOu
 	// pump can deliver.
 	s.emitTurnUsageUpdate(ctx, cycle.state, nil)
 
+	if err := s.retireManagedGeneration(ctx, outbox); err != nil {
+		s.containAgentCycle(ctx, outbox, "the agent-origin cycle's native generation could not be retired")
+
+		return
+	}
+
 	if err := s.commitMirror(ctx); err != nil {
 		s.containAgentCycle(ctx, outbox, "the agent-origin cycle's native rows could not be mirrored")
 

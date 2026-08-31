@@ -742,6 +742,7 @@ func (a *Agent) transferConstructionToRelaunch(
 	attempt.proc = construction.proc
 	attempt.client = construction.client
 	attempt.generationRoot = construction.generationRoot
+	attempt.generationPrepared = construction.generationPrepared
 	attempt.nativeBoundary = construction.nativeBoundary
 
 	if construction.err == nil {
@@ -764,9 +765,15 @@ func (a *Agent) cleanupNativeConstruction(
 		return nil
 	}
 
-	construction.cleanupOnce.Do(func() {
-		construction.cleanupErr = a.cleanupNativeConstructionOwned(ctx, construction, cause)
-	})
+	construction.cleanupMu.Lock()
+	defer construction.cleanupMu.Unlock()
+
+	if construction.cleanupDone {
+		return construction.cleanupErr
+	}
+
+	construction.cleanupErr = a.cleanupNativeConstructionOwned(ctx, construction, cause)
+	construction.cleanupDone = !errors.Is(construction.cleanupErr, ErrNativeTreeBusy)
 
 	return construction.cleanupErr
 }
@@ -781,6 +788,7 @@ func (a *Agent) cleanupNativeConstructionOwned(
 	proc := construction.proc
 	session := construction.session
 	sessionRoot := construction.sessionRoot
+	generationPrepared := construction.generationPrepared
 	browserShim := construction.browserShim
 	residence := construction.residence
 	a.mu.Unlock()
@@ -812,7 +820,7 @@ func (a *Agent) cleanupNativeConstructionOwned(
 
 		closeErr := construction.nativeBoundary.run(cleanupCtx, "construction close", proc.Close)
 
-		containmentErr = errors.Join(containmentErr, shutdownErr, killErr, closeErr)
+		containmentErr = terminalNativeClose(errors.Join(containmentErr, shutdownErr, killErr), closeErr)
 	}
 
 	if !nativeContainmentComplete(containmentErr) {
@@ -820,7 +828,10 @@ func (a *Agent) cleanupNativeConstructionOwned(
 	}
 
 	resourceErr := runNativeBoundaryStep(cleanupCtx, "construction resource cleanup", func() error {
-		return finalizeSessionNativeResources(a, containmentErr, construction.generationRoot, sessionRoot, browserShim, residence)
+		return finalizeSessionNativeResources(
+			a, containmentErr, construction.generationRoot, generationPrepared,
+			sessionRoot, browserShim, residence,
+		)
 	})
 
 	if immutable {
@@ -993,6 +1004,10 @@ func (a *Agent) startSessionConstruction(
 ) (session *agentSession, err error) {
 	defer func() { a.recordNativeContainment(err) }()
 
+	if retryErr := a.retryBusyNativeConstructions(ctx); retryErr != nil {
+		return nil, retryErr
+	}
+
 	// Every session-establishing method fails here on agent configuration a
 	// session cannot start under.
 	if configErr := a.sessionStartConfigurationError(); configErr != nil {
@@ -1136,6 +1151,10 @@ func (a *Agent) startSessionConstruction(
 		return nil, prepareErr
 	}
 
+	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
+		owner.generationPrepared = a.options.hostAuthoritySupplied
+	})
+
 	// Load operator-seeded extensions before wrapper-owned extensions so the
 	// wrapper's reserved question tool and correlation hooks cannot be
 	// replaced by a seed with the same registration name.
@@ -1207,10 +1226,12 @@ func (a *Agent) startSessionConstruction(
 		fingerprint:           sessionStartFingerprint(start),
 		launch:                spec,
 		sessionRoot:           dirs.SessionRoot,
+		generationPrepared:    a.options.hostAuthoritySupplied,
 		browserShim:           browserShim,
 		residence:             residence,
 		permissionMode:        permission,
 		autoRetry:             start.MetaOptions.AutoRetry,
+		mcpServers:            cloneMCPServers(start.McpServers),
 		mcpRefreshPending:     includeMCP,
 		proc:                  proc,
 		client:                client,
@@ -1378,6 +1399,14 @@ func (a *Agent) setUpNativeSession(
 	session.mu.Unlock()
 
 	if start.ForkSession {
+		session.mu.Lock()
+		outbox := session.outbox
+		session.mu.Unlock()
+
+		if err := session.retireManagedGeneration(ctx, outbox); err != nil {
+			return err
+		}
+
 		if err := session.commitMirror(ctx); err != nil {
 			return err
 		}

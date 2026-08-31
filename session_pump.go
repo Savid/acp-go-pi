@@ -1772,8 +1772,19 @@ func (s *agentSession) stopNativeGeneration(ctx context.Context, outbox *session
 		cancelClose()
 	}
 
-	containmentErr := errors.Join(shutdownErr, closeErr, pumpErr)
-	if !nativeContainmentComplete(abortErr) {
+	if nativeContainmentComplete(closeErr) && pumpErr != nil && outbox.pumpDone != nil {
+		joinCtx, cancelJoin := context.WithTimeout(context.Background(), sessionShutdownTimeout)
+		select {
+		case <-outbox.pumpDone:
+			pumpErr = nil
+		case <-joinCtx.Done():
+		}
+
+		cancelJoin()
+	}
+
+	containmentErr := errors.Join(terminalNativeClose(shutdownErr, closeErr), pumpErr)
+	if !nativeContainmentComplete(abortErr) && !nativeContainmentComplete(closeErr) {
 		containmentErr = errors.Join(containmentErr, abortErr)
 	}
 

@@ -50,6 +50,10 @@ bounds only that caller's wait.
 admission. Containment uncertainty fails closed and never falls back to
 ordinary process creation.
 
+Managed mode rejects <code>WithHome</code> before creating a runtime tree. A
+successful prompt or fork is mirrored only after the generation's sole
+<code>Wait</code> completes and <code>ReclaimNativeTree</code> succeeds.
+
 ## Provider authentication
 
 Pi's seven provider-auth extension methods are available only in ordinary mode

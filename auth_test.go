@@ -404,8 +404,6 @@ func TestProviderAuthAbsentWithHostAuthority(t *testing.T) {
 	t.Cleanup(authority.cleanup)
 	agent := NewAgent(
 		WithHostAuthority(authority),
-		WithHome(t.TempDir()),
-		WithProviderAuthRoot(t.TempDir()),
 	)
 	response, err := agent.Initialize(t.Context(), defaultInitializeRequest())
 	require.NoError(t, err)
@@ -609,17 +607,17 @@ func TestAuthHarnessUsesGeneratedAgentDir(t *testing.T) {
 	require.NotEqual(t, harness.home, harness.session.launch.AgentDir)
 	require.Contains(t, harness.session.launch.AgentDir, "acp-go-pi-runtime-")
 
-	spec, err := harness.session.nextRuntimeLaunch(harness.session.launch, "")
+	replacement, err := harness.session.nextRuntimeLaunch(t.Context(), harness.session.launch)
 	require.NoError(t, err)
-	require.NotEqual(t, harness.home, spec.AgentDir)
-	require.NotEqual(t, harness.session.launch.AgentDir, spec.AgentDir)
+	require.NotEqual(t, harness.home, replacement.spec.AgentDir)
+	require.NotEqual(t, harness.session.launch.AgentDir, replacement.spec.AgentDir)
 }
 
 func TestGeneratedAgentDirRelaunchIgnoresLedgerIdentity(t *testing.T) {
 	harness := newAuthHarness(t)
-	spec, err := harness.session.nextRuntimeLaunch(harness.session.launch, "")
+	replacement, err := harness.session.nextRuntimeLaunch(t.Context(), harness.session.launch)
 	require.NoError(t, err)
-	require.NotEqual(t, harness.home, spec.AgentDir)
+	require.NotEqual(t, harness.home, replacement.spec.AgentDir)
 }
 
 // TestAuthCommandIsNotAdvertised pins that the wrapper-owned bridge command is
