@@ -120,7 +120,7 @@ func TestHandoffCapabilityAdvertisedOnlyWithARoot(t *testing.T) {
 	withRoot, err := NewAgent(WithInputHandoffRoot(t.TempDir())).Initialize(t.Context(), defaultInitializeRequest())
 	require.NoError(t, err)
 	require.Equal(t,
-		map[string]any{metaFieldVersions: []int{handoffVersion}},
+		map[string]any{metaFieldVersion: handoffVersion},
 		withRoot.AgentCapabilities.Meta[handoffMetaKey],
 	)
 
@@ -166,7 +166,7 @@ func TestConformanceInitializeAdvertisesMediaKeys(t *testing.T) {
 			require.Equal(t, test.handoffRoot, present)
 
 			if test.handoffRoot {
-				require.Equal(t, map[string]any{metaFieldVersions: []any{float64(handoffVersion)}}, handoff)
+				require.Equal(t, map[string]any{metaFieldVersion: float64(handoffVersion)}, handoff)
 			}
 
 			require.True(t, response.AgentCapabilities.PromptCapabilities.Image)

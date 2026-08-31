@@ -22,9 +22,7 @@ const (
 	metaCapabilityFork      = "fork"
 	elicitationScopeSession = "session"
 
-	// metaFieldVersions carries the supported versions of one family-global
-	// reserved capability literal.
-	metaFieldVersions = "versions"
+	metaFieldVersion = "version"
 )
 
 const (
@@ -727,7 +725,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 	a.mu.Unlock()
 
 	capabilityMeta := map[string]any{
-		routeMetaKey:         map[string]any{metaFieldVersions: []int{routeVersion}},
+		routeMetaKey:         map[string]any{metaFieldVersion: routeVersion},
 		mediaEnvelopeMetaKey: a.mediaEnvelope(),
 		piMetaKey: map[string]any{
 			metaCapabilityFork: map[string]any{
@@ -758,7 +756,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 	// handoff root reached this adapter, so the key is emitted only when one
 	// is configured.
 	if a.inputHandoffRoot() != "" {
-		capabilityMeta[handoffMetaKey] = map[string]any{metaFieldVersions: []int{handoffVersion}}
+		capabilityMeta[handoffMetaKey] = map[string]any{metaFieldVersion: handoffVersion}
 	}
 
 	if a.providerAuth != nil {

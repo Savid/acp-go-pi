@@ -110,7 +110,7 @@ func actionFailureSession(t *testing.T, conn agentClient) (*agentSession, *stubP
 
 	agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
 	agent.conn = conn
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 	process := newStubProcess(false)
 	native := newStubPiClient()
@@ -603,7 +603,7 @@ func TestAnnouncementFailureRevokesHeldHostAction(t *testing.T) {
 				}
 				agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
 				agent.conn = client
-				agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+				agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 				process := newStubProcess(false)
 				native := newStubPiClient()
 				session := &agentSession{agent: agent, id: "action", proc: process, client: native}
@@ -764,7 +764,7 @@ func TestAnnouncedPermissionCrossesTheRequestWriteBarrier(t *testing.T) {
 		releaseRequest: make(chan struct{}),
 	}
 	agent := NewAgent(testContainmentOption())
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, ActivityKinds: []lifecycle.ActivityKind{}}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, ActivityKinds: []lifecycle.ActivityKind{}}
 	connection := newLocalAgentConnection(agent, wire, input)
 	agent.setConnection(connection)
 	t.Cleanup(func() {

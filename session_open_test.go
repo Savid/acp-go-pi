@@ -97,7 +97,7 @@ func TestStartupRecordsWaitForSessionIdentityAndOpeningSnapshot(t *testing.T) {
 	client := newRecordingClient()
 	agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
 	agent.conn = client
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 	process := newStubProcess(false)
 	native := newStubPiClient()
 	native.respondFunc = func(pi.UIResponse) {
@@ -144,7 +144,7 @@ func TestFailedStartupContainsBufferedRecordsWithoutEmission(t *testing.T) {
 	client.failOrdinary = true
 	agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
 	agent.conn = client
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 	process := newStubProcess(false)
 	native := newStubPiClient()
 	session := &agentSession{
@@ -215,7 +215,7 @@ func TestPublishSessionOpenCancellationAndLifecycleFailureBoundaries(t *testing.
 		host := &lifecycleFailingClient{directAgentClient: newDirectAgentClient(), err: errors.New("snapshot refused")}
 		agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
 		agent.conn = host
-		agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+		agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 		process := newStubProcess(false)
 		session := &agentSession{agent: agent, id: "snapshot-failure"}
 		bindTestEstablishingOutbox(session, 1, process, newStubPiClient())

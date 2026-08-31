@@ -43,21 +43,22 @@ func (a *Agent) provenLifecycleFacts() lifecycle.Negotiated {
 // connection. An absent offer leaves the key omitted from the response and the
 // extension dormant for every session on that connection.
 func (a *Agent) negotiateLifecycle(meta map[string]any) (map[string]any, error) {
-	offer, present, refusal := lifecycle.DecodeOffer(meta)
+	present, refusal := lifecycle.DecodeCapability(meta)
 	if refusal != nil {
 		return nil, unsupportedField(refusal.Field)
 	}
 
-	answer, common := lifecycle.Negotiated{}, false
+	answer := lifecycle.Negotiated{}
 	if present {
-		answer, common = offer.Answer(a.provenLifecycleFacts())
+		answer = a.provenLifecycleFacts()
+		answer.Version = lifecycle.Version
 	}
 
 	a.mu.Lock()
 	a.lifecycle = answer
 	a.mu.Unlock()
 
-	if !common {
+	if !present {
 		return map[string]any{}, nil
 	}
 

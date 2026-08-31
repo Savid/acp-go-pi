@@ -336,7 +336,7 @@ func newAgentCycleSession(t *testing.T) *agentCycleFixture {
 	)
 	agent.conn = client
 	agent.lifecycle = lifecycle.Negotiated{
-		Versions:             []int{1},
+		Version:              1,
 		UpdatesOutsidePrompt: true,
 		ActivityKinds:        []lifecycle.ActivityKind{},
 	}

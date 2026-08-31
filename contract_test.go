@@ -725,7 +725,7 @@ func lifecycleInitializeRequest() acp.InitializeRequest {
 	return acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		Meta: map[string]any{lifecycleMetaKey: map[string]any{
-			"versions": []any{lifecycle.Version},
+			"version": lifecycle.Version,
 		}},
 	}
 }

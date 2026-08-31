@@ -2300,7 +2300,7 @@ func TestRelaunchPublicationFailureBranches(t *testing.T) {
 		client := newStubPiClient()
 		client.state = pi.SessionState{SessionID: "id"}
 		session, agent := base(client)
-		agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+		agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
 		agent.setConnection(&lifecycleFailingClient{directAgentClient: newDirectAgentClient(), err: errors.New("stream delivery")})
 		require.ErrorContains(t, session.relaunchProcess(t.Context()), "stream delivery")
 	})
@@ -2313,7 +2313,7 @@ func TestRelaunchPublicationFailureBranches(t *testing.T) {
 func TestRelaunchRecordsGenerationLossBeforeLaunch(t *testing.T) {
 	store := newFaultySessionStore()
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
 	agent.setConnection(newDirectAgentClient())
 	session := &agentSession{agent: agent, id: "id", proc: newStubProcess(true), client: newStubPiClient()}
 	prepareRelaunchFixture(t, session)
@@ -2336,7 +2336,7 @@ func TestRelaunchRechecksCloseAfterRecordingGenerationLoss(t *testing.T) {
 	store := &appendCallbackStore{SessionStore: NewInMemorySessionStore()}
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
 	agent.lifecycle = lifecycle.Negotiated{
-		Versions:             []int{1},
+		Version:              1,
 		UpdatesOutsidePrompt: true,
 		ActivityKinds:        []lifecycle.ActivityKind{},
 	}

@@ -670,7 +670,7 @@ func TestPromptAndSettlementErrorBranches(t *testing.T) {
 // fails before admission and creates neither submission nor turn.
 func TestPromptRejectsMalformedLifecycleCorrelation(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
 	session := &agentSession{agent: agent, id: "id", client: newStubPiClient(), proc: newStubProcess(false)}
 
 	missing := TextPromptRequest("id", "turn", "hi")
@@ -700,7 +700,7 @@ func decodeMeta(t *testing.T, raw string) map[string]any {
 func TestPromptAcceptanceDeliveryFailureFailsTheTurn(t *testing.T) {
 	store := NewInMemorySessionStore()
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
 	connection := newDirectAgentClient()
 	agent.setConnection(connection)
 	session := &agentSession{agent: agent, id: "id", client: newStubPiClient(), proc: newStubProcess(false)}
@@ -766,7 +766,7 @@ func TestPromptSettlementStorePanicContainsOnceAgainstClose(t *testing.T) {
 			logs := &strings.Builder{}
 			agent := NewAgent(testContainmentOption(), WithSessionStore(store),
 				WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
-			agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+			agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 			connection := newDirectAgentClient()
 			agent.setConnection(connection)
 			process := newStubProcess(false)

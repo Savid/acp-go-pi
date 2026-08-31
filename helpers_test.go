@@ -895,7 +895,7 @@ func lifecycleSession(t *testing.T, authoritative bool) (*agentSession, *directA
 	client := newDirectAgentClient()
 	agent := NewAgent(testContainmentOption())
 	agent.conn = client
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
 	if authoritative {
 		agent.lifecycle.AuthoritativeQuiescence = true
 		agent.lifecycle.QuiescenceSource = lifecycle.ProofClassProcessContainment

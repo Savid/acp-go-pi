@@ -361,7 +361,7 @@ func TestAgentCloseOwesTheSameDurableRungAsAWireClose(t *testing.T) {
 		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
 		agent.conn = client
 		agent.lifecycle = lifecycle.Negotiated{
-			Versions:                []int{1},
+			Version:                 1,
 			UpdatesOutsidePrompt:    true,
 			ActivityKinds:           []lifecycle.ActivityKind{},
 			AuthoritativeQuiescence: true,
