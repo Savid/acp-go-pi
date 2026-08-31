@@ -820,7 +820,7 @@ func (a *Agent) cleanupNativeConstructionOwned(
 	}
 
 	resourceErr := runNativeBoundaryStep(cleanupCtx, "construction resource cleanup", func() error {
-		return finalizeSessionRuntimeResources(a, containmentErr, construction.generationRoot, sessionRoot, browserShim, residence)
+		return finalizeSessionNativeResources(a, containmentErr, construction.generationRoot, sessionRoot, browserShim, residence)
 	})
 
 	if immutable {

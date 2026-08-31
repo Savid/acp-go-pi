@@ -41,11 +41,11 @@ var sessionRelaunchWaitContext = func(ctx context.Context) (context.Context, con
 	return context.WithTimeout(ctx, sessionCloseTurnWait)
 }
 
-// finalizeSessionRuntimeResources releases each admission only after its
+// finalizeSessionNativeResources releases each admission only after its
 // native boundary completes. An incomplete native boundary
 // retains its admission and private session root because descendants may
 // still use them.
-func finalizeSessionRuntimeResources(
+func finalizeSessionNativeResources(
 	agent *Agent,
 	runtimeErr error,
 	generationRoot string,
@@ -1523,7 +1523,7 @@ func (s *agentSession) closeOwned(ctx context.Context, attempt *sessionCloseAtte
 	residence := s.residence
 	s.mu.Unlock()
 
-	err = finalizeSessionRuntimeResources(s.agent, err, generationRoot, sessionRoot, browserShim, residence)
+	err = finalizeSessionNativeResources(s.agent, err, generationRoot, sessionRoot, browserShim, residence)
 
 	if s.agent != nil {
 		s.agent.observe.RecordPiProcessExit(closeCtx, "closed", err)
