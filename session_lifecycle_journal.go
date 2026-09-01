@@ -184,10 +184,7 @@ func decodeLifecycleBoundaryRecord(entry SessionStoreEntry) (lifecycleBoundaryRe
 		return lifecycleBoundaryRecord{}, err
 	}
 
-	var record lifecycleBoundaryRecord
-	if decodeErr := json.Unmarshal(entry, &record); decodeErr != nil {
-		return lifecycleBoundaryRecord{}, decodeErr
-	}
+	configurationComplete := false
 
 	if rawConfiguration, present := fields[lifecycleBoundaryFieldConfiguration]; present {
 		configurationFields, configurationErr := decodeLifecycleBoundaryObject(
@@ -200,11 +197,27 @@ func decodeLifecycleBoundaryRecord(entry SessionStoreEntry) (lifecycleBoundaryRe
 		}
 
 		if configurationFields != nil {
-			_, envPresent := configurationFields[metaEnvKey]
+			rawEnv, envPresent := configurationFields[metaEnvKey]
 			_, extraPathDirsPresent := configurationFields[metaExtraPathDirsKey]
-			record.configurationComplete = envPresent && extraPathDirsPresent
+			configurationComplete = envPresent && extraPathDirsPresent
+
+			if envPresent && !bytes.Equal(bytes.TrimSpace(rawEnv), []byte("null")) {
+				if envErr := validateLifecycleBoundaryDynamicObject(
+					rawEnv,
+					"lifecycle boundary configuration env",
+				); envErr != nil {
+					return lifecycleBoundaryRecord{}, envErr
+				}
+			}
 		}
 	}
+
+	var record lifecycleBoundaryRecord
+	if decodeErr := json.Unmarshal(entry, &record); decodeErr != nil {
+		return lifecycleBoundaryRecord{}, decodeErr
+	}
+
+	record.configurationComplete = configurationComplete
 
 	for _, field := range []string{
 		lifecycleFieldVersion,
@@ -311,6 +324,104 @@ func decodeLifecycleBoundaryObject(
 	}
 
 	return fields, nil
+}
+
+// validateLifecycleBoundaryDynamicObject walks a dynamic-name object before
+// encoding/json can collapse duplicate members. Dynamic names are compared
+// exactly: environment keys are case-sensitive on Unix, so Token and TOKEN are
+// distinct values rather than schema aliases. Nested objects are walked with
+// the same rule even though env value validation later requires strings.
+func validateLifecycleBoundaryDynamicObject(raw []byte, object string) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("decode %s: %w", object, err)
+	}
+
+	if token != json.Delim('{') {
+		return fmt.Errorf("%s must be an object", object)
+	}
+
+	if walkErr := walkLifecycleBoundaryDynamicObject(decoder, object); walkErr != nil {
+		return walkErr
+	}
+
+	if _, err = decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("%s carries trailing JSON value", object)
+		}
+
+		return fmt.Errorf("decode %s trailing data: %w", object, err)
+	}
+
+	return nil
+}
+
+func walkLifecycleBoundaryDynamicObject(decoder *json.Decoder, object string) error {
+	seen := map[string]struct{}{}
+
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("decode %s member: %w", object, err)
+		}
+
+		key, ok := keyToken.(string)
+		if !ok {
+			return fmt.Errorf("%s member name must be a string", object)
+		}
+
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("duplicate %s field %q", object, key)
+		}
+
+		seen[key] = struct{}{}
+
+		if err := walkLifecycleBoundaryDynamicValue(decoder, object+"."+key); err != nil {
+			return err
+		}
+	}
+
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("close %s: %w", object, err)
+	}
+
+	return nil
+}
+
+func walkLifecycleBoundaryDynamicValue(decoder *json.Decoder, path string) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+
+	switch delimiter {
+	case '{':
+		return walkLifecycleBoundaryDynamicObject(decoder, path)
+	case '[':
+		index := 0
+		for decoder.More() {
+			if err := walkLifecycleBoundaryDynamicValue(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+				return err
+			}
+
+			index++
+		}
+
+		if _, err := decoder.Token(); err != nil {
+			return fmt.Errorf("close %s: %w", path, err)
+		}
+
+		return nil
+	default:
+		return fmt.Errorf("decode %s: unexpected JSON delimiter %q", path, delimiter)
+	}
 }
 
 func validateLifecycleBoundaryRecord(record lifecycleBoundaryRecord) error {

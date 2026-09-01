@@ -73,19 +73,45 @@ func TestLifecycleBoundaryRestoreValidation(t *testing.T) {
 	}
 }
 
-// TestLastLifecycleBoundaryRejectsDuplicateClosedSchemaFields exercises the
-// production journal reader rather than a test-only decoder. Neither the
-// boundary object nor its nested configuration object has last-write-wins
-// semantics: duplicate durable facts make the whole restore ineligible.
-func TestLastLifecycleBoundaryRejectsDuplicateClosedSchemaFields(t *testing.T) {
+// TestLastLifecycleBoundaryRejectsAmbiguousSchemaFields exercises the
+// production journal reader rather than a test-only decoder. The closed
+// boundary/configuration objects reject aliases and duplicates, while the
+// dynamic environment rejects exact duplicates recursively without folding
+// case. Ambiguous durable facts make the whole restore ineligible.
+func TestLastLifecycleBoundaryRejectsAmbiguousSchemaFields(t *testing.T) {
 	t.Parallel()
 
-	tests := map[string]json.RawMessage{
-		"top level":     json.RawMessage(`{"version":1,"version":1,"configuration":{"env":null,"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
-		"configuration": json.RawMessage(`{"version":1,"configuration":{"env":null,"env":{},"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+	tests := map[string]struct {
+		boundary json.RawMessage
+		want     string
+	}{
+		"top-level duplicate": {
+			boundary: json.RawMessage(`{"version":1,"version":1,"configuration":{"env":null,"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "duplicate",
+		},
+		"configuration duplicate": {
+			boundary: json.RawMessage(`{"version":1,"configuration":{"env":null,"env":{},"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "duplicate",
+		},
+		"environment duplicate": {
+			boundary: json.RawMessage(`{"version":1,"configuration":{"env":{"TOKEN":"one","TOKEN":"two"},"extraPathDirs":[]},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "duplicate",
+		},
+		"nested environment duplicate": {
+			boundary: json.RawMessage(`{"version":1,"configuration":{"env":{"nested":{"token":"one","token":"two"}},"extraPathDirs":[]},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "duplicate",
+		},
+		"top-level case alias": {
+			boundary: json.RawMessage(`{"Version":1,"configuration":{"env":null,"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "unknown",
+		},
+		"configuration case alias": {
+			boundary: json.RawMessage(`{"version":1,"configuration":{"Env":null,"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "unknown",
+		},
 	}
 
-	for name, boundary := range tests {
+	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
@@ -93,14 +119,31 @@ func TestLastLifecycleBoundaryRejectsDuplicateClosedSchemaFields(t *testing.T) {
 			require.NoError(t, store.Append(t.Context(), SessionKey{
 				SessionID: "session",
 				Subpath:   SessionStoreLifecycleSubpath,
-			}, []SessionStoreEntry{boundary}))
+			}, []SessionStoreEntry{test.boundary}))
 
 			agent := NewAgent(WithSessionStore(store))
 			_, found, err := agent.lastLifecycleBoundary(t.Context(), "session")
 			require.False(t, found)
-			require.ErrorContains(t, err, "duplicate")
+			require.ErrorContains(t, err, test.want)
 		})
 	}
+}
+
+func TestLastLifecycleBoundaryAcceptsCaseDistinctEnvironmentKeys(t *testing.T) {
+	t.Parallel()
+
+	boundary := json.RawMessage(`{"version":1,"configuration":{"env":{"Token":"one","TOKEN":"two"},"extraPathDirs":[]},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`)
+	store := NewInMemorySessionStore()
+	require.NoError(t, store.Append(t.Context(), SessionKey{
+		SessionID: "session",
+		Subpath:   SessionStoreLifecycleSubpath,
+	}, []SessionStoreEntry{boundary}))
+
+	agent := NewAgent(WithSessionStore(store))
+	record, found, err := agent.lastLifecycleBoundary(t.Context(), "session")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, map[string]string{"Token": "one", "TOKEN": "two"}, record.Configuration.Env)
 }
 
 // TestCloseBoundaryOnAnIdleForegroundReadsBack pins the journal reader against
