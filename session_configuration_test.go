@@ -93,9 +93,9 @@ func TestLifecycleBoundaryPersistsSessionConfiguration(t *testing.T) {
 
 func TestStoredSessionConfigurationRequiresBothFields(t *testing.T) {
 	tests := map[string]json.RawMessage{
-		"old record":   json.RawMessage(`{"version":1,"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
-		"missing env":  json.RawMessage(`{"version":1,"configuration":{"extraPathDirs":[]},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
-		"missing path": json.RawMessage(`{"version":1,"configuration":{"env":{}},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+		"missing configuration": json.RawMessage(`{"version":1,"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+		"missing env":           json.RawMessage(`{"version":1,"configuration":{"extraPathDirs":[]},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+		"missing path":          json.RawMessage(`{"version":1,"configuration":{"env":{}},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
 	}
 
 	for name, boundary := range tests {
