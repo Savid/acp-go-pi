@@ -1216,19 +1216,32 @@ func (a *Agent) startSession(ctx context.Context, start sessionStart) (session *
 			return
 		}
 
-		a.mu.Lock()
-		closed = closed || a.closed
-		a.mu.Unlock()
-
-		if closed {
-			closeErr := session.Close(context.WithoutCancel(ctx))
-			a.retainIncompleteSession(session, closeErr)
+		if closeErr := a.closeTransferredSessionIfAgentClosed(ctx, session, closed); closeErr != nil {
 			session = nil
-			err = errors.Join(errAgentClosed, closeErr)
+			err = closeErr
 		}
 	}()
 
 	return a.startSessionConstruction(ctx, start, construction)
+}
+
+func (a *Agent) closeTransferredSessionIfAgentClosed(
+	ctx context.Context,
+	session *agentSession,
+	closed bool,
+) error {
+	a.mu.Lock()
+	closed = closed || a.closed
+	a.mu.Unlock()
+
+	if !closed {
+		return nil
+	}
+
+	closeErr := session.Close(context.WithoutCancel(ctx))
+	a.retainIncompleteSession(session, closeErr)
+
+	return errors.Join(errAgentClosed, closeErr)
 }
 
 //nolint:gocyclo // Startup is one fail-closed ownership ladder whose ordered gates must remain visible.
