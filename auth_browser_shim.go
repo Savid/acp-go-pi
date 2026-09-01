@@ -17,7 +17,3 @@ func (a *Agent) newSessionBrowserShim(parent string) *pi.BrowserShim {
 
 	return shim
 }
-
-func (a *Agent) newOwnedSessionBrowserShim(parent string) *pi.BrowserShim {
-	return a.newSessionBrowserShim(parent)
-}

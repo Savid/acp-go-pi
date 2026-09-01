@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	internalpi "github.com/savid/acp-go-pi/internal/pi"
 )
@@ -35,6 +36,23 @@ type closeAgentOnErrContext struct {
 	agent           *Agent
 	once            sync.Once
 }
+
+type closeAgentOnSpanStart struct {
+	agent *Agent
+	once  sync.Once
+}
+
+func (p *closeAgentOnSpanStart) OnStart(context.Context, sdktrace.ReadWriteSpan) {
+	p.once.Do(func() {
+		p.agent.mu.Lock()
+		p.agent.closed = true
+		p.agent.mu.Unlock()
+	})
+}
+
+func (*closeAgentOnSpanStart) OnEnd(sdktrace.ReadOnlySpan)      {}
+func (*closeAgentOnSpanStart) Shutdown(context.Context) error   { return nil }
+func (*closeAgentOnSpanStart) ForceFlush(context.Context) error { return nil }
 
 type contextIgnoringStore struct{ SessionStore }
 
@@ -614,6 +632,44 @@ func TestSessionConstructionFenceEdges(t *testing.T) {
 		agent.constructions[construction] = struct{}{}
 		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
 		require.ErrorIs(t, err, ErrNativeTreeBusy)
+	})
+
+	t.Run("closed after version check", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		agent.closed = true
+		construction := &nativeConstruction{
+			done: make(chan struct{}), nativeBoundary: newNativeBoundaryTracker(),
+		}
+		_, err := agent.startSessionConstruction(t.Context(), sessionStart{Cwd: "/cwd"}, construction)
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("close after executable resolution", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		agent.options.ExecutablePath = ""
+		agent.lookPath = func(string) (string, error) {
+			agent.mu.Lock()
+			agent.closed = true
+			agent.mu.Unlock()
+
+			return "/fake/pi", nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("close when process observation starts", func(t *testing.T) {
+		processor := &closeAgentOnSpanStart{}
+		provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(processor))
+		t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+
+		agent := newStubClientAgent(t, newStubPiClient(), WithTracerProvider(provider))
+		processor.agent = agent
+		agent.versionChecked = true
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
 	})
 
 	t.Run("prepare failure", func(t *testing.T) {
