@@ -404,13 +404,22 @@ func requireNativeCatalogEntry(t *testing.T, methods attendedMethodsWire, provid
 func requireSessionBrowserShim(t *testing.T, scratch string) {
 	t.Helper()
 
-	shim := ""
-	for _, entry := range readNativeBrowserDir(t, scratch) {
-		if entry.IsDir() && strings.HasPrefix(entry.Name(), nativeBrowserShimPrefix) {
-			shim = filepath.Join(scratch, entry.Name())
+	shims := make([]string, 0, 1)
+	err := filepath.WalkDir(scratch, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-	}
-	require.NotEmpty(t, shim, "the session started without a browser-launcher shim in %s", scratch)
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), nativeBrowserShimPrefix) {
+			shims = append(shims, path)
+
+			return filepath.SkipDir
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, shims, 1, "the session did not start with exactly one browser-launcher shim in %s", scratch)
+	shim := shims[0]
 
 	shadowed := make([]string, 0, len(nativeBrowserLauncherNames))
 	for _, entry := range readNativeBrowserDir(t, shim) {
