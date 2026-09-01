@@ -73,6 +73,8 @@ func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir str
 	go func() { data, _ := io.ReadAll(stderrPipe); stderr <- data }()
 
 	result, waitErr := waitNativeProcess(ctx, process)
+
+	terminal := waitErr == nil
 	if waitErr != nil {
 		initialWaitErr := waitErr
 		revokeCtx, cancelRevoke := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
@@ -88,15 +90,25 @@ func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir str
 		if terminalWaitErr != nil {
 			waitErr = errors.Join(initialWaitErr, ctx.Err(), revokeErr, terminalWaitErr, ErrContainmentIncomplete)
 		} else {
+			terminal = true
 			result = terminalResult
 			waitErr = errors.Join(initialWaitErr, ctx.Err(), authorityTerminalRevokeError(revokeErr))
 		}
 	}
 
-	_ = stdoutPipe.Close()
-	_ = stderrPipe.Close()
-	output := <-stdout
-	diagnostic := <-stderr
+	var output, diagnostic []byte
+
+	finishVersionProbeOutput(
+		terminal,
+		func() {
+			output = <-stdout
+			diagnostic = <-stderr
+		},
+		func() {
+			_ = stdoutPipe.Close()
+			_ = stderrPipe.Close()
+		},
+	)
 
 	if waitErr != nil {
 		a.recordNativeContainment(waitErr)
@@ -114,6 +126,18 @@ func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir str
 	}
 
 	return version, nil
+}
+
+func finishVersionProbeOutput(terminal bool, joinReaders func(), closeStreams func()) {
+	if terminal {
+		joinReaders()
+		closeStreams()
+
+		return
+	}
+
+	closeStreams()
+	joinReaders()
 }
 
 func (a *Agent) nativeBaseEnvironment() map[string]string {

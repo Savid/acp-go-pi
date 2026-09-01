@@ -611,6 +611,45 @@ func TestAuthorityProcessControlAndPrimitiveEdges(t *testing.T) {
 	}}), ErrContainmentIncomplete)
 }
 
+func TestAuthorityWaitCallerObservesExactFlightAcrossTerminalSuccessor(t *testing.T) {
+	wantErr := errors.New("first authority wait failed")
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	var callsMu sync.Mutex
+	waitCalls := 0
+	process := &edgeNativeProcess{wait: func(context.Context) (NativeResult, error) {
+		callsMu.Lock()
+		waitCalls++
+		call := waitCalls
+		callsMu.Unlock()
+		if call == 1 {
+			return NativeResult{}, wantErr
+		}
+
+		close(secondStarted)
+		<-releaseSecond
+
+		return NativeResult{Revoked: true}, nil
+	}}
+	wrapper := &authorityPiProcess{agent: NewAgent(), process: process, exited: make(chan struct{})}
+	first := wrapper.startWait()
+	<-first.done
+	second := wrapper.startWait()
+	<-secondStarted
+	close(releaseSecond)
+	<-second.done
+
+	terminal, waitErr := wrapper.awaitWait(t.Context(), first)
+	require.False(t, terminal)
+	require.ErrorIs(t, waitErr, wantErr)
+	require.ErrorIs(t, waitErr, ErrContainmentIncomplete)
+
+	terminal, waitErr = wrapper.awaitWait(t.Context(), second)
+	require.True(t, terminal)
+	require.NoError(t, waitErr)
+	require.NoError(t, wrapper.WaitErr())
+}
+
 func TestAuthorityProcessIncompleteCloseJoinsWaitAndStderrWorkers(t *testing.T) {
 	originalKillTimeout := authorityProcessKillTimeout
 	authorityProcessKillTimeout = time.Nanosecond
@@ -846,6 +885,8 @@ func TestNativeVersionProbeGivesTerminalRejoinAFreshBoundAndJoinsDrains(t *testi
 			if err := ctx.Err(); err != nil {
 				return NativeResult{}, err
 			}
+			_ = stdout.Close()
+			_ = stderr.Close()
 
 			return NativeResult{Revoked: true}, nil
 		},
@@ -867,4 +908,25 @@ func TestNativeVersionProbeGivesTerminalRejoinAFreshBoundAndJoinsDrains(t *testi
 	require.Equal(t, 2, waitCalls)
 	<-stdout.exited
 	<-stderr.exited
+}
+
+func TestTerminalVersionProbeJoinsBufferedOutputBeforeClose(t *testing.T) {
+	buffered := []byte("1.2.3")
+	var output []byte
+	order := make([]string, 0, 2)
+
+	finishVersionProbeOutput(
+		true,
+		func() {
+			order = append(order, "join")
+			output = append([]byte(nil), buffered...)
+		},
+		func() {
+			order = append(order, "close")
+			buffered = nil
+		},
+	)
+
+	require.Equal(t, []string{"join", "close"}, order)
+	require.Equal(t, "1.2.3", string(output), "closing first would truncate buffered version output")
 }

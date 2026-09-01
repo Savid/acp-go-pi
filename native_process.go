@@ -248,18 +248,7 @@ func (p *authorityPiProcess) awaitWait(ctx context.Context, flight *authorityWai
 		<-flight.done
 	}
 
-	p.waitMu.Lock()
-	defer p.waitMu.Unlock()
-
-	if p.terminal {
-		return true, p.waitErr
-	}
-
-	if p.waitErr != nil {
-		return false, p.waitErr
-	}
-
-	return false, flight.waitErr
+	return flight.terminal, flight.waitErr
 }
 func (p *authorityPiProcess) revoke(ctx context.Context) (err error) {
 	defer func() {
