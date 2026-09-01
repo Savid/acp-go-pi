@@ -72,39 +72,26 @@ func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir str
 	go func() { data, _ := io.ReadAll(stdoutPipe); stdout <- data }()
 	go func() { data, _ := io.ReadAll(stderrPipe); stderr <- data }()
 
-	type waitOutcome struct {
-		result NativeResult
-		err    error
-	}
+	result, waitErr := waitNativeProcess(ctx, process)
+	if waitErr != nil && ctx.Err() != nil && detachedWaitError(waitErr) {
+		revokeCtx, cancelRevoke := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
+		revokeErr := revokeNativeProcess(revokeCtx, process)
 
-	waitDone := make(chan waitOutcome, 1)
+		cancelRevoke()
 
-	//nolint:gosec // The sole wait observer must outlive caller cancellation.
-	go func() {
-		result, waitErr := waitNativeProcess(context.Background(), process)
-		waitDone <- waitOutcome{result: result, err: waitErr}
-	}()
+		waitCtx, cancelWait := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
+		terminalResult, terminalWaitErr := waitNativeProcess(waitCtx, process)
 
-	var outcome waitOutcome
-	select {
-	case outcome = <-waitDone:
-	case <-ctx.Done():
-		settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
-		revokeErr := revokeNativeProcess(settleCtx, process)
+		cancelWait()
 
-		select {
-		case outcome = <-waitDone:
-		case <-settleCtx.Done():
-			outcome.err = settleCtx.Err()
-		}
-
-		cancelSettle()
-
-		if outcome.err != nil {
-			outcome.err = errors.Join(ctx.Err(), revokeErr, outcome.err, ErrContainmentIncomplete)
+		if terminalWaitErr != nil {
+			waitErr = errors.Join(ctx.Err(), revokeErr, terminalWaitErr, ErrContainmentIncomplete)
 		} else {
-			outcome.err = errors.Join(ctx.Err(), authorityTerminalRevokeError(revokeErr))
+			result = terminalResult
+			waitErr = errors.Join(ctx.Err(), authorityTerminalRevokeError(revokeErr))
 		}
+	} else if waitErr != nil {
+		waitErr = errors.Join(waitErr, ErrContainmentIncomplete)
 	}
 
 	_ = stdoutPipe.Close()
@@ -112,14 +99,14 @@ func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir str
 	output := <-stdout
 	diagnostic := <-stderr
 
-	if outcome.err != nil {
-		a.recordNativeContainment(outcome.err)
+	if waitErr != nil {
+		a.recordNativeContainment(waitErr)
 
-		return "", outcome.err
+		return "", waitErr
 	}
 
-	if outcome.result.ExitCode != 0 {
-		return "", fmt.Errorf("probe pi version: exit status %d: %s", outcome.result.ExitCode, strings.TrimSpace(string(diagnostic)))
+	if result.ExitCode != 0 {
+		return "", fmt.Errorf("probe pi version: exit status %d: %s", result.ExitCode, strings.TrimSpace(string(diagnostic)))
 	}
 
 	version := strings.TrimSpace(string(output))

@@ -3,10 +3,12 @@ package piacp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -152,6 +154,51 @@ type errorReadCloser struct{ err error }
 
 func (c *errorReadCloser) Read([]byte) (int, error) { return 0, io.EOF }
 func (c *errorReadCloser) Close() error             { return c.err }
+
+type blockingEdgeReadCloser struct {
+	startedOnce sync.Once
+	closeOnce   sync.Once
+	started     chan struct{}
+	closed      chan struct{}
+	exited      chan struct{}
+}
+
+func newBlockingEdgeReadCloser() *blockingEdgeReadCloser {
+	return &blockingEdgeReadCloser{
+		started: make(chan struct{}), closed: make(chan struct{}), exited: make(chan struct{}),
+	}
+}
+
+func (r *blockingEdgeReadCloser) Read([]byte) (int, error) {
+	r.startedOnce.Do(func() { close(r.started) })
+	<-r.closed
+	close(r.exited)
+
+	return 0, io.EOF
+}
+
+func (r *blockingEdgeReadCloser) Close() error {
+	r.closeOnce.Do(func() { close(r.closed) })
+
+	return nil
+}
+
+type signalingWriteCloser struct {
+	sync.Once
+	closed chan struct{}
+}
+
+type emptyWaitMultiError struct{}
+
+func (emptyWaitMultiError) Error() string   { return "empty wait error" }
+func (emptyWaitMultiError) Unwrap() []error { return nil }
+
+func (w *signalingWriteCloser) Write(data []byte) (int, error) { return len(data), nil }
+func (w *signalingWriteCloser) Close() error {
+	w.Do(func() { close(w.closed) })
+
+	return nil
+}
 
 func TestHostAuthorityRuntimeEdges(t *testing.T) {
 	var nilAuthority *edgeHostAuthority
@@ -407,6 +454,7 @@ func TestAuthorityProcessControlAndPrimitiveEdges(t *testing.T) {
 	<-waitFailure.exited
 	require.ErrorIs(t, waitFailure.WaitErr(), wantErr)
 	require.ErrorIs(t, waitFailure.WaitErr(), ErrContainmentIncomplete)
+	require.ErrorIs(t, waitFailure.Kill(), wantErr)
 
 	exitFailure := &authorityPiProcess{
 		agent: NewAgent(), process: &edgeNativeProcess{wait: func(context.Context) (NativeResult, error) {
@@ -421,7 +469,7 @@ func TestAuthorityProcessControlAndPrimitiveEdges(t *testing.T) {
 	close(immediateExited)
 	immediate := &authorityPiProcess{
 		agent: NewAgent(), process: &edgeNativeProcess{},
-		stdin: &errorWriteCloser{}, tail: &nativeStderrTail{limit: 4}, exited: immediateExited,
+		stdin: &errorWriteCloser{}, tail: &nativeStderrTail{limit: 4}, exited: immediateExited, terminal: true,
 	}
 	immediate.managedByHostAuthority()
 	require.True(t, immediate.Exited() == immediateExited)
@@ -434,13 +482,16 @@ func TestAuthorityProcessControlAndPrimitiveEdges(t *testing.T) {
 	delayed := &authorityPiProcess{
 		agent: NewAgent(),
 		process: &edgeNativeProcess{
-			wait: func(context.Context) (NativeResult, error) {
-				<-delayedDone
-
-				return NativeResult{Revoked: true}, nil
+			wait: func(ctx context.Context) (NativeResult, error) {
+				select {
+				case <-delayedDone:
+					return NativeResult{Revoked: true}, nil
+				case <-ctx.Done():
+					return NativeResult{}, ctx.Err()
+				}
 			},
 			revoke: func(context.Context) error {
-				go func() { time.Sleep(time.Millisecond); close(delayedDone) }()
+				close(delayedDone)
 
 				return nil
 			},
@@ -454,13 +505,16 @@ func TestAuthorityProcessControlAndPrimitiveEdges(t *testing.T) {
 	shutdown := &authorityPiProcess{
 		agent: NewAgent(),
 		process: &edgeNativeProcess{
-			wait: func(context.Context) (NativeResult, error) {
-				<-shutdownDone
-
-				return NativeResult{Revoked: true}, nil
+			wait: func(ctx context.Context) (NativeResult, error) {
+				select {
+				case <-shutdownDone:
+					return NativeResult{Revoked: true}, nil
+				case <-ctx.Done():
+					return NativeResult{}, ctx.Err()
+				}
 			},
 			revoke: func(context.Context) error {
-				go func() { time.Sleep(time.Millisecond); close(shutdownDone) }()
+				close(shutdownDone)
 
 				return nil
 			},
@@ -472,11 +526,13 @@ func TestAuthorityProcessControlAndPrimitiveEdges(t *testing.T) {
 
 	cancelDone := make(chan struct{})
 	cancelled := &authorityPiProcess{
-		agent: NewAgent(),
-		process: &edgeNativeProcess{wait: func(context.Context) (NativeResult, error) {
-			<-cancelDone
-
-			return NativeResult{}, nil
+		agent: NewAgent(), process: &edgeNativeProcess{wait: func(ctx context.Context) (NativeResult, error) {
+			select {
+			case <-cancelDone:
+				return NativeResult{}, nil
+			case <-ctx.Done():
+				return NativeResult{}, ctx.Err()
+			}
 		}},
 		stdin: &errorWriteCloser{}, exited: make(chan struct{}),
 	}
@@ -486,18 +542,28 @@ func TestAuthorityProcessControlAndPrimitiveEdges(t *testing.T) {
 	require.ErrorIs(t, cancelled.Shutdown(cancelCtx), context.Canceled)
 	require.ErrorIs(t, cancelled.Shutdown(cancelCtx), ErrContainmentIncomplete)
 	close(cancelDone)
+	require.NoError(t, cancelled.Shutdown(t.Context()))
 	<-cancelled.exited
 
 	originalKillTimeout := authorityProcessKillTimeout
 	t.Cleanup(func() { authorityProcessKillTimeout = originalKillTimeout })
-	authorityProcessKillTimeout = time.Millisecond
+	authorityProcessKillTimeout = time.Nanosecond
 	stuckDone := make(chan struct{})
 	stuck := &authorityPiProcess{
 		agent: NewAgent(),
-		process: &edgeNativeProcess{wait: func(context.Context) (NativeResult, error) {
-			<-stuckDone
+		process: &edgeNativeProcess{wait: func(ctx context.Context) (NativeResult, error) {
+			select {
+			case <-stuckDone:
+				return NativeResult{}, nil
+			default:
+			}
 
-			return NativeResult{}, nil
+			select {
+			case <-stuckDone:
+				return NativeResult{}, nil
+			case <-ctx.Done():
+				return NativeResult{}, ctx.Err()
+			}
 		}},
 		stdin: &errorWriteCloser{}, exited: make(chan struct{}),
 	}
@@ -505,6 +571,7 @@ func TestAuthorityProcessControlAndPrimitiveEdges(t *testing.T) {
 	require.ErrorIs(t, stuck.Kill(), ErrContainmentIncomplete)
 	require.ErrorIs(t, stuck.Close(), ErrContainmentIncomplete)
 	close(stuckDone)
+	require.NoError(t, stuck.Close())
 	<-stuck.exited
 
 	streamDone := make(chan struct{})
@@ -512,7 +579,7 @@ func TestAuthorityProcessControlAndPrimitiveEdges(t *testing.T) {
 	streamErr := &authorityPiProcess{
 		agent: NewAgent(), process: &edgeNativeProcess{}, stdin: &errorWriteCloser{},
 		stdout: &errorReadCloser{err: wantErr}, stderr: &errorReadCloser{err: wantErr},
-		exited: immediateExited, stderrDone: streamDone,
+		exited: immediateExited, stderrDone: streamDone, terminal: true,
 	}
 	require.ErrorIs(t, streamErr.Close(), wantErr)
 	require.ErrorIs(t, streamErr.Close(), wantErr)
@@ -534,6 +601,84 @@ func TestAuthorityProcessControlAndPrimitiveEdges(t *testing.T) {
 	require.ErrorIs(t, settleStartedNativeProcess(&edgeNativeProcess{wait: func(context.Context) (NativeResult, error) {
 		return NativeResult{}, wantErr
 	}}), ErrContainmentIncomplete)
+}
+
+func TestAuthorityProcessIncompleteCloseJoinsWaitAndStderrWorkers(t *testing.T) {
+	originalKillTimeout := authorityProcessKillTimeout
+	authorityProcessKillTimeout = time.Nanosecond
+	t.Cleanup(func() { authorityProcessKillTimeout = originalKillTimeout })
+
+	waitStarted := make(chan struct{})
+	waitExited := make(chan struct{})
+	process := &edgeNativeProcess{wait: func(ctx context.Context) (NativeResult, error) {
+		close(waitStarted)
+		<-ctx.Done()
+		close(waitExited)
+
+		return NativeResult{}, ctx.Err()
+	}}
+	stdin := &signalingWriteCloser{closed: make(chan struct{})}
+	stdout := newBlockingEdgeReadCloser()
+	stderr := newBlockingEdgeReadCloser()
+	wrapper := &authorityPiProcess{
+		agent: NewAgent(), process: process, stdin: stdin, stdout: stdout, stderr: stderr,
+		tail: &nativeStderrTail{limit: 8 << 10}, exited: make(chan struct{}), stderrDone: make(chan struct{}),
+	}
+	go func() {
+		defer close(wrapper.stderrDone)
+		_, _ = io.Copy(wrapper.tail, stderr)
+	}()
+	wrapper.startWait()
+	<-waitStarted
+	<-stderr.started
+
+	require.ErrorIs(t, wrapper.Close(), ErrContainmentIncomplete)
+	<-waitExited
+	<-stdin.closed
+	<-stdout.closed
+	<-stderr.exited
+	select {
+	case <-wrapper.Exited():
+		t.Fatal("a detached Wait was published as terminal")
+	default:
+	}
+}
+
+func TestAuthorityProcessPublishesTerminalResultRacingWaitCancellation(t *testing.T) {
+	waitStarted := make(chan struct{})
+	waitExited := make(chan struct{})
+	wantResult := NativeResult{ExitCode: -1, Signal: 9, Revoked: true}
+	process := &edgeNativeProcess{wait: func(ctx context.Context) (NativeResult, error) {
+		close(waitStarted)
+		<-ctx.Done()
+		close(waitExited)
+
+		return wantResult, nil
+	}}
+	wrapper := &authorityPiProcess{
+		agent: NewAgent(), process: process, stdin: &errorWriteCloser{}, exited: make(chan struct{}),
+	}
+	wrapper.startWait()
+	<-waitStarted
+
+	shutdownCtx, cancelShutdown := context.WithCancel(t.Context())
+	cancelShutdown()
+	require.NoError(t, wrapper.Shutdown(shutdownCtx))
+	<-waitExited
+	<-wrapper.Exited()
+	require.Equal(t, wantResult, wrapper.result)
+	require.NoError(t, wrapper.WaitErr())
+}
+
+func TestDetachedWaitErrorRequiresOnlyContextFailures(t *testing.T) {
+	require.False(t, detachedWaitError(nil))
+	require.False(t, detachedWaitError(ErrHostAuthorityUnavailable))
+	require.False(t, detachedWaitError(ErrContainmentIncomplete))
+	require.False(t, detachedWaitError(emptyWaitMultiError{}))
+	require.True(t, detachedWaitError(errors.Join(context.Canceled, context.DeadlineExceeded)))
+	require.False(t, detachedWaitError(errors.Join(context.Canceled, errors.New("independent failure"))))
+	require.True(t, detachedWaitError(fmt.Errorf("wrapped: %w", context.Canceled)))
+	require.False(t, detachedWaitError(errors.New("ordinary failure")))
 }
 
 func TestNativeVersionProbeEdges(t *testing.T) {
@@ -599,11 +744,16 @@ func TestNativeVersionProbeEdges(t *testing.T) {
 
 	cancelled := func(waitErr error) error {
 		done := make(chan struct{})
+		waitCalls := 0
 		process := &edgeNativeProcess{
-			wait: func(context.Context) (NativeResult, error) {
-				<-done
-
-				return NativeResult{Revoked: true}, waitErr
+			wait: func(ctx context.Context) (NativeResult, error) {
+				waitCalls++
+				select {
+				case <-done:
+					return NativeResult{Revoked: true}, waitErr
+				case <-ctx.Done():
+					return NativeResult{}, ctx.Err()
+				}
 			},
 			revoke: func(context.Context) error {
 				close(done)
@@ -617,6 +767,7 @@ func TestNativeVersionProbeEdges(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 		_, probeErr := agent.probeNativeVersion(ctx, "pi", "/agent")
+		require.Equal(t, 2, waitCalls)
 
 		return probeErr
 	}
@@ -625,12 +776,13 @@ func TestNativeVersionProbeEdges(t *testing.T) {
 
 	originalShutdownTimeout := sessionShutdownTimeout
 	t.Cleanup(func() { sessionShutdownTimeout = originalShutdownTimeout })
-	sessionShutdownTimeout = time.Millisecond
-	stuckDone := make(chan struct{})
-	stuck := &edgeNativeProcess{wait: func(context.Context) (NativeResult, error) {
-		<-stuckDone
+	sessionShutdownTimeout = time.Nanosecond
+	waitExited := make(chan struct{}, 2)
+	stuck := &edgeNativeProcess{wait: func(ctx context.Context) (NativeResult, error) {
+		<-ctx.Done()
+		waitExited <- struct{}{}
 
-		return NativeResult{}, nil
+		return NativeResult{}, ctx.Err()
 	}}
 	agent := edgeManagedAgent(&edgeHostAuthority{start: func(context.Context, NativeRequest) (NativeProcess, error) {
 		return stuck, nil
@@ -639,5 +791,51 @@ func TestNativeVersionProbeEdges(t *testing.T) {
 	cancel()
 	_, err = agent.probeNativeVersion(ctx, "pi", "/agent")
 	require.ErrorIs(t, err, ErrContainmentIncomplete)
-	close(stuckDone)
+	<-waitExited
+	<-waitExited
+}
+
+func TestNativeVersionProbeGivesTerminalRejoinAFreshBoundAndJoinsDrains(t *testing.T) {
+	originalShutdownTimeout := sessionShutdownTimeout
+	sessionShutdownTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { sessionShutdownTimeout = originalShutdownTimeout })
+
+	stdout := newBlockingEdgeReadCloser()
+	stderr := newBlockingEdgeReadCloser()
+	waitCalls := 0
+	process := &edgeNativeProcess{
+		stdout: stdout,
+		stderr: stderr,
+		wait: func(ctx context.Context) (NativeResult, error) {
+			waitCalls++
+			if waitCalls == 1 {
+				<-ctx.Done()
+
+				return NativeResult{}, ctx.Err()
+			}
+
+			if err := ctx.Err(); err != nil {
+				return NativeResult{}, err
+			}
+
+			return NativeResult{Revoked: true}, nil
+		},
+		revoke: func(ctx context.Context) error {
+			<-ctx.Done()
+
+			return ctx.Err()
+		},
+	}
+	agent := edgeManagedAgent(&edgeHostAuthority{start: func(context.Context, NativeRequest) (NativeProcess, error) {
+		return process, nil
+	}})
+	probeCtx, cancelProbe := context.WithCancel(t.Context())
+	cancelProbe()
+
+	_, err := agent.probeNativeVersion(probeCtx, "pi", "/agent")
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrContainmentIncomplete)
+	require.Equal(t, 2, waitCalls)
+	<-stdout.exited
+	<-stderr.exited
 }

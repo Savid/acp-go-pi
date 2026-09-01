@@ -23,7 +23,10 @@ type authorityPiProcess struct {
 
 	stdinOnce   sync.Once
 	stdinErr    error
-	waitOnce    sync.Once
+	waitMu      sync.Mutex
+	waitFlight  *authorityWaitFlight
+	terminal    bool
+	exitOnce    sync.Once
 	exited      chan struct{}
 	stderrDone  chan struct{}
 	waitErr     error
@@ -31,6 +34,15 @@ type authorityPiProcess struct {
 	closeMu     sync.Mutex
 	streamsOnce sync.Once
 	streamsErr  error
+}
+
+type authorityWaitFlight struct {
+	cancel   context.CancelFunc
+	done     chan struct{}
+	result   NativeResult
+	waitErr  error
+	detached bool
+	terminal bool
 }
 
 func (*authorityPiProcess) managedByHostAuthority() {}
@@ -112,22 +124,64 @@ func (a *Agent) startAuthorityPiProcess(ctx context.Context, spec pi.LaunchSpec)
 	return wrapped, pi.NewClient(wrapped.stdin, wrapped.stdout), nil
 }
 
-func (p *authorityPiProcess) startWait() {
-	p.waitOnce.Do(func() {
-		go func() {
-			result, err := waitNativeProcess(context.Background(), p.process)
-			p.result = result
+func (p *authorityPiProcess) startWait() *authorityWaitFlight {
+	p.waitMu.Lock()
+	defer p.waitMu.Unlock()
 
-			if err != nil {
-				p.waitErr = errors.Join(err, ErrContainmentIncomplete)
-				p.agent.recordNativeContainment(p.waitErr)
-			} else if result.ExitCode != 0 && !result.Revoked {
-				p.waitErr = fmt.Errorf("exit status %d", result.ExitCode)
-			}
+	if p.terminal {
+		return nil
+	}
 
-			close(p.exited)
-		}()
-	})
+	if p.waitFlight != nil {
+		return p.waitFlight
+	}
+
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	flight := &authorityWaitFlight{cancel: cancelWait, done: make(chan struct{})}
+	p.waitFlight = flight
+
+	go p.runWait(waitCtx, flight)
+
+	return flight
+}
+
+func (p *authorityPiProcess) runWait(ctx context.Context, flight *authorityWaitFlight) {
+	defer flight.cancel()
+
+	flight.result, flight.waitErr = waitNativeProcess(ctx, p.process)
+	flight.terminal = flight.waitErr == nil
+	flight.detached = ctx.Err() != nil && detachedWaitError(flight.waitErr)
+
+	if flight.terminal && flight.result.ExitCode != 0 && !flight.result.Revoked {
+		flight.waitErr = fmt.Errorf("exit status %d", flight.result.ExitCode)
+	} else if !flight.terminal && !flight.detached {
+		flight.waitErr = errors.Join(flight.waitErr, ErrContainmentIncomplete)
+	}
+
+	var containmentErr error
+
+	p.waitMu.Lock()
+	if p.waitFlight == flight {
+		switch {
+		case flight.terminal:
+			p.result = flight.result
+			p.waitErr = flight.waitErr
+			p.terminal = true
+			p.exitOnce.Do(func() { close(p.exited) })
+		case !flight.detached:
+			p.waitErr = flight.waitErr
+			containmentErr = flight.waitErr
+
+			p.exitOnce.Do(func() { close(p.exited) })
+		}
+	}
+
+	close(flight.done)
+	p.waitMu.Unlock()
+
+	if containmentErr != nil && p.agent != nil {
+		p.agent.recordNativeContainment(containmentErr)
+	}
 }
 
 func (p *authorityPiProcess) CloseStdin() error {
@@ -139,6 +193,9 @@ func (p *authorityPiProcess) Exited() <-chan struct{} { return p.exited }
 func (p *authorityPiProcess) WaitErr() error {
 	select {
 	case <-p.exited:
+		p.waitMu.Lock()
+		defer p.waitMu.Unlock()
+
 		return p.waitErr
 	default:
 		return errors.New("pi process still running")
@@ -147,39 +204,62 @@ func (p *authorityPiProcess) WaitErr() error {
 func (p *authorityPiProcess) StderrTail() string { return p.tail.String() }
 func (p *authorityPiProcess) Shutdown(ctx context.Context) error {
 	_ = p.CloseStdin()
+	flight := p.startWait()
 	revokeErr := p.revoke(ctx)
 
-	select {
-	case <-p.exited:
-		return errors.Join(authorityTerminalRevokeError(revokeErr), p.waitErr)
-	default:
+	terminal, waitErr := p.awaitWait(ctx, flight)
+	if terminal {
+		return errors.Join(authorityTerminalRevokeError(revokeErr), waitErr)
 	}
 
-	select {
-	case <-p.exited:
-		return errors.Join(authorityTerminalRevokeError(revokeErr), p.waitErr)
-	case <-ctx.Done():
-		return errors.Join(revokeErr, ctx.Err(), ErrContainmentIncomplete)
-	}
+	return errors.Join(revokeErr, ctx.Err(), waitErr, ErrContainmentIncomplete)
 }
 func (p *authorityPiProcess) Kill() error {
 	ctx, cancel := context.WithTimeout(context.Background(), authorityProcessKillTimeout)
 	defer cancel()
 
+	flight := p.startWait()
 	revokeErr := p.revoke(ctx)
 
-	select {
-	case <-p.exited:
-		return errors.Join(authorityTerminalRevokeError(revokeErr), p.waitErr)
-	default:
+	terminal, waitErr := p.awaitWait(ctx, flight)
+	if terminal {
+		return errors.Join(authorityTerminalRevokeError(revokeErr), waitErr)
+	}
+
+	return errors.Join(revokeErr, ctx.Err(), waitErr, ErrContainmentIncomplete)
+}
+
+func (p *authorityPiProcess) awaitWait(ctx context.Context, flight *authorityWaitFlight) (bool, error) {
+	if flight == nil {
+		p.waitMu.Lock()
+		defer p.waitMu.Unlock()
+
+		return p.terminal, p.waitErr
 	}
 
 	select {
-	case <-p.exited:
-		return errors.Join(authorityTerminalRevokeError(revokeErr), p.waitErr)
+	case <-flight.done:
 	case <-ctx.Done():
-		return errors.Join(revokeErr, ctx.Err(), ErrContainmentIncomplete)
+		flight.cancel()
+		<-flight.done
 	}
+
+	p.waitMu.Lock()
+	defer p.waitMu.Unlock()
+
+	if p.waitFlight == flight && flight.detached {
+		p.waitFlight = nil
+	}
+
+	if p.terminal {
+		return true, p.waitErr
+	}
+
+	if p.waitErr != nil {
+		return false, p.waitErr
+	}
+
+	return false, flight.waitErr
 }
 func (p *authorityPiProcess) revoke(ctx context.Context) (err error) {
 	defer func() {
@@ -195,24 +275,40 @@ func (p *authorityPiProcess) Close() error {
 	defer p.closeMu.Unlock()
 
 	_ = p.CloseStdin()
-	select {
-	case <-p.exited:
-	default:
-		_ = p.Kill()
-	}
 
-	select {
-	case <-p.exited:
-	default:
-		return ErrContainmentIncomplete
+	p.waitMu.Lock()
+	terminal := p.terminal
+	p.waitMu.Unlock()
+
+	var killErr error
+	if !terminal {
+		killErr = p.Kill()
 	}
 
 	p.streamsOnce.Do(func() {
-		p.streamsErr = errors.Join(p.stdout.Close(), p.stderr.Close())
-		<-p.stderrDone
+		if p.stdout != nil {
+			p.streamsErr = errors.Join(p.streamsErr, p.stdout.Close())
+		}
+
+		if p.stderr != nil {
+			p.streamsErr = errors.Join(p.streamsErr, p.stderr.Close())
+		}
+
+		if p.stderrDone != nil {
+			<-p.stderrDone
+		}
 	})
 
-	return errors.Join(p.waitErr, p.streamsErr)
+	p.waitMu.Lock()
+	terminal = p.terminal
+	waitErr := p.waitErr
+	p.waitMu.Unlock()
+
+	if !terminal {
+		return errors.Join(killErr, waitErr, p.streamsErr, ErrContainmentIncomplete)
+	}
+
+	return errors.Join(killErr, waitErr, p.streamsErr)
 }
 
 type nativeStderrTail struct {
@@ -248,6 +344,32 @@ func waitNativeProcess(ctx context.Context, process NativeProcess) (result Nativ
 	}()
 
 	return process.Wait(ctx)
+}
+
+func detachedWaitError(err error) bool {
+	if err == nil || errors.Is(err, ErrHostAuthorityUnavailable) || errors.Is(err, ErrContainmentIncomplete) {
+		return false
+	}
+
+	switch value := err.(type) {
+	case interface{ Unwrap() []error }:
+		children := value.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+
+		for _, child := range children {
+			if !detachedWaitError(child) {
+				return false
+			}
+		}
+
+		return true
+	case interface{ Unwrap() error }:
+		return detachedWaitError(value.Unwrap())
+	default:
+		return err == context.Canceled || err == context.DeadlineExceeded
+	}
 }
 
 func revokeNativeProcess(ctx context.Context, process NativeProcess) (err error) {

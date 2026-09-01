@@ -772,7 +772,7 @@ func TestHostAuthorityAdmissionRetriesBusyVersionProbe(t *testing.T) {
 	require.Less(t, lastTracePrefix(trace, "reclaim:"), lastTracePrefix(trace, "start:"))
 }
 
-func TestHostAuthorityCanceledControlRemainsRetryableWithSoleWait(t *testing.T) {
+func TestHostAuthorityCanceledControlRejoinsCachedTerminalWait(t *testing.T) {
 	native := newCancellationNativeProcess(NativeResult{ExitCode: -1, Signal: 9, Revoked: true})
 	wrapped := &authorityPiProcess{
 		agent: NewAgent(), process: native,
@@ -790,19 +790,14 @@ func TestHostAuthorityCanceledControlRemainsRetryableWithSoleWait(t *testing.T) 
 	require.ErrorIs(t, err, ErrContainmentIncomplete)
 
 	native.finish()
-	select {
-	case <-wrapped.Exited():
-	case <-t.Context().Done():
-		t.Fatal("detached wait did not observe terminal result")
-	}
 	require.NoError(t, wrapped.Close())
 	require.NoError(t, wrapped.WaitErr())
 	require.Equal(t, NativeResult{ExitCode: -1, Signal: 9, Revoked: true}, wrapped.result)
 
 	native.mu.Lock()
-	require.Equal(t, 1, native.waitCalls)
-	require.Equal(t, 1, native.revokeCalls)
-	require.True(t, native.waitDetached)
+	require.Equal(t, 2, native.waitCalls)
+	require.Equal(t, 2, native.revokeCalls)
+	require.False(t, native.waitDetached)
 	native.mu.Unlock()
 }
 
