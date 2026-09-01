@@ -73,6 +73,36 @@ func TestLifecycleBoundaryRestoreValidation(t *testing.T) {
 	}
 }
 
+// TestLastLifecycleBoundaryRejectsDuplicateClosedSchemaFields exercises the
+// production journal reader rather than a test-only decoder. Neither the
+// boundary object nor its nested configuration object has last-write-wins
+// semantics: duplicate durable facts make the whole restore ineligible.
+func TestLastLifecycleBoundaryRejectsDuplicateClosedSchemaFields(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]json.RawMessage{
+		"top level":     json.RawMessage(`{"version":1,"version":1,"configuration":{"env":null,"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+		"configuration": json.RawMessage(`{"version":1,"configuration":{"env":null,"env":{},"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+	}
+
+	for name, boundary := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			store := NewInMemorySessionStore()
+			require.NoError(t, store.Append(t.Context(), SessionKey{
+				SessionID: "session",
+				Subpath:   SessionStoreLifecycleSubpath,
+			}, []SessionStoreEntry{boundary}))
+
+			agent := NewAgent(WithSessionStore(store))
+			_, found, err := agent.lastLifecycleBoundary(t.Context(), "session")
+			require.False(t, found)
+			require.ErrorContains(t, err, "duplicate")
+		})
+	}
+}
+
 // TestCloseBoundaryOnAnIdleForegroundReadsBack pins the journal reader against
 // the shape its own writer produces. A settled turn leaves the foreground idle:
 // the terminal transition clears the turn and the cycle outlives it, so the

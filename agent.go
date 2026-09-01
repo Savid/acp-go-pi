@@ -78,7 +78,16 @@ type Agent struct {
 
 	// Lock order: acquire mu before any session lock. Do not call session
 	// close methods while holding mu.
-	mu                 sync.Mutex
+	mu sync.Mutex
+	// sessionCarriers serialize load/resume carrier decisions per session id
+	// through the response boundary. An explicit configuration change must
+	// contain the predecessor before it can construct or publish a successor.
+	sessionCarriers map[acp.SessionId]*sessionCarrierTransition
+	// sessionInstallMu serializes the final same-id publication check. Native
+	// constructors run outside it; a collision is contained in
+	// storeStartedSession before the map can change.
+	sessionInstallMu sync.Mutex
+
 	closed             bool
 	conn               agentClient
 	sessions           map[acp.SessionId]*agentSession
@@ -159,6 +168,7 @@ func NewAgent(opts ...Option) *Agent {
 		nativeEnvironment:   nativeEnvironment,
 		scratchParent:       scratchParentForOptions(options),
 		sessions:            make(map[acp.SessionId]*agentSession),
+		sessionCarriers:     make(map[acp.SessionId]*sessionCarrierTransition),
 		retainedSessions:    make(map[*agentSession]struct{}),
 		constructions:       make(map[*nativeConstruction]struct{}),
 		store:               NewInMemorySessionStore(),

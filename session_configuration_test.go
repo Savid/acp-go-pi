@@ -1,7 +1,9 @@
 package piacp
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -174,6 +176,145 @@ func TestColdRestoreReconstructsOmittedConfigurationAndHonorsExplicitEmpty(t *te
 			require.NoError(t, restored.session.Close(t.Context()))
 		})
 	}
+}
+
+// TestChangedActiveCarrierContainsBeforeSuccessorConstruction pins the
+// production restore cutover. While predecessor containment is blocked, the
+// old carrier remains the only addressable session and successor construction
+// has not begun. Only after containment completes may the replacement launch
+// and become addressable.
+func TestChangedActiveCarrierContainsBeforeSuccessorConstruction(t *testing.T) {
+	stored := sessionConfigurationRecord{
+		Env:           map[string]string{"TOKEN": "old"},
+		ExtraPathDirs: []string{"/stored/bin"},
+	}
+	store := NewInMemorySessionStore()
+	appendStoredSessionWithConfiguration(t, store, validSessionUUID, stored)
+
+	initialClient := newStubPiClient()
+	initialClient.state = pi.SessionState{SessionID: validSessionUUID}
+	agent := newStubClientAgent(t, initialClient, WithSessionStore(store))
+
+	start := sessionStart{Cwd: t.TempDir(), ResumeID: validSessionUUID}
+	initial, err := agent.restoreSession(t.Context(), validSessionUUID, start, nil)
+	require.NoError(t, err)
+	initial.finish()
+
+	predecessor := initial.session
+	predecessorProcess, ok := predecessor.proc.(*stubProcess)
+	require.True(t, ok)
+
+	containmentEntered := make(chan struct{})
+	releaseContainment := make(chan struct{})
+	predecessorProcess.shutdownFunc = func(context.Context) error {
+		close(containmentEntered)
+		<-releaseContainment
+
+		return nil
+	}
+
+	successorConstruction := make(chan struct{})
+	successorClient := newStubPiClient()
+	successorClient.state = pi.SessionState{SessionID: validSessionUUID}
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		close(successorConstruction)
+
+		return newStubProcess(false), successorClient, nil
+	}
+
+	type restoreResult struct {
+		restored restoredSession
+		err      error
+	}
+	result := make(chan restoreResult, 1)
+	go func() {
+		restored, restoreErr := agent.restoreSession(context.Background(), validSessionUUID, start,
+			PiOptions{Env: map[string]string{"TOKEN": "new"}}.Meta())
+		result <- restoreResult{restored: restored, err: restoreErr}
+	}()
+
+	<-containmentEntered
+	select {
+	case <-successorConstruction:
+		t.Fatal("successor construction began before predecessor containment")
+	default:
+	}
+
+	addressed, err := agent.session(validSessionUUID)
+	require.NoError(t, err)
+	require.Same(t, predecessor, addressed,
+		"the predecessor stopped being addressable before containment completed")
+
+	close(releaseContainment)
+	replacement := <-result
+	require.NoError(t, replacement.err)
+	require.True(t, replacement.restored.started)
+	replacement.restored.finish()
+
+	select {
+	case <-successorConstruction:
+	default:
+		t.Fatal("successor construction did not begin after predecessor containment")
+	}
+
+	addressed, err = agent.session(validSessionUUID)
+	require.NoError(t, err)
+	require.Same(t, replacement.restored.session, addressed)
+	require.NotSame(t, predecessor, addressed)
+	require.Equal(t, "new", addressed.configuration.Env["TOKEN"])
+	require.Equal(t, stored.ExtraPathDirs, addressed.configuration.ExtraPathDirs,
+		"the omitted carrier was not reconstructed during rotation")
+
+	require.NoError(t, agent.Close())
+}
+
+// TestChangedActiveCarrierContainmentFailurePublishesNothing pins the failure
+// half of the same production cutover. An incomplete predecessor remains the
+// exact addressable owner, and no successor reaches even its native launch.
+func TestChangedActiveCarrierContainmentFailurePublishesNothing(t *testing.T) {
+	stored := sessionConfigurationRecord{
+		Env:           map[string]string{"TOKEN": "old"},
+		ExtraPathDirs: []string{"/stored/bin"},
+	}
+	store := NewInMemorySessionStore()
+	appendStoredSessionWithConfiguration(t, store, validSessionUUID, stored)
+
+	initialClient := newStubPiClient()
+	initialClient.state = pi.SessionState{SessionID: validSessionUUID}
+	agent := newStubClientAgent(t, initialClient, WithSessionStore(store))
+
+	start := sessionStart{Cwd: t.TempDir(), ResumeID: validSessionUUID}
+	initial, err := agent.restoreSession(t.Context(), validSessionUUID, start, nil)
+	require.NoError(t, err)
+	initial.finish()
+
+	predecessor := initial.session
+	predecessorProcess, ok := predecessor.proc.(*stubProcess)
+	require.True(t, ok)
+	predecessorProcess.close = ErrContainmentIncomplete
+
+	successorConstruction := make(chan struct{})
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		close(successorConstruction)
+
+		return nil, nil, errors.New("successor must not launch")
+	}
+
+	_, err = agent.restoreSession(t.Context(), validSessionUUID, start,
+		PiOptions{Env: map[string]string{"TOKEN": "new"}}.Meta())
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
+
+	select {
+	case <-successorConstruction:
+		t.Fatal("successor construction began after incomplete predecessor containment")
+	default:
+	}
+
+	addressed, err := agent.session(validSessionUUID)
+	require.NoError(t, err)
+	require.Same(t, predecessor, addressed)
+	require.Equal(t, "old", addressed.configuration.Env["TOKEN"])
+	require.ErrorIs(t, agent.Close(), ErrContainmentIncomplete)
 }
 
 func appendStoredSessionWithConfiguration(

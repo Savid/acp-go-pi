@@ -106,7 +106,10 @@ func TestContainmentIncompleteInstallAndRemovalOwnersSurviveUntilAgentClose(t *t
 
 		require.ErrorIs(t, agent.storeStartedSession(t.Context(), replacement), ErrContainmentIncomplete)
 		requireRetained(t, agent, previous)
-		require.Same(t, replacement, agent.sessions["shared"])
+		require.Same(t, previous, agent.sessions["shared"],
+			"failed predecessor containment published the successor")
+		require.Equal(t, 1, replacementProcess.closeCalls,
+			"an unpublished successor was not contained")
 
 		require.ErrorIs(t, agent.Close(), ErrContainmentIncomplete)
 		requireRetained(t, agent, previous)

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
@@ -159,8 +160,9 @@ type restoredSession struct {
 	session *agentSession
 	entries []SessionStoreEntry
 	started bool
-	// release ends the restore gate. It is nil for a session this call started,
-	// which no other caller can reach yet.
+	// release ends the active-session restore gate, if any, and the session's
+	// carrier transition. The carrier remains serialized until replay and the
+	// opening response boundary have both completed.
 	release func()
 }
 
@@ -187,6 +189,23 @@ func (a *Agent) restoreSession(
 	start sessionStart,
 	meta map[string]any,
 ) (restoredSession, error) {
+	releaseTransition := a.acquireSessionCarrier(sessionID)
+	carrierReleased := false
+	carrierTransferred := false
+	releaseCarrier := func() {
+		if !carrierReleased {
+			carrierReleased = true
+
+			releaseTransition()
+		}
+	}
+
+	defer func() {
+		if !carrierTransferred {
+			releaseCarrier()
+		}
+	}()
+
 	metaOptions, configurationPresence, err := piOptionsFromMetaWithConfigurationPresence(meta)
 	if err != nil {
 		return restoredSession{}, err
@@ -214,7 +233,39 @@ func (a *Agent) restoreSession(
 	}
 
 	if session := a.activeSessionForStart(sessionID, start); session != nil {
-		return a.restoreActiveSession(ctx, sessionID, session)
+		restored, restoreErr := a.restoreActiveSession(ctx, sessionID, session)
+		if restoreErr != nil {
+			return restoredSession{}, restoreErr
+		}
+
+		activeRelease := restored.release
+		restored.release = func() {
+			if activeRelease != nil {
+				activeRelease()
+			}
+
+			releaseCarrier()
+		}
+		carrierTransferred = true
+
+		return restored, nil
+	}
+
+	// A live session with a different fingerprint is an explicit carrier
+	// rotation. The hard cut is containment first: the old native generation
+	// remains the only addressable owner until Close proves it contained, then
+	// it is detached before any successor process is constructed. A failed
+	// close leaves that exact predecessor installed with its immutable result.
+	if previous := a.activeSession(sessionID); previous != nil {
+		if closeErr := previous.Close(ctx); !nativeContainmentComplete(closeErr) {
+			a.retainIncompleteSession(previous, closeErr)
+
+			return restoredSession{}, closeErr
+		}
+
+		if a.detachSession(sessionID, previous) {
+			a.observe.AddActiveSession(ctx, -1)
+		}
 	}
 
 	entries, boundary, err := a.loadCurrentStoreEntries(ctx, string(sessionID))
@@ -247,7 +298,53 @@ func (a *Agent) restoreSession(
 		return restoredSession{}, err
 	}
 
-	return restoredSession{session: session, entries: entries, started: true}, nil
+	carrierTransferred = true
+
+	return restoredSession{
+		session: session,
+		entries: entries,
+		started: true,
+		release: releaseCarrier,
+	}, nil
+}
+
+type sessionCarrierTransition struct {
+	mu    sync.Mutex
+	users int
+}
+
+// acquireSessionCarrier serializes restore and rotation decisions for one
+// addressable id without coupling unrelated sessions. The returned release is
+// transferred to restoredSession so replay and opening publication remain in
+// the same ordered transition.
+func (a *Agent) acquireSessionCarrier(id acp.SessionId) func() {
+	a.mu.Lock()
+	if a.sessionCarriers == nil {
+		a.sessionCarriers = make(map[acp.SessionId]*sessionCarrierTransition)
+	}
+
+	transition := a.sessionCarriers[id]
+	if transition == nil {
+		transition = &sessionCarrierTransition{}
+		a.sessionCarriers[id] = transition
+	}
+
+	transition.users++
+	a.mu.Unlock()
+
+	transition.mu.Lock()
+
+	return func() {
+		transition.mu.Unlock()
+
+		a.mu.Lock()
+
+		transition.users--
+		if transition.users == 0 && a.sessionCarriers[id] == transition {
+			delete(a.sessionCarriers, id)
+		}
+		a.mu.Unlock()
+	}
 }
 
 // restoreActiveSession answers a restore from a session that is already live.
@@ -621,6 +718,9 @@ func (a *Agent) ensureOpen() error {
 // or resume that passed its entry check is not licensed to resurrect an id the
 // host was told is gone.
 func (a *Agent) storeStartedSession(ctx context.Context, session *agentSession) error {
+	a.sessionInstallMu.Lock()
+	defer a.sessionInstallMu.Unlock()
+
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
@@ -641,6 +741,13 @@ func (a *Agent) storeStartedSession(ctx context.Context, session *agentSession) 
 	}
 
 	previous := a.sessions[session.id]
+	if previous == session {
+		delete(a.retainedSessions, session)
+		a.mu.Unlock()
+
+		return nil
+	}
+
 	if previous == nil && len(a.sessions) >= a.maxActiveSessions() {
 		a.mu.Unlock()
 
@@ -650,22 +757,62 @@ func (a *Agent) storeStartedSession(ctx context.Context, session *agentSession) 
 		return errors.Join(backpressureError("active_sessions"), closeErr)
 	}
 
+	if previous == nil {
+		a.sessions[session.id] = session
+		delete(a.retainedSessions, session)
+		a.mu.Unlock()
+
+		a.observe.AddActiveSession(ctx, 1)
+
+		return nil
+	}
+
+	a.mu.Unlock()
+
+	closeErr := previous.Close(ctx)
+	a.retainIncompleteSession(previous, closeErr)
+
+	if !nativeContainmentComplete(closeErr) {
+		replacementCloseErr := session.Close(context.WithoutCancel(ctx))
+		a.retainIncompleteSession(session, replacementCloseErr)
+
+		return errors.Join(closeErr, replacementCloseErr)
+	}
+
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+
+		closeErr := session.Close(context.WithoutCancel(ctx))
+		a.retainIncompleteSession(session, closeErr)
+
+		return errors.Join(errAgentClosed, closeErr)
+	}
+
+	if _, deleted := a.deleted[session.id]; deleted {
+		a.mu.Unlock()
+
+		closeErr := session.Close(context.WithoutCancel(ctx))
+		a.retainIncompleteSession(session, closeErr)
+
+		return errors.Join(unknownSessionError(), closeErr)
+	}
+
+	// CloseSession or delete may have detached the contained predecessor while
+	// its immutable close was being joined. No other installer can publish here
+	// because sessionInstallMu spans the whole decision.
+	if current := a.sessions[session.id]; current != nil && current != previous {
+		a.mu.Unlock()
+
+		closeErr := session.Close(context.WithoutCancel(ctx))
+		a.retainIncompleteSession(session, closeErr)
+
+		return errors.Join(errors.New("session carrier changed during installation"), closeErr)
+	}
+
 	a.sessions[session.id] = session
 	delete(a.retainedSessions, session)
 	a.mu.Unlock()
-
-	if previous != nil {
-		closeErr := previous.Close(ctx)
-		a.retainIncompleteSession(previous, closeErr)
-
-		if nativeContainmentComplete(closeErr) {
-			return nil
-		}
-
-		return closeErr
-	}
-
-	a.observe.AddActiveSession(ctx, 1)
 
 	return nil
 }
@@ -908,6 +1055,17 @@ func (a *Agent) activeSessionForStart(id acp.SessionId, start sessionStart) *age
 	}
 
 	return session
+}
+
+func (a *Agent) activeSession(id acp.SessionId) *agentSession {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, deleted := a.deleted[id]; deleted {
+		return nil
+	}
+
+	return a.sessions[id]
 }
 
 func (a *Agent) activeSessionConfiguration(id acp.SessionId) (sessionConfigurationRecord, bool) {
