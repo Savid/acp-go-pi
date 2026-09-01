@@ -3,6 +3,7 @@ package piacp
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -32,7 +33,7 @@ func TestLifecycleBoundaryCommitFailure(t *testing.T) {
 func TestLifecycleBoundaryRestoreValidation(t *testing.T) {
 	t.Parallel()
 
-	valid := json.RawMessage(`{"version":1,"streamId":"current","nativeRows":2,"nativeState":"committed","recordedAt":1}`)
+	valid := json.RawMessage(`{"version":1,"configuration":{"env":null,"extraPathDirs":null},"streamId":"current","nativeRows":2,"nativeState":"committed","recordedAt":1}`)
 	record, err := decodeLifecycleBoundaryRecord(valid)
 	require.NoError(t, err)
 	require.Equal(t, "current", record.StreamID)
@@ -61,6 +62,11 @@ func TestLifecycleBoundaryRestoreValidation(t *testing.T) {
 	for name, entry := range invalid {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+			encoded := string(entry)
+			if strings.HasPrefix(encoded, "{") && !strings.Contains(encoded, `"configuration"`) {
+				entry = json.RawMessage(`{"configuration":{"env":null,"extraPathDirs":null},` + strings.TrimPrefix(encoded, "{"))
+			}
+
 			_, decodeErr := decodeLifecycleBoundaryRecord(entry)
 			require.Error(t, decodeErr)
 		})

@@ -187,7 +187,7 @@ func (a *Agent) restoreSession(
 	start sessionStart,
 	meta map[string]any,
 ) (restoredSession, error) {
-	metaOptions, err := piOptionsFromMeta(meta)
+	metaOptions, configurationPresence, err := piOptionsFromMetaWithConfigurationPresence(meta)
 	if err != nil {
 		return restoredSession{}, err
 	}
@@ -202,6 +202,17 @@ func (a *Agent) restoreSession(
 		return restoredSession{}, unknownSessionError()
 	}
 
+	if activeConfiguration, ok := a.activeSessionConfiguration(sessionID); ok {
+		start.MetaOptions, err = resolveSessionConfiguration(
+			start.MetaOptions,
+			configurationPresence,
+			activeConfiguration,
+		)
+		if err != nil {
+			return restoredSession{}, err
+		}
+	}
+
 	if session := a.activeSessionForStart(sessionID, start); session != nil {
 		return a.restoreActiveSession(ctx, sessionID, session)
 	}
@@ -213,6 +224,15 @@ func (a *Agent) restoreSession(
 
 	if len(entries) == 0 {
 		return restoredSession{}, unknownSessionError()
+	}
+
+	start.MetaOptions, err = resolveSessionConfiguration(
+		metaOptions,
+		configurationPresence,
+		boundary.Configuration,
+	)
+	if err != nil {
+		return restoredSession{}, err
 	}
 
 	if openErr := a.ensureOpen(); openErr != nil {
@@ -890,6 +910,25 @@ func (a *Agent) activeSessionForStart(id acp.SessionId, start sessionStart) *age
 	return session
 }
 
+func (a *Agent) activeSessionConfiguration(id acp.SessionId) (sessionConfigurationRecord, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if _, deleted := a.deleted[id]; deleted {
+		return sessionConfigurationRecord{}, false
+	}
+
+	session := a.sessions[id]
+	if session == nil {
+		return sessionConfigurationRecord{}, false
+	}
+
+	return sessionConfiguration(PiOptions{
+		Env:           session.configuration.Env,
+		ExtraPathDirs: session.configuration.ExtraPathDirs,
+	}), true
+}
+
 func sessionStartFingerprint(start sessionStart) string {
 	servers := slices.Clone(start.McpServers)
 	slices.SortFunc(servers, func(left, right acp.McpServer) int {
@@ -1224,6 +1263,7 @@ func (a *Agent) startSessionConstruction(
 		cwd:                   start.Cwd,
 		additionalDirectories: slices.Clone(start.AdditionalDirectories),
 		fingerprint:           sessionStartFingerprint(start),
+		configuration:         sessionConfiguration(start.MetaOptions),
 		launch:                spec,
 		sessionRoot:           dirs.SessionRoot,
 		generationPrepared:    a.options.hostAuthoritySupplied,

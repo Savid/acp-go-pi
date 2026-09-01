@@ -57,6 +57,7 @@ type agentSession struct {
 	cwd                   string
 	additionalDirectories []string
 	fingerprint           string
+	configuration         sessionConfigurationRecord
 
 	// launch is the spec used to start the pi process; a crashed process is
 	// relaunched lazily on the next turn by re-selecting the same native

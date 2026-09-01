@@ -9,6 +9,8 @@ import (
 	"io"
 	"time"
 
+	"github.com/coder/acp-go-sdk"
+
 	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
 
@@ -42,6 +44,10 @@ const (
 // conversation.
 type lifecycleBoundaryRecord struct {
 	Version int `json:"version"`
+	// Configuration is the accepted per-session native environment and ordered
+	// path state for the transcript generation covered by this boundary.
+	Configuration         sessionConfigurationRecord `json:"configuration"`
+	configurationComplete bool
 	// StreamID names the incarnation whose ordered stream reached this
 	// boundary.
 	StreamID string `json:"streamId"`
@@ -84,9 +90,15 @@ func (s *agentSession) commitLifecycleBoundary(ctx context.Context, record lifec
 
 	record.Version = lifecycleBoundaryVersion
 	record.RecordedAtUnixMilli = lifecycleBoundaryNow().UnixMilli()
+	record.Configuration = sessionConfiguration(PiOptions{
+		Env:           s.configuration.Env,
+		ExtraPathDirs: s.configuration.ExtraPathDirs,
+	})
 
-	// Every field is a scalar, so the encoding cannot fail.
-	encoded, _ := json.Marshal(record)
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("%w: encode record: %w", errLifecycleBoundaryCommit, err)
+	}
 
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
@@ -98,7 +110,7 @@ func (s *agentSession) commitLifecycleBoundary(ctx context.Context, record lifec
 	key := SessionKey{SessionID: string(s.id), Subpath: SessionStoreLifecycleSubpath}
 
 	appendCtx, finishAppend := s.agent.observe.StartSessionStore(ctx, "append")
-	err := appendMirrorEntries(appendCtx, s.agent.sessionStore(), key, []SessionStoreEntry{encoded})
+	err = appendMirrorEntries(appendCtx, s.agent.sessionStore(), key, []SessionStoreEntry{encoded})
 
 	finishAppend(err)
 
@@ -130,6 +142,11 @@ func (a *Agent) lastLifecycleBoundary(
 	for index, entry := range entries {
 		record, decodeErr := decodeLifecycleBoundaryRecord(entry)
 		if decodeErr != nil {
+			var requestErr *acp.RequestError
+			if errors.As(decodeErr, &requestErr) {
+				return lifecycleBoundaryRecord{}, false, requestErr
+			}
+
 			return lifecycleBoundaryRecord{}, false, fmt.Errorf("decode lifecycle journal row %d: %w", index, decodeErr)
 		}
 
@@ -168,6 +185,15 @@ func decodeLifecycleBoundaryRecord(entry SessionStoreEntry) (lifecycleBoundaryRe
 
 	_ = json.Unmarshal(entry, &fields) // the strict full decode above already proved valid JSON
 
+	if rawConfiguration, present := fields["configuration"]; present {
+		var configurationFields map[string]json.RawMessage
+		if err := json.Unmarshal(rawConfiguration, &configurationFields); err == nil {
+			_, envPresent := configurationFields[metaEnvKey]
+			_, extraPathDirsPresent := configurationFields[metaExtraPathDirsKey]
+			record.configurationComplete = envPresent && extraPathDirsPresent
+		}
+	}
+
 	for _, field := range []string{
 		lifecycleFieldVersion,
 		lifecycleFieldStreamID,
@@ -185,6 +211,18 @@ func decodeLifecycleBoundaryRecord(entry SessionStoreEntry) (lifecycleBoundaryRe
 		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			return lifecycleBoundaryRecord{}, fmt.Errorf("%s cannot be null", field)
 		}
+	}
+
+	if !record.configurationComplete {
+		return lifecycleBoundaryRecord{}, sessionResumeIncompatibleError("configuration")
+	}
+
+	if _, err := resolveSessionConfiguration(
+		PiOptions{},
+		sessionConfigurationPresence{},
+		record.Configuration,
+	); err != nil {
+		return lifecycleBoundaryRecord{}, err
 	}
 
 	if err := validateLifecycleBoundaryRecord(record); err != nil {

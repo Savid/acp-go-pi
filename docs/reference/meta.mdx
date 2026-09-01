@@ -231,6 +231,11 @@ Session-lifecycle requests accept options and the raw-event opt-in:
 | `autoRetry` | Opt in to pi's native automatic retry of transient provider errors (5xx, timeouts). Default `false`: a native failure surfaces once, immediately, with the real cause. |
 | `outputSchema` | Accepted in the struct for API symmetry only; presence fails closed with the uniform unsupported error, including an empty `{}` schema. |
 
+The accepted `env` map and ordered `extraPathDirs` list are lifecycle identity
+and are written into each durable session boundary. Load, resume, and fork use
+the stored value when the request omits a field. Supplying a field explicitly,
+including `{}` or `[]`, keeps that value as the requested lifecycle input.
+
 ## Update metadata
 
 Model select values carry an informational `_meta.pi` object containing the

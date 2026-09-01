@@ -249,6 +249,7 @@ func appendLifecycleBoundaryForRows(t *testing.T, store SessionStore, sessionID 
 
 	encoded, err := json.Marshal(lifecycleBoundaryRecord{
 		Version:             lifecycleBoundaryVersion,
+		Configuration:       sessionConfiguration(PiOptions{}),
 		StreamID:            "stream",
 		NativeRows:          rows,
 		NativeState:         nativeStateCommitted,

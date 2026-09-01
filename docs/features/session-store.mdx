@@ -65,10 +65,14 @@ A store implements six methods:
 
 The main entry log uses the empty subpath (`SessionStoreMainSubpath`).
 The adapter-owned `SessionStoreLifecycleSubpath` log records each durable
-boundary and the exact native-row count it covers. Restore validates that
-journal strictly. Unknown fields, malformed or unsupported records, a missing
-journal, or any mismatch between the boundary and native row counts fails the
-request; native rows beyond the last valid boundary are not hydrated.
+boundary, the exact native-row count it covers, and the accepted session
+`env` and ordered `extraPathDirs` for that generation. Restore validates that
+journal strictly and reconstructs omitted request values from its last record.
+An explicit value, including an empty map or list, remains a lifecycle input
+and can rotate the native generation. Unknown fields, malformed or unsupported
+records, a missing configuration field or journal, or any mismatch between the
+boundary and native row counts fails the request; native rows beyond the last
+valid boundary are not hydrated.
 `Replace` MUST include the main key exactly once, and MUST refuse a call whose
 replacements name one key twice — two generations of one key with nothing to
 say which was meant, so the whole call fails before any key is written rather
@@ -76,10 +80,11 @@ than resolving the collision by last-write-wins. Session summaries report
 `UpdatedAtUnixMilli` in Unix milliseconds.
 
 Only conversation rows and adapter-owned lifecycle boundary records are
-durable. Credential and config files in the agent directory — `auth.json`,
-`settings.json`, trust state — are seeded, injected at hydrate time, written by
-pi itself, or reconciled to the operator baseline at launch, and are never
-mirrored into the store.
+durable. A boundary record includes session `env`, which can contain deliberate
+provider credentials, so the store must protect it as secret material.
+Credential and config files in the agent directory — `auth.json`,
+`settings.json`, trust state — are seeded, written by pi itself, or reconciled
+to the operator baseline at launch, and are never mirrored into the store.
 
 <Note>
 `WithSessionStoreLoadTimeout` bounds load and list operations during resume.

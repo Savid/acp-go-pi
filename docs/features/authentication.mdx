@@ -80,7 +80,9 @@ err := piacp.Serve(ctx, input, output,
 )
 ```
 
-The bundled clients expose this route as `-auth-file <hostpath>`. Session-store
-mirroring carries conversation rows only; injected credentials and
-agent-directory configuration are excluded. Brokered credentials instead stay
-in the explicitly configured durable Pi home.
+The bundled clients expose this route as `-auth-file <hostpath>`. Seeded
+credential files and agent-directory configuration are excluded from session
+mirroring. Session-scoped environment values are part of the durable lifecycle
+record, including any credentials deliberately supplied there, so protect the
+session store accordingly. Brokered credentials instead stay in the explicitly
+configured durable Pi home.

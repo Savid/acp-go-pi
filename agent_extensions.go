@@ -36,7 +36,7 @@ func (a *Agent) handleForkSession(
 		return acp.UnstableForkSessionResponse{}, unsupportedField(jsonFieldParams)
 	}
 
-	metaOptions, err := piOptionsFromMeta(params.Meta)
+	metaOptions, configurationPresence, err := piOptionsFromMetaWithConfigurationPresence(params.Meta)
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -57,7 +57,7 @@ func (a *Agent) handleForkSession(
 	// boundary proves, never an in-flight transcript generation.
 	parent, _ := a.session(params.SessionId)
 
-	entries, _, err := a.loadCurrentStoreEntries(ctx, string(params.SessionId))
+	entries, boundary, err := a.loadCurrentStoreEntries(ctx, string(params.SessionId))
 	if err != nil {
 		return acp.UnstableForkSessionResponse{}, err
 	}
@@ -75,6 +75,11 @@ func (a *Agent) handleForkSession(
 
 	if !storeSessionHasContent(entries) {
 		return acp.UnstableForkSessionResponse{}, emptyForkSessionError()
+	}
+
+	metaOptions, err = resolveSessionConfiguration(metaOptions, configurationPresence, boundary.Configuration)
+	if err != nil {
+		return acp.UnstableForkSessionResponse{}, err
 	}
 
 	session, err := a.startAndStoreSession(ctx, sessionStart{
