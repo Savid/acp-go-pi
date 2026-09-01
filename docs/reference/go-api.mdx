@@ -8,31 +8,31 @@ The complete API and doc comments are on
 
 ## Entry points
 
-<code>NewAgent(opts...)</code> constructs an agent for direct method use.
-<code>Serve(ctx, input, output, opts...)</code> serves ACP over JSON-RPC
+`NewAgent(opts...)` constructs an agent for direct method use.
+`Serve(ctx, input, output, opts...)` serves ACP over JSON-RPC
 streams.
 
-~~~go
+```go
 err := piacp.Serve(ctx, input, output,
     piacp.WithExecutablePath("/usr/local/bin/pi"),
     piacp.WithScratchDir("/tmp/pi-scratch"),
     piacp.WithDefaultModel("openai/gpt-4o"),
 )
-~~~
+```
 
 ## Host authority
 
-<code>WithHostAuthority(HostAuthority)</code> selects managed execution. The
-public authority contract consists of <code>HostAuthority</code>,
-<code>NativeRequest</code>, <code>NativeProcess</code>,
-<code>NativeResult</code>, and these stable <code>errors.Is</code> sentinels:
+`WithHostAuthority(HostAuthority)` selects managed execution. The
+public authority contract consists of `HostAuthority`,
+`NativeRequest`, `NativeProcess`,
+`NativeResult`, and these stable `errors.Is` sentinels:
 
-- <code>ErrHostAuthorityUnavailable</code>
-- <code>ErrContainmentIncomplete</code>
-- <code>ErrNativeTreeBusy</code>
+- `ErrHostAuthorityUnavailable`
+- `ErrContainmentIncomplete`
+- `ErrNativeTreeBusy`
 
-<code>NativeProcess.Wait</code> is the terminal containment proof.
-<code>Revoke</code> initiates host-owned teardown. A supplied nil or unusable
+`NativeProcess.Wait` is the terminal containment proof.
+`Revoke` initiates host-owned teardown. A supplied nil or unusable
 authority fails initialization before native mutation or launch. Omitting the
 option selects ordinary same-account execution.
 
@@ -40,33 +40,33 @@ option selects ordinary same-account execution.
 
 | Option | Purpose |
 | --- | --- |
-| <code>WithExecutablePath</code> | Configure the Pi executable selector. Managed mode passes it to the host without local resolution. |
-| <code>WithHostAuthority</code> | Route every managed native launch and tree transition through the host. |
-| <code>WithHome</code> | Configure a durable ordinary-mode PI_CODING_AGENT_DIR. Managed mode rejects this option before materialization. |
-| <code>WithScratchDir</code> | Parent for ephemeral session and probe trees. |
-| <code>WithDefaultModel</code> | Default model as provider/id. |
-| <code>WithEnv</code> | Static filtered environment overlay. |
-| <code>WithSeedFiles</code> | Materialize exact files before native-tree prepare. |
-| <code>WithSessionStore</code> | Install durable session mirroring. |
-| <code>WithSessionStoreLoadTimeout</code> | Bound store load and list operations. |
-| <code>WithConcurrencyLimits</code> | Cap active sessions and concurrent client calls. |
-| <code>WithImageLimits</code> | Bound decoded prompt and emitted image bytes. |
-| <code>WithInputHandoffRoot</code> | Allow handoff-form prompt images below one absolute read root. |
-| <code>WithTurnTimeout</code> | Bound a prompt turn. |
-| <code>WithProviderAuthRoot</code> | Enable the values-free provider-auth ledger with WithHome in ordinary mode. |
+| `WithExecutablePath` | Configure the Pi executable selector. Managed mode passes it to the host without local resolution. |
+| `WithHostAuthority` | Route every managed native launch and tree transition through the host. |
+| `WithHome` | Configure a durable ordinary-mode PI_CODING_AGENT_DIR. Managed mode rejects this option before materialization. |
+| `WithScratchDir` | Parent for ephemeral session and probe trees. |
+| `WithDefaultModel` | Default model as provider/id. |
+| `WithEnv` | Static filtered environment overlay. |
+| `WithSeedFiles` | Materialize exact files before native-tree prepare. |
+| `WithSessionStore` | Install durable session mirroring. |
+| `WithSessionStoreLoadTimeout` | Bound store load and list operations. |
+| `WithConcurrencyLimits` | Cap active sessions and concurrent client calls. |
+| `WithImageLimits` | Bound decoded prompt and emitted image bytes. |
+| `WithInputHandoffRoot` | Allow handoff-form prompt images below one absolute read root. |
+| `WithTurnTimeout` | Bound a prompt turn. |
+| `WithProviderAuthRoot` | Enable the values-free provider-auth ledger with WithHome in ordinary mode. |
 | telemetry options | Configure logging and OpenTelemetry providers. |
 
 ## Per-session options
 
-Build <code>_meta.pi.options</code> with <code>NewPiOptions</code>. Supported
+Build `_meta.pi.options` with `NewPiOptions`. Supported
 options select the model, reasoning level, permission mode, automatic retry,
 explicit environment, and additional child search directories.
-<code>WithPiOutputSchema</code> is refused because Pi has no native
+`WithPiOutputSchema` is refused because Pi has no native
 structured-output surface.
 
 ## Request and store helpers
 
 The package provides typed builders for session creation, load, resume, fork,
 prompt, cancel, configuration, list, and delete requests, plus stdio and HTTP
-MCP declarations. <code>SessionStore</code> mirrors Pi JSONL rows; lifecycle
+MCP declarations. `SessionStore` mirrors Pi JSONL rows; lifecycle
 boundary rows remain in their separate current-format subpath.

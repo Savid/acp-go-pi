@@ -5,59 +5,59 @@ description: "Ordinary execution and the borrowed host-authority boundary"
 
 ## Ordinary boundary
 
-Without <code>WithHostAuthority</code>, Pi runs as the adapter account. The
+Without `WithHostAuthority`, Pi runs as the adapter account. The
 adapter owns the direct process lifecycle but does not claim whole-containment
 vacancy. Hosts requiring a stronger boundary must provide one explicitly.
 
 The environment is captured once. Ambient provider credentials, loader hooks,
 shell hooks, Node hooks, and adapter-private values are removed.
-<code>WithEnv</code> and per-session Pi options are deliberate overlays.
+`WithEnv` and per-session Pi options are deliberate overlays.
 Session PATH replacement is rejected; absolute
-<code>WithPiExtraPathDirs</code> entries are prepended to the child search path.
+`WithPiExtraPathDirs` entries are prepended to the child search path.
 
 ## Borrowed host authority
 
-<code>WithHostAuthority</code> borrows four operations from the embedding host:
-<code>NativeEnvironment</code>, <code>PrepareNativeTree</code>,
-<code>StartNative</code>, and <code>ReclaimNativeTree</code>. The adapter never
+`WithHostAuthority` borrows four operations from the embedding host:
+`NativeEnvironment`, `PrepareNativeTree`,
+`StartNative`, and `ReclaimNativeTree`. The adapter never
 selects accounts or changes filesystem ownership itself.
 
 The host supplies the complete base environment and validates executable,
 working-directory, and tree intent independently. The adapter adds its bounded
-session overlay and passes the exact result to <code>StartNative</code>.
+session overlay and passes the exact result to `StartNative`.
 
 ## Tree ownership
 
-A runtime tree is fully materialized before <code>PrepareNativeTree</code>.
+A runtime tree is fully materialized before `PrepareNativeTree`.
 After prepare succeeds, the adapter performs no read, write, stat, walk,
 resolution, or removal below that tree. Natural completion or shutdown must
-settle through <code>NativeProcess.Wait</code>; only then may
-<code>ReclaimNativeTree</code> return it to the adapter. Removal occurs only
+settle through `NativeProcess.Wait`; only then may
+`ReclaimNativeTree` return it to the adapter. Removal occurs only
 after successful reclaim.
 
-<code>ErrNativeTreeBusy</code> means reclaim changed nothing because a process
+`ErrNativeTreeBusy` means reclaim changed nothing because a process
 handle is still live. Failed or uncertain reclaim wraps
-<code>ErrContainmentIncomplete</code> and leaves host cleanup registered.
+`ErrContainmentIncomplete` and leaves host cleanup registered.
 
 ## Cancellation and authority loss
 
-Pi protocol shutdown and stdio closure happen before <code>Revoke</code>.
-<code>Revoke</code> initiates host-owned teardown, and <code>Wait</code> proves
+Pi protocol shutdown and stdio closure happen before `Revoke`.
+`Revoke` initiates host-owned teardown, and `Wait` proves
 root exit, descendant vacancy, and containment cleanup. Caller cancellation
 bounds only that caller's wait.
 
-<code>ErrHostAuthorityUnavailable</code> stops further managed native
+`ErrHostAuthorityUnavailable` stops further managed native
 admission. Containment uncertainty fails closed and never falls back to
 ordinary process creation.
 
-Managed mode rejects <code>WithHome</code> before creating a runtime tree. A
+Managed mode rejects `WithHome` before creating a runtime tree. A
 successful prompt or fork is mirrored only after the generation's sole
-<code>Wait</code> completes and <code>ReclaimNativeTree</code> succeeds.
+`Wait` completes and `ReclaimNativeTree` succeeds.
 
 ## Provider authentication
 
 Pi's seven provider-auth extension methods are available only in ordinary mode
-with both <code>WithHome</code> and <code>WithProviderAuthRoot</code>. Under
-<code>WithHostAuthority</code> the capability is omitted and those methods
+with both `WithHome` and `WithProviderAuthRoot`. Under
+`WithHostAuthority` the capability is omitted and those methods
 follow the ordinary method-not-found path. Browser launchers remain shadowed by
 the session browser shim.

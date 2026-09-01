@@ -8,12 +8,12 @@ embedded Go service. The execution boundary differs by configuration.
 
 ## Ordinary execution
 
-The CLI and an embedded agent with no <code>WithHostAuthority</code> run Pi as
+The CLI and an embedded agent with no `WithHostAuthority` run Pi as
 the adapter's own account. No privileged setup is required.
 
-~~~sh
+```sh
 acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt-4o
-~~~
+```
 
 The adapter captures a small environment at construction, removes ambient
 provider secrets and loader hooks, and applies only explicit agent and session
@@ -21,14 +21,14 @@ overlays. It probes the configured Pi executable before the first session.
 
 ## Host-authority execution
 
-An embedded host can supply <code>WithHostAuthority(authority)</code>. Every Pi
+An embedded host can supply `WithHostAuthority(authority)`. Every Pi
 process, including version probes, session generations, relaunches, and
 browser-shimmed work, then starts through that authority. The adapter
-materializes a complete runtime tree, calls <code>PrepareNativeTree</code>, and
+materializes a complete runtime tree, calls `PrepareNativeTree`, and
 does not access the tree again until the process has settled and
-<code>ReclaimNativeTree</code> succeeds.
+`ReclaimNativeTree` succeeds.
 
-Managed mode rejects <code>WithHome</code> before materialization. Each native
+Managed mode rejects `WithHome` before materialization. Each native
 generation receives a fresh isolated residence reconstructed from the committed
 session store after the prior generation has settled and been reclaimed.
 
@@ -36,21 +36,21 @@ A supplied nil or unusable authority fails initialization before filesystem
 mutation or process launch. Authority failure never retries by launching Pi
 directly.
 
-~~~go
+```go
 agent := piacp.NewAgent(
     piacp.WithHostAuthority(authority),
     piacp.WithExecutablePath("pi"),
     piacp.WithScratchDir("/var/lib/my-host/pi-scratch"),
 )
-~~~
+```
 
-<code>HostAuthority</code> is an embedded capability and has no CLI flag.
+`HostAuthority` is an embedded capability and has no CLI flag.
 
 ## Embedded options
 
-CLI flags map to <code>WithExecutablePath</code>, <code>WithHome</code>,
-<code>WithScratchDir</code>, <code>WithProviderAuthRoot</code>,
-<code>WithDefaultModel</code>, and <code>WithSeedFiles</code>. Session stores,
+CLI flags map to `WithExecutablePath`, `WithHome`,
+`WithScratchDir`, `WithProviderAuthRoot`,
+`WithDefaultModel`, and `WithSeedFiles`. Session stores,
 turn timeouts, concurrency limits, telemetry providers, explicit environment
 overlays, and host authority are Go-only options. See the
 [Go API](/docs/reference/go-api).
