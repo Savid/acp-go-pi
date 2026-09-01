@@ -147,10 +147,8 @@ func piOptionsFromMetaWithConfigurationPresence(
 
 		options = parsed
 
-		values, ok := rawOptions.(map[string]any)
-		if !ok {
-			return PiOptions{}, sessionConfigurationPresence{}, unsupportedField("_meta." + piMetaKey + "." + metaOptionsKey)
-		}
+		// parsePiOptions accepts only this exact representation.
+		values, _ := rawOptions.(map[string]any)
 
 		_, presence.Env = values[metaEnvKey]
 		_, presence.ExtraPathDirs = values[metaExtraPathDirsKey]
@@ -302,6 +300,15 @@ func validatePiOptions(options PiOptions) (PiOptions, error) {
 }
 
 func validateEnvironment(env map[string]string, path string, blocked func(key string) bool) error {
+	return validateEnvironmentForPlatform(env, path, blocked, runtime.GOOS == "windows")
+}
+
+func validateEnvironmentForPlatform(
+	env map[string]string,
+	path string,
+	blocked func(key string) bool,
+	caseInsensitive bool,
+) error {
 	keys := make([]string, 0, len(env))
 	for key := range env {
 		keys = append(keys, key)
@@ -315,7 +322,7 @@ func validateEnvironment(env map[string]string, path string, blocked func(key st
 			return unsupportedField(path + "." + key)
 		}
 
-		if runtime.GOOS == "windows" {
+		if caseInsensitive {
 			canonical := strings.ToUpper(key)
 			if _, ok := seen[canonical]; ok {
 				return unsupportedField(path + "." + key)
