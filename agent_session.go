@@ -191,6 +191,16 @@ func (a *Agent) restoreSession(
 ) (restoredSession, error) {
 	releaseTransition, err := a.acquireSessionCarrier(ctx, sessionID)
 	if err != nil {
+		// Cancellation may refuse a queued carrier transition, but an already
+		// published poison or close fence still owns the active native
+		// generation. Join that exact containment before returning so a
+		// cancelled restore cannot outlive its native owner.
+		if session := a.activeSession(sessionID); session != nil {
+			if fenceErr := session.admissionFenceError(ctx); fenceErr != nil {
+				return restoredSession{}, fenceErr
+			}
+		}
+
 		return restoredSession{}, err
 	}
 
