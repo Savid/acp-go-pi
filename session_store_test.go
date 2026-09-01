@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 )
 
@@ -181,4 +182,46 @@ func TestReplaceAfterDeleteStaysTombstoned(t *testing.T) {
 	loaded, err = store.Load(t.Context(), sub)
 	require.NoError(t, err)
 	require.Empty(t, loaded)
+}
+
+func TestStoreStartedSessionRecheckEdges(t *testing.T) {
+	id := acp.SessionId("replacement")
+
+	for name, mutate := range map[string]func(*Agent, *agentSession){
+		"closed":  func(agent *Agent, _ *agentSession) { agent.closed = true },
+		"deleted": func(agent *Agent, _ *agentSession) { agent.deleted[id] = struct{}{} },
+		"changed": func(agent *Agent, previous *agentSession) {
+			agent.sessions[id] = &agentSession{agent: agent, id: previous.id}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := NewAgent()
+			process := newStubProcess(false)
+			previous := attachTestNativeBoundary(&agentSession{
+				agent: agent, id: id, proc: process, sessionRoot: t.TempDir(),
+			})
+			process.closeFunc = func() error {
+				agent.mu.Lock()
+				mutate(agent, previous)
+				agent.mu.Unlock()
+
+				return nil
+			}
+			agent.sessions[id] = previous
+			replacement := &agentSession{agent: agent, id: id}
+			require.Error(t, agent.storeStartedSession(t.Context(), replacement))
+		})
+	}
+
+	cancelledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := NewAgent().restoreSession(cancelledCtx, id, sessionStart{Cwd: "/cwd"}, nil)
+	require.ErrorIs(t, err, context.Canceled)
+
+	agent := NewAgent()
+	agent.sessions[id] = &agentSession{agent: agent, id: id, configuration: sessionConfigurationRecord{
+		ExtraPathDirs: []string{"relative"},
+	}}
+	_, err = agent.restoreSession(t.Context(), id, sessionStart{Cwd: "/cwd"}, nil)
+	require.Error(t, err)
 }

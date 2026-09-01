@@ -656,3 +656,154 @@ type ordinaryLaunch struct {
 	Canary string `json:"canary"`
 	Args   string `json:"args"`
 }
+
+func TestEnsureVersionCoverageEdges(t *testing.T) {
+	newVersionAgent := func() *Agent {
+		agent := NewAgent(WithExecutablePath("/fake/pi"), WithScratchDir(t.TempDir()))
+		agent.probeVersion = func(context.Context, string, string) (string, error) {
+			return pi.DefaultMinimumVersion, nil
+		}
+
+		return agent
+	}
+
+	t.Run("admission", func(t *testing.T) {
+		agent := newVersionAgent()
+		agent.nativeBusyRoots["/busy"] = struct{}{}
+		require.ErrorIs(t, agent.ensureVersion(t.Context()), ErrNativeTreeBusy)
+	})
+
+	t.Run("busy retry", func(t *testing.T) {
+		agent := newVersionAgent()
+		agent.options.hostAuthoritySupplied = true
+		agent.options.HostAuthority = &edgeHostAuthority{reclaim: func(context.Context, string) error {
+			return ErrNativeTreeBusy
+		}}
+		done := make(chan struct{})
+		close(done)
+		construction := &nativeConstruction{
+			done: done, err: ErrNativeTreeBusy, generationRoot: "/busy", generationPrepared: true,
+			nativeBoundary: newNativeBoundaryTracker(),
+		}
+		agent.constructions[construction] = struct{}{}
+		require.ErrorIs(t, agent.ensureVersion(t.Context()), ErrNativeTreeBusy)
+	})
+
+	t.Run("generation creation", func(t *testing.T) {
+		restoreRuntimeGenerationSeams(t)
+		agent := newVersionAgent()
+		runtimeGenerationEnsureScratchParent = func(string) (string, error) {
+			return "", ErrContainmentIncomplete
+		}
+		require.ErrorIs(t, agent.ensureVersion(t.Context()), ErrContainmentIncomplete)
+	})
+
+	t.Run("close after executable resolution", func(t *testing.T) {
+		agent := NewAgent(WithScratchDir(t.TempDir()))
+		agent.lookPath = func(string) (string, error) {
+			_, _ = agent.beginClose()
+
+			return "/fake/pi", nil
+		}
+		require.ErrorIs(t, agent.ensureVersion(t.Context()), errAgentClosed)
+	})
+
+	t.Run("cancel before probe", func(t *testing.T) {
+		agent := newVersionAgent()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		require.ErrorIs(t, agent.ensureVersion(ctx), context.Canceled)
+	})
+
+	t.Run("close at final gate", func(t *testing.T) {
+		agent := newVersionAgent()
+		ctx := &closeAgentOnErrContext{Context: t.Context(), agent: agent}
+		require.ErrorIs(t, agent.ensureVersion(ctx), errAgentClosed)
+	})
+}
+
+func TestAgentCloseAndAuthorityFenceEdges(t *testing.T) {
+	agent := NewAgent()
+	done := make(chan struct{})
+	close(done)
+	construction := &nativeConstruction{done: done, nativeBoundary: newNativeBoundaryTracker()}
+	agent.constructions[construction] = struct{}{}
+	attempt := &agentCloseAttempt{done: make(chan struct{})}
+	require.NoError(t, agent.close(attempt))
+	_, retained := agent.constructions[construction]
+	require.False(t, retained)
+
+	fenced := NewAgent()
+	shared := &agentSession{agent: fenced, id: acp.SessionId("shared")}
+	retainedOnly := &agentSession{agent: fenced, id: acp.SessionId("retained")}
+	fenced.sessions[shared.id] = shared
+	fenced.sessions[acp.SessionId("shared-alias")] = shared
+	fenced.retainedSessions[shared] = struct{}{}
+	fenced.retainedSessions[retainedOnly] = struct{}{}
+	fenced.fenceSessionsAfterAuthorityLoss(ErrHostAuthorityUnavailable)
+	require.ErrorIs(t, shared.nativeContainmentError(), ErrHostAuthorityUnavailable)
+	require.ErrorIs(t, retainedOnly.nativeContainmentError(), ErrHostAuthorityUnavailable)
+}
+
+func TestConstructionOwnershipEdges(t *testing.T) {
+	process := newStubProcess(false)
+	process.close = ErrContainmentIncomplete
+	agent := NewAgent()
+	construction := &nativeConstruction{proc: process, nativeBoundary: newNativeBoundaryTracker()}
+	require.ErrorIs(t, agent.cleanupNativeConstructionOwned(t.Context(), construction, nil), ErrContainmentIncomplete)
+
+	t.Run("pump boundary changes", func(t *testing.T) {
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "session"}
+		agent := newStubClientAgent(t, client)
+		agent.versionChecked = true
+		client.startFunc = func(context.Context) error {
+			agent.mu.Lock()
+			for owner := range agent.constructions {
+				owner.session.nativeBoundary = newNativeBoundaryTracker()
+			}
+			agent.mu.Unlock()
+
+			return nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, ErrContainmentIncomplete)
+	})
+
+	t.Run("immutable transfer", func(t *testing.T) {
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "session"}
+		agent := newStubClientAgent(t, client)
+		agent.versionChecked = true
+		client.commandsFunc = func() {
+			agent.mu.Lock()
+			for owner := range agent.constructions {
+				owner.immutable = true
+				owner.err = ErrContainmentIncomplete
+			}
+			agent.mu.Unlock()
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, ErrContainmentIncomplete)
+	})
+
+	t.Run("post-transfer close recheck", func(t *testing.T) {
+		agent := NewAgent()
+		open := attachTestNativeBoundary(&agentSession{
+			agent: agent, proc: newStubProcess(false), turn: make(chan struct{}, sessionTurnCapacity),
+		})
+		kept, err := agent.closeTransferredSessionIfAgentClosed(t.Context(), open, false)
+		require.NoError(t, err)
+		require.Same(t, open, kept)
+
+		closed := attachTestNativeBoundary(&agentSession{
+			agent: agent, proc: newStubProcess(false), turn: make(chan struct{}, sessionTurnCapacity),
+		})
+		agent.mu.Lock()
+		agent.closed = true
+		agent.mu.Unlock()
+		removed, err := agent.closeTransferredSessionIfAgentClosed(t.Context(), closed, false)
+		require.ErrorIs(t, err, errAgentClosed)
+		require.Nil(t, removed)
+	})
+}

@@ -24,3 +24,35 @@ func TestPathValidationHelpers(t *testing.T) {
 	require.Error(t, validateSessionStartPaths("/cwd", []string{"relative"}))
 	require.NoError(t, validateSessionStartPaths("/cwd", []string{"/also"}))
 }
+
+func TestConfigurationAndAdmissionEdges(t *testing.T) {
+	_, err := resolveSessionConfiguration(PiOptions{}, sessionConfigurationPresence{}, sessionConfigurationRecord{
+		Env: map[string]string{}, ExtraPathDirs: []string{"relative"},
+	})
+	require.Error(t, err)
+
+	err = validateEnvironmentForPlatform(
+		map[string]string{"Token": "one", "TOKEN": "two"},
+		"env",
+		func(string) bool { return false },
+		true,
+	)
+	require.Error(t, err)
+	require.NoError(t, validateEnvironmentForPlatform(
+		map[string]string{"TOKEN": "one"},
+		"env",
+		func(string) bool { return false },
+		true,
+	))
+
+	agent := NewAgent()
+	agent.options.ProviderAuthRoot = "/provider-auth"
+	agent.options.hostAuthoritySupplied = true
+	require.NoError(t, configureProviderAuth(agent))
+
+	agent.markNativeTreeBusy("")
+	require.Empty(t, agent.nativeBusyRoots)
+	path, err := agent.resolveExecutablePath()
+	require.NoError(t, err)
+	require.Equal(t, rawEventSourceValue, path)
+}

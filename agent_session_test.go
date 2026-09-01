@@ -1923,3 +1923,140 @@ func TestDeleteBoundaryIsObserved(t *testing.T) {
 
 	require.Contains(t, methods, "session/delete")
 }
+
+func TestSessionConstructionFenceEdges(t *testing.T) {
+	wantErr := errors.New("prepare fault")
+
+	t.Run("busy retry", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		done := make(chan struct{})
+		close(done)
+		construction := &nativeConstruction{
+			done: done, err: ErrNativeTreeBusy, generationRoot: "/busy", generationPrepared: true,
+			nativeBoundary: newNativeBoundaryTracker(),
+		}
+		agent.options.hostAuthoritySupplied = true
+		agent.options.HostAuthority = &edgeHostAuthority{reclaim: func(context.Context, string) error {
+			return ErrNativeTreeBusy
+		}}
+		agent.constructions[construction] = struct{}{}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, ErrNativeTreeBusy)
+	})
+
+	t.Run("closed after version check", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		agent.closed = true
+		construction := &nativeConstruction{
+			done: make(chan struct{}), nativeBoundary: newNativeBoundaryTracker(),
+		}
+		_, err := agent.startSessionConstruction(t.Context(), sessionStart{Cwd: "/cwd"}, construction)
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("close after executable resolution", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		agent.options.ExecutablePath = ""
+		agent.lookPath = func(string) (string, error) {
+			agent.mu.Lock()
+			agent.closed = true
+			agent.mu.Unlock()
+
+			return "/fake/pi", nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("close when process observation starts", func(t *testing.T) {
+		processor := &closeAgentOnSpanStart{}
+		provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(processor))
+		t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+
+		agent := newStubClientAgent(t, newStubPiClient(), WithTracerProvider(provider))
+		processor.agent = agent
+		agent.versionChecked = true
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("prepare failure", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		agent.options.hostAuthoritySupplied = true
+		agent.options.HostAuthority = &edgeHostAuthority{prepare: func(context.Context, string) error {
+			return wantErr
+		}}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("close after prepare", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		agent.options.hostAuthoritySupplied = true
+		agent.options.HostAuthority = &edgeHostAuthority{prepare: func(context.Context, string) error {
+			_, _ = agent.beginClose()
+
+			return nil
+		}}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("cancel before launch", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, err := agent.startSession(ctx, sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("close at launch gate", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		ctx := &closeAgentOnErrContext{Context: t.Context(), agent: agent}
+		_, err := agent.startSession(ctx, sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("close after client start", func(t *testing.T) {
+		client := newStubPiClient()
+		agent := newStubClientAgent(t, client)
+		agent.versionChecked = true
+		client.startFunc = func(context.Context) error {
+			_, _ = agent.beginClose()
+
+			return nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("close during setup", func(t *testing.T) {
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "session"}
+		agent := newStubClientAgent(t, client)
+		agent.versionChecked = true
+		client.autoRetryFunc = func(context.Context, bool) error {
+			_, _ = agent.beginClose()
+
+			return nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("fork retirement", func(t *testing.T) {
+		client := newStubPiClient()
+		client.state = pi.SessionState{SessionID: "session"}
+		agent := edgeManagedAgent(&edgeHostAuthority{})
+		session := &agentSession{agent: agent, client: client, proc: newStubProcess(true)}
+		err := agent.setUpNativeSession(t.Context(), session, sessionStart{ForkSession: true}, pi.ModelRef{}, false)
+		require.ErrorIs(t, err, ErrContainmentIncomplete)
+	})
+}
