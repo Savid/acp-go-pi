@@ -3,10 +3,26 @@ package piacp
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 )
+
+type stagedErrorContext struct{ calls atomic.Int32 }
+
+func (*stagedErrorContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (*stagedErrorContext) Done() <-chan struct{}       { return nil }
+func (c *stagedErrorContext) Err() error {
+	if c.calls.Add(1) > 1 {
+		return context.Canceled
+	}
+
+	return nil
+}
+func (*stagedErrorContext) Value(any) any { return nil }
 
 func TestConfigurationAndAdmissionEdges(t *testing.T) {
 	_, err := resolveSessionConfiguration(PiOptions{}, sessionConfigurationPresence{}, sessionConfigurationRecord{
@@ -235,4 +251,98 @@ func TestManagedGenerationRetirementEdges(t *testing.T) {
 	managedAgent.markNativeTreeBusy("/success")
 	require.NoError(t, managed.reclaimManagedGeneration(t.Context(), other))
 	require.False(t, managed.generationPrepared)
+}
+
+func TestSessionCarrierAndLookupEdges(t *testing.T) {
+	id := acp.SessionId(validSessionUUID)
+	agent := NewAgent()
+	agent.sessionCarriers = nil
+	cancelledCtx, cancelImmediately := context.WithCancel(t.Context())
+	cancelImmediately()
+	_, err := agent.acquireSessionCarrier(cancelledCtx, id)
+	require.ErrorIs(t, err, context.Canceled)
+
+	release, err := agent.acquireSessionCarrier(t.Context(), id)
+	require.NoError(t, err)
+	release()
+	release()
+	require.Empty(t, agent.sessionCarriers)
+
+	agent.sessionCarriers = nil
+	_, err = agent.acquireSessionCarrier(&stagedErrorContext{}, id)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Empty(t, agent.sessionCarriers)
+
+	blocked := &sessionCarrierTransition{token: make(chan struct{}, 1)}
+	agent.sessionCarriers = map[acp.SessionId]*sessionCarrierTransition{id: blocked}
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		time.Sleep(time.Millisecond)
+		cancel()
+	}()
+	_, err = agent.acquireSessionCarrier(ctx, id)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 0, blocked.users)
+
+	session := &agentSession{id: id, configuration: sessionConfigurationRecord{
+		Env: map[string]string{"TOKEN": "value"}, ExtraPathDirs: []string{"/bin"},
+	}}
+	agent.sessions[id] = session
+	agent.deleted[id] = struct{}{}
+	require.Nil(t, agent.activeSession(id))
+	_, ok := agent.activeSessionConfiguration(id)
+	require.False(t, ok)
+
+	delete(agent.deleted, id)
+	require.Same(t, session, agent.activeSession(id))
+	configuration, ok := agent.activeSessionConfiguration(id)
+	require.True(t, ok)
+	require.Equal(t, session.configuration, configuration)
+	delete(agent.sessions, id)
+	_, ok = agent.activeSessionConfiguration(id)
+	require.False(t, ok)
+}
+
+func TestTurnGenerationStopAndFenceEdges(t *testing.T) {
+	wantErr := errors.New("turn fault")
+	session := &agentSession{agent: NewAgent()}
+	require.ErrorIs(t, session.stopTurnGeneration(t.Context(), nil), ErrContainmentIncomplete)
+
+	process := newStubProcess(true)
+	client := newStubPiClient()
+	complete := newTestSessionOutbox(1)
+	complete.proc = process
+	complete.client = client
+	pumpCancelled := false
+	complete.pumpCancel = func() { pumpCancelled = true }
+	require.NoError(t, session.stopTurnGeneration(t.Context(), complete))
+	require.True(t, pumpCancelled)
+
+	process = newStubProcess(true)
+	process.close = ErrContainmentIncomplete
+	client = newStubPiClient()
+	client.abortErr = errors.Join(wantErr, ErrContainmentIncomplete)
+	incomplete := newTestSessionOutbox(2)
+	incomplete.proc = process
+	incomplete.client = client
+	require.ErrorIs(t, session.stopTurnGeneration(t.Context(), incomplete), ErrContainmentIncomplete)
+	require.ErrorIs(t, session.stopTurnGeneration(t.Context(), incomplete), wantErr)
+
+	process = newStubProcess(true)
+	blockedPump := make(chan struct{})
+	blocked := newTestSessionOutbox(3)
+	blocked.proc = process
+	blocked.pumpDone = blockedPump
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, session.stopTurnGeneration(ctx, blocked), ErrContainmentIncomplete)
+
+	require.NoError(t, session.awaitTurnFence())
+	session.turnFenceStarted = true
+	require.NoError(t, session.awaitTurnFence())
+	done := make(chan struct{})
+	close(done)
+	session.turnFenceDone = done
+	session.turnFenceErr = wantErr
+	require.ErrorIs(t, session.awaitTurnFence(), wantErr)
 }
