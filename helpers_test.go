@@ -40,7 +40,7 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
 	agent := NewAgent(append(base, opts...)...)
-	agent.probeVersion = func(context.Context, string, string, string) (string, error) {
+	agent.probeVersion = func(context.Context, string, string) (string, error) {
 		return pi.DefaultMinimumVersion, nil
 	}
 

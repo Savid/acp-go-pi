@@ -971,7 +971,7 @@ func TestCurrentUsageAndListPaginationHelpers(t *testing.T) {
 func TestStartSessionFailureBranches(t *testing.T) {
 	baseAgent := func() *Agent {
 		agent := NewAgent(testContainmentOption(), WithExecutablePath("/fake/pi"), WithScratchDir(t.TempDir()), WithLogger(slog.New(slog.DiscardHandler)))
-		agent.probeVersion = func(context.Context, string, string, string) (string, error) {
+		agent.probeVersion = func(context.Context, string, string) (string, error) {
 			return pi.DefaultMinimumVersion, nil
 		}
 

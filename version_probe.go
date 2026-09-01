@@ -10,7 +10,7 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
-func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir, _ string) (string, error) {
+func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir string) (string, error) {
 	environment := (pi.LaunchSpec{AgentDir: agentDir, BaseEnvironment: a.nativeBaseEnvironment()}).Environ()
 	if !a.options.hostAuthoritySupplied {
 		return pi.ProbeOrdinaryVersion(ctx, executable, environment)

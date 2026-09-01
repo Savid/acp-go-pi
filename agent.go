@@ -116,7 +116,7 @@ type Agent struct {
 	providerAuth *providerAuth
 
 	startPiProcess func(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error)
-	probeVersion   func(ctx context.Context, executablePath string, agentDir string, generationRoot string) (string, error)
+	probeVersion   func(ctx context.Context, executablePath string, agentDir string) (string, error)
 	lookPath       func(file string) (string, error)
 }
 
@@ -996,7 +996,7 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 		return generation.finalize(context.WithoutCancel(ctx), closedErr)
 	}
 
-	version, err := a.probeVersion(ctx, executable, probeAgentDir, generation.root)
+	version, err := a.probeVersion(ctx, executable, probeAgentDir)
 	if closedErr := a.ensureOpen(); closedErr != nil {
 		err = errors.Join(err, closedErr)
 	}
