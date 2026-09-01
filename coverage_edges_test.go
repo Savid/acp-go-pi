@@ -1059,7 +1059,9 @@ func TestConstructionOwnershipEdges(t *testing.T) {
 		open := attachTestNativeBoundary(&agentSession{
 			agent: agent, proc: newStubProcess(false), turn: make(chan struct{}, sessionTurnCapacity),
 		})
-		require.NoError(t, agent.closeTransferredSessionIfAgentClosed(t.Context(), open, false))
+		kept, err := agent.closeTransferredSessionIfAgentClosed(t.Context(), open, false)
+		require.NoError(t, err)
+		require.Same(t, open, kept)
 
 		closed := attachTestNativeBoundary(&agentSession{
 			agent: agent, proc: newStubProcess(false), turn: make(chan struct{}, sessionTurnCapacity),
@@ -1067,6 +1069,8 @@ func TestConstructionOwnershipEdges(t *testing.T) {
 		agent.mu.Lock()
 		agent.closed = true
 		agent.mu.Unlock()
-		require.ErrorIs(t, agent.closeTransferredSessionIfAgentClosed(t.Context(), closed, false), errAgentClosed)
+		removed, err := agent.closeTransferredSessionIfAgentClosed(t.Context(), closed, false)
+		require.ErrorIs(t, err, errAgentClosed)
+		require.Nil(t, removed)
 	})
 }
