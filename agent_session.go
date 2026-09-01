@@ -189,7 +189,11 @@ func (a *Agent) restoreSession(
 	start sessionStart,
 	meta map[string]any,
 ) (restoredSession, error) {
-	releaseTransition := a.acquireSessionCarrier(sessionID)
+	releaseTransition, err := a.acquireSessionCarrier(ctx, sessionID)
+	if err != nil {
+		return restoredSession{}, err
+	}
+
 	carrierReleased := false
 	carrierTransferred := false
 	releaseCarrier := func() {
@@ -309,7 +313,7 @@ func (a *Agent) restoreSession(
 }
 
 type sessionCarrierTransition struct {
-	mu    sync.Mutex
+	token chan struct{}
 	users int
 }
 
@@ -317,7 +321,11 @@ type sessionCarrierTransition struct {
 // addressable id without coupling unrelated sessions. The returned release is
 // transferred to restoredSession so replay and opening publication remain in
 // the same ordered transition.
-func (a *Agent) acquireSessionCarrier(id acp.SessionId) func() {
+func (a *Agent) acquireSessionCarrier(ctx context.Context, id acp.SessionId) (func(), error) {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
+
 	a.mu.Lock()
 	if a.sessionCarriers == nil {
 		a.sessionCarriers = make(map[acp.SessionId]*sessionCarrierTransition)
@@ -325,25 +333,48 @@ func (a *Agent) acquireSessionCarrier(id acp.SessionId) func() {
 
 	transition := a.sessionCarriers[id]
 	if transition == nil {
-		transition = &sessionCarrierTransition{}
+		transition = &sessionCarrierTransition{token: make(chan struct{}, 1)}
+		transition.token <- struct{}{}
+
 		a.sessionCarriers[id] = transition
 	}
 
 	transition.users++
 	a.mu.Unlock()
 
-	transition.mu.Lock()
+	select {
+	case <-transition.token:
+		if err := context.Cause(ctx); err != nil {
+			transition.token <- struct{}{}
+
+			a.releaseSessionCarrierUser(id, transition)
+
+			return nil, err
+		}
+	case <-ctx.Done():
+		a.releaseSessionCarrierUser(id, transition)
+
+		return nil, context.Cause(ctx)
+	}
+
+	var once sync.Once
 
 	return func() {
-		transition.mu.Unlock()
+		once.Do(func() {
+			transition.token <- struct{}{}
 
-		a.mu.Lock()
+			a.releaseSessionCarrierUser(id, transition)
+		})
+	}, nil
+}
 
-		transition.users--
-		if transition.users == 0 && a.sessionCarriers[id] == transition {
-			delete(a.sessionCarriers, id)
-		}
-		a.mu.Unlock()
+func (a *Agent) releaseSessionCarrierUser(id acp.SessionId, transition *sessionCarrierTransition) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	transition.users--
+	if transition.users == 0 && a.sessionCarriers[id] == transition {
+		delete(a.sessionCarriers, id)
 	}
 }
 

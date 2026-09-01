@@ -61,6 +61,41 @@ func TestRecoveredEmptyConfigurationKeepsLifecycleFingerprint(t *testing.T) {
 	require.Equal(t, sessionStartFingerprint(start), sessionStartFingerprint(recovered))
 }
 
+func TestSessionCarrierTransitionHonorsCancellation(t *testing.T) {
+	agent := NewAgent()
+
+	releaseOwner, err := agent.acquireSessionCarrier(t.Context(), "session")
+	require.NoError(t, err)
+
+	waiterCtx, cancelWaiter := context.WithCancel(t.Context())
+	cancelWaiter()
+
+	_, err = agent.acquireSessionCarrier(waiterCtx, "session")
+	require.ErrorIs(t, err, context.Canceled)
+
+	agent.mu.Lock()
+	transition := agent.sessionCarriers["session"]
+	users := 0
+	if transition != nil {
+		users = transition.users
+	}
+	agent.mu.Unlock()
+	require.NotNil(t, transition)
+	require.Equal(t, 1, users)
+
+	releaseIndependent, err := agent.acquireSessionCarrier(t.Context(), "independent")
+	require.NoError(t, err)
+	releaseIndependent()
+
+	releaseOwner()
+	releaseOwner()
+
+	agent.mu.Lock()
+	remainingTransitions := len(agent.sessionCarriers)
+	agent.mu.Unlock()
+	require.Zero(t, remainingTransitions)
+}
+
 func TestLifecycleBoundaryPersistsSessionConfiguration(t *testing.T) {
 	store := NewInMemorySessionStore()
 	session := &agentSession{
