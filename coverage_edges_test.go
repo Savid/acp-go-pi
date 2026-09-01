@@ -346,3 +346,60 @@ func TestTurnGenerationStopAndFenceEdges(t *testing.T) {
 	session.turnFenceErr = wantErr
 	require.ErrorIs(t, session.awaitTurnFence(), wantErr)
 }
+
+func TestPumpNativeBoundaryEdges(t *testing.T) {
+	wantErr := errors.New("boundary fault")
+	require.ErrorIs(t, runNativeBoundaryStep(t.Context(), "error", func() error { return wantErr }), wantErr)
+	require.ErrorIs(t, runNativeBoundaryStep(t.Context(), "panic", func() error { panic("boundary") }), ErrContainmentIncomplete)
+	cancelledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, runNativeBoundaryStep(cancelledCtx, "cancelled", func() error { return nil }), context.Canceled)
+
+	tracker := newNativeBoundaryTracker()
+	require.ErrorIs(t, tracker.run(t.Context(), "panic", func() error { panic("tracker") }), ErrContainmentIncomplete)
+
+	session := &agentSession{agent: NewAgent(), id: acp.SessionId(validSessionUUID)}
+	missing := newTestSessionOutbox(1)
+	require.NoError(t, session.stopNativeGeneration(t.Context(), missing))
+
+	process := newStubProcess(true)
+	client := newStubPiClient()
+	client.abortErr = wantErr
+	complete := newTestSessionOutbox(2)
+	complete.proc = process
+	complete.client = client
+	pumpCancelled := false
+	complete.pumpCancel = func() { pumpCancelled = true }
+	require.NoError(t, session.stopNativeGeneration(t.Context(), complete))
+	require.True(t, pumpCancelled)
+
+	process = newStubProcess(true)
+	process.close = ErrContainmentIncomplete
+	client = newStubPiClient()
+	client.abortErr = errors.Join(wantErr, ErrContainmentIncomplete)
+	incomplete := newTestSessionOutbox(3)
+	incomplete.proc = process
+	incomplete.client = client
+	require.ErrorIs(t, session.stopNativeGeneration(t.Context(), incomplete), wantErr)
+
+	process = newStubProcess(true)
+	pumpDone := make(chan struct{})
+	join := newTestSessionOutbox(4)
+	join.proc = process
+	ctx, cancelDuringPump := context.WithCancel(t.Context())
+	join.pumpCancel = func() {
+		cancelDuringPump()
+		go func() {
+			time.Sleep(time.Millisecond)
+			close(pumpDone)
+		}()
+	}
+	join.pumpDone = pumpDone
+	require.NoError(t, session.stopNativeGeneration(ctx, join))
+
+	containmentOutbox := newTestSessionOutbox(5)
+	containmentProcess := newStubProcess(true)
+	containmentProcess.close = ErrContainmentIncomplete
+	containmentOutbox.proc = containmentProcess
+	require.ErrorIs(t, session.containGenerationSync(t.Context(), containmentOutbox, "coverage"), ErrContainmentIncomplete)
+}
