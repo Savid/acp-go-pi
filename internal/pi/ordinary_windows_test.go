@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -36,7 +37,12 @@ func TestOrdinaryWindowsExecutableResolutionExecutesSuppliedPATHEXTChild(t *test
 		"PATHEXT=.PROBE",
 	})
 	require.NoError(t, err)
-	require.Equal(t, child, resolved)
+	require.True(t, strings.EqualFold(filepath.Clean(child), filepath.Clean(resolved)))
+	childInfo, err := os.Stat(child)
+	require.NoError(t, err)
+	resolvedInfo, err := os.Stat(resolved)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(childInfo, resolvedInfo))
 
 	marker := filepath.Join(t.TempDir(), "executed")
 	command := exec.Command(resolved, "-test.run=^TestOrdinaryWindowsExecutableResolutionExecutesSuppliedPATHEXTChild$", "--", windowsChildArgument)
