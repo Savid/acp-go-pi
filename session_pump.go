@@ -360,10 +360,11 @@ func (g *dispatchGate) Unlock() {
 // be admitted while at least one ancestor token remains, and zero is terminal,
 // so a waiter that observes completion can never race a later Add.
 type generationProducers struct {
-	mu    sync.Mutex
-	count int
-	done  chan struct{}
-	idle  chan struct{}
+	mu       sync.Mutex
+	count    int
+	children int
+	done     chan struct{}
+	idle     chan struct{}
 }
 
 func newGenerationProducers() *generationProducers {
@@ -385,11 +386,12 @@ func (p *generationProducers) acquire(n int) (func(), bool) {
 		return func() {}, false
 	}
 
-	if p.count == 1 {
+	if p.children == 0 {
 		p.idle = make(chan struct{})
 	}
 
 	p.count += n
+	p.children += n
 	p.mu.Unlock()
 
 	var once sync.Once
@@ -402,17 +404,26 @@ func (p *generationProducers) acquire(n int) (func(), bool) {
 }
 
 func (p *generationProducers) releaseRoot() {
-	if p != nil {
-		p.release(1)
+	if p == nil {
+		return
 	}
+
+	p.mu.Lock()
+	p.count--
+
+	if p.count == 0 {
+		close(p.done)
+	}
+	p.mu.Unlock()
 }
 
 func (p *generationProducers) release(n int) {
 	p.mu.Lock()
 
 	p.count -= n
+	p.children -= n
 
-	if p.count == 1 {
+	if p.children == 0 {
 		close(p.idle)
 	}
 

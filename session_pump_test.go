@@ -352,6 +352,20 @@ func TestGenerationProducerAndObservationClosedEdges(t *testing.T) {
 	require.False(t, admitted)
 }
 
+func TestGenerationProducerChildrenRemainJoinedAfterRootExit(t *testing.T) {
+	producers := newGenerationProducers()
+	releaseChild, admitted := producers.acquire(1)
+	require.True(t, admitted)
+
+	producers.releaseRoot()
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	cancelWait()
+	require.ErrorIs(t, producers.waitChildren(waitCtx), ErrContainmentIncomplete)
+
+	releaseChild()
+	require.NoError(t, producers.waitChildren(t.Context()))
+}
+
 func TestStopPumpJoinsProducerRootAfterPumpExit(t *testing.T) {
 	outbox := newTestSessionOutbox(1)
 	pumpDone := make(chan struct{})
