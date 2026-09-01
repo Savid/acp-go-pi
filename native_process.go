@@ -11,6 +11,8 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
+var authorityProcessKillTimeout = 30 * time.Second
+
 type authorityPiProcess struct {
 	agent   *Agent
 	process NativeProcess
@@ -161,7 +163,7 @@ func (p *authorityPiProcess) Shutdown(ctx context.Context) error {
 	}
 }
 func (p *authorityPiProcess) Kill() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), authorityProcessKillTimeout)
 	defer cancel()
 
 	revokeErr := p.revoke(ctx)
@@ -181,10 +183,6 @@ func (p *authorityPiProcess) Kill() error {
 }
 func (p *authorityPiProcess) revoke(ctx context.Context) (err error) {
 	defer func() {
-		if recover() != nil {
-			err = ErrHostAuthorityUnavailable
-		}
-
 		if errors.Is(err, ErrHostAuthorityUnavailable) {
 			p.agent.recordNativeContainment(err)
 		}
