@@ -24,6 +24,11 @@ const (
 	privateEnvPrefix           = "ACP_" + "GO_PI_INTERNAL_"
 )
 
+var (
+	ordinaryProcessPipe = os.Pipe
+	ordinaryProcessKill = func(process *os.Process) error { return process.Kill() }
+)
+
 type LaunchSpec struct {
 	ExecutablePath      string
 	NativeRoot          string
@@ -180,12 +185,12 @@ func StartOrdinaryProcess(ctx context.Context, spec LaunchSpec) (*Process, error
 	cmd.Dir = spec.Cwd
 	cmd.Env = environment
 
-	stdinRead, stdin, err := os.Pipe()
+	stdinRead, stdin, err := ordinaryProcessPipe()
 	if err != nil {
 		return nil, fmt.Errorf("create native stdin: %w", err)
 	}
 
-	stdout, stdoutWrite, err := os.Pipe()
+	stdout, stdoutWrite, err := ordinaryProcessPipe()
 	if err != nil {
 		_ = stdinRead.Close()
 		_ = stdin.Close()
@@ -261,7 +266,7 @@ func (p *Process) Kill() error {
 		return nil
 	}
 
-	err := p.cmd.Process.Kill()
+	err := ordinaryProcessKill(p.cmd.Process)
 	if errors.Is(err, os.ErrProcessDone) {
 		return nil
 	}

@@ -11,6 +11,9 @@ import (
 )
 
 func TestProbeOrdinaryVersion(t *testing.T) {
+	_, err := ProbeOrdinaryVersion(t.Context(), "", nil)
+	require.ErrorContains(t, err, "resolve pi version executable")
+
 	script := filepath.Join(t.TempDir(), "fake-pi")
 	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\necho ' 0.80.6 '\n"), 0o700))
 	version, err := ProbeOrdinaryVersion(t.Context(), script, CaptureOrdinaryEnvironmentEntries())
