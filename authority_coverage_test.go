@@ -444,17 +444,25 @@ func TestAuthorityProcessStartFailureEdges(t *testing.T) {
 
 func TestAuthorityProcessControlAndPrimitiveEdges(t *testing.T) {
 	wantErr := errors.New("native fault")
+	waitFailureCalls := 0
 
 	waitFailure := &authorityPiProcess{
 		agent: NewAgent(), process: &edgeNativeProcess{wait: func(context.Context) (NativeResult, error) {
-			return NativeResult{}, wantErr
+			waitFailureCalls++
+			if waitFailureCalls == 1 {
+				return NativeResult{}, wantErr
+			}
+
+			return NativeResult{Revoked: true}, nil
 		}}, exited: make(chan struct{}),
 	}
 	waitFailure.startWait()
 	<-waitFailure.exited
 	require.ErrorIs(t, waitFailure.WaitErr(), wantErr)
 	require.ErrorIs(t, waitFailure.WaitErr(), ErrContainmentIncomplete)
-	require.ErrorIs(t, waitFailure.Kill(), wantErr)
+	require.NoError(t, waitFailure.Kill())
+	require.NoError(t, waitFailure.WaitErr())
+	require.Equal(t, 2, waitFailureCalls)
 
 	exitFailure := &authorityPiProcess{
 		agent: NewAgent(), process: &edgeNativeProcess{wait: func(context.Context) (NativeResult, error) {
@@ -736,11 +744,32 @@ func TestNativeVersionProbeEdges(t *testing.T) {
 	require.Empty(t, version)
 	require.ErrorContains(t, err, "empty output")
 
-	version, err = probe(t, &edgeNativeProcess{wait: func(context.Context) (NativeResult, error) {
-		return NativeResult{}, wantErr
-	}})
+	waitCalls := 0
+	revokeCalls := 0
+	revoked := false
+	version, err = probe(t, &edgeNativeProcess{
+		wait: func(context.Context) (NativeResult, error) {
+			waitCalls++
+			if waitCalls == 1 {
+				return NativeResult{}, wantErr
+			}
+
+			require.True(t, revoked)
+
+			return NativeResult{Revoked: true}, nil
+		},
+		revoke: func(context.Context) error {
+			revokeCalls++
+			revoked = true
+
+			return nil
+		},
+	})
 	require.Empty(t, version)
 	require.ErrorIs(t, err, wantErr)
+	require.NotErrorIs(t, err, ErrContainmentIncomplete)
+	require.Equal(t, 2, waitCalls)
+	require.Equal(t, 1, revokeCalls)
 
 	cancelled := func(waitErr error) error {
 		done := make(chan struct{})

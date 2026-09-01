@@ -161,11 +161,33 @@ func TestGenerationRetentionEdges(t *testing.T) {
 	otherFailure := &agentSession{agent: managedAgent, retainedRoot: "/other", retainedPrepared: true}
 	require.ErrorIs(t, otherFailure.releaseRetainedGeneration(t.Context()), wantErr)
 
-	managedAgent.options.HostAuthority = &edgeHostAuthority{}
-	materializeRemoveAll = func(string) error { return wantErr }
+	reclaimCalls := 0
+	managedAgent.options.HostAuthority = &edgeHostAuthority{reclaim: func(context.Context, string) error {
+		reclaimCalls++
+		if reclaimCalls > 1 {
+			return errors.New("duplicate reclaim")
+		}
+
+		return nil
+	}}
+	removeCalls := 0
+	materializeRemoveAll = func(string) error {
+		removeCalls++
+		if removeCalls == 1 {
+			return wantErr
+		}
+
+		return nil
+	}
 	removeFailure := &agentSession{agent: managedAgent, retainedRoot: "/remove", retainedPrepared: true}
 	require.ErrorIs(t, removeFailure.releaseRetainedGeneration(t.Context()), wantErr)
+	require.False(t, removeFailure.retainedPrepared)
+	require.NoError(t, removeFailure.releaseRetainedGeneration(t.Context()))
+	require.Equal(t, 1, reclaimCalls)
+	require.Equal(t, 2, removeCalls)
+	require.Empty(t, removeFailure.retainedRoot)
 
+	managedAgent.options.HostAuthority = &edgeHostAuthority{}
 	materializeRemoveAll = func(string) error { return nil }
 	success := &agentSession{agent: managedAgent, retainedRoot: "/success", retainedPrepared: true}
 	managedAgent.markNativeTreeBusy("/success")

@@ -1474,6 +1474,12 @@ func (s *agentSession) releaseRetainedGeneration(ctx context.Context) error {
 		}
 
 		s.agent.clearNativeTreeBusy(root)
+
+		s.mu.Lock()
+		if s.retainedRoot == root {
+			s.retainedPrepared = false
+		}
+		s.mu.Unlock()
 	}
 
 	if err := s.agent.removeNativeTree(root); err != nil {

@@ -73,7 +73,8 @@ func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir str
 	go func() { data, _ := io.ReadAll(stderrPipe); stderr <- data }()
 
 	result, waitErr := waitNativeProcess(ctx, process)
-	if waitErr != nil && ctx.Err() != nil && detachedWaitError(waitErr) {
+	if waitErr != nil {
+		initialWaitErr := waitErr
 		revokeCtx, cancelRevoke := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
 		revokeErr := revokeNativeProcess(revokeCtx, process)
 
@@ -85,13 +86,11 @@ func (a *Agent) probeNativeVersion(ctx context.Context, executable, agentDir str
 		cancelWait()
 
 		if terminalWaitErr != nil {
-			waitErr = errors.Join(ctx.Err(), revokeErr, terminalWaitErr, ErrContainmentIncomplete)
+			waitErr = errors.Join(initialWaitErr, ctx.Err(), revokeErr, terminalWaitErr, ErrContainmentIncomplete)
 		} else {
 			result = terminalResult
-			waitErr = errors.Join(ctx.Err(), authorityTerminalRevokeError(revokeErr))
+			waitErr = errors.Join(initialWaitErr, ctx.Err(), authorityTerminalRevokeError(revokeErr))
 		}
-	} else if waitErr != nil {
-		waitErr = errors.Join(waitErr, ErrContainmentIncomplete)
 	}
 
 	_ = stdoutPipe.Close()

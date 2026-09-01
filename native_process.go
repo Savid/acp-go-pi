@@ -169,10 +169,14 @@ func (p *authorityPiProcess) runWait(ctx context.Context, flight *authorityWaitF
 			p.terminal = true
 			p.exitOnce.Do(func() { close(p.exited) })
 		case !flight.detached:
-			p.waitErr = flight.waitErr
+			p.waitErr = errors.Join(p.waitErr, flight.waitErr)
 			containmentErr = flight.waitErr
 
 			p.exitOnce.Do(func() { close(p.exited) })
+		}
+
+		if !flight.terminal {
+			p.waitFlight = nil
 		}
 	}
 
@@ -246,10 +250,6 @@ func (p *authorityPiProcess) awaitWait(ctx context.Context, flight *authorityWai
 
 	p.waitMu.Lock()
 	defer p.waitMu.Unlock()
-
-	if p.waitFlight == flight && flight.detached {
-		p.waitFlight = nil
-	}
 
 	if p.terminal {
 		return true, p.waitErr
