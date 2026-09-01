@@ -89,9 +89,7 @@ func TestSessionBrowserShimIsNilWhenItCannotBeMaterialised(t *testing.T) {
 
 	agent := newStubClientAgent(t, newStubPiClient(), WithScratchDir(blocked))
 	require.Nil(t, agent.newSessionBrowserShim(blocked))
-	owned, err := agent.newOwnedSessionBrowserShim(blocked)
-	require.NoError(t, err)
-	require.Nil(t, owned)
+	require.Nil(t, agent.newOwnedSessionBrowserShim(blocked))
 }
 
 // TestAuthorizeRefusesOAuthWithoutABrowserShim pins the fail-closed outcome on a

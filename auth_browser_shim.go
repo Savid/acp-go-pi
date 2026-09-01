@@ -18,11 +18,6 @@ func (a *Agent) newSessionBrowserShim(parent string) *pi.BrowserShim {
 	return shim
 }
 
-func (a *Agent) newOwnedSessionBrowserShim(parent string) (*pi.BrowserShim, error) {
-	shim := a.newSessionBrowserShim(parent)
-	if shim == nil {
-		return nil, nil //nolint:nilnil // Absence is the fail-closed auth result; the session itself may proceed.
-	}
-
-	return shim, nil
+func (a *Agent) newOwnedSessionBrowserShim(parent string) *pi.BrowserShim {
+	return a.newSessionBrowserShim(parent)
 }

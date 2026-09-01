@@ -31,6 +31,14 @@ func resolveSessionConfiguration(
 		return PiOptions{}, sessionResumeIncompatibleError(metaOptionPath(metaExtraPathDirsKey))
 	}
 
+	return mergeSessionConfiguration(options, presence, stored), nil
+}
+
+func mergeSessionConfiguration(
+	options PiOptions,
+	presence sessionConfigurationPresence,
+	stored sessionConfigurationRecord,
+) PiOptions {
 	if !presence.Env {
 		options.Env = cloneStringMap(stored.Env)
 	}
@@ -39,7 +47,7 @@ func resolveSessionConfiguration(
 		options.ExtraPathDirs = slices.Clone(stored.ExtraPathDirs)
 	}
 
-	return options, nil
+	return options
 }
 
 func sessionResumeIncompatibleError(field string) error {

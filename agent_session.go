@@ -291,14 +291,11 @@ func (a *Agent) restoreSession(
 		return restoredSession{}, unknownSessionError()
 	}
 
-	start.MetaOptions, err = resolveSessionConfiguration(
+	start.MetaOptions = mergeSessionConfiguration(
 		metaOptions,
 		configurationPresence,
 		boundary.Configuration,
 	)
-	if err != nil {
-		return restoredSession{}, err
-	}
 
 	if openErr := a.ensureOpen(); openErr != nil {
 		return restoredSession{}, openErr

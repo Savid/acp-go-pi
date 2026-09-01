@@ -77,9 +77,7 @@ func (a *Agent) createSessionRuntime() (sessionDirs, *pi.BrowserShim, error) {
 		return sessionDirs{}, nil, err
 	}
 
-	shim, err := a.newOwnedSessionBrowserShim(dirs.Root)
-
-	return dirs, shim, err
+	return dirs, a.newOwnedSessionBrowserShim(dirs.Root), nil
 }
 
 // durableHome materializes Pi's stable native auth residence and reports its

@@ -906,11 +906,7 @@ func (s *agentSession) nextRuntimeLaunch(
 	result.spec.SessionID = string(s.id)
 	result.spec.BaseEnvironment = s.agent.nativeBaseEnvironment()
 
-	result.browserShim, err = s.agent.newOwnedSessionBrowserShim(dirs.Root)
-	if err != nil {
-		return fail(err)
-	}
-
+	result.browserShim = s.agent.newOwnedSessionBrowserShim(dirs.Root)
 	result.spec.BrowserShim = result.browserShim
 
 	if reconcileErr := s.agent.reconcileHomeStartupDefaults(dirs.AgentDir); reconcileErr != nil {

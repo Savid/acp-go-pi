@@ -77,10 +77,7 @@ func (a *Agent) handleForkSession(
 		return acp.UnstableForkSessionResponse{}, emptyForkSessionError()
 	}
 
-	metaOptions, err = resolveSessionConfiguration(metaOptions, configurationPresence, boundary.Configuration)
-	if err != nil {
-		return acp.UnstableForkSessionResponse{}, err
-	}
+	metaOptions = mergeSessionConfiguration(metaOptions, configurationPresence, boundary.Configuration)
 
 	session, err := a.startAndStoreSession(ctx, sessionStart{
 		Cwd:                   params.Cwd,
