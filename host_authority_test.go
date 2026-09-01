@@ -76,6 +76,10 @@ func (a *deterministicHostAuthority) PrepareNativeTree(_ context.Context, root s
 	return prepareErr
 }
 
+func (*deterministicHostAuthority) ReadNativeAppendLog(context.Context, string, uint64) ([][]byte, error) {
+	return nil, nil
+}
+
 func (a *deterministicHostAuthority) ReclaimNativeTree(_ context.Context, root string) error {
 	a.mu.Lock()
 	if a.busyReclaims > 0 {
