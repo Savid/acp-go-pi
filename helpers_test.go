@@ -642,6 +642,7 @@ type stubPiClient struct {
 	modelsErr       error
 	commands        []pi.SlashCommand
 	commandsErr     error
+	commandsFunc    func()
 }
 
 func newStubPiClient() *stubPiClient {
@@ -847,6 +848,10 @@ func (c *stubPiClient) GetSessionStats(context.Context) (pi.SessionStats, error)
 	return c.stats, c.statsErr
 }
 func (c *stubPiClient) GetCommands(context.Context) ([]pi.SlashCommand, error) {
+	if c.commandsFunc != nil {
+		c.commandsFunc()
+	}
+
 	return c.commands, c.commandsErr
 }
 

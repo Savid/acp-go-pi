@@ -955,3 +955,46 @@ func TestSessionCloseReleaseEdges(t *testing.T) {
 	}
 	require.ErrorIs(t, retained.Close(t.Context()), wantErr)
 }
+
+func TestConstructionOwnershipEdges(t *testing.T) {
+	process := newStubProcess(false)
+	process.close = ErrContainmentIncomplete
+	agent := NewAgent()
+	construction := &nativeConstruction{proc: process, nativeBoundary: newNativeBoundaryTracker()}
+	require.ErrorIs(t, agent.cleanupNativeConstructionOwned(t.Context(), construction, nil), ErrContainmentIncomplete)
+
+	t.Run("pump boundary changes", func(t *testing.T) {
+		client := newStubPiClient()
+		client.state = internalpi.SessionState{SessionID: "session"}
+		agent := newStubClientAgent(t, client)
+		agent.versionChecked = true
+		client.startFunc = func(context.Context) error {
+			agent.mu.Lock()
+			for owner := range agent.constructions {
+				owner.session.nativeBoundary = newNativeBoundaryTracker()
+			}
+			agent.mu.Unlock()
+
+			return nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, ErrContainmentIncomplete)
+	})
+
+	t.Run("immutable transfer", func(t *testing.T) {
+		client := newStubPiClient()
+		client.state = internalpi.SessionState{SessionID: "session"}
+		agent := newStubClientAgent(t, client)
+		agent.versionChecked = true
+		client.commandsFunc = func() {
+			agent.mu.Lock()
+			for owner := range agent.constructions {
+				owner.immutable = true
+				owner.err = ErrContainmentIncomplete
+			}
+			agent.mu.Unlock()
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, ErrContainmentIncomplete)
+	})
+}
