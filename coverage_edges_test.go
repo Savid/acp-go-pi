@@ -3,6 +3,9 @@ package piacp
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -31,6 +34,12 @@ type closeAgentOnErrContext struct {
 	context.Context //nolint:containedctx // Test hook closes the agent at the explicit final context gate.
 	agent           *Agent
 	once            sync.Once
+}
+
+type contextIgnoringStore struct{ SessionStore }
+
+func (s *contextIgnoringStore) Load(_ context.Context, key SessionKey) ([]SessionStoreEntry, error) {
+	return s.SessionStore.Load(context.Background(), key)
 }
 
 func (c *closeAgentOnErrContext) Err() error {
@@ -292,8 +301,18 @@ func TestSessionCarrierAndLookupEdges(t *testing.T) {
 	agent.sessionCarriers = map[acp.SessionId]*sessionCarrierTransition{id: blocked}
 	ctx, cancel := context.WithCancel(t.Context())
 	go func() {
-		time.Sleep(time.Millisecond)
-		cancel()
+		for {
+			agent.mu.Lock()
+			registered := blocked.users == 1
+			agent.mu.Unlock()
+			if registered {
+				cancel()
+
+				return
+			}
+
+			runtime.Gosched()
+		}
 	}()
 	_, err = agent.acquireSessionCarrier(ctx, id)
 	require.ErrorIs(t, err, context.Canceled)
@@ -532,4 +551,407 @@ func TestAgentCloseAndAuthorityFenceEdges(t *testing.T) {
 	fenced.fenceSessionsAfterAuthorityLoss(ErrHostAuthorityUnavailable)
 	require.ErrorIs(t, shared.nativeContainmentError(), ErrHostAuthorityUnavailable)
 	require.ErrorIs(t, retainedOnly.nativeContainmentError(), ErrHostAuthorityUnavailable)
+}
+
+func TestStoreStartedSessionRecheckEdges(t *testing.T) {
+	id := acp.SessionId("replacement")
+
+	for name, mutate := range map[string]func(*Agent, *agentSession){
+		"closed":  func(agent *Agent, _ *agentSession) { agent.closed = true },
+		"deleted": func(agent *Agent, _ *agentSession) { agent.deleted[id] = struct{}{} },
+		"changed": func(agent *Agent, previous *agentSession) {
+			agent.sessions[id] = &agentSession{agent: agent, id: previous.id}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := NewAgent()
+			process := newStubProcess(false)
+			previous := attachTestNativeBoundary(&agentSession{
+				agent: agent, id: id, proc: process, sessionRoot: t.TempDir(),
+			})
+			process.closeFunc = func() error {
+				agent.mu.Lock()
+				mutate(agent, previous)
+				agent.mu.Unlock()
+
+				return nil
+			}
+			agent.sessions[id] = previous
+			replacement := &agentSession{agent: agent, id: id}
+			require.Error(t, agent.storeStartedSession(t.Context(), replacement))
+		})
+	}
+
+	cancelledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := NewAgent().restoreSession(cancelledCtx, id, sessionStart{Cwd: "/cwd"}, nil)
+	require.ErrorIs(t, err, context.Canceled)
+
+	agent := NewAgent()
+	agent.sessions[id] = &agentSession{agent: agent, id: id, configuration: sessionConfigurationRecord{
+		ExtraPathDirs: []string{"relative"},
+	}}
+	_, err = agent.restoreSession(t.Context(), id, sessionStart{Cwd: "/cwd"}, nil)
+	require.Error(t, err)
+}
+
+func TestSessionConstructionFenceEdges(t *testing.T) {
+	wantErr := errors.New("prepare fault")
+
+	t.Run("busy retry", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		done := make(chan struct{})
+		close(done)
+		construction := &nativeConstruction{
+			done: done, err: ErrNativeTreeBusy, generationRoot: "/busy", generationPrepared: true,
+			nativeBoundary: newNativeBoundaryTracker(),
+		}
+		agent.options.hostAuthoritySupplied = true
+		agent.options.HostAuthority = &edgeHostAuthority{reclaim: func(context.Context, string) error {
+			return ErrNativeTreeBusy
+		}}
+		agent.constructions[construction] = struct{}{}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, ErrNativeTreeBusy)
+	})
+
+	t.Run("prepare failure", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		agent.options.hostAuthoritySupplied = true
+		agent.options.HostAuthority = &edgeHostAuthority{prepare: func(context.Context, string) error {
+			return wantErr
+		}}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("close after prepare", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		agent.options.hostAuthoritySupplied = true
+		agent.options.HostAuthority = &edgeHostAuthority{prepare: func(context.Context, string) error {
+			_, _ = agent.beginClose()
+
+			return nil
+		}}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("cancel before launch", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, err := agent.startSession(ctx, sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("close at launch gate", func(t *testing.T) {
+		agent := newStubClientAgent(t, newStubPiClient())
+		agent.versionChecked = true
+		ctx := &closeAgentOnErrContext{Context: t.Context(), agent: agent}
+		_, err := agent.startSession(ctx, sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("close after client start", func(t *testing.T) {
+		client := newStubPiClient()
+		agent := newStubClientAgent(t, client)
+		agent.versionChecked = true
+		client.startFunc = func(context.Context) error {
+			_, _ = agent.beginClose()
+
+			return nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("close during setup", func(t *testing.T) {
+		client := newStubPiClient()
+		client.state = internalpi.SessionState{SessionID: "session"}
+		agent := newStubClientAgent(t, client)
+		agent.versionChecked = true
+		client.autoRetryFunc = func(context.Context, bool) error {
+			_, _ = agent.beginClose()
+
+			return nil
+		}
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		require.ErrorIs(t, err, errAgentClosed)
+	})
+
+	t.Run("fork retirement", func(t *testing.T) {
+		client := newStubPiClient()
+		client.state = internalpi.SessionState{SessionID: "session"}
+		agent := edgeManagedAgent(&edgeHostAuthority{})
+		session := &agentSession{agent: agent, client: client, proc: newStubProcess(true)}
+		err := agent.setUpNativeSession(t.Context(), session, sessionStart{ForkSession: true}, internalpi.ModelRef{}, false)
+		require.ErrorIs(t, err, ErrContainmentIncomplete)
+	})
+}
+
+func TestNextRuntimeLaunchCoverageEdges(t *testing.T) {
+	wantErr := errors.New("runtime launch fault")
+	fixture := func(t *testing.T) (*agentSession, internalpi.LaunchSpec) {
+		t.Helper()
+
+		agent := NewAgent(WithScratchDir(t.TempDir()))
+		session := &agentSession{agent: agent, id: acp.SessionId("runtime"), sessionRoot: t.TempDir()}
+		dirs, err := createSessionGeneration(session.sessionRoot)
+		require.NoError(t, err)
+		require.NoError(t, agent.applyGenerationAgentDir(&dirs))
+		previous := internalpi.LaunchSpec{NativeRoot: dirs.Root, AgentDir: dirs.AgentDir, SessionDir: dirs.SessionDir}
+		session.launch = previous
+
+		return session, previous
+	}
+
+	t.Run("reclaim", func(t *testing.T) {
+		session, previous := fixture(t)
+		session.generationPrepared = true
+		session.agent.options.hostAuthoritySupplied = true
+		session.agent.options.HostAuthority = &edgeHostAuthority{reclaim: func(context.Context, string) error { return wantErr }}
+		_, err := session.nextRuntimeLaunch(t.Context(), previous)
+		require.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("pending commit", func(t *testing.T) {
+		session, previous := fixture(t)
+		session.managedCommitPending = true
+		session.sessionFilePath = filepath.Join(t.TempDir(), "session.jsonl")
+		require.NoError(t, os.WriteFile(session.sessionFilePath, []byte("{}\n"), 0o600))
+		store := newFaultySessionStore()
+		store.appendErr = wantErr
+		session.agent.options.SessionStore = store
+		_, err := session.nextRuntimeLaunch(t.Context(), previous)
+		require.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("admission", func(t *testing.T) {
+		session, _ := fixture(t)
+		session.agent.nativeBusyRoots["/busy"] = struct{}{}
+		_, err := session.nextRuntimeLaunch(t.Context(), internalpi.LaunchSpec{})
+		require.ErrorIs(t, err, ErrNativeTreeBusy)
+	})
+
+	t.Run("store load", func(t *testing.T) {
+		session, _ := fixture(t)
+		session.agent.options.SessionStore = &errorSessionStore{loadErr: wantErr}
+		_, err := session.nextRuntimeLaunch(t.Context(), internalpi.LaunchSpec{})
+		require.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("agent directory", func(t *testing.T) {
+		session, _ := fixture(t)
+		session.agent.options.Home = "relative"
+		_, err := session.nextRuntimeLaunch(t.Context(), internalpi.LaunchSpec{})
+		require.Error(t, err)
+	})
+
+	t.Run("residence", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		session, _ := fixture(t)
+		mkdirTemp := materializeMkdirTemp
+		materializeMkdirTemp = func(parent, pattern string) (string, error) {
+			root, err := mkdirTemp(parent, pattern)
+			if err != nil {
+				return "", err
+			}
+			agentDir := filepath.Join(root, "agent")
+			if err := os.MkdirAll(agentDir, 0o700); err != nil {
+				return "", err
+			}
+			if err := os.WriteFile(filepath.Join(agentDir, ".acp-session"), nil, 0o600); err != nil {
+				return "", err
+			}
+
+			return root, nil
+		}
+		_, err := session.nextRuntimeLaunch(t.Context(), internalpi.LaunchSpec{})
+		require.ErrorContains(t, err, "create session residence root")
+	})
+
+	t.Run("seed", func(t *testing.T) {
+		session, _ := fixture(t)
+		session.agent.options.SeedFiles = map[string]string{internalpi.SettingsFileName: "{"}
+		_, err := session.nextRuntimeLaunch(t.Context(), internalpi.LaunchSpec{})
+		require.Error(t, err)
+	})
+
+	t.Run("seed manifest", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		session, _ := fixture(t)
+		session.agent.options.SeedFiles = map[string]string{"seed.txt": "value"}
+		mkdirTemp := materializeMkdirTemp
+		materializeMkdirTemp = func(parent, pattern string) (string, error) {
+			root, err := mkdirTemp(parent, pattern)
+			if err != nil {
+				return "", err
+			}
+			agentDir := filepath.Join(root, "agent")
+			if err := os.MkdirAll(agentDir, 0o700); err != nil {
+				return "", err
+			}
+			if err := os.WriteFile(filepath.Join(agentDir, ".seed-manifest.json"), []byte("{"), 0o600); err != nil {
+				return "", err
+			}
+
+			return root, nil
+		}
+		_, err := session.nextRuntimeLaunch(t.Context(), internalpi.LaunchSpec{})
+		require.Error(t, err)
+		var seedErr *internalpi.SeedFileError
+		require.NotErrorAs(t, err, &seedErr)
+	})
+
+	t.Run("explicit resources", func(t *testing.T) {
+		session, _ := fixture(t)
+		original := agentDirExplicitResources
+		t.Cleanup(func() { agentDirExplicitResources = original })
+		agentDirExplicitResources = func(internalpi.AgentDir) (internalpi.ExplicitResources, error) {
+			return internalpi.ExplicitResources{}, wantErr
+		}
+		_, err := session.nextRuntimeLaunch(t.Context(), internalpi.LaunchSpec{})
+		require.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("prepare", func(t *testing.T) {
+		session, _ := fixture(t)
+		session.agent.options.hostAuthoritySupplied = true
+		session.agent.options.HostAuthority = &edgeHostAuthority{prepare: func(context.Context, string) error { return wantErr }}
+		_, err := session.nextRuntimeLaunch(t.Context(), internalpi.LaunchSpec{})
+		require.ErrorIs(t, err, wantErr)
+	})
+}
+
+func TestRelaunchProcessCoverageEdges(t *testing.T) {
+	wantErr := errors.New("relaunch fault")
+	fixture := func(t *testing.T, client *stubPiClient) (*agentSession, *Agent) {
+		t.Helper()
+
+		agent := NewAgent()
+		session := &agentSession{
+			agent: agent, id: acp.SessionId("relaunch"), proc: newStubProcess(true), client: newStubPiClient(),
+		}
+		prepareRelaunchFixture(t, session)
+		client.state = internalpi.SessionState{SessionID: string(session.id), SessionFile: "/fresh"}
+		agent.startPiProcess = func(context.Context, internalpi.LaunchSpec) (piProcess, piClient, error) {
+			return newStubProcess(false), client, nil
+		}
+
+		return session, agent
+	}
+
+	t.Run("retained generation", func(t *testing.T) {
+		session, _ := fixture(t, newStubPiClient())
+		session.retainedRoot = "/retained"
+		session.retainedErr = wantErr
+		require.ErrorIs(t, session.relaunchProcess(t.Context()), wantErr)
+	})
+
+	t.Run("session closes after materialization", func(t *testing.T) {
+		session, agent := fixture(t, newStubPiClient())
+		agent.options.hostAuthoritySupplied = true
+		agent.options.HostAuthority = &edgeHostAuthority{prepare: func(context.Context, string) error {
+			session.mu.Lock()
+			session.closing = true
+			session.mu.Unlock()
+
+			return nil
+		}}
+		require.Error(t, session.relaunchProcess(t.Context()))
+	})
+
+	t.Run("agent closes after materialization", func(t *testing.T) {
+		session, agent := fixture(t, newStubPiClient())
+		agent.options.hostAuthoritySupplied = true
+		agent.options.HostAuthority = &edgeHostAuthority{prepare: func(context.Context, string) error {
+			_, _ = agent.beginClose()
+
+			return nil
+		}}
+		require.ErrorIs(t, session.relaunchProcess(t.Context()), errAgentClosed)
+	})
+
+	t.Run("cancel before spawn", func(t *testing.T) {
+		session, agent := fixture(t, newStubPiClient())
+		agent.options.SessionStore = &contextIgnoringStore{SessionStore: NewInMemorySessionStore()}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		require.ErrorIs(t, session.relaunchProcess(ctx), context.Canceled)
+	})
+
+	t.Run("agent closes after spawn", func(t *testing.T) {
+		session, agent := fixture(t, newStubPiClient())
+		agent.startPiProcess = func(context.Context, internalpi.LaunchSpec) (piProcess, piClient, error) {
+			_, _ = agent.beginClose()
+
+			return newStubProcess(false), newStubPiClient(), nil
+		}
+		require.ErrorIs(t, session.relaunchProcess(t.Context()), errAgentClosed)
+	})
+
+	t.Run("thinking level", func(t *testing.T) {
+		client := newStubPiClient()
+		client.thinkingErr = wantErr
+		session, _ := fixture(t, client)
+		session.thinkingLevel = internalpi.ThinkingLevelMax
+		require.ErrorIs(t, session.relaunchProcess(t.Context()), wantErr)
+	})
+
+	t.Run("model", func(t *testing.T) {
+		client := newStubPiClient()
+		client.setModelErr = wantErr
+		session, _ := fixture(t, client)
+		session.model = "provider/model"
+		require.ErrorIs(t, session.relaunchProcess(t.Context()), wantErr)
+	})
+
+	t.Run("failed replacement cleanup", func(t *testing.T) {
+		restoreMaterializeSeams(t)
+		client := newStubPiClient()
+		client.startErr = wantErr
+		session, agent := fixture(t, client)
+		var replacementRoot string
+		agent.startPiProcess = func(_ context.Context, spec internalpi.LaunchSpec) (piProcess, piClient, error) {
+			replacementRoot = spec.NativeRoot
+
+			return newStubProcess(false), client, nil
+		}
+		removeAll := materializeRemoveAll
+		materializeRemoveAll = func(path string) error {
+			if path == replacementRoot && replacementRoot != "" {
+				return errors.New("replacement cleanup fault")
+			}
+
+			return removeAll(path)
+		}
+		err := session.relaunchProcess(t.Context())
+		require.ErrorIs(t, err, wantErr)
+		require.ErrorContains(t, err, "replacement cleanup fault")
+	})
+}
+
+func TestSessionCloseReleaseEdges(t *testing.T) {
+	wantErr := errors.New("close release fault")
+
+	managedAgent := edgeManagedAgent(&edgeHostAuthority{reclaim: func(context.Context, string) error {
+		return wantErr
+	}})
+	managed := &agentSession{
+		agent: managedAgent, id: acp.SessionId("managed-close"),
+		launch: internalpi.LaunchSpec{NativeRoot: "/managed"}, generationPrepared: true,
+	}
+	require.ErrorIs(t, managed.Close(t.Context()), wantErr)
+	require.ErrorIs(t, managed.nativeContainmentError(), wantErr)
+
+	retained := &agentSession{
+		agent: NewAgent(), id: acp.SessionId("retained-close"),
+		retainedRoot: "/retained", retainedErr: wantErr,
+	}
+	require.ErrorIs(t, retained.Close(t.Context()), wantErr)
 }
