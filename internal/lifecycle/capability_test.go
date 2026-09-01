@@ -30,6 +30,14 @@ func TestLifecycleCapabilityStrictScalar(t *testing.T) {
 		{"duplicate", `{"version":1,"version":1}`},
 		{"unknown", `{"version":1,"unknown":true}`},
 		{"trailing", `{"version":1} {}`},
+		{"empty input", ``},
+		{"non-object", `[]`},
+		{"malformed member", `{"version":1,`},
+		{"malformed close", `{"version":1`},
+		{"updates type", `{"version":1,"updatesOutsidePrompt":1}`},
+		{"authority type", `{"version":1,"authoritativeQuiescence":1}`},
+		{"source type", `{"version":1,"quiescenceSource":1}`},
+		{"kinds type", `{"version":1,"activityKinds":1}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -37,5 +45,17 @@ func TestLifecycleCapabilityStrictScalar(t *testing.T) {
 			var value Negotiated
 			require.Error(t, json.Unmarshal([]byte(test.data), &value))
 		})
+	}
+}
+
+func TestLifecycleCapabilityDirectFramingFailures(t *testing.T) {
+	t.Parallel()
+
+	for _, data := range []string{
+		`{"version":1`,
+		`{"version":1} {}`,
+	} {
+		var value Negotiated
+		require.Error(t, value.UnmarshalJSON([]byte(data)))
 	}
 }

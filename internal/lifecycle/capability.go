@@ -22,15 +22,10 @@ func (n *Negotiated) UnmarshalJSON(data []byte) error {
 	seen := make(map[string]struct{})
 
 	for decoder.More() {
-		token, err := decoder.Token()
-		if err != nil {
-			return fmt.Errorf("decode lifecycle capability member: %w", err)
-		}
-
-		field, ok := token.(string)
-		if !ok {
-			return errors.New("lifecycle capability member name must be a string")
-		}
+		// encoding/json only yields string member names while traversing an
+		// object, and More has already proved that a member remains.
+		token, _ := decoder.Token()
+		field, _ := token.(string)
 
 		if _, duplicate := seen[field]; duplicate {
 			return fmt.Errorf("duplicate lifecycle capability field %q", field)
