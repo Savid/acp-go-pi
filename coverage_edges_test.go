@@ -3,12 +3,15 @@ package piacp
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
+
+	internalpi "github.com/savid/acp-go-pi/internal/pi"
 )
 
 type stagedErrorContext struct{ calls atomic.Int32 }
@@ -23,6 +26,18 @@ func (c *stagedErrorContext) Err() error {
 	return nil
 }
 func (*stagedErrorContext) Value(any) any { return nil }
+
+type closeAgentOnErrContext struct {
+	context.Context //nolint:containedctx // Test hook closes the agent at the explicit final context gate.
+	agent           *Agent
+	once            sync.Once
+}
+
+func (c *closeAgentOnErrContext) Err() error {
+	c.once.Do(func() { _, _ = c.agent.beginClose() })
+
+	return nil
+}
 
 func TestConfigurationAndAdmissionEdges(t *testing.T) {
 	_, err := resolveSessionConfiguration(PiOptions{}, sessionConfigurationPresence{}, sessionConfigurationRecord{
@@ -384,16 +399,15 @@ func TestPumpNativeBoundaryEdges(t *testing.T) {
 
 	process = newStubProcess(true)
 	pumpDone := make(chan struct{})
+	process.closeFunc = func() error {
+		close(pumpDone)
+
+		return nil
+	}
 	join := newTestSessionOutbox(4)
 	join.proc = process
 	ctx, cancelDuringPump := context.WithCancel(t.Context())
-	join.pumpCancel = func() {
-		cancelDuringPump()
-		go func() {
-			time.Sleep(time.Millisecond)
-			close(pumpDone)
-		}()
-	}
+	join.pumpCancel = cancelDuringPump
 	join.pumpDone = pumpDone
 	require.NoError(t, session.stopNativeGeneration(ctx, join))
 
@@ -402,4 +416,120 @@ func TestPumpNativeBoundaryEdges(t *testing.T) {
 	containmentProcess.close = ErrContainmentIncomplete
 	containmentOutbox.proc = containmentProcess
 	require.ErrorIs(t, session.containGenerationSync(t.Context(), containmentOutbox, "coverage"), ErrContainmentIncomplete)
+}
+
+func TestSettlementAndAutonomousRetirementEdges(t *testing.T) {
+	wantErr := errors.New("settlement boundary fault")
+	done := make(chan struct{})
+	close(done)
+	session := &agentSession{
+		agent:            NewAgent(),
+		turnFenceStarted: true,
+		turnFenceDone:    done,
+		turnFenceErr:     wantErr,
+	}
+	timedOut := &atomic.Bool{}
+	timedOut.Store(true)
+	_, err := session.settlePrompt(
+		t.Context(),
+		acp.PromptRequest{},
+		&promptTurnState{},
+		promptOutcome{},
+		timedOut,
+	)
+	require.ErrorIs(t, err, wantErr)
+	require.ErrorContains(t, err, "exceeded")
+
+	fixture := newAgentCycleFixture(t)
+	fixture.session.agent.options.hostAuthoritySupplied = true
+	fixture.session.agent.options.HostAuthority = &edgeHostAuthority{}
+	fixture.session.completeAgentCycle(t.Context(), nil, &agentCycle{state: &promptTurnState{}})
+}
+
+func TestEnsureVersionCoverageEdges(t *testing.T) {
+	newVersionAgent := func() *Agent {
+		agent := NewAgent(WithExecutablePath("/fake/pi"), WithScratchDir(t.TempDir()))
+		agent.probeVersion = func(context.Context, string, string) (string, error) {
+			return internalpi.DefaultMinimumVersion, nil
+		}
+
+		return agent
+	}
+
+	t.Run("admission", func(t *testing.T) {
+		agent := newVersionAgent()
+		agent.nativeBusyRoots["/busy"] = struct{}{}
+		require.ErrorIs(t, agent.ensureVersion(t.Context()), ErrNativeTreeBusy)
+	})
+
+	t.Run("busy retry", func(t *testing.T) {
+		agent := newVersionAgent()
+		agent.options.hostAuthoritySupplied = true
+		agent.options.HostAuthority = &edgeHostAuthority{reclaim: func(context.Context, string) error {
+			return ErrNativeTreeBusy
+		}}
+		done := make(chan struct{})
+		close(done)
+		construction := &nativeConstruction{
+			done: done, err: ErrNativeTreeBusy, generationRoot: "/busy", generationPrepared: true,
+			nativeBoundary: newNativeBoundaryTracker(),
+		}
+		agent.constructions[construction] = struct{}{}
+		require.ErrorIs(t, agent.ensureVersion(t.Context()), ErrNativeTreeBusy)
+	})
+
+	t.Run("generation creation", func(t *testing.T) {
+		restoreRuntimeGenerationSeams(t)
+		agent := newVersionAgent()
+		runtimeGenerationEnsureScratchParent = func(string) (string, error) {
+			return "", ErrContainmentIncomplete
+		}
+		require.ErrorIs(t, agent.ensureVersion(t.Context()), ErrContainmentIncomplete)
+	})
+
+	t.Run("close after executable resolution", func(t *testing.T) {
+		agent := NewAgent(WithScratchDir(t.TempDir()))
+		agent.lookPath = func(string) (string, error) {
+			_, _ = agent.beginClose()
+
+			return "/fake/pi", nil
+		}
+		require.ErrorIs(t, agent.ensureVersion(t.Context()), errAgentClosed)
+	})
+
+	t.Run("cancel before probe", func(t *testing.T) {
+		agent := newVersionAgent()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		require.ErrorIs(t, agent.ensureVersion(ctx), context.Canceled)
+	})
+
+	t.Run("close at final gate", func(t *testing.T) {
+		agent := newVersionAgent()
+		ctx := &closeAgentOnErrContext{Context: t.Context(), agent: agent}
+		require.ErrorIs(t, agent.ensureVersion(ctx), errAgentClosed)
+	})
+}
+
+func TestAgentCloseAndAuthorityFenceEdges(t *testing.T) {
+	agent := NewAgent()
+	done := make(chan struct{})
+	close(done)
+	construction := &nativeConstruction{done: done, nativeBoundary: newNativeBoundaryTracker()}
+	agent.constructions[construction] = struct{}{}
+	attempt := &agentCloseAttempt{done: make(chan struct{})}
+	require.NoError(t, agent.close(attempt))
+	_, retained := agent.constructions[construction]
+	require.False(t, retained)
+
+	fenced := NewAgent()
+	shared := &agentSession{agent: fenced, id: acp.SessionId("shared")}
+	retainedOnly := &agentSession{agent: fenced, id: acp.SessionId("retained")}
+	fenced.sessions[shared.id] = shared
+	fenced.sessions[acp.SessionId("shared-alias")] = shared
+	fenced.retainedSessions[shared] = struct{}{}
+	fenced.retainedSessions[retainedOnly] = struct{}{}
+	fenced.fenceSessionsAfterAuthorityLoss(ErrHostAuthorityUnavailable)
+	require.ErrorIs(t, shared.nativeContainmentError(), ErrHostAuthorityUnavailable)
+	require.ErrorIs(t, retainedOnly.nativeContainmentError(), ErrHostAuthorityUnavailable)
 }
