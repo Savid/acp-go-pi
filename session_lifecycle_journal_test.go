@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -10,6 +11,66 @@ import (
 
 	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
+
+func TestLifecycleBoundaryDecoderEdges(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		``,
+		`[]`,
+		`{"`,
+		`{"allowed":`,
+		`{"allowed":1`,
+		`{} x`,
+	} {
+		_, err := decodeLifecycleBoundaryObject([]byte(raw), "edge", []string{"allowed"})
+		require.Error(t, err, raw)
+	}
+
+	for _, raw := range []string{
+		``,
+		`[]`,
+		`{"`,
+		`{"outer":{"inner":1}`,
+		`{"array":[1, {"nested": true}]`,
+		`{"array":[`,
+		`{"array":[1`,
+		`{"array":[{"nested":}`,
+		`{} {}`,
+		`{} x`,
+	} {
+		require.Error(t, validateLifecycleBoundaryDynamicObject([]byte(raw), "edge"), raw)
+	}
+	require.NoError(t, validateLifecycleBoundaryDynamicObject(
+		[]byte(`{"array":[1,{"nested":[true,null]}]}`), "edge",
+	))
+
+	decoder := json.NewDecoder(bytes.NewBufferString(`{"unterminated":`))
+	_, err := decoder.Token()
+	require.NoError(t, err)
+	require.Error(t, walkLifecycleBoundaryDynamicObject(decoder, "edge"))
+
+	for _, entry := range []SessionStoreEntry{
+		json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+		json.RawMessage(`{"version":1,"configuration":{"env":{},"extraPathDirs":["relative"]},"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+	} {
+		_, err = decodeLifecycleBoundaryRecord(entry)
+		require.Error(t, err)
+	}
+
+	store := NewInMemorySessionStore()
+	require.NoError(t, store.Append(t.Context(), SessionKey{
+		SessionID: "edge", Subpath: SessionStoreLifecycleSubpath,
+	}, []SessionStoreEntry{json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":1}`)}))
+	_, found, err := NewAgent(WithSessionStore(store)).lastLifecycleBoundary(t.Context(), "edge")
+	require.False(t, found)
+	require.Error(t, err)
+
+	session, _ := lifecycleSession(t, false)
+	session.fencePersistence()
+	require.True(t, session.persistFenced)
+	require.NoError(t, session.commitLifecycleBoundary(t.Context(), lifecycleBoundaryRecord{}))
+}
 
 // TestLifecycleBoundaryCommitFailure pins that a store the boundary record
 // cannot append to fails the boundary instead of letting a terminal event

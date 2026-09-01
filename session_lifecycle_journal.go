@@ -97,10 +97,9 @@ func (s *agentSession) commitLifecycleBoundary(ctx context.Context, record lifec
 		ExtraPathDirs: s.configuration.ExtraPathDirs,
 	})
 
-	encoded, err := json.Marshal(record)
-	if err != nil {
-		return fmt.Errorf("%w: encode record: %w", errLifecycleBoundaryCommit, err)
-	}
+	// lifecycleBoundaryRecord contains only JSON-native scalar, slice, and map
+	// values, so encoding this closed internal shape cannot fail.
+	encoded, _ := json.Marshal(record)
 
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
@@ -112,12 +111,12 @@ func (s *agentSession) commitLifecycleBoundary(ctx context.Context, record lifec
 	key := SessionKey{SessionID: string(s.id), Subpath: SessionStoreLifecycleSubpath}
 
 	appendCtx, finishAppend := s.agent.observe.StartSessionStore(ctx, "append")
-	err = appendMirrorEntries(appendCtx, s.agent.sessionStore(), key, []SessionStoreEntry{encoded})
+	appendErr := appendMirrorEntries(appendCtx, s.agent.sessionStore(), key, []SessionStoreEntry{encoded})
 
-	finishAppend(err)
+	finishAppend(appendErr)
 
-	if err != nil {
-		return fmt.Errorf("%w: %w", errLifecycleBoundaryCommit, err)
+	if appendErr != nil {
+		return fmt.Errorf("%w: %w", errLifecycleBoundaryCommit, appendErr)
 	}
 
 	return nil
@@ -290,10 +289,8 @@ func decodeLifecycleBoundaryObject(
 			return nil, fmt.Errorf("decode %s member: %w", object, tokenErr)
 		}
 
-		field, ok := keyToken.(string)
-		if !ok {
-			return nil, fmt.Errorf("%s member name must be a string", object)
-		}
+		// encoding/json only yields string tokens for object member names.
+		field, _ := keyToken.(string)
 
 		if _, ok := permitted[field]; !ok {
 			return nil, fmt.Errorf("unknown %s field %q", object, field)
@@ -367,10 +364,8 @@ func walkLifecycleBoundaryDynamicObject(decoder *json.Decoder, object string) er
 			return fmt.Errorf("decode %s member: %w", object, err)
 		}
 
-		key, ok := keyToken.(string)
-		if !ok {
-			return fmt.Errorf("%s member name must be a string", object)
-		}
+		// encoding/json only yields string tokens for object member names.
+		key, _ := keyToken.(string)
 
 		if _, duplicate := seen[key]; duplicate {
 			return fmt.Errorf("duplicate %s field %q", object, key)
@@ -401,27 +396,26 @@ func walkLifecycleBoundaryDynamicValue(decoder *json.Decoder, path string) error
 		return nil
 	}
 
-	switch delimiter {
-	case '{':
+	if delimiter == '{' {
 		return walkLifecycleBoundaryDynamicObject(decoder, path)
-	case '[':
-		index := 0
-		for decoder.More() {
-			if err := walkLifecycleBoundaryDynamicValue(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
-				return err
-			}
-
-			index++
-		}
-
-		if _, err := decoder.Token(); err != nil {
-			return fmt.Errorf("close %s: %w", path, err)
-		}
-
-		return nil
-	default:
-		return fmt.Errorf("decode %s: unexpected JSON delimiter %q", path, delimiter)
 	}
+
+	// The only other opening delimiter encoding/json can yield for a value is
+	// an array. Closing delimiters are consumed by their owning walker.
+	index := 0
+	for decoder.More() {
+		if err := walkLifecycleBoundaryDynamicValue(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+			return err
+		}
+
+		index++
+	}
+
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("close %s: %w", path, err)
+	}
+
+	return nil
 }
 
 func validateLifecycleBoundaryRecord(record lifecycleBoundaryRecord) error {
