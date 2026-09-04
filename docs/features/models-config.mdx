@@ -95,10 +95,11 @@ Keep secrets in `WithEnv` rather than in seeded files; see
 
 pi reads `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` from
 `settings.json` once at process start to choose what a session begins on, and
-writes its own selection back into those same keys whenever a session changes
-model or thinking level. In ordinary mode, `WithHome` gives every session one
-shared agent directory, so those three keys are the one channel through which a
-session's runtime choice could reach another session's startup.
+writes a selection back into those same keys wherever one is saved as the
+default: pi's own explicit save, and — on pi before 0.84.3 — every session
+change of model or thinking level. In ordinary mode, `WithHome` gives every
+session one shared agent directory, so those three keys are the one channel
+through which a session's runtime choice could reach another session's startup.
 
 The adapter never records a session's own model or thinking level there. Both
 travel to each pi process on its own RPC channel. Instead the adapter captures

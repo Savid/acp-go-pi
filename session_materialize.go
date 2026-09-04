@@ -112,11 +112,11 @@ func (a *Agent) durableHome() (string, error) {
 // reconcileHomeStartupDefaults puts the durable home's settings.json back to
 // the operator baseline for the keys pi reads at process start to choose a
 // model and thinking level. Every session launches against that one file and
-// pi writes its own choice into it whenever a session changes model or
-// thinking level, so without this a launch would start on whatever another
-// session last selected. The restored content is the operator's, identical for
-// every session, so concurrent launches cannot disagree about it. An ephemeral
-// per-session agent directory shares nothing and needs no reconciliation.
+// pi writes a choice into it wherever one is saved as the default, so without
+// this a launch would start on whatever another session last left there. The
+// restored content is the operator's, identical for every session, so
+// concurrent launches cannot disagree about it. An ephemeral per-session agent
+// directory shares nothing and needs no reconciliation.
 func (a *Agent) reconcileHomeStartupDefaults(agentDir string) error {
 	if a.options.Home == "" {
 		return nil

@@ -11,11 +11,12 @@ import (
 )
 
 // The settings.json keys pi reads once at process start to choose the model
-// and thinking level a session begins on. pi writes its own choice back into
-// the same keys whenever a session changes model or thinking level, so in a
-// durable home — one agent directory every session launches against — they are
-// the channel through which one session's runtime choice would otherwise
-// decide the next session's startup state.
+// and thinking level a session begins on. pi writes a choice back into the same
+// keys wherever one is saved as the default — its own explicit save, and every
+// session change on pi before 0.84.3 — so in a durable home, one agent
+// directory every session launches against, they are the channel through which
+// one session's runtime choice would otherwise decide the next session's
+// startup state.
 const (
 	settingDefaultProvider      = "defaultProvider"
 	settingDefaultModel         = "defaultModel"
