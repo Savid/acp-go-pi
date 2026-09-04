@@ -73,9 +73,8 @@ func TestOrdinaryUnixLookupEdges(t *testing.T) {
 }
 
 func TestOrdinaryProcessDetachedFailureEdges(t *testing.T) {
-	script := writeOrdinaryScript(t, "exit 0")
 	_, err := StartOrdinaryProcess(t.Context(), LaunchSpec{
-		ExecutablePath:  script,
+		ExecutablePath:  fakeOrdinaryExecutable(t),
 		AgentDir:        t.TempDir(),
 		BaseEnvironment: map[string]string{"PATH": os.Getenv("PATH")},
 		Cwd:             filepath.Join(t.TempDir(), "missing"),
@@ -95,7 +94,7 @@ func TestOrdinaryProcessDetachedFailureEdges(t *testing.T) {
 	require.False(t, process.waitStep(cancelled))
 	require.NoError(t, (*Process)(nil).Kill())
 
-	running := startOrdinaryScript(t, "while :; do sleep 1; done", time.Second)
+	running := startOrdinaryChild(t, ordinaryChildOutliveStdin, 30*time.Second)
 	require.NoError(t, running.Close())
 }
 

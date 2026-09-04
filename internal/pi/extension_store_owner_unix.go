@@ -27,3 +27,11 @@ func sharedExtensionOwnedByCaller(info fs.FileInfo) error {
 
 	return nil
 }
+
+// sharedExtensionModeLoose reports a store path an account other than its owner
+// may write. The store holds code pi executes, so an entry a second account
+// could rewrite between the check and the launch is never one a child starts
+// from.
+func sharedExtensionModeLoose(info fs.FileInfo) bool {
+	return info.Mode().Perm()&sharedExtensionLooseModeBits != 0
+}

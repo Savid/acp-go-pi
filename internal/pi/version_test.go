@@ -2,8 +2,6 @@ package pi
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,27 +12,30 @@ func TestProbeOrdinaryVersion(t *testing.T) {
 	_, err := ProbeOrdinaryVersion(t.Context(), "", nil)
 	require.ErrorContains(t, err, "resolve pi version executable")
 
-	script := filepath.Join(t.TempDir(), "fake-pi")
-	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\necho ' 0.80.6 '\n"), 0o700))
-	version, err := ProbeOrdinaryVersion(t.Context(), script, CaptureOrdinaryEnvironmentEntries())
+	executable := fakeOrdinaryExecutable(t)
+
+	version, err := ProbeOrdinaryVersion(t.Context(), executable, childProbeEnvironment(ordinaryChildVersion))
 	require.NoError(t, err)
 	require.Equal(t, "0.80.6", version)
 
-	empty := filepath.Join(t.TempDir(), "empty-pi")
-	require.NoError(t, os.WriteFile(empty, []byte("#!/bin/sh\nexit 0\n"), 0o700))
-	_, err = ProbeOrdinaryVersion(t.Context(), empty, CaptureOrdinaryEnvironmentEntries())
+	_, err = ProbeOrdinaryVersion(t.Context(), executable, childProbeEnvironment(ordinaryChildSilent))
 	require.ErrorContains(t, err, "empty output")
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
-	slow := filepath.Join(t.TempDir(), "slow-pi")
-	require.NoError(t, os.WriteFile(slow, []byte("#!/bin/sh\nsleep 30\n"), 0o700))
-	_, err = ProbeOrdinaryVersion(ctx, slow, CaptureOrdinaryEnvironmentEntries())
+	_, err = ProbeOrdinaryVersion(ctx, executable, childProbeEnvironment(ordinaryChildSleep))
 	require.Error(t, err)
 }
 
 func CaptureOrdinaryEnvironmentEntries() []string {
 	return environmentEntries(CaptureOrdinaryEnvironment())
+}
+
+// childProbeEnvironment is a captured ordinary environment with the fake
+// child's mode appended. The capture filter drops names pi has no use for,
+// which includes this one, so the probe is handed it directly.
+func childProbeEnvironment(mode string) []string {
+	return append(CaptureOrdinaryEnvironmentEntries(), ordinaryChildEnvKey+"="+mode)
 }
 
 func TestCheckMinimumVersion(t *testing.T) {

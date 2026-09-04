@@ -76,7 +76,7 @@ func newAuthHarness(t *testing.T, opts ...Option) *authHarness {
 		exchanges: make(map[string]*authExchange),
 	}
 
-	session, err := agent.startAndStoreSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	session, err := agent.startAndStoreSession(t.Context(), sessionStart{Cwd: testCwd})
 	require.NoError(t, err)
 	establishTestSession(session)
 

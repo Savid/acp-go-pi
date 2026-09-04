@@ -2,11 +2,9 @@ package pi
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -47,8 +45,8 @@ func TestLaunchSpecEnviron(t *testing.T) {
 	separator := string(os.PathListSeparator)
 	spec := LaunchSpec{
 		AgentDir:        "/agent",
-		BaseEnvironment: map[string]string{"PATH": "/usr/bin", "HOME": "/home/native"},
-		ExtraPathDirs:   []string{"/session/bin"},
+		BaseEnvironment: map[string]string{"PATH": absTestPath("usr", "bin"), "HOME": "/home/native"},
+		ExtraPathDirs:   []string{absTestPath("session", "bin")},
 		Env: map[string]string{
 			"OPENAI_API_KEY": "explicit",
 			"NODE_OPTIONS":   "--require=/tmp/inject.js",
@@ -59,7 +57,7 @@ func TestLaunchSpecEnviron(t *testing.T) {
 
 	environment := spec.Environ()
 	require.IsIncreasing(t, environment)
-	require.Contains(t, environment, "PATH=/session/bin"+separator+"/usr/bin")
+	require.Contains(t, environment, "PATH="+absTestPath("session", "bin")+separator+absTestPath("usr", "bin"))
 	require.Contains(t, environment, "HOME=/home/native")
 	require.Contains(t, environment, "OPENAI_API_KEY=explicit")
 	require.Contains(t, environment, "PI_OFFLINE=1")
@@ -72,10 +70,12 @@ func TestPrependPathDirsDropsUnusableEntries(t *testing.T) {
 	t.Parallel()
 
 	separator := string(os.PathListSeparator)
-	require.Equal(t, "/usr/bin", prependPathDirs("/usr/bin", nil))
-	require.Equal(t, "/usr/bin", prependPathDirs("/usr/bin", []string{"relative", ""}))
-	require.Equal(t, "/opt/bin"+separator+"/usr/bin", prependPathDirs("/usr/bin", []string{"/opt/bin"}))
-	require.Equal(t, "/usr/bin", prependPathDirs("/usr/bin", []string{"/a" + separator + "/b"}))
+	base := absTestPath("usr", "bin")
+	extra := absTestPath("opt", "bin")
+	require.Equal(t, base, prependPathDirs(base, nil))
+	require.Equal(t, base, prependPathDirs(base, []string{"relative", ""}))
+	require.Equal(t, extra+separator+base, prependPathDirs(base, []string{extra}))
+	require.Equal(t, base, prependPathDirs(base, []string{absTestPath("a") + separator + absTestPath("b")}))
 }
 
 func TestSafeExplicitEnvKeyBoundary(t *testing.T) {
@@ -88,34 +88,16 @@ func TestSafeExplicitEnvKeyBoundary(t *testing.T) {
 	}
 }
 
-func writeOrdinaryScript(t *testing.T, body string) string {
+func startOrdinaryChild(t *testing.T, mode string, step time.Duration) *Process {
 	t.Helper()
 
-	path := filepath.Join(t.TempDir(), "fake-pi")
-	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o700))
-
-	return path
-}
-
-func startOrdinaryScript(t *testing.T, body string, step time.Duration) *Process {
-	t.Helper()
-
-	executable := writeOrdinaryScript(t, body)
-	spec := LaunchSpec{
-		ExecutablePath:      executable,
+	process, err := StartOrdinaryProcess(t.Context(), LaunchSpec{
+		ExecutablePath:      fakeOrdinaryExecutable(t),
 		AgentDir:            t.TempDir(),
 		BaseEnvironment:     map[string]string{"PATH": os.Getenv("PATH")},
+		Env:                 map[string]string{ordinaryChildEnvKey: mode},
 		ShutdownStepTimeout: step,
-	}
-	var process *Process
-	var err error
-	for attempt := 0; attempt < 50; attempt++ {
-		process, err = StartOrdinaryProcess(t.Context(), spec)
-		if err == nil || !errors.Is(err, syscall.ETXTBSY) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = process.Close() })
 
@@ -130,7 +112,7 @@ func TestStartOrdinaryProcessValidation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err = StartOrdinaryProcess(ctx, LaunchSpec{ExecutablePath: "/bin/sh"})
+	_, err = StartOrdinaryProcess(ctx, LaunchSpec{ExecutablePath: fakeOrdinaryExecutable(t)})
 	require.ErrorIs(t, err, context.Canceled)
 
 	_, err = StartOrdinaryProcess(t.Context(), LaunchSpec{ExecutablePath: filepath.Join(t.TempDir(), "missing")})
@@ -140,7 +122,7 @@ func TestStartOrdinaryProcessValidation(t *testing.T) {
 func TestOrdinaryProcessStdinEOFAndOutput(t *testing.T) {
 	t.Parallel()
 
-	process := startOrdinaryScript(t, `cat >/dev/null; echo done`, time.Second)
+	process := startOrdinaryChild(t, ordinaryChildDrainAndReport, 30*time.Second)
 	require.ErrorContains(t, process.WaitErr(), "still running")
 	_, err := process.Stdin().Write([]byte("input\n"))
 	require.NoError(t, err)
@@ -155,21 +137,25 @@ func TestOrdinaryProcessStdinEOFAndOutput(t *testing.T) {
 	require.NoError(t, process.WaitErr())
 	data := make([]byte, 16)
 	n, _ := process.Stdout().Read(data)
-	require.Equal(t, "done\n", string(data[:n]))
+	require.Equal(t, ordinaryChildReply, strings.TrimSpace(string(data[:n])))
 }
 
 func TestOrdinaryProcessShutdownAndKill(t *testing.T) {
 	t.Parallel()
 
-	graceful := startOrdinaryScript(t, `cat >/dev/null`, time.Second)
+	// The step timeout only has to outlast the child's own startup, and the
+	// child is a whole Go binary rather than a shell: a second is not a
+	// property of the shutdown being proved, and under race instrumentation it
+	// is not always enough for one to reach its first read.
+	graceful := startOrdinaryChild(t, ordinaryChildDrain, 30*time.Second)
 	require.NoError(t, graceful.Shutdown(t.Context()))
 	require.NoError(t, graceful.WaitErr())
 
-	forced := startOrdinaryScript(t, `trap '' TERM; while :; do sleep 0.1; done`, 20*time.Millisecond)
+	forced := startOrdinaryChild(t, ordinaryChildOutliveStdin, 20*time.Millisecond)
 	require.NoError(t, forced.Shutdown(t.Context()))
 	require.Error(t, forced.WaitErr())
 
-	killed := startOrdinaryScript(t, `while :; do sleep 0.1; done`, time.Second)
+	killed := startOrdinaryChild(t, ordinaryChildOutliveStdin, 30*time.Second)
 	require.NoError(t, killed.Kill())
 	select {
 	case <-killed.Exited():
@@ -181,17 +167,16 @@ func TestOrdinaryProcessShutdownAndKill(t *testing.T) {
 func TestOrdinaryProcessStderrAndEnvironment(t *testing.T) {
 	t.Parallel()
 
-	failed := startOrdinaryScript(t, `echo "boom: real cause" >&2; exit 3`, time.Second)
+	failed := startOrdinaryChild(t, ordinaryChildFail, 30*time.Second)
 	<-failed.Exited()
 	require.ErrorContains(t, failed.WaitErr(), "exit status 3")
-	require.Contains(t, failed.StderrTail(), "boom: real cause")
+	require.Contains(t, failed.StderrTail(), ordinaryChildStderr)
 
-	script := writeOrdinaryScript(t, `env`)
 	process, err := StartOrdinaryProcess(t.Context(), LaunchSpec{
-		ExecutablePath:  script,
+		ExecutablePath:  fakeOrdinaryExecutable(t),
 		AgentDir:        t.TempDir(),
 		BaseEnvironment: map[string]string{"PATH": os.Getenv("PATH")},
-		Env:             map[string]string{"TEST_EXPLICIT_VALUE": "ok"},
+		Env:             map[string]string{"TEST_EXPLICIT_VALUE": "ok", ordinaryChildEnvKey: ordinaryChildReportEnv},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = process.Close() })
@@ -225,7 +210,7 @@ func TestOrdinaryTailBufferBounds(t *testing.T) {
 func TestOrdinaryProcessKillAfterExit(t *testing.T) {
 	t.Parallel()
 
-	process := startOrdinaryScript(t, `exit 0`, time.Second)
+	process := startOrdinaryChild(t, ordinaryChildExit, 30*time.Second)
 	<-process.Exited()
 	require.NoError(t, process.Kill())
 	require.NoError(t, process.WaitErr())

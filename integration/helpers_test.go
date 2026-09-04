@@ -97,6 +97,14 @@ func expectedBuiltinCommandNames(t *testing.T, executable string) []string {
 }
 
 func TestMain(m *testing.M) {
+	// A copy of this binary published as a pi executable carries its
+	// instructions in a file beside the image. The role is claimed here,
+	// before the test framework looks at arguments that belong to pi.
+	if sidecar, found := loadFakePiSidecar(); found {
+		recordFakePiLaunch(sidecar)
+		os.Exit(runFakePi(os.Args))
+	}
+
 	previousLogger := slog.Default()
 	slog.SetDefault(integrationLogger)
 

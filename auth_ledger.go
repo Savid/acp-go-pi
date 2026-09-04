@@ -257,7 +257,7 @@ func (l *authLedger) writeEntry(record authLedgerRecord) error {
 		return errors.Join(fmt.Errorf("commit provider auth ledger entry: %w", err), ledgerRemove(temp))
 	}
 
-	return l.syncDir()
+	return syncAuthLedgerDirectory(l.dir)
 }
 
 func writeLedgerFile(file ledgerFile, contents []byte) error {
@@ -274,15 +274,6 @@ func writeLedgerFile(file ledgerFile, contents []byte) error {
 	}
 
 	return file.Close()
-}
-
-func (l *authLedger) syncDir() error {
-	dir, err := ledgerOpen(l.dir)
-	if err != nil {
-		return fmt.Errorf("open provider auth ledger root: %w", err)
-	}
-
-	return errors.Join(dir.Sync(), dir.Close())
 }
 
 func (l *authLedger) list() ([]authLedgerRecord, error) {

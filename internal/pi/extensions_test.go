@@ -166,11 +166,9 @@ func TestSessionResidenceFilesArePublishedOnce(t *testing.T) {
 
 	residence, files := mustCreateResidence(t, t.TempDir(), t.TempDir(), &MCPConfig{})
 
-	info, err := os.Stat(files.MCPConfigPath)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o400), info.Mode().Perm())
+	requireRestrictedMode(t, files.MCPConfigPath, 0o400)
 
-	_, err = residence.publish(MCPConfigFileName, []byte("replacement"))
+	_, err := residence.publish(MCPConfigFileName, []byte("replacement"))
 	require.ErrorContains(t, err, "publish session residence file")
 	require.NoFileExists(t, files.MCPConfigPath+residenceStagingSuffix)
 

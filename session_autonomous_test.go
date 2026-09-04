@@ -1555,7 +1555,7 @@ func TestCancelledHostDoorsStillJoinObservableContainment(t *testing.T) {
 				return nil
 			}
 
-			start := sessionStart{Cwd: "/cwd", ResumeID: "id"}
+			start := sessionStart{Cwd: testCwd, ResumeID: "id"}
 			session := &agentSession{
 				agent:       agent,
 				id:          "id",

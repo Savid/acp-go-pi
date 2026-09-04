@@ -31,7 +31,75 @@ const (
 	// selects the default scenario, which mimics a credential-less real pi
 	// (unknown model, empty catalog, prompts rejected).
 	envFakePiMode = "ACP_GO_PI_FAKE_MODE"
+	// fakePiSidecarSuffix names the instruction file that sits beside a copy of
+	// this binary published as a pi executable. A copy is launched by the
+	// adapter itself, so it arrives with pi's arguments and with an environment
+	// the launch spec composed rather than one a test wrote: the file beside
+	// the image is the one channel neither of those touches. The root package's
+	// unit fixture spells the same suffix.
+	fakePiSidecarSuffix = ".acp-fake-pi.json"
 )
+
+// fakePiSidecar is everything a published copy of this binary needs to act as
+// a pi: what to answer, and where to record that it was launched at all.
+type fakePiSidecar struct {
+	Scenario     fakeScenario `json:"scenario"`
+	LaunchRecord string       `json:"launchRecord,omitempty"`
+	CanaryEnv    string       `json:"canaryEnv,omitempty"`
+}
+
+// fakePiSidecarFor names the instruction file belonging to one executable.
+func fakePiSidecarFor(executable string) string {
+	return executable + fakePiSidecarSuffix
+}
+
+// loadFakePiSidecar reads the instruction file beside this executable, and
+// reports absence rather than failing: an ordinary test run of this binary has
+// no sidecar and is not a fake pi.
+func loadFakePiSidecar() (fakePiSidecar, bool) {
+	executable, err := os.Executable()
+	if err != nil {
+		return fakePiSidecar{}, false
+	}
+
+	data, err := os.ReadFile(fakePiSidecarFor(executable)) // #nosec G304 -- path derived from this image.
+	if err != nil {
+		return fakePiSidecar{}, false
+	}
+
+	var sidecar fakePiSidecar
+	if json.Unmarshal(data, &sidecar) != nil {
+		return fakePiSidecar{}, false
+	}
+
+	return sidecar, true
+}
+
+// recordFakePiLaunch appends one line naming the arguments this launch carried
+// and the value of the ambient canary the launch was supposed to have
+// scrubbed. It is written before anything is parsed, so a launch that goes on
+// to fail still leaves its evidence.
+func recordFakePiLaunch(sidecar fakePiSidecar) {
+	if sidecar.LaunchRecord == "" {
+		return
+	}
+
+	line, err := json.Marshal(map[string]string{
+		"canary": os.Getenv(sidecar.CanaryEnv),
+		"args":   strings.Join(os.Args[1:], " "),
+	})
+	if err != nil {
+		return
+	}
+
+	file, err := os.OpenFile(sidecar.LaunchRecord, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) // #nosec G304 -- path supplied by the test that published this image.
+	if err != nil {
+		return
+	}
+
+	_, _ = file.Write(append(line, '\n'))
+	_ = file.Close()
+}
 
 const fakePiVersion = "0.80.6"
 
@@ -312,6 +380,10 @@ func runFakePi(args []string) int {
 
 func loadFakeScenario() (fakeScenario, error) {
 	var scenario fakeScenario
+
+	if sidecar, found := loadFakePiSidecar(); found {
+		return sidecar.Scenario, nil
+	}
 
 	path := os.Getenv(envFakePiMode)
 	if path == "" {

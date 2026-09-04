@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -443,7 +442,7 @@ func TestCloseAndServeJoinAdmittedIncompleteSessionConstruction(t *testing.T) {
 		_, err := agent.NewSession(context.Background(), NewSessionRequest(t.TempDir()))
 		newSessionErr <- err
 	}()
-	<-spawnStarted
+	awaitTestSignal(t, spawnStarted, "the admitted session construction reaching the spawn")
 
 	serveCreated := make(chan struct{})
 	newServeAgent = func(...Option) *Agent {
@@ -459,7 +458,7 @@ func TestCloseAndServeJoinAdmittedIncompleteSessionConstruction(t *testing.T) {
 	})
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- Serve(serveCtx, input, io.Discard) }()
-	<-serveCreated
+	awaitTestSignal(t, serveCreated, "Serve adopting the agent under construction")
 	cancelServe()
 
 	closeErr := make(chan error, 1)
@@ -529,14 +528,14 @@ func TestCloseAndServeJoinAdmittedIncompletePromptRelaunch(t *testing.T) {
 	})
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- Serve(serveCtx, input, io.Discard) }()
-	<-serveCreated
+	awaitTestSignal(t, serveCreated, "Serve adopting the agent holding the relaunching session")
 
 	promptErr := make(chan error, 1)
 	go func() {
 		_, err := agent.Prompt(context.Background(), TextPromptRequest(sessionID, "relaunch-turn", "retry"))
 		promptErr <- err
 	}()
-	<-spawnStarted
+	awaitTestSignal(t, spawnStarted, "the prompt relaunch reaching the spawn")
 
 	cancelServe()
 	closeErr := make(chan error, 1)
@@ -566,24 +565,21 @@ func TestCloseAndServeJoinAdmittedIncompletePromptRelaunch(t *testing.T) {
 	require.ErrorIs(t, agent.Close(), ErrContainmentIncomplete)
 }
 
+// ordinaryPiHarness publishes a fake pi that records every launch it receives,
+// and hands back the executable and the record. The recording is the harness's
+// own first act rather than a wrapper around it, because a wrapper would have
+// to be a script and the adapter launches an executable image.
 func ordinaryPiHarness(t *testing.T, scenario unitFakeScenario) (string, string) {
 	t.Helper()
 
-	dir := t.TempDir()
-	record := filepath.Join(dir, "launch.jsonl")
-	inner := unitFakeExecutable(t, scenario)
-	wrapper := filepath.Join(dir, "pi")
+	record := filepath.Join(t.TempDir(), "launch.jsonl")
+	executable := publishUnitFake(t, unitFakeSidecar{
+		Scenario:     scenario,
+		LaunchRecord: record,
+		CanaryEnv:    "ACP_GO_PI_TEST_ACTUAL_AMBIENT",
+	})
 
-	script := fmt.Sprintf(
-		"#!/bin/sh\n"+
-			"printf '{\"canary\":\"%%s\",\"args\":\"%%s\"}\\n' "+
-			"\"${ACP_GO_PI_TEST_ACTUAL_AMBIENT:-}\" \"$*\" >> %q\n"+
-			"exec %q \"$@\"\n",
-		record, inner,
-	)
-	require.NoError(t, os.WriteFile(wrapper, []byte(script), 0o700))
-
-	return wrapper, record
+	return executable, record
 }
 
 func ordinaryLaunches(t *testing.T, record string) []ordinaryLaunch {
@@ -766,7 +762,7 @@ func TestConstructionOwnershipEdges(t *testing.T) {
 
 			return nil
 		}
-		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: testCwd})
 		require.ErrorIs(t, err, ErrContainmentIncomplete)
 	})
 
@@ -783,7 +779,7 @@ func TestConstructionOwnershipEdges(t *testing.T) {
 			}
 			agent.mu.Unlock()
 		}
-		_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
+		_, err := agent.startSession(t.Context(), sessionStart{Cwd: testCwd})
 		require.ErrorIs(t, err, ErrContainmentIncomplete)
 	})
 

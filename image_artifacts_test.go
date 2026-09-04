@@ -45,7 +45,7 @@ func imageArtifactRows(t *testing.T, timestamp time.Time) []SessionStoreEntry {
 	png := fixtureBase64(t, "valid.png")
 
 	return []SessionStoreEntry{
-		json.RawMessage(`{"type":"session","cwd":"/cwd"}`),
+		json.RawMessage(`{"type":"session","cwd":` + testCwdJSON + `}`),
 		messageRow(t, pi.AgentMessage{
 			Role:      messageRoleUser,
 			Timestamp: timestamp.UnixMilli(),

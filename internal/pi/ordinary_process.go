@@ -267,7 +267,7 @@ func (p *Process) Kill() error {
 	}
 
 	err := ordinaryProcessKill(p.cmd.Process)
-	if errors.Is(err, os.ErrProcessDone) {
+	if ordinaryProcessAlreadyFinished(err) {
 		return nil
 	}
 

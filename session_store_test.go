@@ -215,13 +215,13 @@ func TestStoreStartedSessionRecheckEdges(t *testing.T) {
 
 	cancelledCtx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, err := NewAgent().restoreSession(cancelledCtx, id, sessionStart{Cwd: "/cwd"}, nil)
+	_, err := NewAgent().restoreSession(cancelledCtx, id, sessionStart{Cwd: testCwd}, nil)
 	require.ErrorIs(t, err, context.Canceled)
 
 	agent := NewAgent()
 	agent.sessions[id] = &agentSession{agent: agent, id: id, configuration: sessionConfigurationRecord{
 		ExtraPathDirs: []string{"relative"},
 	}}
-	_, err = agent.restoreSession(t.Context(), id, sessionStart{Cwd: "/cwd"}, nil)
+	_, err = agent.restoreSession(t.Context(), id, sessionStart{Cwd: testCwd}, nil)
 	require.Error(t, err)
 }

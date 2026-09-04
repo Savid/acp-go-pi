@@ -636,7 +636,7 @@ func TestHostAuthorityForkMirrorFollowsWaitAndReclaim(t *testing.T) {
 	t.Cleanup(authority.cleanup)
 	baseStore := NewInMemorySessionStore()
 	require.NoError(t, baseStore.Append(t.Context(), SessionKey{SessionID: string(forkParentID)}, []SessionStoreEntry{
-		json.RawMessage(`{"type":"session","id":"` + string(forkParentID) + `","cwd":"/cwd"}`),
+		json.RawMessage(`{"type":"session","id":"` + string(forkParentID) + `","cwd":` + testCwdJSON + `}`),
 		json.RawMessage(`{"type":"message","role":"user"}`),
 	}))
 	appendLifecycleBoundaryForRows(t, baseStore, string(forkParentID), 2)

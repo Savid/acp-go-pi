@@ -9,20 +9,20 @@ import (
 func TestPathValidationHelpers(t *testing.T) {
 	require.Error(t, validateRequiredAbsolutePath("cwd", ""))
 	require.Error(t, validateRequiredAbsolutePath("cwd", "relative"))
-	require.NoError(t, validateRequiredAbsolutePath("cwd", "/absolute"))
+	require.NoError(t, validateRequiredAbsolutePath("cwd", absTestPath("absolute")))
 	require.NoError(t, validateOptionalAbsolutePath("cwd", nil))
 	empty := ""
 	require.NoError(t, validateOptionalAbsolutePath("cwd", &empty))
 	relative := "relative"
 	require.Error(t, validateOptionalAbsolutePath("cwd", &relative))
-	absolute := "/absolute"
+	absolute := absTestPath("absolute")
 	require.NoError(t, validateOptionalAbsolutePath("cwd", &absolute))
 	require.Error(t, validateAbsolutePaths("paths", []string{""}))
 	require.Error(t, validateAbsolutePaths("paths", []string{"relative"}))
-	require.NoError(t, validateAbsolutePaths("paths", []string{"/one", "/two"}))
+	require.NoError(t, validateAbsolutePaths("paths", []string{absTestPath("one"), absTestPath("two")}))
 	require.Error(t, validateSessionStartPaths("", nil))
-	require.Error(t, validateSessionStartPaths("/cwd", []string{"relative"}))
-	require.NoError(t, validateSessionStartPaths("/cwd", []string{"/also"}))
+	require.Error(t, validateSessionStartPaths(testCwd, []string{"relative"}))
+	require.NoError(t, validateSessionStartPaths(testCwd, []string{absTestPath("also")}))
 }
 
 func TestConfigurationAndAdmissionEdges(t *testing.T) {

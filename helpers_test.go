@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,6 +28,41 @@ const (
 	forkParentID = acp.SessionId("11111111-1111-4111-8111-111111111111")
 	forkChildID  = "22222222-2222-4222-8222-222222222222"
 )
+
+// windowsGOOS names the one platform whose path spelling and environment
+// folding differ from every other target this adapter builds for.
+const windowsGOOS = "windows"
+
+// absTestPath builds a host-absolute path from POSIX-looking segments, so a
+// test states "an absolute working directory" rather than a spelling only one
+// platform accepts.
+func absTestPath(segments ...string) string {
+	root := "/"
+	if runtime.GOOS == windowsGOOS {
+		root = `C:\`
+	}
+
+	return filepath.Join(append([]string{root}, segments...)...)
+}
+
+// testCwd is the host-absolute working directory tests open sessions under.
+var testCwd = absTestPath("cwd")
+
+// testCwdJSON is testCwd as a JSON string, quotes and separator escaping
+// included, so a stored row names the same directory a request carries.
+var testCwdJSON = jsonLiteral(testCwd)
+
+// jsonLiteral encodes a value the test itself supplies, for embedding in a raw
+// store row. Only a value no test constructs can fail here, so a failure is a
+// programming error rather than a case a caller answers.
+func jsonLiteral(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+
+	return string(encoded)
+}
 
 // newStubClientAgent builds an agent whose version probe and pi process
 // launch are faked so tests can drive the given stub client directly.
@@ -885,4 +922,41 @@ func lifecycleSession(t *testing.T, authoritative bool) (*agentSession, *directA
 // which is why no fixture may stand one in for a real prompt's correlation.
 func testSubmission() lifecycle.Submission {
 	return lifecycle.Submission{SubmissionID: "submission", ClientNonce: "nonce"}
+}
+
+// launchEnvValue reads a composed launch environment the way the platform
+// stores it. Windows folds environment names to one case, so the key a caller
+// supplied is not always the key the launch carries.
+func launchEnvValue(env map[string]string, key string) string {
+	if value, found := env[key]; found {
+		return value
+	}
+
+	for name, value := range env {
+		if strings.EqualFold(name, key) {
+			return value
+		}
+	}
+
+	return ""
+}
+
+// testSignalTimeout bounds a rendezvous a test waits on. It is generous
+// because it is not measuring anything: it exists only so a signal that will
+// never arrive is reported where it was expected instead of hanging the
+// package until its own timeout.
+const testSignalTimeout = 30 * time.Second
+
+// awaitTestSignal receives one rendezvous signal or fails the test. A signal
+// that never comes almost always means the call meant to reach the point that
+// sends it was refused before it got there, and a bounded wait names that
+// failure instead of leaving a goroutine dump to be read.
+func awaitTestSignal(t *testing.T, signal <-chan struct{}, what string) {
+	t.Helper()
+
+	select {
+	case <-signal:
+	case <-time.After(testSignalTimeout):
+		require.FailNowf(t, "timed out waiting for a test signal", "%s", what)
+	}
 }

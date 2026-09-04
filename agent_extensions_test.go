@@ -147,7 +147,7 @@ func TestForkExtensionStoreLimitAfterNativeClone(t *testing.T) {
 func TestForkFailsClosedWhenOpeningCatalogIsRejected(t *testing.T) {
 	store := newFaultySessionStore()
 	appendForkParentRows(t, store,
-		json.RawMessage(`{"type":"session","id":"`+string(forkParentID)+`","cwd":"/cwd"}`),
+		json.RawMessage(`{"type":"session","id":"`+string(forkParentID)+`","cwd":`+testCwdJSON+`}`),
 		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`[{"type":"text","text":"hi"}]`)}),
 	)
 	client := newStubPiClient()

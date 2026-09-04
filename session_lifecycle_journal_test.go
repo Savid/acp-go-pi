@@ -190,23 +190,6 @@ func TestLastLifecycleBoundaryRejectsAmbiguousSchemaFields(t *testing.T) {
 	}
 }
 
-func TestLastLifecycleBoundaryAcceptsCaseDistinctEnvironmentKeys(t *testing.T) {
-	t.Parallel()
-
-	boundary := json.RawMessage(`{"version":1,"configuration":{"env":{"Token":"one","TOKEN":"two"},"extraPathDirs":[]},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`)
-	store := NewInMemorySessionStore()
-	require.NoError(t, store.Append(t.Context(), SessionKey{
-		SessionID: "session",
-		Subpath:   SessionStoreLifecycleSubpath,
-	}, []SessionStoreEntry{boundary}))
-
-	agent := NewAgent(WithSessionStore(store))
-	record, found, err := agent.lastLifecycleBoundary(t.Context(), "session")
-	require.NoError(t, err)
-	require.True(t, found)
-	require.Equal(t, map[string]string{"Token": "one", "TOKEN": "two"}, record.Configuration.Env)
-}
-
 // TestCloseBoundaryOnAnIdleForegroundReadsBack pins the journal reader against
 // the shape its own writer produces. A settled turn leaves the foreground idle:
 // the terminal transition clears the turn and the cycle outlives it, so the
@@ -262,17 +245,17 @@ func TestSessionRestoreMethodsRejectAnInvalidLifecycleJournal(t *testing.T) {
 
 	tests := map[string]func(*Agent) error{
 		"load": func(agent *Agent) error {
-			_, err := agent.LoadSession(t.Context(), LoadSessionRequest(validSessionUUID, "/cwd"))
+			_, err := agent.LoadSession(t.Context(), LoadSessionRequest(validSessionUUID, testCwd))
 
 			return err
 		},
 		"resume": func(agent *Agent) error {
-			_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(validSessionUUID, "/cwd"))
+			_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(validSessionUUID, testCwd))
 
 			return err
 		},
 		"fork": func(agent *Agent) error {
-			_, err := agent.handleForkSession(t.Context(), forkRaw(t, ForkSessionRequest(validSessionUUID, "/cwd")))
+			_, err := agent.handleForkSession(t.Context(), forkRaw(t, ForkSessionRequest(validSessionUUID, testCwd)))
 
 			return err
 		},
@@ -284,7 +267,7 @@ func TestSessionRestoreMethodsRejectAnInvalidLifecycleJournal(t *testing.T) {
 
 			store := NewInMemorySessionStore()
 			require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: validSessionUUID}, []SessionStoreEntry{
-				json.RawMessage(`{"type":"session","id":"01234567-89ab-cdef-0123-456789abcdef","cwd":"/cwd"}`),
+				json.RawMessage(`{"type":"session","id":"01234567-89ab-cdef-0123-456789abcdef","cwd":` + testCwdJSON + `}`),
 			}))
 			require.NoError(t, store.Append(t.Context(), SessionKey{
 				SessionID: validSessionUUID,
@@ -295,4 +278,21 @@ func TestSessionRestoreMethodsRejectAnInvalidLifecycleJournal(t *testing.T) {
 			require.ErrorContains(t, invoke(agent), "decode lifecycle journal")
 		})
 	}
+}
+
+// caseDistinctEnvironmentBoundary stores one lifecycle boundary whose
+// configuration names two environment variables that differ only in case. What
+// a reader may do with it is platform-specific, so the two verdicts are pinned
+// in the platform files beside this helper.
+func caseDistinctEnvironmentBoundary(t *testing.T) *Agent {
+	t.Helper()
+
+	boundary := json.RawMessage(`{"version":1,"configuration":{"env":{"Token":"one","TOKEN":"two"},"extraPathDirs":[]},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`)
+	store := NewInMemorySessionStore()
+	require.NoError(t, store.Append(t.Context(), SessionKey{
+		SessionID: "session",
+		Subpath:   SessionStoreLifecycleSubpath,
+	}, []SessionStoreEntry{boundary}))
+
+	return NewAgent(WithSessionStore(store))
 }

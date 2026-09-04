@@ -13,7 +13,7 @@ func TestReplayMappingsAndStoreMetadata(t *testing.T) {
 	png := fixtureBase64(t, "valid.png")
 	rows := []SessionStoreEntry{
 		json.RawMessage(`bad`),
-		json.RawMessage(`{"type":"session","cwd":"/cwd"}`),
+		json.RawMessage(`{"type":"session","cwd":` + testCwdJSON + `}`),
 		json.RawMessage(`{"type":"session_info","name":" Named "}`),
 		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`[{"type":"text","text":"hello"},{"type":"image","data":"` + png + `","mimeType":"image/png"}]`)}),
 		messageRow(t, pi.AgentMessage{Role: messageRoleAssistant, ACPMessageID: "018f47ad-839d-7f70-b7f7-c01d6d97b675", Content: json.RawMessage(`[{"type":"thinking","thinking":"thought"},{"type":"text","text":"answer"},{"type":"toolCall","id":"call","name":"bash","arguments":{"command":"true"}}]`)}),
@@ -25,7 +25,7 @@ func TestReplayMappingsAndStoreMetadata(t *testing.T) {
 	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675", *updates[2].AgentThoughtChunk.MessageId)
 	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675", *updates[3].AgentMessageChunk.MessageId)
 	require.Equal(t, "Named", storeSessionTitle("fallback", rows))
-	require.Equal(t, "/cwd", storeSessionCwd(rows))
+	require.Equal(t, testCwd, storeSessionCwd(rows))
 	require.True(t, storeSessionHasContent(rows))
 	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675", terminalAssistantMessageID(rows))
 

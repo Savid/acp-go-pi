@@ -751,7 +751,7 @@ func TestCloseAndRelaunchElectOneExactGeneration(t *testing.T) {
 
 		relaunchDone := make(chan error, 1)
 		go func() { relaunchDone <- session.relaunchProcess(context.Background()) }()
-		<-started
+		awaitTestSignal(t, started, "the relaunch reaching the native client start")
 
 		attempt, owner := session.beginClose()
 		require.True(t, owner)
@@ -793,7 +793,7 @@ func TestCloseAndRelaunchElectOneExactGeneration(t *testing.T) {
 
 		relaunchDone := make(chan error, 1)
 		go func() { relaunchDone <- session.relaunchProcess(context.Background()) }()
-		<-published
+		awaitTestSignal(t, published, "the relaunch publishing its whole generation")
 
 		attempt, owner := session.beginClose()
 		require.True(t, owner)
@@ -1468,9 +1468,7 @@ func TestSessionResidenceSurvivesRelaunch(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, config, relaunchedConfig)
 
-			info, err := os.Stat(relaunched.Env[pi.EnvMCPConfig])
-			require.NoError(t, err)
-			require.Equal(t, os.FileMode(0o400), info.Mode().Perm())
+			requireRestrictedMode(t, relaunched.Env[pi.EnvMCPConfig], 0o400)
 
 			for _, path := range relaunched.ExtensionPaths {
 				require.FileExists(t, path)
@@ -1666,7 +1664,7 @@ func TestNextRuntimeLaunchFailureBranches(t *testing.T) {
 		replacement, err := session.nextRuntimeLaunch(t.Context(), previous)
 		require.NoError(t, err)
 		require.NoDirExists(t, oldRoot)
-		require.NotNil(t, replacement.browserShim)
+		requireRelaunchBrowserShim(t, replacement.browserShim)
 		require.NotNil(t, replacement.residence)
 		require.Equal(t, filepath.Dir(replacement.spec.Env[pi.EnvMCPConfig]), replacement.residence.Root())
 		require.Equal(t, string(session.id), replacement.spec.SessionID)

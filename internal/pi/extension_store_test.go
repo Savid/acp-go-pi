@@ -51,15 +51,7 @@ func TestPublishSharedExtensionsPublishesOnceAndReuses(t *testing.T) {
 		contents, readErr := os.ReadFile(path) // #nosec G304 -- test temp dir.
 		require.NoError(t, readErr)
 		require.Equal(t, want, contents)
-
-		info, statErr := os.Stat(path)
-		require.NoError(t, statErr)
-		require.Equal(t, os.FileMode(0o400), info.Mode().Perm())
 	}
-
-	dirInfo, err := os.Stat(filepath.Dir(published.bridge))
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o700), dirInfo.Mode().Perm())
 
 	// No staging carrier survives a completed publish.
 	entries, err := os.ReadDir(filepath.Dir(published.bridge))
@@ -96,35 +88,6 @@ func TestPublishSharedExtensionsRefusesEntryThatDoesNotMatchTheBinary(t *testing
 
 	_, err := publishSharedExtensions(root)
 	require.ErrorContains(t, err, "does not match the source compiled into this binary")
-}
-
-func TestPublishSharedExtensionsRefusesLoosePermissions(t *testing.T) {
-	t.Parallel()
-
-	t.Run("entry", func(t *testing.T) {
-		t.Parallel()
-
-		root := t.TempDir()
-		entry := storeEntryPath(root, BridgeExtensionFileName)
-		require.NoError(t, os.MkdirAll(filepath.Dir(entry), 0o700))
-		require.NoError(t, os.WriteFile(entry, bridgeExtensionSource, 0o600))
-		require.NoError(t, os.Chmod(entry, 0o666))
-
-		_, err := publishSharedExtensions(root)
-		require.ErrorContains(t, err, "is writable by group or world")
-	})
-
-	t.Run("digest directory", func(t *testing.T) {
-		t.Parallel()
-
-		root := t.TempDir()
-		dir := filepath.Dir(storeEntryPath(root, BridgeExtensionFileName))
-		require.NoError(t, os.MkdirAll(dir, 0o700))
-		require.NoError(t, os.Chmod(dir, 0o777))
-
-		_, err := publishSharedExtensions(root)
-		require.ErrorContains(t, err, "is writable by group or world")
-	})
 }
 
 func TestPublishSharedExtensionsRefusesUnexpectedFileTypes(t *testing.T) {

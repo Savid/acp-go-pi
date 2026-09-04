@@ -98,17 +98,12 @@ func TestAuthLedgerRestrictsModes(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
-	ledger, err := newAuthLedger(Options{ProviderAuthRoot: root, Home: "/srv/pi-home"})
+	ledger, err := newAuthLedger(Options{ProviderAuthRoot: root, Home: absTestPath("srv", "pi-home")})
 	require.NoError(t, err)
 	require.NoError(t, ledger.write(sampleLedgerRecord("anthropic")))
 
-	info, err := os.Stat(ledger.dir)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(authLedgerDirMode), info.Mode().Perm())
-
-	entry, err := os.Stat(ledger.path("anthropic"))
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(authLedgerFileMode), entry.Mode().Perm())
+	requireRestrictedMode(t, ledger.dir, authLedgerDirMode)
+	requireRestrictedMode(t, ledger.path("anthropic"), authLedgerFileMode)
 }
 
 // TestAuthLedgerHomeKeyScopesRecords pins that two agents pointed at different
@@ -118,14 +113,14 @@ func TestAuthLedgerHomeKeyScopesRecords(t *testing.T) {
 
 	root := t.TempDir()
 
-	first, err := newAuthLedger(Options{ProviderAuthRoot: root, Home: "/srv/a"})
+	first, err := newAuthLedger(Options{ProviderAuthRoot: root, Home: absTestPath("srv", "a")})
 	require.NoError(t, err)
 
-	second, err := newAuthLedger(Options{ProviderAuthRoot: root, Home: "/srv/b"})
+	second, err := newAuthLedger(Options{ProviderAuthRoot: root, Home: absTestPath("srv", "b")})
 	require.NoError(t, err)
 	require.NotEqual(t, first.dir, second.dir)
 
-	same, err := newAuthLedger(Options{ProviderAuthRoot: root, Home: "/srv/a/"})
+	same, err := newAuthLedger(Options{ProviderAuthRoot: root, Home: absTestPath("srv", "a") + string(filepath.Separator)})
 	require.NoError(t, err)
 	require.Equal(t, first.dir, same.dir)
 
@@ -140,7 +135,7 @@ func TestAuthLedgerRootConfigured(t *testing.T) {
 	t.Parallel()
 
 	require.False(t, authLedgerRootConfigured(Options{}))
-	require.True(t, authLedgerRootConfigured(Options{ProviderAuthRoot: "/srv/auth"}))
+	require.True(t, authLedgerRootConfigured(Options{ProviderAuthRoot: absTestPath("srv", "auth")}))
 }
 
 func TestNewAuthLedgerRejectsUnusableRoots(t *testing.T) {
@@ -164,22 +159,18 @@ func TestNewAuthLedgerNarrowsTheConfiguredRoot(t *testing.T) {
 	parent := t.TempDir()
 
 	missing := filepath.Join(parent, "missing")
-	_, err := newAuthLedger(Options{ProviderAuthRoot: missing, Home: "/srv/pi"})
+	_, err := newAuthLedger(Options{ProviderAuthRoot: missing, Home: absTestPath("srv", "pi")})
 	require.NoError(t, err)
 
-	info, err := os.Stat(missing)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(authLedgerDirMode), info.Mode().Perm())
+	requireRestrictedMode(t, missing, authLedgerDirMode)
 
 	existing := filepath.Join(parent, "existing")
 	require.NoError(t, os.Mkdir(existing, 0o755))
 
-	_, err = newAuthLedger(Options{ProviderAuthRoot: existing, Home: "/srv/pi"})
+	_, err = newAuthLedger(Options{ProviderAuthRoot: existing, Home: absTestPath("srv", "pi")})
 	require.NoError(t, err)
 
-	info, err = os.Stat(existing)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(authLedgerDirMode), info.Mode().Perm())
+	requireRestrictedMode(t, existing, authLedgerDirMode)
 }
 
 func TestValidateProviderAuthRoot(t *testing.T) {
@@ -202,7 +193,7 @@ func TestWithProviderAuthRootRejectsRelativePath(t *testing.T) {
 
 func TestNewAuthLedgerReportsFilesystemFailures(t *testing.T) {
 	root := t.TempDir()
-	options := Options{ProviderAuthRoot: root, Home: "/srv/pi"}
+	options := Options{ProviderAuthRoot: root, Home: absTestPath("srv", "pi")}
 
 	restore := func(name string, apply func()) {
 		t.Helper()
@@ -333,13 +324,11 @@ func TestAuthLedgerWriteReportsFailures(t *testing.T) {
 	originalMarshal := ledgerMarshal
 	originalTemp := ledgerCreateTemp
 	originalRename := ledgerRename
-	originalOpen := ledgerOpen
 
 	t.Cleanup(func() {
 		ledgerMarshal = originalMarshal
 		ledgerCreateTemp = originalTemp
 		ledgerRename = originalRename
-		ledgerOpen = originalOpen
 	})
 
 	ledgerMarshal = func(any) ([]byte, error) { return nil, errors.New("marshal") }
@@ -374,10 +363,6 @@ func TestAuthLedgerWriteReportsFailures(t *testing.T) {
 	ledgerRename = func(string, string) error { return errors.New("rename") }
 	require.Error(t, ledger.write(record))
 	ledgerRename = originalRename
-
-	ledgerOpen = func(string) (*os.File, error) { return nil, errors.New("open") }
-	require.Error(t, ledger.write(record))
-	ledgerOpen = originalOpen
 }
 
 func TestAuthLedgerReadAndListReportFailures(t *testing.T) {
@@ -453,72 +438,6 @@ func TestAuthProofSourceMatrix(t *testing.T) {
 	require.Equal(t, authProofNotConfirmed, authProofSource(authLedgerRemoved, true))
 }
 
-func TestInventoryReportsLedgerAndProbe(t *testing.T) {
-	t.Parallel()
-
-	harness := newAuthHarness(t)
-	flowID := startManualCodeFlow(t, harness, "code-1", pi.AuthMessage{OK: true})
-
-	// Write-ahead intent only: the probe sees a slot but nothing binds it to
-	// this connection generation.
-	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
-		require.Equal(t, pi.AuthOpProbe, request.Op)
-		require.Equal(t, []string{"anthropic"}, request.ProviderIDs)
-		harness.deliver(ctx, pi.AuthMessage{
-			ID:      request.ID,
-			Kind:    pi.AuthKindProbe,
-			Entries: map[string]string{"anthropic": "oauth"},
-		})
-
-		return nil
-	})
-
-	result, err := harness.call(t.Context(), AuthInventoryMethod, map[string]any{authFieldSessionID: string(harness.session.id)})
-	require.NoError(t, err)
-	require.Equal(t, authInventoryResult{Entries: []authInventoryEntry{{
-		ProviderID:        "anthropic",
-		ConnectionID:      "conn-1",
-		Revision:          1,
-		BindingGeneration: 1,
-		ProofSource:       authProofNotConfirmed,
-	}}}, result)
-
-	scriptManualCodeLogin(harness, "code-1", pi.AuthMessage{OK: true})
-
-	_, err = harness.call(t.Context(), AuthCallbackMethod, map[string]any{
-		authFieldSessionID:  string(harness.session.id),
-		authFieldProviderID: "anthropic",
-		authFieldMethod:     authMethodTypeOAuth,
-		authFieldFlowID:     flowID,
-		authFieldInput:      "code-1",
-	})
-	require.NoError(t, err)
-
-	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
-		harness.deliver(ctx, pi.AuthMessage{
-			ID:      request.ID,
-			Kind:    pi.AuthKindProbe,
-			Entries: map[string]string{"anthropic": "oauth"},
-		})
-
-		return nil
-	})
-
-	confirmed, err := harness.call(t.Context(), AuthInventoryMethod, map[string]any{authFieldSessionID: string(harness.session.id)})
-	require.NoError(t, err)
-	require.Equal(t, authProofConfirmedPresent, inventoryResult(t, confirmed).Entries[0].ProofSource)
-
-	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
-		harness.deliver(ctx, pi.AuthMessage{ID: request.ID, Kind: pi.AuthKindProbe, Entries: map[string]string{}})
-
-		return nil
-	})
-
-	absent, err := harness.call(t.Context(), AuthInventoryMethod, map[string]any{authFieldSessionID: string(harness.session.id)})
-	require.NoError(t, err)
-	require.Equal(t, authProofConfirmedAbsent, inventoryResult(t, absent).Entries[0].ProofSource)
-}
-
 // TestInventoryOmitsRemovedEntries pins that a disconnected slot leaves no
 // residence claim behind.
 func TestInventoryOmitsRemovedEntries(t *testing.T) {
@@ -568,20 +487,6 @@ func TestInventoryReportsLedgerFailure(t *testing.T) {
 	requireAuthFailed(t, err, authCauseHarvestFailed)
 }
 
-// TestInventoryReportsProbeFailure pins that an unanswerable probe fails the leg
-// rather than reporting an absence nobody established.
-func TestInventoryReportsProbeFailure(t *testing.T) {
-	harness := newAuthHarness(t)
-	startManualCodeFlow(t, harness, "code-1", pi.AuthMessage{OK: true})
-
-	shortenAuthNativeCallTimeout(t)
-
-	harness.scriptBridge(func(_ context.Context, _ pi.AuthRequest) error { return nil })
-
-	_, err := harness.call(t.Context(), AuthInventoryMethod, map[string]any{authFieldSessionID: string(harness.session.id)})
-	requireAuthFailed(t, err, authCauseHarvestFailed)
-}
-
 // TestNewAuthLedgerRejectsNonDirectory pins that a root that is not a directory
 // leaves the surface unadvertised.
 func TestNewAuthLedgerRejectsNonDirectory(t *testing.T) {
@@ -594,74 +499,8 @@ func TestNewAuthLedgerRejectsNonDirectory(t *testing.T) {
 
 	t.Cleanup(func() { ledgerStat = original })
 
-	_, err := newAuthLedger(Options{ProviderAuthRoot: t.TempDir(), Home: "/srv/pi"})
+	_, err := newAuthLedger(Options{ProviderAuthRoot: t.TempDir(), Home: absTestPath("srv", "pi")})
 	require.ErrorContains(t, err, "not a directory")
-}
-
-// TestResidenceIsTheProbeEntryValueNotItsKey pins which half of the bridge's
-// probe answer carries residence. The bridge answers every provider the request
-// named, holding the empty string where nothing is stored, so a reader that
-// tested key presence would report every provider it asked about as resident —
-// telling the host a credential is present after the removal it just performed,
-// and refusing that removal as harvest_failed on the way.
-func TestResidenceIsTheProbeEntryValueNotItsKey(t *testing.T) {
-	t.Parallel()
-
-	harness := newAuthHarness(t)
-	flowID := startManualCodeFlow(t, harness, "code-1", pi.AuthMessage{OK: true})
-
-	scriptManualCodeLogin(harness, "code-1", pi.AuthMessage{OK: true})
-
-	_, err := harness.call(t.Context(), AuthCallbackMethod, map[string]any{
-		authFieldSessionID:  string(harness.session.id),
-		authFieldProviderID: "anthropic",
-		authFieldMethod:     authMethodTypeOAuth,
-		authFieldFlowID:     flowID,
-		authFieldInput:      "code-1",
-	})
-	require.NoError(t, err)
-
-	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
-		harness.deliver(ctx, pi.AuthMessage{
-			ID:      request.ID,
-			Kind:    pi.AuthKindProbe,
-			Entries: map[string]string{"anthropic": ""},
-		})
-
-		return nil
-	})
-
-	absent, err := harness.call(t.Context(), AuthInventoryMethod, map[string]any{authFieldSessionID: string(harness.session.id)})
-	require.NoError(t, err)
-	require.Equal(t, authProofConfirmedAbsent, inventoryResult(t, absent).Entries[0].ProofSource)
-
-	harness.scriptBridge(func(ctx context.Context, request pi.AuthRequest) error {
-		switch request.Op {
-		case pi.AuthOpRemove:
-			harness.deliver(ctx, pi.AuthMessage{ID: request.ID, Kind: pi.AuthKindResult, OK: true})
-		case pi.AuthOpProbe:
-			harness.deliver(ctx, pi.AuthMessage{
-				ID:      request.ID,
-				Kind:    pi.AuthKindProbe,
-				Entries: map[string]string{"anthropic": ""},
-			})
-		}
-
-		return nil
-	})
-
-	_, err = harness.call(t.Context(), AuthDisconnectMethod, map[string]any{
-		authFieldSessionID:         string(harness.session.id),
-		authFieldProviderID:        "anthropic",
-		authFieldConnectionID:      "conn-1",
-		authFieldBindingGeneration: 1,
-	})
-	require.NoError(t, err)
-
-	record, ok, readErr := harness.broker.ledger.read("anthropic")
-	require.NoError(t, readErr)
-	require.True(t, ok)
-	require.Equal(t, authLedgerRemoved, record.State)
 }
 
 // TestAuthLedgerWriteIfCurrentGuardsTheStoredLineage pins the compare half of

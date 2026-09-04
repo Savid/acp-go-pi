@@ -35,9 +35,7 @@ func TestAgentDirWritesExplicitAuthJSON(t *testing.T) {
 	contents, err := os.ReadFile(path) // #nosec G304 -- test temp dir.
 	require.NoError(t, err)
 	require.Equal(t, auth, contents)
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	requireRestrictedMode(t, path, 0o600)
 
 	restoreAgentDirSeams(t)
 	realWrite := fsWriteFile

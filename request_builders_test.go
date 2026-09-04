@@ -14,7 +14,7 @@ import (
 
 func TestSessionRequestBuildersAndCloning(t *testing.T) {
 	meta := map[string]any{"foreign": map[string]any{"list": []any{"value"}}}
-	request := NewSessionRequest("/cwd",
+	request := NewSessionRequest(testCwd,
 		WithSessionAdditionalDirectories("/one", "/two"),
 		WithSessionMeta(meta),
 		WithSessionPiOptions(NewPiOptions(WithPiModel("fake/model"))),
@@ -27,16 +27,16 @@ func TestSessionRequestBuildersAndCloning(t *testing.T) {
 	anyMap(t, meta["foreign"])["changed"] = true
 	require.NotContains(t, anyMap(t, request.Meta["foreign"]), "changed")
 
-	load := LoadSessionRequest("id", "/cwd", WithSessionMeta(map[string]any{"x": true}))
-	resume := ResumeSessionRequest("id", "/cwd")
+	load := LoadSessionRequest("id", testCwd, WithSessionMeta(map[string]any{"x": true}))
+	resume := ResumeSessionRequest("id", testCwd)
 	require.Equal(t, acp.SessionId("id"), load.SessionId)
 	require.Equal(t, acp.SessionId("id"), resume.SessionId)
 	require.NotNil(t, load.McpServers)
 	require.Nil(t, resume.AdditionalDirectories)
 
-	output := NewSessionRequest("/cwd", WithSessionOutputSchema(map[string]any{"type": "object"}))
+	output := NewSessionRequest(testCwd, WithSessionOutputSchema(map[string]any{"type": "object"}))
 	require.NotEmpty(t, output.Meta)
-	emptyOutput := NewSessionRequest("/cwd", WithSessionOutputSchema(map[string]any{}))
+	emptyOutput := NewSessionRequest(testCwd, WithSessionOutputSchema(map[string]any{}))
 	require.Equal(t, map[string]any{}, anyMap(t, anyMap(t, emptyOutput.Meta[piMetaKey])[metaOptionsKey])[metaOutputSchemaKey])
 
 	prompt := PromptRequest("id", "turn-1", acp.TextBlock("text"))
@@ -59,11 +59,11 @@ func TestSessionRequestBuildersAndCloning(t *testing.T) {
 	require.Equal(t, acp.SessionId("id"), DeleteSessionRequest("id").SessionId)
 
 	list := ListSessionsRequest(
-		WithListSessionsCwd("/cwd"),
+		WithListSessionsCwd(testCwd),
 		WithListSessionsCursor("cursor"),
 		WithListSessionsMeta(map[string]any{"x": []string{"y"}}),
 	)
-	require.Equal(t, "/cwd", *list.Cwd)
+	require.Equal(t, testCwd, *list.Cwd)
 	require.Equal(t, "cursor", *list.Cursor)
 	require.Equal(t, []string{"y"}, list.Meta["x"])
 }
@@ -186,10 +186,10 @@ func TestMetaBuildersRejectEveryReservedLiteral(t *testing.T) {
 		}
 
 		for name, meta := range map[string]map[string]any{
-			"session/new":    NewSessionRequest("/cwd", WithSessionMeta(caller)).Meta,
-			"session/load":   LoadSessionRequest("id", "/cwd", WithSessionMeta(caller)).Meta,
-			"session/resume": ResumeSessionRequest("id", "/cwd", WithSessionMeta(caller)).Meta,
-			"session/fork":   ForkSessionRequest("id", "/cwd", WithSessionMeta(caller)).Meta,
+			"session/new":    NewSessionRequest(testCwd, WithSessionMeta(caller)).Meta,
+			"session/load":   LoadSessionRequest("id", testCwd, WithSessionMeta(caller)).Meta,
+			"session/resume": ResumeSessionRequest("id", testCwd, WithSessionMeta(caller)).Meta,
+			"session/fork":   ForkSessionRequest("id", testCwd, WithSessionMeta(caller)).Meta,
 			"session/list":   ListSessionsRequest(WithListSessionsMeta(caller)).Meta,
 		} {
 			require.Equal(t, caller, meta, name)

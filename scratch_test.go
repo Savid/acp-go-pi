@@ -37,7 +37,7 @@ func TestEnsureScratchParent(t *testing.T) {
 		info, err := os.Stat(dir)
 		require.NoError(t, err)
 		require.True(t, info.IsDir())
-		require.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+		requireRestrictedMode(t, dir, 0o700)
 	})
 
 	t.Run("regular-file parent is an error", func(t *testing.T) {

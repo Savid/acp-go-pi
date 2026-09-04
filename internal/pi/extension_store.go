@@ -245,7 +245,7 @@ func requireGuardedSharedExtensionPath(path string, info fs.FileInfo, wantDir bo
 		return fmt.Errorf("shared extension store %q is not a directory", path)
 	case !wantDir && !info.Mode().IsRegular():
 		return fmt.Errorf("shared extension %q is not a regular file", path)
-	case info.Mode().Perm()&sharedExtensionLooseModeBits != 0:
+	case sharedExtensionModeLoose(info):
 		return fmt.Errorf("shared extension path %q is writable by group or world", path)
 	}
 

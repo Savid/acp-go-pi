@@ -28,7 +28,7 @@ func TestPiOptionsMetaPreservesExplicitEmptyConfiguration(t *testing.T) {
 func TestResolveSessionConfigurationDistinguishesOmittedAndExplicitEmpty(t *testing.T) {
 	stored := sessionConfigurationRecord{
 		Env:           map[string]string{"TOKEN": "stored"},
-		ExtraPathDirs: []string{"/stored/first", "/stored/second"},
+		ExtraPathDirs: []string{absTestPath("stored", "first"), absTestPath("stored", "second")},
 	}
 
 	omitted, err := resolveSessionConfiguration(PiOptions{}, sessionConfigurationPresence{}, stored)
@@ -49,7 +49,7 @@ func TestResolveSessionConfigurationDistinguishesOmittedAndExplicitEmpty(t *test
 }
 
 func TestRecoveredEmptyConfigurationKeepsLifecycleFingerprint(t *testing.T) {
-	start := sessionStart{Cwd: "/cwd", ResumeID: "session"}
+	start := sessionStart{Cwd: testCwd, ResumeID: "session"}
 	recovered := start
 	var err error
 	recovered.MetaOptions, err = resolveSessionConfiguration(
@@ -103,7 +103,7 @@ func TestLifecycleBoundaryPersistsSessionConfiguration(t *testing.T) {
 		id:    "session",
 		configuration: sessionConfigurationRecord{
 			Env:           map[string]string{"TOKEN": "durable"},
-			ExtraPathDirs: []string{"/first", "/second"},
+			ExtraPathDirs: []string{absTestPath("first"), absTestPath("second")},
 		},
 	}
 
@@ -168,7 +168,7 @@ func TestStoredSessionConfigurationRejectsUnsafeValues(t *testing.T) {
 func TestColdRestoreReconstructsOmittedConfigurationAndHonorsExplicitEmpty(t *testing.T) {
 	stored := sessionConfigurationRecord{
 		Env:           map[string]string{"TOKEN": "stored"},
-		ExtraPathDirs: []string{"/stored/first", "/stored/second"},
+		ExtraPathDirs: []string{absTestPath("stored", "first"), absTestPath("stored", "second")},
 	}
 
 	tests := map[string]struct {
@@ -221,7 +221,7 @@ func TestColdRestoreReconstructsOmittedConfigurationAndHonorsExplicitEmpty(t *te
 func TestChangedActiveCarrierContainsBeforeSuccessorConstruction(t *testing.T) {
 	stored := sessionConfigurationRecord{
 		Env:           map[string]string{"TOKEN": "old"},
-		ExtraPathDirs: []string{"/stored/bin"},
+		ExtraPathDirs: []string{absTestPath("stored", "bin")},
 	}
 	store := NewInMemorySessionStore()
 	appendStoredSessionWithConfiguration(t, store, validSessionUUID, stored)
@@ -309,7 +309,7 @@ func TestChangedActiveCarrierContainsBeforeSuccessorConstruction(t *testing.T) {
 func TestChangedActiveCarrierContainmentFailurePublishesNothing(t *testing.T) {
 	stored := sessionConfigurationRecord{
 		Env:           map[string]string{"TOKEN": "old"},
-		ExtraPathDirs: []string{"/stored/bin"},
+		ExtraPathDirs: []string{absTestPath("stored", "bin")},
 	}
 	store := NewInMemorySessionStore()
 	appendStoredSessionWithConfiguration(t, store, validSessionUUID, stored)
