@@ -1,139 +1,37 @@
 ---
 title: "CLI"
-description: "Every flag the acp-go-pi binary accepts and what it maps to"
+description: "Every flag accepted by the acp-go-pi subprocess"
 ---
 
-`acp-go-pi` speaks ACP over stdin/stdout. Flags use Go's single-dash syntax.
+`acp-go-pi` speaks ACP over stdin/stdout. Flags use Go's single-dash
+syntax.
 
 ```sh
 acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt-4o
 ```
 
-## Optional Linux isolation policy
-
-Normal serve mode needs no isolation flag and runs Pi as the command's current
-root or non-root identity. The optional `-process-isolation-config` flag explicitly selects the
-trusted-root Linux-only boundary. Once supplied, it is never ignored or
-reinterpreted as ordinary execution, including on non-Linux platforms.
-The policy must be a root-owned, single-link regular file with mode `0600`.
-Every component is opened from `/` without following symlinks, and every
-ancestor must be root-owned and not writable by group or other. Unknown JSON
-fields and trailing JSON values are rejected.
-
-```json
-{
-  "uid": 20001,
-  "gid": 20001,
-  "standaloneOwnerId": "pi-deployment-1",
-  "standaloneStateRoot": "/var/lib/acp-go-pi",
-  "baseEnvironment": {
-    "PATH": "/usr/local/bin:/usr/bin:/bin",
-    "HOME": "/var/lib/acp-go-pi",
-    "USER": "acp-go-pi",
-    "LOGNAME": "acp-go-pi",
-    "LANG": "C.UTF-8"
-  },
-  "inheritEnvironment": []
-}
-```
-
-`standaloneOwnerId` is the nonsecret, case-sensitive deployment identity:
-1--256 ASCII bytes, beginning alphanumeric, with remaining bytes limited to
-alphanumerics and `._:@/-`. `standaloneStateRoot` is the existing dedicated
-durable provider state root, is neither `/` nor equal to or beneath
-`/var/lib/acp-go/agent-identities`. Its clean absolute UTF-8 path is limited to
-4096 bytes with no control character, and Linux resolves the complete path
-componentwise from `/` without following symlinks or magic links. Every
-ancestor is root-owned and not group/world writable; the final directory is
-owned by the configured UID:GID with mode `0700`. The authority binds its exact
-path, device, and inode.
-
-The supervisor must run as root. The UID/GID must name a nonroot account with
-that same-name private primary group, no supplementary groups, and a target-owned mode
-`0700` home matching `HOME`, reached without symlinks beneath protected
-root-owned ancestry; `/root` and `/nonexistent` are forbidden. `USER` and
-`LOGNAME` must match the account.
-`PATH` must contain existing canonical absolute directories. The isolated child gets
-only `baseEnvironment` plus variables explicitly named in
-`inheritEnvironment`; identity, search-path, loader, interpreter, XDG/native
-home, and adapter-private variables cannot be inherited. Unset or duplicate
-inheritance entries fail startup. Darwin, Windows, and other platforms refuse
-an explicit policy rather than weakening this contract. Without this flag,
-ordinary execution remains portable and does not apply these absolute-PATH or
-account constraints.
-
-Provision the target as a locked system account with a non-login shell, its
-same-name private group, and no sudo policy. Its UID and primary GID cannot be
-shared by another account. Password locking is not a substitute for disabling
-login paths, and a locked account still needs the validated private writable
-home for native tools.
-
 ## Flags
 
 | Flag | Purpose |
 | --- | --- |
-| `-path` | pi CLI executable (default: search the captured ordinary `PATH`, or a static base `PATH` an embedding host set through `WithEnv`). Per-session extra path directories affect the launched child's `PATH`, not this lookup. |
-| `-home` | Durable per-instance `PI_CODING_AGENT_DIR`. Empty gives sessions ephemeral agent directories. Required when `-provider-auth-root` is supplied. |
-| `-process-isolation-config` | Optional absolute path to the strict standalone Linux isolation policy described above. A supplied invalid policy fails before serving. |
-| `-scratch-dir` | Parent directory for all ephemeral scratch (isolated per-session agent and session directories, hydration temp files, and the version probe's isolated `PI_CODING_AGENT_DIR`/settings residence). Empty means the system temp directory. |
-| `-provider-auth-root` | Durable root for Pi's values-free provider-auth ledger. Empty leaves the seven `_pi/auth/*` legs unadvertised. |
-| `-model` | Default model for new sessions, as `"provider/id"`. |
-| `-seed-file` | Write a host file into each session's agent directory as `<relpath>=<hostpath>`; repeatable. |
+| `-path` | Pi executable; default searches the captured ordinary PATH. |
+| `-home` | Durable per-instance PI_CODING_AGENT_DIR; empty uses ephemeral session state. |
+| `-scratch-dir` | Parent for ephemeral session and version-probe trees, and for the extension store sessions share. |
+| `-provider-auth-root` | Durable values-free provider-auth ledger root; requires -home. |
+| `-model` | Default model as provider/id. |
+| `-seed-file` | Materialize relpath=hostpath in each session agent directory; repeatable. |
 | `-debug` | Emit debug logs to stderr. |
 | `-version` | Print adapter version and exit. |
 
-<Note>
-Not every embedded option has a flag. Turn timeouts, concurrency limits,
-per-session credential env injection, OpenTelemetry providers, and the session store are
-embedded-Go only — configure them with the [Go API](/docs/reference/go-api)
-options such as `WithTurnTimeout`, `WithPiEnv`, and `WithSessionStore`.
-</Note>
+## Execution boundary
 
-## Darwin containment operations
+The CLI runs Pi ordinarily as the command's account. Host-authority execution
+is available only to embedded Go hosts through `WithHostAuthority`;
+a borrowed capability cannot be represented by a configuration file or
+command-line flag.
 
-Ordinary standalone execution launches directly on Darwin. These operational
-commands inspect only generations left by an embedded host that explicitly
-uses `WithDarwinBestEffortContainment`; ordinary sessions create no such
-record, and best effort does not establish that `setsid` descendants are
-absent.
+## Embedded-only configuration
 
-Each actual Darwin native launch gets a fresh `0700` generation root and a
-128-bit runtime id. Inspect current records without changing processes or
-files:
-
-```sh
-acp-go-pi containment diagnose -scratch-dir /tmp/pi-scratch
-```
-
-Select one runtime explicitly for cleanup:
-
-```sh
-acp-go-pi containment cleanup \
-  -scratch-dir /tmp/pi-scratch \
-  -runtime-id 0123456789abcdef0123456789abcdef \
-  -force
-```
-
-Both commands write one JSON object to stdout. Common fields are `vendor`,
-`containment`, `scratch_parent`, and the exact warning `PID-by-PID cleanup has
-a PID-reuse time-of-check/time-of-use race and can signal an unrelated reused
-PID; correlation is not ownership or proof of absence; inherited markers can
-be scrubbed`.
-`diagnose` adds a sorted `records` array; each record contains `runtime_id`,
-`state`, `generation_root`, `correlated_pids`, and `ambiguous_pids`. `cleanup`
-adds `runtime_id`, `generation_root`, `term_signaled_pids`,
-`kill_signaled_pids`, `remaining_correlated_pids`, `ambiguous_pids`, and
-`root_removed`.
-
-Usage errors return exit 2 with stderr only. Operational errors return exit 1.
-When cleanup has selected and inspected a record but cannot finish, it emits
-the populated JSON result to stdout and the error to stderr; failures before
-record selection emit no stdout. Success returns exit 0. These operations are
-available only on Darwin.
-
-The `-force` help and this warning disclose that per-PID revalidation cannot
-eliminate PID-reuse or collateral-signalling risk. Cleanup uses one fixed
-five-second deadline beginning before its first process enumeration; the TERM
-grace, KILL phase, and final scan share that deadline. Deadline exhaustion is
-terminal and retains the selected generation root without further validation,
-enumeration, or removal.
+Session stores, turn timeouts, concurrency limits, explicit environment
+overlays, image limits, input handoff roots, telemetry providers, and host
+authority are configured through the [Go API](/docs/reference/go-api).

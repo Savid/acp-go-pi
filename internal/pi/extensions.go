@@ -229,13 +229,23 @@ type SessionResidenceFiles struct {
 }
 
 // CreateSessionResidence creates one session's residence under agentDir and
-// publishes everything it holds: the wrapper-owned extensions, plus the MCP
-// extension and config when mcp is supplied. The residence is complete when it
-// returns, so nothing ever writes into it again.
-func CreateSessionResidence(agentDir string, mcp *MCPConfig) (*SessionResidence, SessionResidenceFiles, error) {
+// publishes everything it holds. The extension sources are the same bytes for
+// every session, so they live in the content-addressed store under extRoot
+// rather than here: a path minted per session would make pi compile them again
+// on every launch. What stays is the session's own MCP config, which no other
+// session may read. The residence is complete when it returns, so nothing ever
+// writes into it again.
+func CreateSessionResidence(
+	extRoot string, agentDir string, mcp *MCPConfig,
+) (*SessionResidence, SessionResidenceFiles, error) {
+	shared, err := publishSharedExtensions(extRoot)
+	if err != nil {
+		return nil, SessionResidenceFiles{}, err
+	}
+
 	parent := filepath.Join(agentDir, sessionResidenceDir)
-	if err := fsMkdirAll(parent, 0o700); err != nil {
-		return nil, SessionResidenceFiles{}, fmt.Errorf("create session residence root: %w", err)
+	if mkdirErr := fsMkdirAll(parent, 0o700); mkdirErr != nil {
+		return nil, SessionResidenceFiles{}, fmt.Errorf("create session residence root: %w", mkdirErr)
 	}
 
 	root, err := fsMkdirTemp(parent, "session-*")
@@ -245,7 +255,7 @@ func CreateSessionResidence(agentDir string, mcp *MCPConfig) (*SessionResidence,
 
 	residence := &SessionResidence{root: root}
 
-	files, err := residence.publishAll(mcp)
+	files, err := residence.publishAll(shared, mcp)
 	if err != nil {
 		return nil, SessionResidenceFiles{}, errors.Join(err, residence.Remove())
 	}
@@ -297,29 +307,14 @@ func (r *SessionResidence) publish(name string, contents []byte) (string, error)
 	return path, nil
 }
 
-func (r *SessionResidence) publishAll(mcp *MCPConfig) (SessionResidenceFiles, error) {
-	bridgePath, err := r.publish(BridgeExtensionFileName, bridgeExtensionSource)
-	if err != nil {
-		return SessionResidenceFiles{}, err
-	}
-
-	pathExtensionPath, err := r.publish(PathExtensionFileName, pathExtensionSource)
-	if err != nil {
-		return SessionResidenceFiles{}, err
-	}
-
-	files := SessionResidenceFiles{ExtensionPaths: []string{bridgePath, pathExtensionPath}}
+func (r *SessionResidence) publishAll(shared sharedExtensionPaths, mcp *MCPConfig) (SessionResidenceFiles, error) {
+	files := SessionResidenceFiles{ExtensionPaths: []string{shared.bridge, shared.path}}
 
 	if mcp == nil {
 		return files, nil
 	}
 
-	mcpPath, err := r.publish(MCPExtensionFileName, mcpExtensionSource)
-	if err != nil {
-		return SessionResidenceFiles{}, err
-	}
-
-	files.ExtensionPaths = append(files.ExtensionPaths, mcpPath)
+	files.ExtensionPaths = append(files.ExtensionPaths, shared.mcp)
 
 	encoded, err := marshalMCPConfig(*mcp, "", "  ")
 	if err != nil {

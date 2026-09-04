@@ -328,7 +328,7 @@ func TestPromptParentCancellationReturnsContainmentFailure(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := newStubPiClient()
 	process := newStubProcess(false)
-	process.close = pi.ErrProcessContainmentIncomplete
+	process.close = ErrContainmentIncomplete
 	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
 	startTestPump(session, client)
 
@@ -341,14 +341,14 @@ func TestPromptParentCancellationReturnsContainmentFailure(t *testing.T) {
 
 	require.Eventually(t, func() bool { return session.activeTurnDelivery() != nil }, time.Second, time.Millisecond)
 	cancel()
-	require.ErrorIs(t, <-promptDone, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, <-promptDone, ErrContainmentIncomplete)
 }
 
 // TestSettlementReportsAnIncompleteContainmentBoundary pins that a boundary
 // which did not complete outranks the terminal event it precedes: every accepted
 // exit reports the containment failure and none of them commits or settles.
 func TestSettlementReportsAnIncompleteContainmentBoundary(t *testing.T) {
-	fenceErr := pi.ErrProcessContainmentIncomplete
+	fenceErr := ErrContainmentIncomplete
 	var timedOut atomic.Bool
 
 	for name, outcome := range map[string]promptOutcome{
@@ -375,7 +375,7 @@ func TestSettlementReportsAnIncompleteContainmentBoundary(t *testing.T) {
 }
 
 func TestPromptTransportEndReturnsContainmentProofFailure(t *testing.T) {
-	fenceErr := pi.ErrProcessContainmentIncomplete
+	fenceErr := ErrContainmentIncomplete
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	client := newStubPiClient()
 	process := newStubProcess(false)
@@ -670,7 +670,7 @@ func TestPromptAndSettlementErrorBranches(t *testing.T) {
 // fails before admission and creates neither submission nor turn.
 func TestPromptRejectsMalformedLifecycleCorrelation(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
 	session := &agentSession{agent: agent, id: "id", client: newStubPiClient(), proc: newStubProcess(false)}
 
 	missing := TextPromptRequest("id", "turn", "hi")
@@ -700,7 +700,7 @@ func decodeMeta(t *testing.T, raw string) map[string]any {
 func TestPromptAcceptanceDeliveryFailureFailsTheTurn(t *testing.T) {
 	store := NewInMemorySessionStore()
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
 	connection := newDirectAgentClient()
 	agent.setConnection(connection)
 	session := &agentSession{agent: agent, id: "id", client: newStubPiClient(), proc: newStubProcess(false)}
@@ -766,7 +766,7 @@ func TestPromptSettlementStorePanicContainsOnceAgainstClose(t *testing.T) {
 			logs := &strings.Builder{}
 			agent := NewAgent(testContainmentOption(), WithSessionStore(store),
 				WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
-			agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+			agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 			connection := newDirectAgentClient()
 			agent.setConnection(connection)
 			process := newStubProcess(false)

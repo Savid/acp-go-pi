@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -22,18 +21,8 @@ const (
 	metaCapabilityFork      = "fork"
 	elicitationScopeSession = "session"
 
-	// metaFieldVersions carries the supported versions of one family-global
-	// reserved capability literal.
-	metaFieldVersions = "versions"
+	metaFieldVersion = "version"
 )
-
-const (
-	darwinPlatform  = "darwin"
-	linuxPlatform   = "linux"
-	windowsPlatform = "windows"
-)
-
-var agentRuntimePlatform = runtime.GOOS
 
 var newServeAgent = NewAgent
 
@@ -84,10 +73,21 @@ type Agent struct {
 	// ordinaryEnvironment is captured and sanitized once at construction so
 	// later ambient changes cannot cross into an existing agent generation.
 	ordinaryEnvironment map[string]string
+	nativeEnvironment   map[string]string
+	scratchParent       string
 
 	// Lock order: acquire mu before any session lock. Do not call session
 	// close methods while holding mu.
-	mu                 sync.Mutex
+	mu sync.Mutex
+	// sessionCarriers serialize load/resume carrier decisions per session id
+	// through the response boundary. An explicit configuration change must
+	// contain the predecessor before it can construct or publish a successor.
+	sessionCarriers map[acp.SessionId]*sessionCarrierTransition
+	// sessionInstallMu serializes the final same-id publication check. Native
+	// constructors run outside it; a collision is contained in
+	// storeStartedSession before the map can change.
+	sessionInstallMu sync.Mutex
+
 	closed             bool
 	conn               agentClient
 	sessions           map[acp.SessionId]*agentSession
@@ -102,8 +102,10 @@ type Agent struct {
 	// answer leaves the extension dormant for every session on it.
 	lifecycle            lifecycle.Negotiated
 	optionErr            error
-	processes            *providerProcessTracker
 	nativeContainmentErr error
+	nativeBusyRoots      map[string]struct{}
+	authorityLossOnce    sync.Once
+	closeAccountingOnce  sync.Once
 	closeAttempt         *agentCloseAttempt
 
 	versionMu      sync.Mutex
@@ -123,7 +125,7 @@ type Agent struct {
 	providerAuth *providerAuth
 
 	startPiProcess func(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error)
-	probeVersion   func(ctx context.Context, executablePath string, agentDir string, containment pi.ContainmentSpec) (string, error)
+	probeVersion   func(ctx context.Context, executablePath string, agentDir string) (string, error)
 	lookPath       func(file string) (string, error)
 }
 
@@ -148,122 +150,74 @@ func NewAgent(opts ...Option) *Agent {
 		TracerProvider: options.TracerProvider,
 		Version:        options.AgentVersion,
 	})
-	mode := containmentMode(options)
-	options.RuntimeResourceHooks = instrumentRuntimeResourceHooks(options.RuntimeResourceHooks, observe, mode)
 	ordinaryEnvironment := pi.CaptureOrdinaryEnvironment()
+
+	var nativeEnvironment map[string]string
+
+	var authorityErr error
+
+	if options.hostAuthoritySupplied {
+		nativeEnvironment, authorityErr = readHostEnvironment(options.HostAuthority)
+	}
 
 	agent := &Agent{
 		options:             options,
 		log:                 log,
 		observe:             observe,
 		ordinaryEnvironment: ordinaryEnvironment,
+		nativeEnvironment:   nativeEnvironment,
+		scratchParent:       scratchParentForOptions(options),
 		sessions:            make(map[acp.SessionId]*agentSession),
+		sessionCarriers:     make(map[acp.SessionId]*sessionCarrierTransition),
 		retainedSessions:    make(map[*agentSession]struct{}),
 		constructions:       make(map[*nativeConstruction]struct{}),
 		store:               NewInMemorySessionStore(),
 		deleted:             make(map[acp.SessionId]struct{}),
+		nativeBusyRoots:     make(map[string]struct{}),
 		positionEncoding:    acp.PositionEncodingKindUtf16,
 		optionErr: errors.Join(
+			authorityErr,
+			optionFailure(log, optionFieldHome, validateManagedHome(options)),
 			optionFailure(log, optionFieldEnv, validateEnvironment(options.Env, optionFieldEnv, blockedAgentEnvKey)),
 			optionFailure(log, optionFieldConcurrencyLimits, validateConcurrencyLimits(options.ConcurrencyLimits)),
-			optionFailure(log, optionFieldContainment, validateContainmentOption(options)),
 			optionFailure(log, optionFieldImageLimits, validateImageLimits(options.ImageLimits)),
 			optionFailure(log, optionFieldInputHandoffRoot, validateInputHandoffRoot(options.InputHandoffRoot)),
 		),
-		startPiProcess: startRealPiProcess,
-		probeVersion:   pi.ProbeVersion,
 		lookPath: func(file string) (string, error) {
-			return pi.ResolveExecutable(file, internalProcessIsolation(options.ProcessIsolation, options.testOnlyNoCredential, options.testOnlyIdentityLockRoot), ordinaryEnvironment, options.Env)
+			return pi.ResolveExecutable(file, ordinaryEnvironment, options.Env)
 		},
 	}
-	agent.processes = newProviderProcessTracker(options.RuntimeResourceHooks)
+	agent.startPiProcess = agent.startRealPiProcess
+	agent.probeVersion = agent.probeNativeVersion
 
 	agent.optionErr = errors.Join(
 		agent.optionErr,
 		optionFailure(log, optionFieldProviderAuthRoot, configureProviderAuth(agent)),
 	)
 
-	observeRuntimeContainment(context.Background(), options.RuntimeResourceHooks, mode)
-
-	if mode == RuntimeContainmentBestEffort {
-		log.WarnContext(
-			context.Background(),
-			"Darwin process containment is best effort; escaped descendants may survive, marker correlation is not ownership and markers can be scrubbed, numeric process-group reuse can cause collateral signalling, and native-root permits do not bound escaped provider work",
-			slog.String("containment", string(mode)),
-		)
-	}
-
 	return agent
-}
-
-// ContainmentMode reports the effective native process boundary.
-func (a *Agent) ContainmentMode() RuntimeContainmentMode {
-	if a == nil {
-		return RuntimeContainmentUnavailable
-	}
-
-	return containmentMode(a.options)
-}
-
-func containmentMode(options Options) RuntimeContainmentMode {
-	if options.DarwinBestEffortContainment && agentRuntimePlatform != darwinPlatform {
-		return RuntimeContainmentUnavailable
-	}
-
-	if options.ProcessIsolation != nil && options.DarwinBestEffortContainment {
-		return RuntimeContainmentUnavailable
-	}
-
-	if options.ProcessIsolation == nil {
-		if options.DarwinBestEffortContainment {
-			return RuntimeContainmentBestEffort
-		}
-
-		return RuntimeContainmentSharedIdentity
-	}
-
-	if agentRuntimePlatform == linuxPlatform {
-		return RuntimeContainmentAuthoritative
-	}
-
-	return RuntimeContainmentUnavailable
-}
-
-func validateContainmentOption(options Options) error {
-	if options.ProcessIsolation != nil && options.DarwinBestEffortContainment {
-		return errors.New("explicit process isolation cannot be combined with darwin best-effort containment")
-	}
-
-	if options.DarwinBestEffortContainment && agentRuntimePlatform != darwinPlatform {
-		return errors.New("darwin best-effort containment is only valid on darwin")
-	}
-
-	return nil
 }
 
 func (a *Agent) startTrackedPiProcess(
 	ctx context.Context,
 	spec pi.LaunchSpec,
-) (piProcess, piClient, *providerProcessRoot, error) {
+) (piProcess, piClient, error) {
 	process, client, err := a.startPiProcess(ctx, spec)
 	if err != nil {
-		if !providerProcessTreeComplete(err) {
-			root := a.processes.registerDeferred()
-			a.recordNativeContainment(err)
+		a.recordNativeContainment(err)
 
-			return process, client, root, err
-		}
-
-		return nil, nil, nil, err
+		return process, client, err
 	}
 
-	root := a.processes.registerDeferred()
-
-	return process, client, root, nil
+	return process, client, nil
 }
 
-func startRealPiProcess(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
-	process, err := pi.StartProcess(ctx, spec)
+func (a *Agent) startRealPiProcess(ctx context.Context, spec pi.LaunchSpec) (piProcess, piClient, error) {
+	if a.options.hostAuthoritySupplied {
+		return a.startAuthorityPiProcess(ctx, spec)
+	}
+
+	process, err := pi.StartOrdinaryProcess(ctx, spec)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -324,7 +278,19 @@ func (a *Agent) beginClose() (*agentCloseAttempt, bool) {
 	defer a.mu.Unlock()
 
 	if a.closeAttempt != nil {
-		return a.closeAttempt, false
+		attempt := a.closeAttempt
+		select {
+		case <-attempt.done:
+			if errors.Is(attempt.err, ErrNativeTreeBusy) && nativeContainmentComplete(attempt.err) {
+				retry := &agentCloseAttempt{done: make(chan struct{})}
+				a.closeAttempt = retry
+
+				return retry, true
+			}
+		default:
+		}
+
+		return attempt, false
 	}
 
 	attempt := &agentCloseAttempt{done: make(chan struct{})}
@@ -395,7 +361,7 @@ func (a *Agent) awaitClose(attempt *agentCloseAttempt) error {
 	case <-attempt.done:
 	case <-waitCtx.Done():
 		if !a.quarantineClose(attempt, fmt.Errorf("%w: join agent close attempt: %v",
-			pi.ErrProcessContainmentIncomplete, waitCtx.Err())) {
+			ErrContainmentIncomplete, waitCtx.Err())) {
 			<-attempt.done
 		}
 	}
@@ -405,7 +371,7 @@ func (a *Agent) awaitClose(attempt *agentCloseAttempt) error {
 
 func (a *Agent) close(attempt *agentCloseAttempt) error {
 	constructionErr := a.awaitNativeConstructions()
-	if !pi.ProcessContainmentComplete(constructionErr) {
+	if !nativeContainmentComplete(constructionErr) {
 		a.recordNativeContainment(constructionErr)
 
 		return constructionErr
@@ -440,13 +406,17 @@ func (a *Agent) close(attempt *agentCloseAttempt) error {
 	a.conn = nil
 	a.mu.Unlock()
 
-	if active > 0 {
-		a.observe.AddActiveSession(context.Background(), -int64(active))
-	}
+	a.closeAccountingOnce.Do(func() {
+		if active > 0 {
+			a.observe.AddActiveSession(context.Background(), -int64(active))
+		}
+	})
 
 	var closeErrs []error
 
 	completed := make([]*agentSession, 0, len(sessions))
+	busySessions := make([]*agentSession, 0, len(sessions))
+
 	for _, session := range sessions {
 		if attempt.settlement.Load() == closeSettlementQuarantined {
 			return attempt.result()
@@ -458,6 +428,12 @@ func (a *Agent) close(attempt *agentCloseAttempt) error {
 		session.detachLifecycleDelivery()
 
 		if err := session.Close(context.Background()); err != nil {
+			if errors.Is(err, ErrNativeTreeBusy) && nativeContainmentComplete(err) {
+				busySessions = append(busySessions, session)
+
+				continue
+			}
+
 			closeErrs = append(closeErrs, err)
 
 			continue
@@ -471,6 +447,37 @@ func (a *Agent) close(attempt *agentCloseAttempt) error {
 	}
 
 	a.mu.Lock()
+	constructions := make([]*nativeConstruction, 0, len(a.constructions))
+
+	for construction := range a.constructions {
+		constructions = append(constructions, construction)
+	}
+	a.mu.Unlock()
+
+	for _, construction := range constructions {
+		constructionErr := a.cleanupNativeConstruction(context.Background(), construction, construction.err)
+		if constructionErr != nil {
+			closeErrs = append(closeErrs, constructionErr)
+
+			continue
+		}
+
+		a.mu.Lock()
+		delete(a.constructions, construction)
+		a.mu.Unlock()
+	}
+
+	for _, session := range busySessions {
+		if err := session.Close(context.Background()); err != nil {
+			closeErrs = append(closeErrs, err)
+
+			continue
+		}
+
+		completed = append(completed, session)
+	}
+
+	a.mu.Lock()
 	for _, session := range completed {
 		delete(a.retainedSessions, session)
 
@@ -480,16 +487,10 @@ func (a *Agent) close(attempt *agentCloseAttempt) error {
 			}
 		}
 	}
-
-	for construction := range a.constructions {
-		if construction.err != nil {
-			closeErrs = append(closeErrs, construction.err)
-		}
-	}
 	a.mu.Unlock()
 
 	closeErr := errors.Join(closeErrs...)
-	if !pi.ProcessContainmentComplete(closeErr) {
+	if !nativeContainmentComplete(closeErr) {
 		a.recordNativeContainment(closeErr)
 
 		return closeErr
@@ -505,22 +506,21 @@ type nativeConstruction struct {
 	// must still publish every handle it acquires so its late-result quarantine
 	// can synchronously contain and release those exact resources.
 	immutable   bool
-	cleanupOnce sync.Once
+	cleanupMu   sync.Mutex
+	cleanupDone bool
 	cleanupErr  error
 
-	proc           piProcess
-	client         piClient
-	processRoot    *providerProcessRoot
-	generationRoot string
-	sessionRoot    string
-	nativeRelease  func()
-	scratchRelease func()
-	browserShim    *pi.BrowserShim
-	residence      *pi.SessionResidence
-	runtime        *runtimeGeneration
-	session        *agentSession
-	nativeBoundary *nativeBoundaryTracker
-	err            error
+	proc               piProcess
+	client             piClient
+	generationRoot     string
+	generationPrepared bool
+	sessionRoot        string
+	browserShim        *pi.BrowserShim
+	residence          *pi.SessionResidence
+	runtime            *runtimeGeneration
+	session            *agentSession
+	nativeBoundary     *nativeBoundaryTracker
+	err                error
 }
 
 type agentCloseAttempt struct {
@@ -585,7 +585,7 @@ func (a *Agent) finishNativeConstruction(construction *nativeConstruction, retai
 		construction.err = err
 	}
 
-	if construction.err != nil && !pi.ProcessContainmentComplete(construction.err) {
+	if construction.err != nil && !nativeContainmentComplete(construction.err) {
 		retain = true
 	}
 
@@ -621,7 +621,7 @@ func (a *Agent) awaitNativeConstructions() error {
 		case <-construction.done:
 		case <-joinCtx.Done():
 			incomplete := fmt.Errorf("%w: join native construction owner: %v",
-				pi.ErrProcessContainmentIncomplete, joinCtx.Err())
+				ErrContainmentIncomplete, joinCtx.Err())
 
 			a.mu.Lock()
 			if !construction.immutable {
@@ -640,7 +640,7 @@ func (a *Agent) awaitNativeConstructions() error {
 }
 
 func (a *Agent) recordNativeContainment(err error) {
-	if pi.ProcessContainmentComplete(err) {
+	if nativeContainmentComplete(err) {
 		return
 	}
 
@@ -649,6 +649,69 @@ func (a *Agent) recordNativeContainment(err error) {
 		a.nativeContainmentErr = err
 	}
 	a.mu.Unlock()
+
+	if errors.Is(err, ErrHostAuthorityUnavailable) {
+		a.authorityLossOnce.Do(func() {
+			go a.fenceSessionsAfterAuthorityLoss(err)
+		})
+	}
+}
+
+func (a *Agent) fenceSessionsAfterAuthorityLoss(err error) {
+	a.mu.Lock()
+	sessions := make([]*agentSession, 0, len(a.sessions)+len(a.retainedSessions))
+	seen := make(map[*agentSession]struct{}, len(a.sessions)+len(a.retainedSessions))
+
+	for _, session := range a.sessions {
+		if _, ok := seen[session]; ok {
+			continue
+		}
+
+		sessions = append(sessions, session)
+		seen[session] = struct{}{}
+	}
+
+	for session := range a.retainedSessions {
+		if _, ok := seen[session]; ok {
+			continue
+		}
+
+		sessions = append(sessions, session)
+		seen[session] = struct{}{}
+	}
+	a.mu.Unlock()
+
+	for _, session := range sessions {
+		session.recordNativeContainment(err)
+		_ = session.Close(context.Background())
+	}
+}
+
+func (a *Agent) markNativeTreeBusy(root string) {
+	if root == "" {
+		return
+	}
+
+	a.mu.Lock()
+	a.nativeBusyRoots[root] = struct{}{}
+	a.mu.Unlock()
+}
+
+func (a *Agent) clearNativeTreeBusy(root string) {
+	a.mu.Lock()
+	delete(a.nativeBusyRoots, root)
+	a.mu.Unlock()
+}
+
+func (a *Agent) nativeAdmissionError() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if len(a.nativeBusyRoots) == 0 {
+		return nil
+	}
+
+	return ErrNativeTreeBusy
 }
 
 func (a *Agent) nativeContainmentError() error {
@@ -674,6 +737,10 @@ func (a *Agent) setConnection(conn agentClient) {
 // prompt without ever calling initialize, and options that never validated
 // must not reach a native process.
 func (a *Agent) optionsError() error {
+	if errors.Is(a.optionErr, ErrHostAuthorityUnavailable) {
+		return ErrHostAuthorityUnavailable
+	}
+
 	var reqErr *acp.RequestError
 	if !errors.As(a.optionErr, &reqErr) {
 		return nil
@@ -727,7 +794,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 	a.mu.Unlock()
 
 	capabilityMeta := map[string]any{
-		routeMetaKey:         map[string]any{metaFieldVersions: []int{routeVersion}},
+		routeMetaKey:         map[string]any{metaFieldVersion: routeVersion},
 		mediaEnvelopeMetaKey: a.mediaEnvelope(),
 		piMetaKey: map[string]any{
 			metaCapabilityFork: map[string]any{
@@ -758,7 +825,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 	// handoff root reached this adapter, so the key is emitted only when one
 	// is configured.
 	if a.inputHandoffRoot() != "" {
-		capabilityMeta[handoffMetaKey] = map[string]any{metaFieldVersions: []int{handoffVersion}}
+		capabilityMeta[handoffMetaKey] = map[string]any{metaFieldVersion: handoffVersion}
 	}
 
 	if a.providerAuth != nil {
@@ -860,6 +927,14 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 	a.versionMu.Lock()
 	defer a.versionMu.Unlock()
 
+	if retryErr := a.retryBusyNativeConstructions(ctx); retryErr != nil {
+		return retryErr
+	}
+
+	if admissionErr := errors.Join(a.nativeContainmentError(), a.nativeAdmissionError()); admissionErr != nil {
+		return admissionErr
+	}
+
 	if a.versionChecked {
 		return a.ensureOpen()
 	}
@@ -874,7 +949,7 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 		ownerErr := construction.err
 		a.mu.Unlock()
 
-		retain := !pi.ProcessContainmentComplete(returnErr)
+		retain := !nativeContainmentComplete(returnErr)
 
 		if generationOwner != nil && generationOwner.err != nil {
 			ownerErr = errors.Join(ownerErr, generationOwner.err)
@@ -888,14 +963,6 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 		a.finishNativeConstruction(construction, retain, ownerErr)
 	}()
 
-	if validationErr := validateProcessIsolationOption(a.options.ProcessIsolation); validationErr != nil {
-		return validationErr
-	}
-
-	if a.options.ProcessIsolation != nil && a.ContainmentMode() == RuntimeContainmentUnavailable {
-		return fmt.Errorf("%w: native process containment is unavailable", ErrProcessContainmentIncomplete)
-	}
-
 	executable, err := a.resolveExecutablePath()
 	if err != nil {
 		return err
@@ -905,7 +972,7 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 		return closedErr
 	}
 
-	containment, generation, err := a.createRuntimeGeneration(ctx, RuntimeResourceDiscovery)
+	generation, err := a.createRuntimeGeneration(ctx)
 	if err != nil {
 		return err
 	}
@@ -914,64 +981,47 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 		owner.runtime = generation
 		owner.generationRoot = generation.root
 		owner.sessionRoot = generation.root
-		owner.scratchRelease = generation.release
 	})
 
 	if closedErr := a.ensureOpen(); closedErr != nil {
-		return generation.finalize(closedErr)
+		return generation.finalize(context.WithoutCancel(ctx), closedErr)
 	}
 
-	probeAgentDir, err := generation.prepareVersionProbeAgentDir(a.nativeOwnershipIsolation())
+	probeAgentDir, err := generation.prepareVersionProbeAgentDir(ctx)
 	if err != nil {
-		return generation.finalize(err)
-	}
-
-	nativeRelease, err := acquireNativeRoot(ctx, a.options.RuntimeResourceHooks, RuntimeResourceDiscovery)
-	if err != nil {
-		return generation.finalize(err)
+		return generation.finalize(context.WithoutCancel(ctx), err)
 	}
 
 	a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
-		owner.nativeRelease = nativeRelease
+		owner.generationPrepared = a.options.hostAuthoritySupplied
 	})
-
-	if closedErr := a.ensureOpen(); closedErr != nil {
-		finalErr := generation.finalize(closedErr)
-		releaseNativeRootWhenComplete(nativeRelease, finalErr)
-
-		return finalErr
-	}
 
 	// This is the final launch gate. Nothing between it and probeVersion invokes
 	// external code or drops the Agent close fence.
 	if contextErr := ctx.Err(); contextErr != nil {
-		finalErr := generation.finalize(contextErr)
-		releaseNativeRootWhenComplete(nativeRelease, finalErr)
-
-		return finalErr
+		return generation.finalize(context.WithoutCancel(ctx), contextErr)
 	}
 
 	if closedErr := a.ensureOpen(); closedErr != nil {
-		finalErr := generation.finalize(closedErr)
-		releaseNativeRootWhenComplete(nativeRelease, finalErr)
-
-		return finalErr
+		return generation.finalize(context.WithoutCancel(ctx), closedErr)
 	}
 
-	version, err := a.probeVersion(ctx, executable, probeAgentDir, containment)
+	version, err := a.probeVersion(ctx, executable, probeAgentDir)
 	if closedErr := a.ensureOpen(); closedErr != nil {
 		err = errors.Join(err, closedErr)
 	}
 
-	err = generation.finalize(err)
-	releaseNativeRootWhenComplete(nativeRelease, err)
+	if err == nil {
+		err = pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion)
+	}
 
-	if pi.ProcessContainmentComplete(err) {
+	versionValidated := err == nil
+
+	err = generation.finalize(context.WithoutCancel(ctx), err)
+
+	if nativeContainmentComplete(err) && !errors.Is(err, ErrNativeTreeBusy) {
 		a.updateNativeConstruction(construction, func(owner *nativeConstruction) {
-			owner.nativeRelease = nil
-			if generation.err == nil {
-				owner.scratchRelease = nil
-			}
+			owner.runtime = nil
 		})
 	}
 
@@ -979,10 +1029,10 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 	// or reported an unsupported version is the readiness stage of a native
 	// start and carries the uniform failure shape.
 	if err != nil {
-		return a.nativeStartFailure(ctx, failureCauseProcessExit, err, nil)
-	}
+		if versionValidated && errors.Is(err, ErrNativeTreeBusy) {
+			a.versionChecked = true
+		}
 
-	if err := pi.CheckMinimumVersion(version, pi.DefaultMinimumVersion); err != nil {
 		return a.nativeStartFailure(ctx, failureCauseProcessExit, err, nil)
 	}
 
@@ -991,9 +1041,47 @@ func (a *Agent) ensureVersion(ctx context.Context) (returnErr error) {
 	return nil
 }
 
+func (a *Agent) retryBusyNativeConstructions(ctx context.Context) error {
+	a.mu.Lock()
+	constructions := make([]*nativeConstruction, 0)
+
+	for construction := range a.constructions {
+		select {
+		case <-construction.done:
+			if errors.Is(construction.err, ErrNativeTreeBusy) ||
+				(construction.runtime != nil && errors.Is(construction.runtime.err, ErrNativeTreeBusy)) {
+				constructions = append(constructions, construction)
+			}
+		default:
+		}
+	}
+	a.mu.Unlock()
+
+	var retryErr error
+
+	for _, construction := range constructions {
+		err := a.cleanupNativeConstruction(context.WithoutCancel(ctx), construction, construction.err)
+		if err != nil {
+			retryErr = errors.Join(retryErr, err)
+
+			continue
+		}
+
+		a.mu.Lock()
+		delete(a.constructions, construction)
+		a.mu.Unlock()
+	}
+
+	return retryErr
+}
+
 func (a *Agent) resolveExecutablePath() (string, error) {
 	if a.options.ExecutablePath != "" {
 		return a.options.ExecutablePath, nil
+	}
+
+	if a.options.hostAuthoritySupplied {
+		return rawEventSourceValue, nil
 	}
 
 	path, err := a.lookPath("pi")

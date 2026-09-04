@@ -120,6 +120,16 @@ func (s *agentSession) publishSessionOpen(ctx context.Context) error {
 	}
 
 	if err := s.openLifecycleStream(ctx, generation); err != nil {
+		if (err == context.Canceled || err == context.DeadlineExceeded) && outbox != nil {
+			outbox.mu.Lock()
+			retired := outbox.ended || outbox.fenced || outbox.closing
+			outbox.mu.Unlock()
+
+			if retired {
+				return nil
+			}
+		}
+
 		s.agent.log.ErrorContext(ctx, "open pi session lifecycle stream failed",
 			slog.String(acpFieldSessionID, string(s.id)),
 		)
@@ -143,7 +153,7 @@ func (s *agentSession) publishSessionOpen(ctx context.Context) error {
 		// here rather than poisoning a session whose only fault was being closed
 		// while it was still opening.
 		if errors.Is(err, errGenerationRetired) {
-			return err
+			return nil
 		}
 
 		containmentErr := s.containGenerationSync(

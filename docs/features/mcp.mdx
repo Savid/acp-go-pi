@@ -41,8 +41,8 @@ servers := []acp.McpServer{
 The adapter gives every session a private residence under its agent directory
 and writes that session's MCP config and wrapper extensions into it. Each file
 is published once and left read-only, and the residence is removed with the
-session. Because a configured `WithHome` makes every session share one agent
-directory, the residence is what keeps one session's server commands,
+session. In ordinary mode, a configured `WithHome` makes every session share
+one agent directory, so the residence is what keeps one session's server commands,
 arguments, environment, and credential-bearing headers unreadable and
 unreplaceable by another. The extension connects to every declared server
 during lifecycle establishment.

@@ -76,7 +76,7 @@ func newAuthHarness(t *testing.T, opts ...Option) *authHarness {
 		exchanges: make(map[string]*authExchange),
 	}
 
-	session, err := agent.startAndStoreSession(t.Context(), sessionStart{Cwd: "/cwd"})
+	session, err := agent.startAndStoreSession(t.Context(), sessionStart{Cwd: testCwd})
 	require.NoError(t, err)
 	establishTestSession(session)
 
@@ -334,7 +334,6 @@ func TestRequestedProviderAuthResidenceFailsInitializationWhenIncompleteOrUnusab
 		{name: "home is a file", options: []Option{WithHome(homeFile), WithProviderAuthRoot(t.TempDir())}, want: "prepare provider auth home"},
 		{name: "relative ledger", options: []Option{WithHome(t.TempDir()), WithProviderAuthRoot("relative/root")}, want: "prepare provider auth ledger"},
 		{name: "ledger is a file", options: []Option{WithHome(t.TempDir()), WithProviderAuthRoot(rootFile)}, want: "prepare provider auth ledger"},
-		{name: "explicit isolation", options: []Option{testProcessIsolationOption(), WithHome(t.TempDir()), WithProviderAuthRoot(t.TempDir())}, want: "prepare provider auth home"},
 	} {
 		var logs bytes.Buffer
 
@@ -398,6 +397,25 @@ func TestAuthCapabilityAbsentWithoutRoot(t *testing.T) {
 	piMeta, ok := resp.AgentCapabilities.Meta[piMetaKey].(map[string]any)
 	require.True(t, ok)
 	require.NotContains(t, piMeta, providerAuthCapabilityKey)
+}
+
+func TestProviderAuthAbsentWithHostAuthority(t *testing.T) {
+	authority := newDeterministicHostAuthority()
+	t.Cleanup(authority.cleanup)
+	agent := NewAgent(
+		WithHostAuthority(authority),
+	)
+	response, err := agent.Initialize(t.Context(), defaultInitializeRequest())
+	require.NoError(t, err)
+	piMeta, ok := response.AgentCapabilities.Meta[piMetaKey].(map[string]any)
+	require.True(t, ok)
+	require.NotContains(t, piMeta, providerAuthCapabilityKey)
+	for _, method := range authMethodNames() {
+		_, err := agent.HandleExtensionMethod(t.Context(), method, json.RawMessage(`{}`))
+		var requestError *acp.RequestError
+		require.ErrorAs(t, err, &requestError)
+		require.Equal(t, -32601, requestError.Code)
+	}
 }
 
 // TestAuthLegsUnadvertisedReturnMethodNotFound pins that an absent surface
@@ -589,37 +607,17 @@ func TestAuthHarnessUsesGeneratedAgentDir(t *testing.T) {
 	require.NotEqual(t, harness.home, harness.session.launch.AgentDir)
 	require.Contains(t, harness.session.launch.AgentDir, "acp-go-pi-runtime-")
 
-	spec, err := harness.session.nextRuntimeLaunch(harness.session.launch, "")
+	replacement, err := harness.session.nextRuntimeLaunch(t.Context(), harness.session.launch)
 	require.NoError(t, err)
-	require.NotEqual(t, harness.home, spec.AgentDir)
-	require.NotEqual(t, harness.session.launch.AgentDir, spec.AgentDir)
-}
-
-// TestDurableHomeIsRefusedWithProcessIsolation pins both halves of the refusal:
-// explicit isolation never gets the durable home, and the verdict it gives is
-// the uniform option shape naming the option the host set — not a raw Go error
-// a host has to read prose out of.
-func TestDurableHomeIsRefusedWithProcessIsolation(t *testing.T) {
-	originalPlatform := agentRuntimePlatform
-	agentRuntimePlatform = linuxPlatform
-	t.Cleanup(func() { agentRuntimePlatform = originalPlatform })
-
-	capability := processIsolationCapabilityStub{}
-	agent := newStubClientAgent(t, newStubPiClient(), WithProcessIsolation(ProcessIsolation{
-		UID: 11, GID: 22, BaseEnvironment: map[string]string{},
-		IdentityLock: capability, AuthorityDomain: capability,
-	}), WithHome(t.TempDir()))
-	agent.versionChecked = true
-
-	_, err := agent.startSession(t.Context(), sessionStart{Cwd: "/cwd"})
-	requireRefusedField(t, optionFieldHome, err)
+	require.NotEqual(t, harness.home, replacement.spec.AgentDir)
+	require.NotEqual(t, harness.session.launch.AgentDir, replacement.spec.AgentDir)
 }
 
 func TestGeneratedAgentDirRelaunchIgnoresLedgerIdentity(t *testing.T) {
 	harness := newAuthHarness(t)
-	spec, err := harness.session.nextRuntimeLaunch(harness.session.launch, "")
+	replacement, err := harness.session.nextRuntimeLaunch(t.Context(), harness.session.launch)
 	require.NoError(t, err)
-	require.NotEqual(t, harness.home, spec.AgentDir)
+	require.NotEqual(t, harness.home, replacement.spec.AgentDir)
 }
 
 // TestAuthCommandIsNotAdvertised pins that the wrapper-owned bridge command is

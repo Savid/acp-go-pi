@@ -1,9 +1,7 @@
 package piacp
 
 import (
-	"context"
 	"log/slog"
-	"os"
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
@@ -13,86 +11,6 @@ import (
 
 // Option configures the pi ACP agent.
 type Option func(*Options)
-
-// ProcessIdentityLockCapability is a duplicable descriptor a trusted supervisor
-// hands the adapter for the host-global UID lock or the authority domain. The
-// descriptor is validated and never exposed to the native pi process.
-type ProcessIdentityLockCapability interface {
-	Duplicate() (*os.File, error)
-}
-
-// ProcessIsolation is an explicit hardened Linux identity policy. Omitting
-// WithProcessIsolation selects ordinary execution as the current identity.
-type ProcessIsolation struct {
-	UID             uint32
-	GID             uint32
-	BaseEnvironment map[string]string
-	// IdentityLock is an optional trusted-supervisor descriptor for the
-	// host-global UID lock. Linux supervisors validate it and never expose it to
-	// the native pi process. Standalone embeddings should leave it nil.
-	IdentityLock        ProcessIdentityLockCapability
-	AuthorityDomain     ProcessIdentityLockCapability
-	StandaloneOwnerID   string
-	StandaloneStateRoot string
-}
-
-// RuntimeResourceKind identifies the lifecycle scope consuming a host-managed resource.
-type RuntimeResourceKind string
-
-const (
-	RuntimeResourceRuntime   RuntimeResourceKind = "runtime"
-	RuntimeResourceSession   RuntimeResourceKind = "session"
-	RuntimeResourcePrompt    RuntimeResourceKind = "prompt"
-	RuntimeResourceDiscovery RuntimeResourceKind = "discovery"
-)
-
-// RuntimeProcessKind identifies a class of sibling-owned process a host may
-// account for. Pi holds no cross-process native home lock, so it never reports
-// RuntimeProcessHomeLockSupervisor; only provider-descendant snapshots are
-// emitted, and only where the containment boundary can prove the inventory.
-type RuntimeProcessKind string
-
-const (
-	RuntimeProcessHomeLockSupervisor RuntimeProcessKind = "home_lock_supervisor"
-	RuntimeProcessProviderDescendant RuntimeProcessKind = "provider_descendant"
-)
-
-type RuntimeStartupStage string
-
-const (
-	RuntimeStartupSpawn         RuntimeStartupStage = "spawn"
-	RuntimeStartupReadiness     RuntimeStartupStage = "readiness"
-	RuntimeStartupConfiguration RuntimeStartupStage = "configuration"
-	RuntimeStartupSession       RuntimeStartupStage = "session"
-)
-
-// RuntimeContainmentMode identifies the effective native process boundary.
-type RuntimeContainmentMode string
-
-const (
-	RuntimeContainmentAuthoritative RuntimeContainmentMode = "authoritative"
-	RuntimeContainmentBestEffort    RuntimeContainmentMode = "best_effort"
-	// RuntimeContainmentSharedIdentity is ordinary, non-authoritative execution
-	// as the adapter's current identity. It proves direct-child liveness only;
-	// it carries no descendant inventory, whole-tree quiescence, or credential
-	// separation claim.
-	RuntimeContainmentSharedIdentity RuntimeContainmentMode = "shared_identity"
-	RuntimeContainmentUnavailable    RuntimeContainmentMode = "unavailable"
-)
-
-// RuntimeResourceHooks lets an embedding host enforce native-root and
-// scratch-root limits. ObserveStartupStage receives the stage result as a Go
-// error because the host is the trusted in-process embedder that already owns
-// this adapter's process; it is not the ACP client, which only ever sees the
-// closed contracted error shapes.
-type RuntimeResourceHooks struct {
-	AcquireNativeRoot      func(context.Context, RuntimeResourceKind) (func(), error)
-	ReserveScratchRoot     func(context.Context, RuntimeResourceKind) (func(), error)
-	ObserveProcess         func(context.Context, RuntimeProcessKind, int64)
-	ObserveProcessSnapshot func(context.Context, RuntimeProcessKind, int)
-	ObserveStartupStage    func(context.Context, RuntimeResourceKind, RuntimeStartupStage, time.Duration, error)
-	ObserveContainment     func(context.Context, RuntimeContainmentMode)
-}
 
 // Options configures the ACP agent process and the pi RPC-mode sessions it
 // starts.
@@ -105,22 +23,19 @@ type Options struct {
 	AgentVersion string
 
 	// ExecutablePath is the pi CLI executable path. If empty, PATH is searched.
-	ExecutablePath string
-	// ProcessIsolation is optional hardened Linux isolation. Nil selects
-	// ordinary execution as the current root or non-root identity.
-	ProcessIsolation *ProcessIsolation
-	// Home is the durable per-instance PI_CODING_AGENT_DIR shared by sessions.
-	// Empty gives each session an ephemeral agent directory. Provider auth is
-	// advertised only with both Home and ProviderAuthRoot configured.
+	ExecutablePath        string
+	HostAuthority         HostAuthority
+	hostAuthoritySupplied bool
+	// Home is the durable per-instance PI_CODING_AGENT_DIR shared by ordinary-mode
+	// sessions. Managed mode rejects it and always builds isolated generation
+	// residences. Provider auth is advertised only with both Home and
+	// ProviderAuthRoot configured in ordinary mode.
 	Home string
 	// ScratchDir is the parent directory for all ephemeral on-disk
 	// materialization (per-session roots, hydration temp files, and the version
 	// probe's isolated PI_CODING_AGENT_DIR/settings residence). Empty means the
 	// system temp directory. The directory is created 0700 when missing.
 	ScratchDir string
-	// DarwinBestEffortContainment explicitly selects Darwin process-group
-	// containment. It is invalid on every other platform.
-	DarwinBestEffortContainment bool
 	// DefaultModel selects the model for newly created pi sessions when
 	// non-empty, as "provider/id" (for example "openai/gpt-4o").
 	DefaultModel string
@@ -148,8 +63,7 @@ type Options struct {
 	SessionStoreLoadTimeout time.Duration
 	// TurnTimeout bounds one pi prompt turn. Zero (the default) means no
 	// deadline. On expiry the turn is aborted and fails with cause "timeout".
-	TurnTimeout          time.Duration
-	RuntimeResourceHooks RuntimeResourceHooks
+	TurnTimeout time.Duration
 	// ConcurrencyLimits controls process-local backpressure.
 	ConcurrencyLimits ConcurrencyLimits
 	// SeedFiles maps paths relative to the pi agent directory a session
@@ -175,9 +89,7 @@ type Options struct {
 	ProviderAuthRoot string
 	// imageLimitsSet records whether WithImageLimits supplied the struct; an
 	// omitted option leaves every field at its default.
-	imageLimitsSet           bool
-	testOnlyNoCredential     bool
-	testOnlyIdentityLockRoot string
+	imageLimitsSet bool
 }
 
 // ConcurrencyLimits controls per-agent/session backpressure. Zero fields use defaults.
@@ -195,12 +107,6 @@ func applyOptions(opts []Option) Options {
 
 	for _, opt := range opts {
 		opt(&options)
-	}
-
-	if options.ProcessIsolation != nil {
-		cloned := *options.ProcessIsolation
-		cloned.BaseEnvironment = cloneStringMap(options.ProcessIsolation.BaseEnvironment)
-		options.ProcessIsolation = &cloned
 	}
 
 	if !options.imageLimitsSet {
@@ -246,22 +152,18 @@ func WithExecutablePath(path string) Option {
 	}
 }
 
-// WithProcessIsolation explicitly requires every native process and probe to
-// run through the hardened Linux boundary as the supplied non-root identity
-// with no supplementary groups. The
-// base environment is a complete replacement for the adapter environment;
-// WithEnv and session environment values overlay it.
-func WithProcessIsolation(isolation ProcessIsolation) Option {
+// WithHostAuthority routes native processes and tree ownership through authority.
+func WithHostAuthority(authority HostAuthority) Option {
 	return func(options *Options) {
-		cloned := isolation
-		cloned.BaseEnvironment = cloneStringMap(isolation.BaseEnvironment)
-		options.ProcessIsolation = &cloned
+		options.hostAuthoritySupplied = true
+		options.HostAuthority = authority
 	}
 }
 
 // WithHome sets the durable per-instance PI_CODING_AGENT_DIR shared by all
-// sessions. It is required for provider auth so Pi's native cross-process
-// credential lock and credential residence survive session teardown.
+// ordinary-mode sessions. Managed mode rejects it. It is required for provider
+// auth so Pi's native cross-process credential lock and credential residence
+// survive session teardown.
 func WithHome(path string) Option {
 	return func(options *Options) {
 		options.Home = path
@@ -295,22 +197,6 @@ func WithScratchDir(dir string) Option {
 func WithInputHandoffRoot(dir string) Option {
 	return func(options *Options) {
 		options.InputHandoffRoot = dir
-	}
-}
-
-// WithDarwinBestEffortContainment opts into Darwin process-group containment.
-// The boundary reaps the direct child and waits for the captured original
-// process group to disappear, but cannot contain descendants that leave it.
-func WithDarwinBestEffortContainment() Option {
-	return func(options *Options) {
-		options.DarwinBestEffortContainment = true
-	}
-}
-
-// WithRuntimeResourceHooks installs host-facing native-root and scratch-root admission hooks.
-func WithRuntimeResourceHooks(hooks RuntimeResourceHooks) Option {
-	return func(options *Options) {
-		options.RuntimeResourceHooks = hooks
 	}
 }
 
@@ -400,10 +286,10 @@ func WithConcurrencyLimits(limits ConcurrencyLimits) Option {
 // closed, because pi records a load error for unparsable settings and then
 // silently runs its own defaults.
 //
-// The directory written to is per session only when no durable Home is
-// configured. With WithHome, every session launches against that one shared
-// directory and the seed is written there, so a seeded file is agent-scoped
-// operator configuration rather than per-session state.
+// The directory written to is per session unless ordinary mode has a durable
+// Home. With WithHome in ordinary mode, every session launches against that one
+// shared directory and the seed is written there, so a seeded file is
+// agent-scoped operator configuration rather than per-session state.
 //
 // Paths are confined to the agent directory: absolute paths, ".." escapes, and
 // empty keys fail closed at session start.

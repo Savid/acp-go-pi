@@ -9,6 +9,8 @@ import (
 	"io"
 	"time"
 
+	"github.com/coder/acp-go-sdk"
+
 	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
 
@@ -21,6 +23,8 @@ const lifecycleBoundaryFieldNativeRows = "nativeRows"
 const lifecycleBoundaryFieldNativeState = "nativeState"
 
 const lifecycleBoundaryFieldRecordedAt = "recordedAt"
+
+const lifecycleBoundaryFieldConfiguration = "configuration"
 
 // Native-state dispositions a boundary record states. The durable format is a
 // raw mirror of pi's own session file, so a cycle whose frames pi never wrote
@@ -42,6 +46,10 @@ const (
 // conversation.
 type lifecycleBoundaryRecord struct {
 	Version int `json:"version"`
+	// Configuration is the accepted per-session native environment and ordered
+	// path state for the transcript generation covered by this boundary.
+	Configuration         sessionConfigurationRecord `json:"configuration"`
+	configurationComplete bool
 	// StreamID names the incarnation whose ordered stream reached this
 	// boundary.
 	StreamID string `json:"streamId"`
@@ -84,8 +92,13 @@ func (s *agentSession) commitLifecycleBoundary(ctx context.Context, record lifec
 
 	record.Version = lifecycleBoundaryVersion
 	record.RecordedAtUnixMilli = lifecycleBoundaryNow().UnixMilli()
+	record.Configuration = sessionConfiguration(PiOptions{
+		Env:           s.configuration.Env,
+		ExtraPathDirs: s.configuration.ExtraPathDirs,
+	})
 
-	// Every field is a scalar, so the encoding cannot fail.
+	// lifecycleBoundaryRecord contains only JSON-native scalar, slice, and map
+	// values, so encoding this closed internal shape cannot fail.
 	encoded, _ := json.Marshal(record)
 
 	s.commitMu.Lock()
@@ -98,12 +111,12 @@ func (s *agentSession) commitLifecycleBoundary(ctx context.Context, record lifec
 	key := SessionKey{SessionID: string(s.id), Subpath: SessionStoreLifecycleSubpath}
 
 	appendCtx, finishAppend := s.agent.observe.StartSessionStore(ctx, "append")
-	err := appendMirrorEntries(appendCtx, s.agent.sessionStore(), key, []SessionStoreEntry{encoded})
+	appendErr := appendMirrorEntries(appendCtx, s.agent.sessionStore(), key, []SessionStoreEntry{encoded})
 
-	finishAppend(err)
+	finishAppend(appendErr)
 
-	if err != nil {
-		return fmt.Errorf("%w: %w", errLifecycleBoundaryCommit, err)
+	if appendErr != nil {
+		return fmt.Errorf("%w: %w", errLifecycleBoundaryCommit, appendErr)
 	}
 
 	return nil
@@ -130,6 +143,11 @@ func (a *Agent) lastLifecycleBoundary(
 	for index, entry := range entries {
 		record, decodeErr := decodeLifecycleBoundaryRecord(entry)
 		if decodeErr != nil {
+			var requestErr *acp.RequestError
+			if errors.As(decodeErr, &requestErr) {
+				return lifecycleBoundaryRecord{}, false, requestErr
+			}
+
 			return lifecycleBoundaryRecord{}, false, fmt.Errorf("decode lifecycle journal row %d: %w", index, decodeErr)
 		}
 
@@ -147,26 +165,58 @@ func (a *Agent) lastLifecycleBoundary(
 }
 
 func decodeLifecycleBoundaryRecord(entry SessionStoreEntry) (lifecycleBoundaryRecord, error) {
-	decoder := json.NewDecoder(bytes.NewReader(entry))
-	decoder.DisallowUnknownFields()
-
-	var record lifecycleBoundaryRecord
-	if err := decoder.Decode(&record); err != nil {
+	fields, err := decodeLifecycleBoundaryObject(entry, "lifecycle boundary", []string{
+		lifecycleFieldVersion,
+		lifecycleBoundaryFieldConfiguration,
+		lifecycleFieldStreamID,
+		"turnId",
+		"cycleId",
+		"outcome",
+		"stopReason",
+		lifecycleBoundaryFieldNativeRows,
+		lifecycleBoundaryFieldNativeState,
+		"detail",
+		"vacancyProven",
+		lifecycleBoundaryFieldRecordedAt,
+	})
+	if err != nil {
 		return lifecycleBoundaryRecord{}, err
 	}
 
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return lifecycleBoundaryRecord{}, errors.New("trailing JSON value")
+	configurationComplete := false
+
+	if rawConfiguration, present := fields[lifecycleBoundaryFieldConfiguration]; present {
+		configurationFields, configurationErr := decodeLifecycleBoundaryObject(
+			rawConfiguration,
+			"lifecycle boundary configuration",
+			[]string{metaEnvKey, metaExtraPathDirsKey},
+		)
+		if configurationErr != nil {
+			return lifecycleBoundaryRecord{}, configurationErr
 		}
 
-		return lifecycleBoundaryRecord{}, fmt.Errorf("decode trailing data: %w", err)
+		if configurationFields != nil {
+			rawEnv, envPresent := configurationFields[metaEnvKey]
+			_, extraPathDirsPresent := configurationFields[metaExtraPathDirsKey]
+			configurationComplete = envPresent && extraPathDirsPresent
+
+			if envPresent && !bytes.Equal(bytes.TrimSpace(rawEnv), []byte("null")) {
+				if envErr := validateLifecycleBoundaryDynamicObject(
+					rawEnv,
+					"lifecycle boundary configuration env",
+				); envErr != nil {
+					return lifecycleBoundaryRecord{}, envErr
+				}
+			}
+		}
 	}
 
-	var fields map[string]json.RawMessage
+	var record lifecycleBoundaryRecord
+	if decodeErr := json.Unmarshal(entry, &record); decodeErr != nil {
+		return lifecycleBoundaryRecord{}, decodeErr
+	}
 
-	_ = json.Unmarshal(entry, &fields) // the strict full decode above already proved valid JSON
+	record.configurationComplete = configurationComplete
 
 	for _, field := range []string{
 		lifecycleFieldVersion,
@@ -187,11 +237,185 @@ func decodeLifecycleBoundaryRecord(entry SessionStoreEntry) (lifecycleBoundaryRe
 		}
 	}
 
+	if !record.configurationComplete {
+		return lifecycleBoundaryRecord{}, sessionResumeIncompatibleError(lifecycleBoundaryFieldConfiguration)
+	}
+
+	if _, err := resolveSessionConfiguration(
+		PiOptions{},
+		sessionConfigurationPresence{},
+		record.Configuration,
+	); err != nil {
+		return lifecycleBoundaryRecord{}, err
+	}
+
 	if err := validateLifecycleBoundaryRecord(record); err != nil {
 		return lifecycleBoundaryRecord{}, err
 	}
 
 	return record, nil
+}
+
+// decodeLifecycleBoundaryObject walks one closed journal object without ever
+// materializing it through a map first. encoding/json otherwise accepts a
+// duplicate name and silently keeps its last value, which is not an exact
+// durable schema.
+func decodeLifecycleBoundaryObject(
+	raw []byte,
+	object string,
+	allowed []string,
+) (map[string]json.RawMessage, error) {
+	permitted := make(map[string]struct{}, len(allowed))
+	for _, field := range allowed {
+		permitted[field] = struct{}{}
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", object, err)
+	}
+
+	if token != json.Delim('{') {
+		return nil, fmt.Errorf("%s must be an object", object)
+	}
+
+	fields := make(map[string]json.RawMessage, len(allowed))
+
+	for decoder.More() {
+		keyToken, tokenErr := decoder.Token()
+		if tokenErr != nil {
+			return nil, fmt.Errorf("decode %s member: %w", object, tokenErr)
+		}
+
+		// encoding/json only yields string tokens for object member names.
+		field, _ := keyToken.(string)
+
+		if _, ok := permitted[field]; !ok {
+			return nil, fmt.Errorf("unknown %s field %q", object, field)
+		}
+
+		if _, duplicate := fields[field]; duplicate {
+			return nil, fmt.Errorf("duplicate %s field %q", object, field)
+		}
+
+		var value json.RawMessage
+		if decodeErr := decoder.Decode(&value); decodeErr != nil {
+			return nil, fmt.Errorf("decode %s field %q: %w", object, field, decodeErr)
+		}
+
+		fields[field] = value
+	}
+
+	if _, err = decoder.Token(); err != nil {
+		return nil, fmt.Errorf("close %s: %w", object, err)
+	}
+
+	if _, err = decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("%s carries trailing JSON value", object)
+		}
+
+		return nil, fmt.Errorf("decode %s trailing data: %w", object, err)
+	}
+
+	return fields, nil
+}
+
+// validateLifecycleBoundaryDynamicObject walks a dynamic-name object before
+// encoding/json can collapse duplicate members. Dynamic names are compared
+// exactly: environment keys are case-sensitive on Unix, so Token and TOKEN are
+// distinct values rather than schema aliases. Nested objects are walked with
+// the same rule even though env value validation later requires strings.
+func validateLifecycleBoundaryDynamicObject(raw []byte, object string) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("decode %s: %w", object, err)
+	}
+
+	if token != json.Delim('{') {
+		return fmt.Errorf("%s must be an object", object)
+	}
+
+	if walkErr := walkLifecycleBoundaryDynamicObject(decoder, object); walkErr != nil {
+		return walkErr
+	}
+
+	if _, err = decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("%s carries trailing JSON value", object)
+		}
+
+		return fmt.Errorf("decode %s trailing data: %w", object, err)
+	}
+
+	return nil
+}
+
+func walkLifecycleBoundaryDynamicObject(decoder *json.Decoder, object string) error {
+	seen := map[string]struct{}{}
+
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("decode %s member: %w", object, err)
+		}
+
+		// encoding/json only yields string tokens for object member names.
+		key, _ := keyToken.(string)
+
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("duplicate %s field %q", object, key)
+		}
+
+		seen[key] = struct{}{}
+
+		if err := walkLifecycleBoundaryDynamicValue(decoder, object+"."+key); err != nil {
+			return err
+		}
+	}
+
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("close %s: %w", object, err)
+	}
+
+	return nil
+}
+
+func walkLifecycleBoundaryDynamicValue(decoder *json.Decoder, path string) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+
+	if delimiter == '{' {
+		return walkLifecycleBoundaryDynamicObject(decoder, path)
+	}
+
+	// The only other opening delimiter encoding/json can yield for a value is
+	// an array. Closing delimiters are consumed by their owning walker.
+	index := 0
+	for decoder.More() {
+		if err := walkLifecycleBoundaryDynamicValue(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+			return err
+		}
+
+		index++
+	}
+
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("close %s: %w", path, err)
+	}
+
+	return nil
 }
 
 func validateLifecycleBoundaryRecord(record lifecycleBoundaryRecord) error {

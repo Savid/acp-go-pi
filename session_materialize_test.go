@@ -3,7 +3,6 @@ package piacp
 import (
 	"encoding/json"
 	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,18 +13,6 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
-type materializeTestDirEntry struct {
-	name    string
-	dir     bool
-	info    os.FileInfo
-	infoErr error
-}
-
-func (entry materializeTestDirEntry) Name() string               { return entry.name }
-func (entry materializeTestDirEntry) IsDir() bool                { return entry.dir }
-func (materializeTestDirEntry) Type() os.FileMode                { return 0 }
-func (entry materializeTestDirEntry) Info() (os.FileInfo, error) { return entry.info, entry.infoErr }
-
 func restoreMaterializeSeams(t *testing.T) {
 	t.Helper()
 	mkdirAll := materializeMkdirAll
@@ -35,8 +22,6 @@ func restoreMaterializeSeams(t *testing.T) {
 	writeFile := materializeWriteFile
 	stat := materializeStat
 	readFile := materializeReadFile
-	walkDir := materializeWalkDir
-	rel := materializeRel
 	t.Cleanup(func() {
 		materializeMkdirAll = mkdirAll
 		materializeMkdirTemp = mkdirTemp
@@ -45,8 +30,6 @@ func restoreMaterializeSeams(t *testing.T) {
 		materializeWriteFile = writeFile
 		materializeStat = stat
 		materializeReadFile = readFile
-		materializeWalkDir = walkDir
-		materializeRel = rel
 	})
 }
 
@@ -138,68 +121,6 @@ func TestRuntimeGenerationMaterializeBranches(t *testing.T) {
 		_, err := createSessionGeneration(t.TempDir())
 		require.ErrorContains(t, err, "create session runtime generation")
 	})
-
-	t.Run("walk source", func(t *testing.T) {
-		err := copyGenerationAgentDir(filepath.Join(t.TempDir(), "missing"), t.TempDir())
-		require.Error(t, err)
-	})
-
-	t.Run("relative path", func(t *testing.T) {
-		restoreMaterializeSeams(t)
-		materializeRel = func(string, string) (string, error) { return "", wantErr }
-		materializeWalkDir = func(root string, walk fs.WalkDirFunc) error {
-			return walk(filepath.Join(root, "child"), materializeTestDirEntry{name: "child"}, nil)
-		}
-		require.ErrorIs(t, copyGenerationAgentDir("source", "target"), wantErr)
-		_, err := rebaseGenerationPath("path", "old", "new")
-		require.ErrorContains(t, err, "outside")
-	})
-
-	t.Run("entry info", func(t *testing.T) {
-		restoreMaterializeSeams(t)
-		materializeWalkDir = func(root string, walk fs.WalkDirFunc) error {
-			return walk(filepath.Join(root, "child"), materializeTestDirEntry{name: "child", infoErr: wantErr}, nil)
-		}
-		require.ErrorIs(t, copyGenerationAgentDir("source", "target"), wantErr)
-	})
-
-	t.Run("directory", func(t *testing.T) {
-		restoreMaterializeSeams(t)
-		source := t.TempDir()
-		require.NoError(t, os.Mkdir(filepath.Join(source, "nested"), 0o750))
-		target := t.TempDir()
-		require.NoError(t, copyGenerationAgentDir(source, target))
-		require.DirExists(t, filepath.Join(target, "nested"))
-	})
-
-	t.Run("non regular", func(t *testing.T) {
-		restoreMaterializeSeams(t)
-		source := t.TempDir()
-		require.NoError(t, os.Symlink("target", filepath.Join(source, "link")))
-		require.ErrorContains(t, copyGenerationAgentDir(source, t.TempDir()), "non-regular")
-	})
-
-	t.Run("read file", func(t *testing.T) {
-		restoreMaterializeSeams(t)
-		source := t.TempDir()
-		require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("data"), 0o600))
-		materializeReadFile = func(string) ([]byte, error) { return nil, wantErr }
-		require.ErrorIs(t, copyGenerationAgentDir(source, t.TempDir()), wantErr)
-	})
-
-	t.Run("write file", func(t *testing.T) {
-		restoreMaterializeSeams(t)
-		source := t.TempDir()
-		require.NoError(t, os.WriteFile(filepath.Join(source, "file"), []byte("data"), 0o600))
-		materializeWriteFile = func(string, []byte, os.FileMode) error { return wantErr }
-		require.ErrorIs(t, copyGenerationAgentDir(source, t.TempDir()), wantErr)
-	})
-
-	rebased, err := rebaseGenerationPath("", "/old", "/new")
-	require.NoError(t, err)
-	require.Empty(t, rebased)
-	_, err = rebaseGenerationPath("/outside", "/old", "/new")
-	require.ErrorContains(t, err, "outside")
 }
 
 func TestSessionStoreLoadTimeoutDefaults(t *testing.T) {
@@ -214,9 +135,7 @@ func TestDurableHomeMaterialization(t *testing.T) {
 		dirs := sessionDirs{Root: t.TempDir(), AgentDir: "/generated"}
 		require.NoError(t, NewAgent(WithHome(home)).applyGenerationAgentDir(&dirs))
 		require.Equal(t, home, dirs.AgentDir)
-		info, err := os.Stat(home)
-		require.NoError(t, err)
-		require.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+		requireRestrictedMode(t, home, 0o700)
 		require.NoDirExists(t, filepath.Join(dirs.Root, "agent"))
 	})
 
@@ -264,12 +183,12 @@ func TestReconcileHomeStartupDefaultsFailsClosed(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(home, pi.SettingsFileName), []byte(`{"defaultModel":`), 0o600))
 
 		agent := newStubClientAgent(t, newStubPiClient(), WithHome(home))
-		_, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+		_, err := agent.NewSession(t.Context(), NewSessionRequest(testCwd))
 		require.ErrorContains(t, err, "decode pi settings")
 
 		// The captured failure is the home's, not the session's: it holds for
 		// every later session too.
-		_, err = agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+		_, err = agent.NewSession(t.Context(), NewSessionRequest(testCwd))
 		require.ErrorContains(t, err, "decode pi settings")
 	})
 
@@ -279,14 +198,14 @@ func TestReconcileHomeStartupDefaultsFailsClosed(t *testing.T) {
 		client.state = pi.SessionState{SessionID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
 		agent := newStubClientAgent(t, client, WithHome(home))
 
-		response, err := agent.NewSession(t.Context(), NewSessionRequest("/cwd"))
+		response, err := agent.NewSession(t.Context(), NewSessionRequest(testCwd))
 		require.NoError(t, err)
 		session, err := agent.session(response.SessionId)
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, session.Close(t.Context())) })
 
 		require.NoError(t, os.WriteFile(filepath.Join(home, pi.SettingsFileName), []byte(`{"defaultModel":`), 0o600))
-		_, err = agent.NewSession(t.Context(), NewSessionRequest("/other"))
+		_, err = agent.NewSession(t.Context(), NewSessionRequest(absTestPath("other")))
 		require.ErrorContains(t, err, "decode pi settings")
 	})
 }

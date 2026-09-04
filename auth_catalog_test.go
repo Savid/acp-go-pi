@@ -253,29 +253,3 @@ func TestAuthLoopbackHostIgnoresUnparsableRedirect(t *testing.T) {
 
 	require.False(t, authLoopbackHost("https://provider.test/a?redirect_uri=http%3A%2F%2F%5B%3A%3A1"))
 }
-
-func TestOwnedBrowserShimRemovesARefusedOwnershipHandoff(t *testing.T) {
-	scratch := t.TempDir()
-	agent := NewAgent(
-		WithScratchDir(scratch),
-		WithProcessIsolation(ProcessIsolation{
-			UID: 11, GID: 22, BaseEnvironment: map[string]string{},
-			StandaloneOwnerID:   "browser-shim-handoff-refusal",
-			StandaloneStateRoot: "/var/tmp/acp-go-pi-browser-shim-handoff-refusal",
-		}),
-	)
-
-	shim, err := agent.newOwnedSessionBrowserShim()
-	require.Error(t, err)
-	require.Nil(t, shim)
-	require.Empty(t, browserShimDirs(t, scratch))
-}
-
-func TestSessionStartRevalidatesExplicitIsolation(t *testing.T) {
-	agent := &Agent{options: Options{ProcessIsolation: &ProcessIsolation{
-		UID: 0, GID: 22, BaseEnvironment: map[string]string{},
-	}}}
-
-	err := agent.sessionStartConfigurationError()
-	require.ErrorContains(t, err, "UID and GID must be nonzero")
-}

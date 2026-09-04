@@ -10,28 +10,13 @@ import (
 // extension rides under on every surface that carries it.
 const lifecycleMetaKey = lifecycle.MetaKey
 
-// provenLifecycleFacts resolves the answer for the active configuration from
-// the same code path that enforces containment, never from a compiled-in
-// constant.
-//
-//   - `updatesOutsidePrompt` is true because the session's process-generation
-//     outbox routes every native event whether or not a prompt is in flight,
-//     and the stream opens on the establishing response rather than inside a
-//     prompt.
-//   - `authoritativeQuiescence` is true only where session close proves
-//     whole-tree vacancy: the Linux supervised boundary enumerates its own
-//     tree, and every other boundary signals a process group without being
-//     able to state what remained.
-//   - `activityKinds` is empty because no native event carries a background
-//     activity entity: the agent and turn brackets, the queue update, the
-//     compaction and auto-retry pairs, and the tool events are all foreground.
 func (a *Agent) provenLifecycleFacts() lifecycle.Negotiated {
 	proven := lifecycle.Negotiated{
 		UpdatesOutsidePrompt: true,
 		ActivityKinds:        []lifecycle.ActivityKind{},
 	}
 
-	if a.ContainmentMode() == RuntimeContainmentAuthoritative {
+	if a.options.hostAuthoritySupplied {
 		proven.AuthoritativeQuiescence = true
 		proven.QuiescenceSource = lifecycle.ProofClassProcessContainment
 	}
@@ -43,21 +28,22 @@ func (a *Agent) provenLifecycleFacts() lifecycle.Negotiated {
 // connection. An absent offer leaves the key omitted from the response and the
 // extension dormant for every session on that connection.
 func (a *Agent) negotiateLifecycle(meta map[string]any) (map[string]any, error) {
-	offer, present, refusal := lifecycle.DecodeOffer(meta)
+	present, refusal := lifecycle.DecodeCapability(meta)
 	if refusal != nil {
 		return nil, unsupportedField(refusal.Field)
 	}
 
-	answer, common := lifecycle.Negotiated{}, false
+	answer := lifecycle.Negotiated{}
 	if present {
-		answer, common = offer.Answer(a.provenLifecycleFacts())
+		answer = a.provenLifecycleFacts()
+		answer.Version = lifecycle.Version
 	}
 
 	a.mu.Lock()
 	a.lifecycle = answer
 	a.mu.Unlock()
 
-	if !common {
+	if !present {
 		return map[string]any{}, nil
 	}
 

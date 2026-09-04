@@ -18,18 +18,18 @@ import (
 // real pi processes, the way a configured home is driven by a sequence of
 // sessions.
 type startupDefaultsHome struct {
-	executable  string
-	root        string
-	home        string
-	containment pi.ContainmentSpec
-	launches    int
+	executable      string
+	root            string
+	home            string
+	baseEnvironment map[string]string
+	launches        int
 }
 
 func newStartupDefaultsHome(t *testing.T, executable string) *startupDefaultsHome {
 	t.Helper()
 
-	containment := integrationContainmentSpec(t)
-	root := containment.GenerationRoot
+	runtime := newIntegrationRuntime(t)
+	root := runtime.root
 	home := filepath.Join(root, "home")
 
 	// pi refuses to switch to a model whose provider has no credential, so the
@@ -40,7 +40,7 @@ func newStartupDefaultsHome(t *testing.T, executable string) *startupDefaultsHom
 		AuthJSON: []byte(`{"openai":{"type":"api_key","key":"integration-not-a-real-key"}}`),
 	}).Write())
 
-	return &startupDefaultsHome{executable: executable, root: root, home: home, containment: containment}
+	return &startupDefaultsHome{executable: executable, root: root, home: home, baseEnvironment: runtime.baseEnvironment}
 }
 
 // launch starts one pi process against the home and returns its client.
@@ -51,12 +51,13 @@ func (h *startupDefaultsHome) launch(t *testing.T, ctx context.Context) *pi.Clie
 	sessionDir := filepath.Join(h.root, "sessions", string(rune('a'+h.launches)))
 	require.NoError(t, os.MkdirAll(sessionDir, 0o700))
 
-	process, err := pi.StartProcess(ctx, pi.LaunchSpec{
-		ExecutablePath: h.executable,
-		AgentDir:       h.home,
-		SessionDir:     sessionDir,
-		Cwd:            h.root,
-		Containment:    h.containment,
+	process, err := pi.StartOrdinaryProcess(ctx, pi.LaunchSpec{
+		ExecutablePath:  h.executable,
+		AgentDir:        h.home,
+		SessionDir:      sessionDir,
+		Cwd:             h.root,
+		NativeRoot:      h.root,
+		BaseEnvironment: h.baseEnvironment,
 	})
 	require.NoError(t, err)
 
@@ -79,6 +80,29 @@ func (h *startupDefaultsHome) launch(t *testing.T, ctx context.Context) *pi.Clie
 	})
 
 	return client
+}
+
+// selectStartupDefaults records one model and thinking level in the home's
+// startup keys, leaving every other key in the file alone. Since pi 0.84.3 a
+// session's own selection stays session-scoped, so a selection reaches the
+// shared file only where something puts it there deliberately: pi's explicit
+// save, or any pi older than that on every session change. The keys are what
+// the next launch reads either way, so the drift this reconciliation exists
+// for is staged rather than inferred from one pi version's persistence.
+func (h *startupDefaultsHome) selectStartupDefaults(t *testing.T, model pi.Model, level string) {
+	t.Helper()
+
+	settings := h.settings(t)
+	settings["defaultProvider"] = model.Provider
+	settings["defaultModel"] = model.ID
+
+	if level != "" {
+		settings["defaultThinkingLevel"] = level
+	}
+
+	encoded, err := json.Marshal(settings)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(h.home, pi.SettingsFileName), encoded, 0o600))
 }
 
 // settings reads what the next pi process launched against the home would read.
@@ -148,6 +172,7 @@ func TestPiCLIStartupDefaultsSurviveAnotherSession(t *testing.T) {
 	_, err = first.SetModel(ctx, elsewhere.Provider, elsewhere.ID)
 	require.NoError(t, err)
 	require.NoError(t, first.SetThinkingLevel(ctx, level))
+	home.selectStartupDefaults(t, elsewhere, level)
 
 	// The hazard, observed in the file every session shares.
 	persisted := home.settings(t)
@@ -228,6 +253,7 @@ func TestPiCLIStartupDefaultsKeepOperatorConfiguration(t *testing.T) {
 	session := home.launch(t, ctx)
 	_, err = session.SetModel(ctx, elsewhere.Provider, elsewhere.ID)
 	require.NoError(t, err)
+	home.selectStartupDefaults(t, elsewhere, "")
 	require.Equal(t, elsewhere.ID, home.settings(t)["defaultModel"])
 
 	require.NoError(t, baseline.Restore(home.home))

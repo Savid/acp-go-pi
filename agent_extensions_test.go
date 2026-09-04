@@ -125,7 +125,7 @@ func TestForkExtensionStoreLimitAfterNativeClone(t *testing.T) {
 		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}),
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
-	agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
+	agent.probeVersion = func(context.Context, string, string) (string, error) {
 		return pi.DefaultMinimumVersion, nil
 	}
 	agent.sessions["occupied"] = &agentSession{agent: agent, id: "occupied"}
@@ -147,7 +147,7 @@ func TestForkExtensionStoreLimitAfterNativeClone(t *testing.T) {
 func TestForkFailsClosedWhenOpeningCatalogIsRejected(t *testing.T) {
 	store := newFaultySessionStore()
 	appendForkParentRows(t, store,
-		json.RawMessage(`{"type":"session","id":"`+string(forkParentID)+`","cwd":"/cwd"}`),
+		json.RawMessage(`{"type":"session","id":"`+string(forkParentID)+`","cwd":`+testCwdJSON+`}`),
 		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`[{"type":"text","text":"hi"}]`)}),
 	)
 	client := newStubPiClient()

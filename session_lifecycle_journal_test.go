@@ -1,14 +1,76 @@
 package piacp
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
+
+func TestLifecycleBoundaryDecoderEdges(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		``,
+		`[]`,
+		`{"`,
+		`{"allowed":`,
+		`{"allowed":1`,
+		`{} x`,
+	} {
+		_, err := decodeLifecycleBoundaryObject([]byte(raw), "edge", []string{"allowed"})
+		require.Error(t, err, raw)
+	}
+
+	for _, raw := range []string{
+		``,
+		`[]`,
+		`{"`,
+		`{"outer":{"inner":1}`,
+		`{"array":[1, {"nested": true}]`,
+		`{"array":[`,
+		`{"array":[1`,
+		`{"array":[{"nested":}`,
+		`{} {}`,
+		`{} x`,
+	} {
+		require.Error(t, validateLifecycleBoundaryDynamicObject([]byte(raw), "edge"), raw)
+	}
+	require.NoError(t, validateLifecycleBoundaryDynamicObject(
+		[]byte(`{"array":[1,{"nested":[true,null]}]}`), "edge",
+	))
+
+	decoder := json.NewDecoder(bytes.NewBufferString(`{"unterminated":`))
+	_, err := decoder.Token()
+	require.NoError(t, err)
+	require.Error(t, walkLifecycleBoundaryDynamicObject(decoder, "edge"))
+
+	for _, entry := range []SessionStoreEntry{
+		json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+		json.RawMessage(`{"version":1,"configuration":{"env":{},"extraPathDirs":["relative"]},"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
+	} {
+		_, err = decodeLifecycleBoundaryRecord(entry)
+		require.Error(t, err)
+	}
+
+	store := NewInMemorySessionStore()
+	require.NoError(t, store.Append(t.Context(), SessionKey{
+		SessionID: "edge", Subpath: SessionStoreLifecycleSubpath,
+	}, []SessionStoreEntry{json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":1}`)}))
+	_, found, err := NewAgent(WithSessionStore(store)).lastLifecycleBoundary(t.Context(), "edge")
+	require.False(t, found)
+	require.Error(t, err)
+
+	session, _ := lifecycleSession(t, false)
+	session.fencePersistence()
+	require.True(t, session.persistFenced)
+	require.NoError(t, session.commitLifecycleBoundary(t.Context(), lifecycleBoundaryRecord{}))
+}
 
 // TestLifecycleBoundaryCommitFailure pins that a store the boundary record
 // cannot append to fails the boundary instead of letting a terminal event
@@ -32,7 +94,7 @@ func TestLifecycleBoundaryCommitFailure(t *testing.T) {
 func TestLifecycleBoundaryRestoreValidation(t *testing.T) {
 	t.Parallel()
 
-	valid := json.RawMessage(`{"version":1,"streamId":"current","nativeRows":2,"nativeState":"committed","recordedAt":1}`)
+	valid := json.RawMessage(`{"version":1,"configuration":{"env":null,"extraPathDirs":null},"streamId":"current","nativeRows":2,"nativeState":"committed","recordedAt":1}`)
 	record, err := decodeLifecycleBoundaryRecord(valid)
 	require.NoError(t, err)
 	require.Equal(t, "current", record.StreamID)
@@ -42,13 +104,13 @@ func TestLifecycleBoundaryRestoreValidation(t *testing.T) {
 		"malformed":                 json.RawMessage(`not-json`),
 		"trailing value":            json.RawMessage(string(valid) + ` {}`),
 		"malformed trailing data":   json.RawMessage(string(valid) + ` {`),
-		"unknown field":             json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":1,"legacy":true}`),
+		"unknown field":             json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":1,"extra":true}`),
 		"missing required":          json.RawMessage(`{"version":1,"streamId":"","nativeState":"committed","recordedAt":1}`),
 		"null optional":             json.RawMessage(`{"version":1,"streamId":"","turnId":null,"nativeRows":0,"nativeState":"committed","recordedAt":1}`),
 		"unsupported version":       json.RawMessage(`{"version":2,"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
 		"negative rows":             json.RawMessage(`{"version":1,"streamId":"","nativeRows":-1,"nativeState":"committed","recordedAt":1}`),
 		"nonpositive timestamp":     json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"committed","recordedAt":0}`),
-		"unsupported disposition":   json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"legacy","recordedAt":1}`),
+		"unsupported native state":  json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"invented","recordedAt":1}`),
 		"uncommitted vacancy":       json.RawMessage(`{"version":1,"streamId":"","nativeRows":0,"nativeState":"retained","vacancyProven":true,"recordedAt":1}`),
 		"identity without stream":   json.RawMessage(`{"version":1,"streamId":"","turnId":"turn","cycleId":"cycle","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
 		"stop without outcome":      json.RawMessage(`{"version":1,"streamId":"","stopReason":"end_turn","nativeRows":0,"nativeState":"committed","recordedAt":1}`),
@@ -61,8 +123,69 @@ func TestLifecycleBoundaryRestoreValidation(t *testing.T) {
 	for name, entry := range invalid {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+			encoded := string(entry)
+			if strings.HasPrefix(encoded, "{") && !strings.Contains(encoded, `"configuration"`) {
+				entry = json.RawMessage(`{"configuration":{"env":null,"extraPathDirs":null},` + strings.TrimPrefix(encoded, "{"))
+			}
+
 			_, decodeErr := decodeLifecycleBoundaryRecord(entry)
 			require.Error(t, decodeErr)
+		})
+	}
+}
+
+// TestLastLifecycleBoundaryRejectsAmbiguousSchemaFields exercises the
+// production journal reader rather than a test-only decoder. The closed
+// boundary/configuration objects reject aliases and duplicates, while the
+// dynamic environment rejects exact duplicates recursively without folding
+// case. Ambiguous durable facts make the whole restore ineligible.
+func TestLastLifecycleBoundaryRejectsAmbiguousSchemaFields(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		boundary json.RawMessage
+		want     string
+	}{
+		"top-level duplicate": {
+			boundary: json.RawMessage(`{"version":1,"version":1,"configuration":{"env":null,"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "duplicate",
+		},
+		"configuration duplicate": {
+			boundary: json.RawMessage(`{"version":1,"configuration":{"env":null,"env":{},"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "duplicate",
+		},
+		"environment duplicate": {
+			boundary: json.RawMessage(`{"version":1,"configuration":{"env":{"TOKEN":"one","TOKEN":"two"},"extraPathDirs":[]},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "duplicate",
+		},
+		"nested environment duplicate": {
+			boundary: json.RawMessage(`{"version":1,"configuration":{"env":{"nested":{"token":"one","token":"two"}},"extraPathDirs":[]},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "duplicate",
+		},
+		"top-level case alias": {
+			boundary: json.RawMessage(`{"Version":1,"configuration":{"env":null,"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "unknown",
+		},
+		"configuration case alias": {
+			boundary: json.RawMessage(`{"version":1,"configuration":{"Env":null,"extraPathDirs":null},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`),
+			want:     "unknown",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			store := NewInMemorySessionStore()
+			require.NoError(t, store.Append(t.Context(), SessionKey{
+				SessionID: "session",
+				Subpath:   SessionStoreLifecycleSubpath,
+			}, []SessionStoreEntry{test.boundary}))
+
+			agent := NewAgent(WithSessionStore(store))
+			_, found, err := agent.lastLifecycleBoundary(t.Context(), "session")
+			require.False(t, found)
+			require.ErrorContains(t, err, test.want)
 		})
 	}
 }
@@ -122,17 +245,17 @@ func TestSessionRestoreMethodsRejectAnInvalidLifecycleJournal(t *testing.T) {
 
 	tests := map[string]func(*Agent) error{
 		"load": func(agent *Agent) error {
-			_, err := agent.LoadSession(t.Context(), LoadSessionRequest(validSessionUUID, "/cwd"))
+			_, err := agent.LoadSession(t.Context(), LoadSessionRequest(validSessionUUID, testCwd))
 
 			return err
 		},
 		"resume": func(agent *Agent) error {
-			_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(validSessionUUID, "/cwd"))
+			_, err := agent.ResumeSession(t.Context(), ResumeSessionRequest(validSessionUUID, testCwd))
 
 			return err
 		},
 		"fork": func(agent *Agent) error {
-			_, err := agent.handleForkSession(t.Context(), forkRaw(t, ForkSessionRequest(validSessionUUID, "/cwd")))
+			_, err := agent.handleForkSession(t.Context(), forkRaw(t, ForkSessionRequest(validSessionUUID, testCwd)))
 
 			return err
 		},
@@ -144,7 +267,7 @@ func TestSessionRestoreMethodsRejectAnInvalidLifecycleJournal(t *testing.T) {
 
 			store := NewInMemorySessionStore()
 			require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: validSessionUUID}, []SessionStoreEntry{
-				json.RawMessage(`{"type":"session","id":"01234567-89ab-cdef-0123-456789abcdef","cwd":"/cwd"}`),
+				json.RawMessage(`{"type":"session","id":"01234567-89ab-cdef-0123-456789abcdef","cwd":` + testCwdJSON + `}`),
 			}))
 			require.NoError(t, store.Append(t.Context(), SessionKey{
 				SessionID: validSessionUUID,
@@ -155,4 +278,21 @@ func TestSessionRestoreMethodsRejectAnInvalidLifecycleJournal(t *testing.T) {
 			require.ErrorContains(t, invoke(agent), "decode lifecycle journal")
 		})
 	}
+}
+
+// caseDistinctEnvironmentBoundary stores one lifecycle boundary whose
+// configuration names two environment variables that differ only in case. What
+// a reader may do with it is platform-specific, so the two verdicts are pinned
+// in the platform files beside this helper.
+func caseDistinctEnvironmentBoundary(t *testing.T) *Agent {
+	t.Helper()
+
+	boundary := json.RawMessage(`{"version":1,"configuration":{"env":{"Token":"one","TOKEN":"two"},"extraPathDirs":[]},"streamId":"stream","nativeRows":1,"nativeState":"committed","recordedAt":1}`)
+	store := NewInMemorySessionStore()
+	require.NoError(t, store.Append(t.Context(), SessionKey{
+		SessionID: "session",
+		Subpath:   SessionStoreLifecycleSubpath,
+	}, []SessionStoreEntry{boundary}))
+
+	return NewAgent(WithSessionStore(store))
 }

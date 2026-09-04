@@ -16,6 +16,10 @@ func scratchParent(dir string) string {
 	return os.TempDir()
 }
 
+func scratchParentForOptions(options Options) string {
+	return scratchParent(options.ScratchDir)
+}
+
 // ensureScratchParent resolves the scratch parent and creates it 0700 when
 // missing.
 func ensureScratchParent(dir string) (string, error) {

@@ -295,10 +295,7 @@ type sessionOutbox struct {
 	generationDone <-chan struct{}
 	pumpCancel     context.CancelFunc
 	pumpDone       chan struct{}
-	processRoot    *providerProcessRoot
 	nativeBoundary *nativeBoundaryTracker
-	observeMu      sync.Mutex
-	observePending bool
 
 	containment *generationContainment
 	producers   *generationProducers
@@ -363,10 +360,11 @@ func (g *dispatchGate) Unlock() {
 // be admitted while at least one ancestor token remains, and zero is terminal,
 // so a waiter that observes completion can never race a later Add.
 type generationProducers struct {
-	mu    sync.Mutex
-	count int
-	done  chan struct{}
-	idle  chan struct{}
+	mu       sync.Mutex
+	count    int
+	children int
+	done     chan struct{}
+	idle     chan struct{}
 }
 
 func newGenerationProducers() *generationProducers {
@@ -388,11 +386,12 @@ func (p *generationProducers) acquire(n int) (func(), bool) {
 		return func() {}, false
 	}
 
-	if p.count == 1 {
+	if p.children == 0 {
 		p.idle = make(chan struct{})
 	}
 
 	p.count += n
+	p.children += n
 	p.mu.Unlock()
 
 	var once sync.Once
@@ -405,17 +404,26 @@ func (p *generationProducers) acquire(n int) (func(), bool) {
 }
 
 func (p *generationProducers) releaseRoot() {
-	if p != nil {
-		p.release(1)
+	if p == nil {
+		return
 	}
+
+	p.mu.Lock()
+	p.count--
+
+	if p.count == 0 {
+		close(p.done)
+	}
+	p.mu.Unlock()
 }
 
 func (p *generationProducers) release(n int) {
 	p.mu.Lock()
 
 	p.count -= n
+	p.children -= n
 
-	if p.count == 1 {
+	if p.children == 0 {
 		close(p.idle)
 	}
 
@@ -439,7 +447,7 @@ func (p *generationProducers) waitChildren(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("%w: join generation child producer chain: %v",
-			pi.ErrProcessContainmentIncomplete, ctx.Err())
+			ErrContainmentIncomplete, ctx.Err())
 	}
 }
 
@@ -453,25 +461,8 @@ func (p *generationProducers) wait(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("%w: join generation producer chain: %v",
-			pi.ErrProcessContainmentIncomplete, ctx.Err())
+			ErrContainmentIncomplete, ctx.Err())
 	}
-}
-
-func (o *sessionOutbox) claimProviderObservation() bool {
-	if o == nil {
-		return false
-	}
-
-	o.observeMu.Lock()
-	defer o.observeMu.Unlock()
-
-	if !o.observePending {
-		return false
-	}
-
-	o.observePending = false
-
-	return true
 }
 
 type containmentOwner uint8
@@ -508,18 +499,16 @@ func (o *sessionOutbox) bindRuntime(
 	client piClient,
 	cancel context.CancelFunc,
 	done chan struct{},
-	root *providerProcessRoot,
 	boundary *nativeBoundaryTracker,
 ) error {
 	if boundary == nil || o == nil || o.nativeBoundary == nil || o.nativeBoundary != boundary {
-		return errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("native generation boundary owner is missing"))
+		return errors.Join(ErrContainmentIncomplete, errors.New("native generation boundary owner is missing"))
 	}
 
 	o.proc = proc
 	o.client = client
 	o.pumpCancel = cancel
 	o.pumpDone = done
-	o.processRoot = root
 
 	return nil
 }
@@ -1161,7 +1150,7 @@ func (o *sessionOutbox) popStartup() (startupRecord, outboxAdmission, bool) {
 // rule exists to catch, and it stays fail-closed.
 func (o *sessionOutbox) acceptEstablishment() error {
 	if o == nil {
-		return errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("native generation outbox is missing"))
+		return errors.Join(ErrContainmentIncomplete, errors.New("native generation outbox is missing"))
 	}
 
 	o.mu.Lock()
@@ -1304,7 +1293,7 @@ func (s *agentSession) startPumpContext(
 	if boundary == nil {
 		cancel()
 
-		return 0, errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("native generation boundary owner is missing"))
+		return 0, errors.Join(ErrContainmentIncomplete, errors.New("native generation boundary owner is missing"))
 	}
 
 	s.mu.Lock()
@@ -1319,7 +1308,7 @@ func (s *agentSession) startPumpContext(
 		s.mu.Unlock()
 		cancel()
 
-		return 0, errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("native generation boundary owner changed"))
+		return 0, errors.Join(ErrContainmentIncomplete, errors.New("native generation boundary owner changed"))
 	}
 
 	s.pumpGeneration++
@@ -1330,9 +1319,8 @@ func (s *agentSession) startPumpContext(
 
 	// newSessionOutbox was constructed with this exact non-nil boundary, so the
 	// construction-owned binding cannot fail after the checks above.
-	_ = outbox.bindRuntime(s.proc, client, cancel, done, s.providerProcessRoot, boundary)
+	_ = outbox.bindRuntime(s.proc, client, cancel, done, boundary)
 
-	outbox.observePending = false
 	s.outbox = outbox
 	s.pumpCancel = cancel
 	s.pumpDone = done
@@ -1352,8 +1340,6 @@ func (s *agentSession) publishRuntimeGeneration(
 	cancel context.CancelFunc,
 	proc piProcess,
 	client piClient,
-	root *providerProcessRoot,
-	nativeRelease func(),
 	boundary *nativeBoundaryTracker,
 ) (uint64, *sessionOutbox, bool) {
 	done := make(chan struct{})
@@ -1378,13 +1364,10 @@ func (s *agentSession) publishRuntimeGeneration(
 	outbox.generationDone = ctx.Done()
 	outbox.inheritPromptAdmission(s.promptAdmission)
 
-	_ = outbox.bindRuntime(proc, client, cancel, done, root, boundary)
+	_ = outbox.bindRuntime(proc, client, cancel, done, boundary)
 
-	outbox.observePending = true
 	s.proc = proc
 	s.client = client
-	s.providerProcessRoot = root
-	s.nativeRootRelease = nativeRelease
 	s.nativeBoundary = boundary
 	s.outbox = outbox
 	s.pumpCancel = cancel
@@ -1653,7 +1636,7 @@ func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOut
 				defer releaseProducer()
 
 				containmentErr, _ := outbox.awaitContainment()
-				if !pi.ProcessContainmentComplete(containmentErr) {
+				if !nativeContainmentComplete(containmentErr) {
 					s.recordNativeContainment(containmentErr)
 
 					return
@@ -1678,7 +1661,7 @@ func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOut
 		defer releaseProducer()
 
 		containmentErr := errors.Join(
-			pi.ErrProcessContainmentIncomplete,
+			ErrContainmentIncomplete,
 			errors.New("native generation containment did not complete"),
 		)
 
@@ -1698,7 +1681,7 @@ func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOut
 			s.recordNativeContainment(containmentErr)
 		}
 
-		if !pi.ProcessContainmentComplete(containmentErr) {
+		if !nativeContainmentComplete(containmentErr) {
 			return
 		}
 
@@ -1717,7 +1700,7 @@ func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOut
 
 func (s *agentSession) containGenerationSync(ctx context.Context, outbox *sessionOutbox, cause string) error {
 	if outbox == nil {
-		err := errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("native generation owner is missing"))
+		err := errors.Join(ErrContainmentIncomplete, errors.New("native generation owner is missing"))
 		s.recordNativeContainment(err)
 
 		return err
@@ -1736,7 +1719,7 @@ func (s *agentSession) containGenerationSync(ctx context.Context, outbox *sessio
 
 	if !ok {
 		containmentErr = errors.Join(
-			pi.ErrProcessContainmentIncomplete,
+			ErrContainmentIncomplete,
 			errors.New("native generation producer admission is closed"),
 		)
 		s.recordNativeContainment(containmentErr)
@@ -1771,7 +1754,7 @@ func (s *agentSession) stopNativeGeneration(ctx context.Context, outbox *session
 
 		cancelShutdown()
 	} else {
-		shutdownErr = errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("native generation has no contained process root"))
+		shutdownErr = errors.Join(ErrContainmentIncomplete, errors.New("native generation has no contained process root"))
 	}
 
 	if outbox.pumpCancel != nil {
@@ -1800,30 +1783,23 @@ func (s *agentSession) stopNativeGeneration(ctx context.Context, outbox *session
 		cancelClose()
 	}
 
-	containmentErr := errors.Join(shutdownErr, closeErr, pumpErr)
-	if !pi.ProcessContainmentComplete(abortErr) {
+	if nativeContainmentComplete(closeErr) && pumpErr != nil && outbox.pumpDone != nil {
+		joinCtx, cancelJoin := context.WithTimeout(context.Background(), sessionShutdownTimeout)
+		select {
+		case <-outbox.pumpDone:
+			pumpErr = nil
+		case <-joinCtx.Done():
+		}
+
+		cancelJoin()
+	}
+
+	containmentErr := errors.Join(terminalNativeClose(shutdownErr, closeErr), pumpErr)
+	if !nativeContainmentComplete(abortErr) && !nativeContainmentComplete(closeErr) {
 		containmentErr = errors.Join(containmentErr, abortErr)
 	}
 
-	if outbox.processRoot != nil {
-		complete := providerProcessTreeComplete(containmentErr)
-		retireErr := runNativeBoundaryStep(ctx, "retirement", func() error {
-			outbox.processRoot.retire(context.WithoutCancel(ctx), complete)
-
-			return nil
-		})
-		containmentErr = errors.Join(containmentErr, retireErr)
-
-		if complete && retireErr == nil {
-			s.mu.Lock()
-			if s.providerProcessRoot == outbox.processRoot {
-				s.providerProcessRoot = nil
-			}
-			s.mu.Unlock()
-		}
-	}
-
-	if s.agent != nil && pi.ProcessContainmentComplete(containmentErr) {
+	if s.agent != nil && nativeContainmentComplete(containmentErr) {
 		s.agent.observe.RecordPiProcessExit(ctx, "contained", containmentErr)
 	}
 
@@ -1840,14 +1816,14 @@ func (s *agentSession) stopNativeGeneration(ctx context.Context, outbox *session
 func runNativeBoundaryStep(ctx context.Context, stage string, step func() error) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%w: native generation %s did not start: %w",
-			pi.ErrProcessContainmentIncomplete, stage, err)
+			ErrContainmentIncomplete, stage, err)
 	}
 
 	done := make(chan error, 1)
 
 	go func() {
 		err := errors.Join(
-			pi.ErrProcessContainmentIncomplete,
+			ErrContainmentIncomplete,
 			fmt.Errorf("native generation %s did not complete", stage),
 		)
 
@@ -1866,13 +1842,13 @@ func runNativeBoundaryStep(ctx context.Context, stage string, step func() error)
 	case err := <-done:
 		if contextErr := ctx.Err(); contextErr != nil {
 			return fmt.Errorf("%w: native generation %s did not complete: %w",
-				pi.ErrProcessContainmentIncomplete, stage, contextErr)
+				ErrContainmentIncomplete, stage, contextErr)
 		}
 
 		return err
 	case <-ctx.Done():
 		return fmt.Errorf("%w: native generation %s did not complete: %w",
-			pi.ErrProcessContainmentIncomplete, stage, ctx.Err())
+			ErrContainmentIncomplete, stage, ctx.Err())
 	}
 }
 
@@ -1898,12 +1874,12 @@ type nativeBoundaryCall struct {
 
 func (t *nativeBoundaryTracker) run(ctx context.Context, stage string, step func() error) error {
 	if t == nil {
-		return errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("native generation boundary owner is missing"))
+		return errors.Join(ErrContainmentIncomplete, errors.New("native generation boundary owner is missing"))
 	}
 
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%w: native generation %s did not start: %w",
-			pi.ErrProcessContainmentIncomplete, stage, err)
+			ErrContainmentIncomplete, stage, err)
 	}
 
 	for {
@@ -1925,7 +1901,7 @@ func (t *nativeBoundaryTracker) run(ctx context.Context, stage string, step func
 
 		go func() {
 			err := errors.Join(
-				pi.ErrProcessContainmentIncomplete,
+				ErrContainmentIncomplete,
 				fmt.Errorf("native generation %s did not complete", stage),
 			)
 
@@ -1941,7 +1917,7 @@ func (t *nativeBoundaryTracker) run(ctx context.Context, stage string, step func
 					t.active = nil
 				}
 
-				if !pi.ProcessContainmentComplete(err) && t.incomplete == nil {
+				if !nativeContainmentComplete(err) && t.incomplete == nil {
 					t.incomplete = err
 				}
 
@@ -1962,7 +1938,7 @@ func (t *nativeBoundaryTracker) awaitPrior(ctx context.Context, stage string, ca
 		return nil
 	case <-ctx.Done():
 		incomplete := fmt.Errorf("%w: native generation %s did not start after %s: %w",
-			pi.ErrProcessContainmentIncomplete, stage, call.stage, ctx.Err())
+			ErrContainmentIncomplete, stage, call.stage, ctx.Err())
 		t.detachIncomplete(call, incomplete)
 
 		return incomplete
@@ -1978,7 +1954,7 @@ func (t *nativeBoundaryTracker) await(ctx context.Context, call *nativeBoundaryC
 
 		if contextErr := ctx.Err(); contextErr != nil {
 			incomplete := fmt.Errorf("%w: native generation %s did not complete: %w",
-				pi.ErrProcessContainmentIncomplete, call.stage, contextErr)
+				ErrContainmentIncomplete, call.stage, contextErr)
 
 			t.retainIncomplete(incomplete)
 			err = incomplete
@@ -1987,7 +1963,7 @@ func (t *nativeBoundaryTracker) await(ctx context.Context, call *nativeBoundaryC
 		return err
 	case <-ctx.Done():
 		incomplete := fmt.Errorf("%w: native generation %s did not complete: %w",
-			pi.ErrProcessContainmentIncomplete, call.stage, ctx.Err())
+			ErrContainmentIncomplete, call.stage, ctx.Err())
 
 		t.detachIncomplete(call, incomplete)
 
@@ -2023,7 +1999,7 @@ func (t *nativeBoundaryTracker) retainIncomplete(err error) {
 
 func (t *nativeBoundaryTracker) retainedIncomplete() error {
 	if t == nil {
-		return errors.Join(pi.ErrProcessContainmentIncomplete, errors.New("native generation boundary owner is missing"))
+		return errors.Join(ErrContainmentIncomplete, errors.New("native generation boundary owner is missing"))
 	}
 
 	t.mu.Lock()
@@ -2041,11 +2017,11 @@ type nativeBoundaryPanicError struct {
 }
 
 func (e *nativeBoundaryPanicError) Error() string {
-	return fmt.Sprintf("%s: native generation %s panicked", pi.ErrProcessContainmentIncomplete, e.stage)
+	return fmt.Sprintf("%s: native generation %s panicked", ErrContainmentIncomplete, e.stage)
 }
 
 func (*nativeBoundaryPanicError) Unwrap() error {
-	return pi.ErrProcessContainmentIncomplete
+	return ErrContainmentIncomplete
 }
 
 // recordNativeSettlement fences the mirror for the turn that owns the current
@@ -2290,7 +2266,7 @@ func (s *agentSession) stopPumpBounded(ctx context.Context) error {
 		case <-done:
 		case <-ctx.Done():
 			return fmt.Errorf("%w: join native generation pump: %w",
-				pi.ErrProcessContainmentIncomplete, ctx.Err())
+				ErrContainmentIncomplete, ctx.Err())
 		}
 
 		if outbox != nil {

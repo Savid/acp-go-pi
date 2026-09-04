@@ -8,8 +8,6 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
-
-	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 // TestLifecycleIdentityNamesTheIncarnation pins the boundary-record identity:
@@ -37,7 +35,7 @@ func TestSettlementWaitIsBoundedAndCompletedBoundaryFencesLifecycle(t *testing.T
 	cancel()
 	err := session.awaitSettlementContext(cancelled)
 	require.ErrorContains(t, err, context.Canceled.Error())
-	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 
 	want := errors.New("completed failed boundary")
 	done := make(chan struct{})

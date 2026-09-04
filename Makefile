@@ -1,21 +1,7 @@
 .DEFAULT_GOAL := help
 
-.PHONY: test-trusted-supervisor _privileged-shard-guard _privileged-shard-coverage _privileged-shard-trusted-supervisor _privileged-coverage-gate
-
 GOLANGCI_LINT_VERSION ?= v2.12.2
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
-
-# Removed public surfaces and forbidden hard-cutover terms. Hex-escaped so the
-# term list never contains a literal forbidden term. Expanded with `printf %b`.
-#
-# The singular activity-kind literal is banned in its delimited forms only: it
-# names nothing in the closed activity-kind set, but it is also an ordinary
-# English noun public docs use legitimately ("the goal of this package"). So the
-# pattern matches the three shapes an identifier or wire value takes -- the
-# backticked code span, the quoted string, and the ActivityGoal identifier. A
-# native pi command of the same name stays legal by construction: its code span
-# opens with a slash, so the bare delimited literal never appears.
-REMOVED_PUBLIC_TERMS = --cl\x69|pi\x20acp|pro\x78y|compatibilit\x79|deprecat\x65d|legac\x79|migratio\x6e|session/imp\x6frt|sdkMessag\x65|emitRawSDKMessag\x65s|setGoa\x6c|goa\x6cs|\x60goa\x6c\x60|"goa\x6c"|\\bActivityGoa\x6c\\b|\x4e\x45\x53|SSE\x20MCP|mcpCapabilities\\.ac\x70|\\bExportSessio\x6e\\b|\\bImportSessio\x6e\\b|\\bDeleteSessio\x6e\\b|\\bParseConfi\x67\\b
 
 .PHONY: build lint fmt-check fmt test coverage-check test-cross-compile test-integration-smoke test-integration-live test-integration-cover test-integration-attended test-integration-keystore test-integration-native-browser docs-audit clean tidy vuln modernize-check audit test/cover help
 
@@ -36,74 +22,15 @@ fmt:
 	gofmt -w $$(find . -name '*.go' -not -path './.git/*')
 	$(GOLANGCI_LINT) fmt ./...
 
-# Explicit isolated launches prove their standalone identity vacant across the
-# PID namespace. Those hardening tests run far past the ordinary default suite.
 GO_TEST_TIMEOUT ?= 40m
 
 ## test: run unit tests with race detector and shuffled order
 test:
 	go test -race -shuffle=on -timeout=$(GO_TEST_TIMEOUT) ./...
 
-## test-trusted-supervisor: run Linux root-only native authority tests
-test-trusted-supervisor:
-	@test "$$(uname -s)" = Linux
-	@test "$$(id -u)" -eq 0
-	@for directory in /var/lib/acp-go /var/lib/acp-go/agent-identities; do if [ ! -e "$$directory" ] && [ ! -L "$$directory" ]; then install -d -o root -g root -m 0700 "$$directory"; fi; [ "$$(stat -c '%F %u %g %a' -- "$$directory")" = 'directory 0 0 700' ] || { echo "unsafe trusted-supervisor authority directory $$directory" >&2; exit 1; }; done
-	@selector='^(Test.*(ProcessIsolationActual|TrustedSupervisor|SupervisorGuardianSIGKILL|SupervisorLivenessSIGKILL|GeneratedNative|NativeOwnedDirectory|BorrowedIdentityAdoption|BorrowedDomainAdoption|BorrowedDisposition|AgentIdentityLock|AgentStandalone|AuthorityDomain|IdentityDisposition|PersistentProof|SupervisorConfigIsSealed|CommandCreatorThread|ProviderCreator|SecurityLimits).*)$$'; listing=$$(mktemp); log=$$(mktemp); rc=$$(mktemp); module=$$(go list -mod=readonly -m); status=$$?; \
-	[ "$$status" -eq 0 ] || { rm -f "$$listing" "$$log" "$$rc"; exit "$$status"; }; \
-	go test -list "$$selector" ./... >"$$listing"; status=$$?; \
-	[ "$$status" -eq 0 ] || { rm -f "$$listing" "$$log" "$$rc"; exit "$$status"; }; \
-	required='TrustedSupervisor SupervisorGuardianSIGKILL SupervisorGuardianSIGKILLBeforeNativeLaunchRefusesStartAndCompletesAfterECHILD SupervisorLivenessSIGKILL GeneratedNative BorrowedIdentityAdoption BorrowedDomainAdoption BorrowedDisposition AgentIdentityLock AgentStandalone AuthorityDomain IdentityDisposition CommandCreatorThread SecurityLimits ProcessIsolationActual'; case "$$module" in github.com/savid/acp-go-amp|github.com/savid/acp-go-claude|github.com/savid/acp-go-hermes|github.com/savid/acp-go-pi) ;; github.com/savid/acp-go-codex|github.com/savid/acp-go-opencode) required="$$required PersistentProof SupervisorConfigIsSealed ProviderCreator" ;; *) rm -f "$$listing" "$$log" "$$rc"; echo "unrecognized trusted-supervisor module $$module"; exit 1 ;; esac; \
-	for class in $$required; do grep -Eq "^Test.*$${class}" "$$listing" || { rm -f "$$listing" "$$log" "$$rc"; echo "trusted-supervisor selector discovered no $${class} tests"; exit 1; }; done; \
-	expected=$$(grep -Ec '^Test' "$$listing" || true); rm -f "$$listing"; \
-	[ "$$expected" -gt 0 ] || { rm -f "$$log" "$$rc"; echo 'trusted-supervisor selector discovered no tests'; exit 1; }; \
-	{ go test -race -count=1 -json -run "$$selector" ./...; echo $$? >"$$rc"; } | tee "$$log"; \
-	status=$$(cat "$$rc"); passed=$$(grep -Ec '"Action":"pass","Package":"[^"]+","Test":"Test[^/"]+"' "$$log" || true); skipped=$$(grep -Ec '"Action":"skip","Package":"[^"]+","Test":"Test[^"]+"' "$$log" || true); \
-	rm -f "$$log" "$$rc"; \
-	[ "$$status" -eq 0 ] || exit "$$status"; \
-	[ "$$passed" -eq "$$expected" ] || { echo "trusted-supervisor pass count $$passed, want $$expected"; exit 1; }; \
-	[ "$$skipped" -eq 0 ] || { echo "trusted-supervisor skip count $$skipped, want 0"; exit 1; }
-
 ## coverage-check: require 100% statement coverage with race instrumentation
 coverage-check:
 	go test -race -coverprofile=coverage.out -covermode=atomic -timeout=$(GO_TEST_TIMEOUT) ./...
-	@awk 'NR > 1 && $$(NF - 1) > 0 && $$NF == 0 { print "uncovered statement block: " $$0; missed = 1 } END { if (missed) exit 1 }' coverage.out
-	@go tool cover -func=coverage.out | awk 'BEGIN { found = 0 } /^total:/ { found = 1; if ($$3 != "100.0%") { printf "total coverage %s, want 100.0%%\n", $$3; exit 1 } printf "total coverage %s\n", $$3 } END { if (!found) { print "missing total coverage line"; exit 1 } }'
-
-# Private container-only shard verbs. Public release targets above always cover
-# ./... and enforce their complete gates; only the privileged coordinator calls
-# these explicitly partial targets after validating a six-module package map.
-_privileged-shard-guard:
-	@test '$(ACP_GO_PRIVILEGED_INTERNAL)' = 1
-	@case '$(ACP_GO_PRIVILEGED_SHARD)' in root|provider) ;; *) echo 'invalid privileged shard $(ACP_GO_PRIVILEGED_SHARD)' >&2; exit 1 ;; esac
-	@test -n '$(ACP_GO_PRIVILEGED_MODULE)'
-	@test -n '$(ACP_GO_PRIVILEGED_PACKAGES)'
-	@test -n '$(ACP_GO_PRIVILEGED_REQUIRED_CLASSES)'
-	@test "$$(go list -mod=readonly -m)" = '$(ACP_GO_PRIVILEGED_MODULE)'
-
-_privileged-shard-coverage: _privileged-shard-guard
-	@case '$(ACP_GO_PRIVILEGED_COVERAGE_OUT)' in .tmp/coverage-*.out) ;; *) echo 'invalid privileged coverage output $(ACP_GO_PRIVILEGED_COVERAGE_OUT)' >&2; exit 1 ;; esac
-	go test -race -coverprofile='$(ACP_GO_PRIVILEGED_COVERAGE_OUT)' -covermode=atomic -timeout=$(GO_TEST_TIMEOUT) $(ACP_GO_PRIVILEGED_PACKAGES)
-
-_privileged-shard-trusted-supervisor: _privileged-shard-guard
-	@test "$$(uname -s)" = Linux
-	@test "$$(id -u)" -eq 0
-	@for directory in /var/lib/acp-go /var/lib/acp-go/agent-identities; do if [ ! -e "$$directory" ] && [ ! -L "$$directory" ]; then install -d -o root -g root -m 0700 "$$directory"; fi; [ "$$(stat -c '%F %u %g %a' -- "$$directory")" = 'directory 0 0 700' ] || { echo "unsafe trusted-supervisor authority directory $$directory" >&2; exit 1; }; done
-	@selector='^(Test.*(ProcessIsolationActual|TrustedSupervisor|SupervisorGuardianSIGKILL|SupervisorLivenessSIGKILL|GeneratedNative|NativeOwnedDirectory|BorrowedIdentityAdoption|BorrowedDomainAdoption|BorrowedDisposition|AgentIdentityLock|AgentStandalone|AuthorityDomain|IdentityDisposition|PersistentProof|SupervisorConfigIsSealed|CommandCreatorThread|ProviderCreator|SecurityLimits).*)$$'; listing=$$(mktemp); log=$$(mktemp); rc=$$(mktemp); \
-	go test -list "$$selector" $(ACP_GO_PRIVILEGED_PACKAGES) >"$$listing"; status=$$?; \
-	[ "$$status" -eq 0 ] || { rm -f "$$listing" "$$log" "$$rc"; exit "$$status"; }; \
-	required='$(ACP_GO_PRIVILEGED_REQUIRED_CLASSES)'; \
-	for class in $$required; do grep -Eq "^Test.*$${class}" "$$listing" || { rm -f "$$listing" "$$log" "$$rc"; echo "trusted-supervisor selector discovered no $${class} tests in $(ACP_GO_PRIVILEGED_SHARD) shard"; exit 1; }; done; \
-	expected=$$(grep -Ec '^Test' "$$listing" || true); rm -f "$$listing"; \
-	[ "$$expected" -gt 0 ] || { rm -f "$$log" "$$rc"; echo 'trusted-supervisor shard selector discovered no tests'; exit 1; }; \
-	{ go test -race -count=1 -json -run "$$selector" $(ACP_GO_PRIVILEGED_PACKAGES); echo $$? >"$$rc"; } | tee "$$log"; \
-	status=$$(cat "$$rc"); passed=$$(grep -Ec '"Action":"pass","Package":"[^"]+","Test":"Test[^/"]+"' "$$log" || true); skipped=$$(grep -Ec '"Action":"skip","Package":"[^"]+","Test":"Test[^"]+"' "$$log" || true); \
-	rm -f "$$log" "$$rc"; \
-	[ "$$status" -eq 0 ] || exit "$$status"; \
-	[ "$$passed" -eq "$$expected" ] || { echo "trusted-supervisor pass count $$passed, want $$expected"; exit 1; }; \
-	[ "$$skipped" -eq 0 ] || { echo "trusted-supervisor skip count $$skipped, want 0"; exit 1; }
-
-_privileged-coverage-gate:
 	@awk 'NR > 1 && $$(NF - 1) > 0 && $$NF == 0 { print "uncovered statement block: " $$0; missed = 1 } END { if (missed) exit 1 }' coverage.out
 	@go tool cover -func=coverage.out | awk 'BEGIN { found = 0 } /^total:/ { found = 1; if ($$3 != "100.0%") { printf "total coverage %s, want 100.0%%\n", $$3; exit 1 } printf "total coverage %s\n", $$3 } END { if (!found) { print "missing total coverage line"; exit 1 } }'
 
@@ -115,6 +42,7 @@ test-cross-compile:
 	GOOS=darwin GOARCH=arm64 go test -c -o .tmp/cross/pi-darwin.test ./internal/pi
 	GOOS=darwin GOARCH=arm64 go test -c -o .tmp/cross/pi-cmd-darwin.test ./cmd/acp-go-pi
 	GOOS=darwin GOARCH=arm64 go build ./...
+	GOOS=windows GOARCH=amd64 go test -c -o .tmp/cross/pi-root-windows.test .
 	GOOS=windows GOARCH=amd64 go test -c -o .tmp/cross/pi-windows.test ./internal/pi
 	GOOS=windows GOARCH=amd64 go test -c -o .tmp/cross/pi-cmd-windows.test ./cmd/acp-go-pi
 	GOOS=freebsd GOARCH=amd64 go build ./...
@@ -178,18 +106,12 @@ test-integration-cover:
 	go tool covdata percent -i=.tmp/integration-cover/data
 	go tool covdata textfmt -i=.tmp/integration-cover/data -o coverage-integration.out
 
-## docs-audit: check public docs, examples, required files, CLI flags, and removed terms
+## docs-audit: check required public docs, examples, and CLI flag coverage
 docs-audit:
 	@missing=0; for file in README.md doc.go docs.json example_test.go AGENTS.md docs/overview.mdx docs/core/sessions.mdx docs/core/prompt-streaming.mdx docs/features/authentication.mdx docs/features/elicitation.mdx docs/features/mcp.mdx docs/features/models-config.mdx docs/features/permissions.mdx docs/features/raw-events.mdx docs/features/session-store.mdx docs/get-started/examples.mdx docs/get-started/install.mdx docs/get-started/quickstart.mdx docs/get-started/run-modes.mdx docs/operations/observability.mdx docs/operations/security.mdx docs/operations/troubleshooting.mdx docs/reference/acp-methods.mdx docs/reference/cli.mdx docs/reference/go-api.mdx docs/reference/meta.mdx docs/reference/updates.mdx examples/minimal-client/main.go examples/resume-from-file/main.go examples/interactive-chat/main.go; do if [ ! -f "$$file" ]; then echo "missing required docs file: $$file"; missing=1; fi; done; exit $$missing
-	@for flag in -path -home -scratch-dir -provider-auth-root -process-isolation-config -model -seed-file -debug -version; do rg -q -- "$$flag" docs/reference/cli.mdx || { echo "missing CLI flag in docs/reference/cli.mdx: $$flag"; exit 1; }; done
-	@for flag in path home scratch-dir provider-auth-root process-isolation-config model seed-file debug version; do rg -q -- "\"$$flag\"" cmd/acp-go-pi/*.go || { echo "missing CLI flag registration in command code: $$flag"; exit 1; }; done
-	@pattern=$$(printf '%b' '$(REMOVED_PUBLIC_TERMS)'); ! rg -n -- "$$pattern" README.md doc.go docs.json docs examples cmd/acp-go-pi/*.go AGENTS.md
-	@rg -q 'SupervisorGuardianSIGKILL' Makefile
-	@rg -q 'SupervisorLivenessSIGKILL' Makefile
-	@rg -q 'BorrowedIdentityAdoption' Makefile
-	@rg -q 'BorrowedDomainAdoption' Makefile
-	@rg -q 'validateInheritedAgentIdentityFlock' internal/pi/agent_identity_lock_linux.go
-	@rg -q '/proc/self/fdinfo/' docs/operations/security.mdx
+	@for flag in -path -home -scratch-dir -provider-auth-root -model -seed-file -debug -version; do rg -q -- "$$flag" docs/reference/cli.mdx || { echo "missing CLI flag in docs/reference/cli.mdx: $$flag"; exit 1; }; done
+	@for flag in path home scratch-dir provider-auth-root model seed-file debug version; do rg -q -- "\"$$flag\"" cmd/acp-go-pi/*.go || { echo "missing CLI flag registration in command code: $$flag"; exit 1; }; done
+	@for test in TestHostAuthorityManagedLaunchTrace TestHostAuthorityPreparedTreeExclusivity TestHostAuthorityReclaimPrecedesRemoval TestHostAuthorityNoOrdinaryFallback; do rg -q "func $$test" host_authority_test.go || { echo "missing host authority test: $$test"; exit 1; }; done
 
 ## clean: remove build artifacts
 clean:

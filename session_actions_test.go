@@ -110,7 +110,7 @@ func actionFailureSession(t *testing.T, conn agentClient) (*agentSession, *stubP
 
 	agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
 	agent.conn = conn
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 	agent.clientCapabilities.Elicitation = &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}}
 	process := newStubProcess(false)
 	native := newStubPiClient()
@@ -299,7 +299,7 @@ func TestActionWriterIgnoringCancellationCannotVetoNativeCloseAndIsRetained(t *t
 	<-client.entered
 
 	closeErr := agent.Close()
-	require.ErrorIs(t, closeErr, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, closeErr, ErrContainmentIncomplete)
 	require.Equal(t, 1, process.shutdownCalls, "bounded host delivery cannot veto native shutdown")
 	require.Equal(t, 1, process.closeCalls, "bounded host delivery cannot veto native close")
 	native.mu.Lock()
@@ -311,7 +311,7 @@ func TestActionWriterIgnoringCancellationCannotVetoNativeCloseAndIsRetained(t *t
 
 	close(client.release)
 	<-dialogDone
-	require.ErrorIs(t, agent.Close(), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, agent.Close(), ErrContainmentIncomplete)
 }
 
 func TestActionRequestCancellationAtEachWriteBarrierContainsExactGeneration(t *testing.T) {
@@ -476,7 +476,7 @@ func TestTimedOutActionAnnouncementRetainsImmutableGeneration(t *testing.T) {
 
 	closed := make(chan error, 1)
 	go func() { closed <- session.Close(context.Background()) }()
-	require.ErrorIs(t, <-closed, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, <-closed, ErrContainmentIncomplete)
 	require.Equal(t, 1, process.shutdownCalls)
 	require.Equal(t, 1, process.closeCalls)
 
@@ -490,7 +490,7 @@ func TestTimedOutActionAnnouncementRetainsImmutableGeneration(t *testing.T) {
 	session.lcMu.Lock()
 	require.Equal(t, sequence, session.lc.stream.Sequence())
 	require.Empty(t, session.lc.blockers)
-	require.ErrorIs(t, session.lc.quarantineErr, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, session.lc.quarantineErr, ErrContainmentIncomplete)
 	session.lcMu.Unlock()
 	require.Equal(t, 1, process.shutdownCalls, "late announcement release repeated containment")
 	require.Equal(t, 1, process.closeCalls, "late announcement release repeated cleanup")
@@ -603,7 +603,7 @@ func TestAnnouncementFailureRevokesHeldHostAction(t *testing.T) {
 				}
 				agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
 				agent.conn = client
-				agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+				agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 				process := newStubProcess(false)
 				native := newStubPiClient()
 				session := &agentSession{agent: agent, id: "action", proc: process, client: native}
@@ -711,7 +711,7 @@ func TestActionAdmissionFailureMatrixCancelsExactNativeOwner(t *testing.T) {
 
 func TestLifecycleActionAnnouncementPanicIsContained(t *testing.T) {
 	err := runLifecycleActionAnnouncement(t.Context(), nil, pendingAction{}, lifecycle.ActionPermission)
-	require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, err, ErrContainmentIncomplete)
 }
 
 func TestStaleStreamAfterActionWriteIsRevokedWithoutAnswer(t *testing.T) {
@@ -764,7 +764,7 @@ func TestAnnouncedPermissionCrossesTheRequestWriteBarrier(t *testing.T) {
 		releaseRequest: make(chan struct{}),
 	}
 	agent := NewAgent(testContainmentOption())
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, ActivityKinds: []lifecycle.ActivityKind{}}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, ActivityKinds: []lifecycle.ActivityKind{}}
 	connection := newLocalAgentConnection(agent, wire, input)
 	agent.setConnection(connection)
 	t.Cleanup(func() {

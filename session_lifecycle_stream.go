@@ -10,7 +10,6 @@ import (
 	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-pi/internal/lifecycle"
-	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 const lifecycleFieldVersion = "version"
@@ -786,7 +785,7 @@ func (s *agentSession) quarantineLifecycleGeneration(generation uint64, err erro
 		return
 	}
 
-	s.lc.quarantineErr = errors.Join(pi.ErrProcessContainmentIncomplete, err)
+	s.lc.quarantineErr = errors.Join(ErrContainmentIncomplete, err)
 }
 
 func (s *agentSession) lifecycleGenerationQuarantine(generation uint64) error {

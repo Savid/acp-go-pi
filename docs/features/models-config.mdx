@@ -64,11 +64,11 @@ The same values travel on the wire as `_meta.pi.options.model` and
 
 `WithSeedFiles` (CLI: `-seed-file`) writes files into the pi agent directory a
 session launches against, before the pi process starts, so the CLI reads them
-as its own config. Without `WithHome` that directory is a fresh isolated one
-per session and seeds never touch a durable pi home. With `WithHome` it is the
-one durable directory every session launches against, and each launch writes
-the seeds there again, so the operator's files are what pi reads however a
-previous session left them.
+as its own config. Without `WithHome` that directory is isolated and seeds
+never touch a durable pi home. Managed mode creates it fresh for every native
+generation. In ordinary mode, `WithHome` selects the one durable directory
+every session launches against, and each launch writes the seeds there again,
+so the operator's files are what pi reads however a previous session left them.
 
 Every seed, `settings.json` included, is written verbatim. A seeded
 `settings.json` that is not valid JSON fails closed at session start, because
@@ -95,10 +95,11 @@ Keep secrets in `WithEnv` rather than in seeded files; see
 
 pi reads `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` from
 `settings.json` once at process start to choose what a session begins on, and
-writes its own selection back into those same keys whenever a session changes
-model or thinking level. `WithHome` gives every session one shared agent
-directory, so those three keys are the one channel through which a session's
-runtime choice could reach another session's startup.
+writes a selection back into those same keys wherever one is saved as the
+default: pi's own explicit save, and — on pi before 0.84.3 — every session
+change of model or thinking level. In ordinary mode, `WithHome` gives every
+session one shared agent directory, so those three keys are the one channel
+through which a session's runtime choice could reach another session's startup.
 
 The adapter never records a session's own model or thinking level there. Both
 travel to each pi process on its own RPC channel. Instead the adapter captures

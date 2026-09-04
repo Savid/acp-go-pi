@@ -9,7 +9,6 @@ import (
 	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-pi/internal/lifecycle"
-	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 type actionRequestWriteAckKey struct{}
@@ -240,8 +239,8 @@ func announcedBoundActionRequest[T any](
 		// fenced here. A timeout or panic leaves the hook quarantined; trying to
 		// acquire lcMu behind it would make close unbounded. Incomplete native
 		// containment likewise permits no lifecycle mutation.
-		if pi.ProcessContainmentComplete(containmentErr) &&
-			!errors.Is(announceErr, pi.ErrProcessContainmentIncomplete) {
+		if nativeContainmentComplete(containmentErr) &&
+			!errors.Is(announceErr, ErrContainmentIncomplete) {
 			session.revokeLifecycleAction(action)
 		}
 

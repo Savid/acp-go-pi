@@ -13,18 +13,18 @@ import (
 
 const (
 	// SessionStoreFormat identifies the durable store format written by this
-	// package: raw pi session JSONL rows appended after settled turns.
+	// package: raw pi session JSONL plus adapter-owned lifecycle records.
 	SessionStoreFormat = "pi-session-jsonl-v1"
 	// SessionStoreMainSubpath addresses a session's main entry log.
 	SessionStoreMainSubpath = ""
 	// SessionStoreLifecycleSubpath addresses a session's adapter-owned
 	// lifecycle boundary log. Its rows are wrapper records rather than native
 	// transcript, so the main log stays exactly the bytes pi wrote and no
-	// boundary fact is ever replayed as conversation.
+	// boundary or session-configuration fact is replayed as conversation.
 	SessionStoreLifecycleSubpath = "lifecycle"
 )
 
-// SessionStoreEntry is one raw native JSON row.
+// SessionStoreEntry is one JSON row in a main or adapter-owned store log.
 type SessionStoreEntry = json.RawMessage
 
 // SessionKey addresses one entry log inside the session store.

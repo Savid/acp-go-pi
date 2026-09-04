@@ -74,10 +74,6 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
-	if len(args) > 0 && args[0] == "containment" {
-		return runContainmentCommand(args[1:], stdout, stderr)
-	}
-
 	flags := flag.NewFlagSet("acp-go-pi", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 
@@ -85,7 +81,6 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	piHome := flags.String("home", "", "durable per-instance PI_CODING_AGENT_DIR; empty gives each session an ephemeral one")
 	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
 	providerAuthRoot := flags.String("provider-auth-root", "", "durable root for the values-free provider-auth ledger; empty leaves provider auth unadvertised")
-	isolationConfigPath := flags.String(processIsolationConfigFlag, "", "optional absolute path to the root-owned mode-0600 Linux child-isolation policy")
 	model := flags.String("model", "", "default pi model as provider/id")
 	seedFiles := &seedFileFlag{}
 	flags.Var(seedFiles, "seed-file", "seed file written into each session's pi agent dir as <relpath>=<hostpath>; repeatable")
@@ -102,19 +97,6 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		_, _ = fmt.Fprintln(stdout, version)
 
 		return 0
-	}
-
-	var isolation *processIsolationConfig
-
-	if *isolationConfigPath != "" {
-		loaded, err := processIsolationConfigLoader(*isolationConfigPath)
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "acp-go-pi: process isolation: %v\n", err)
-
-			return 1
-		}
-
-		isolation = &loaded
 	}
 
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
@@ -153,16 +135,6 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		piacp.WithDefaultModel(*model),
 		piacp.WithLogger(logger),
 	)
-
-	if isolation != nil {
-		serveOptions = append(serveOptions, piacp.WithProcessIsolation(piacp.ProcessIsolation{
-			UID:                 isolation.UID,
-			GID:                 isolation.GID,
-			BaseEnvironment:     isolation.BaseEnvironment,
-			StandaloneOwnerID:   isolation.StandaloneOwnerID,
-			StandaloneStateRoot: isolation.StandaloneStateRoot,
-		}))
-	}
 
 	if len(seedFiles.files) > 0 {
 		serveOptions = append(serveOptions, piacp.WithSeedFiles(seedFiles.files))

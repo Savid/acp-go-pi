@@ -284,7 +284,7 @@ func handoffFilePath(uri *string) (string, *handoffError) {
 		return "", handoffInvalid("handoff image uri path must be absolute")
 	}
 
-	return filepath.Clean(filepath.FromSlash(parsed.Path)), nil
+	return filepath.Clean(handoffLocalPath(parsed.Path)), nil
 }
 
 // handoffRelativePath maps an absolute handoff path to the name it has inside

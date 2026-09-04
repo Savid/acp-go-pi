@@ -8,8 +8,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
-	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +29,41 @@ const (
 	forkChildID  = "22222222-2222-4222-8222-222222222222"
 )
 
+// windowsGOOS names the one platform whose path spelling and environment
+// folding differ from every other target this adapter builds for.
+const windowsGOOS = "windows"
+
+// absTestPath builds a host-absolute path from POSIX-looking segments, so a
+// test states "an absolute working directory" rather than a spelling only one
+// platform accepts.
+func absTestPath(segments ...string) string {
+	root := "/"
+	if runtime.GOOS == windowsGOOS {
+		root = `C:\`
+	}
+
+	return filepath.Join(append([]string{root}, segments...)...)
+}
+
+// testCwd is the host-absolute working directory tests open sessions under.
+var testCwd = absTestPath("cwd")
+
+// testCwdJSON is testCwd as a JSON string, quotes and separator escaping
+// included, so a stored row names the same directory a request carries.
+var testCwdJSON = jsonLiteral(testCwd)
+
+// jsonLiteral encodes a value the test itself supplies, for embedding in a raw
+// store row. Only a value no test constructs can fail here, so a failure is a
+// programming error rather than a case a caller answers.
+func jsonLiteral(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+
+	return string(encoded)
+}
+
 // newStubClientAgent builds an agent whose version probe and pi process
 // launch are faked so tests can drive the given stub client directly.
 func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Agent {
@@ -41,7 +77,7 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
 	agent := NewAgent(append(base, opts...)...)
-	agent.probeVersion = func(context.Context, string, string, pi.ContainmentSpec) (string, error) {
+	agent.probeVersion = func(context.Context, string, string) (string, error) {
 		return pi.DefaultMinimumVersion, nil
 	}
 
@@ -53,7 +89,7 @@ func newStubClientAgent(t *testing.T, client *stubPiClient, opts ...Option) *Age
 	return agent
 }
 
-// testNativeDialog binds legacy unit-test entry points to the exact native
+// testNativeDialog binds concise unit-test entry points to the exact native
 // generation they arrange. Production dialog delivery has no unbound adapter.
 func testNativeDialog(session *agentSession, request pi.UIRequest) *nativeDialog {
 	session.mu.Lock()
@@ -108,36 +144,6 @@ func announcedActionRequest[T any](
 
 func testContainmentOption() Option {
 	return func(*Options) {}
-}
-
-// testProcessIsolationOption installs the isolated shape: a native identity
-// that is never the identity running the test, so the fixture keeps describing
-// a launch with a privilege boundary to cross whoever runs it.
-func testProcessIsolationOption() Option {
-	return func(options *Options) {
-		uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
-		if uid == 0 {
-			uid, gid = 11, 22
-		} else {
-			uid, gid = uid+1, gid+1
-		}
-		WithProcessIsolation(ProcessIsolation{
-			UID: uid, GID: gid,
-			BaseEnvironment:   map[string]string{"PATH": os.Getenv("PATH"), "HOME": os.Getenv("HOME")},
-			StandaloneOwnerID: "acp-go-pi-tests", StandaloneStateRoot: os.TempDir(),
-		})(options)
-		options.testOnlyNoCredential = true
-		options.testOnlyIdentityLockRoot = testIdentityLockRoot()
-	}
-}
-
-func testIdentityLockRoot() string {
-	root := filepath.Join(os.TempDir(), "acp-go-pi-agent-identities-"+strconv.Itoa(os.Getpid()))
-	if err := os.Mkdir(root, 0o700); err != nil && !os.IsExist(err) {
-		panic(err)
-	}
-
-	return root
 }
 
 // newFailingCloseProcess returns a stub process whose shutdown and close
@@ -280,6 +286,7 @@ func appendLifecycleBoundaryForRows(t *testing.T, store SessionStore, sessionID 
 
 	encoded, err := json.Marshal(lifecycleBoundaryRecord{
 		Version:             lifecycleBoundaryVersion,
+		Configuration:       sessionConfiguration(PiOptions{}),
 		StreamID:            "stream",
 		NativeRows:          rows,
 		NativeState:         nativeStateCommitted,
@@ -376,7 +383,7 @@ func reserveOutboxPrompt(outbox *sessionOutbox, delivery *turnDelivery) error {
 
 func bindTestOutbox(session *agentSession) *sessionOutbox {
 	outbox := newTestSessionOutbox(1)
-	if err := outbox.bindRuntime(session.proc, session.client, nil, nil, session.providerProcessRoot, outbox.nativeBoundary); err != nil {
+	if err := outbox.bindRuntime(session.proc, session.client, nil, nil, outbox.nativeBoundary); err != nil {
 		panic(err)
 	}
 	session.outbox = outbox
@@ -388,7 +395,7 @@ func bindTestOutbox(session *agentSession) *sessionOutbox {
 	return outbox
 }
 
-// attachTestNativeBoundary gives manually assembled legacy fixtures an exact
+// attachTestNativeBoundary gives manually assembled fixtures an exact
 // construction-owned native boundary. Production constructors must never mint
 // this owner implicitly.
 func attachTestNativeBoundary(session *agentSession) *agentSession {
@@ -418,9 +425,9 @@ func bindTestRuntime(
 	client piClient,
 	cancel context.CancelFunc,
 	done chan struct{},
-	root *providerProcessRoot,
+	_ any,
 ) {
-	if err := outbox.bindRuntime(process, client, cancel, done, root, outbox.nativeBoundary); err != nil {
+	if err := outbox.bindRuntime(process, client, cancel, done, outbox.nativeBoundary); err != nil {
 		panic(err)
 	}
 }
@@ -428,7 +435,7 @@ func bindTestRuntime(
 func bindTestEstablishingOutbox(session *agentSession, generation uint64, process piProcess, client piClient) *sessionOutbox {
 	boundary := newNativeBoundaryTracker()
 	outbox := newSessionOutbox(generation, boundary)
-	if err := outbox.bindRuntime(process, client, nil, nil, nil, boundary); err != nil {
+	if err := outbox.bindRuntime(process, client, nil, nil, boundary); err != nil {
 		panic(err)
 	}
 	session.proc = process
@@ -672,6 +679,7 @@ type stubPiClient struct {
 	modelsErr       error
 	commands        []pi.SlashCommand
 	commandsErr     error
+	commandsFunc    func()
 }
 
 func newStubPiClient() *stubPiClient {
@@ -877,6 +885,10 @@ func (c *stubPiClient) GetSessionStats(context.Context) (pi.SessionStats, error)
 	return c.stats, c.statsErr
 }
 func (c *stubPiClient) GetCommands(context.Context) ([]pi.SlashCommand, error) {
+	if c.commandsFunc != nil {
+		c.commandsFunc()
+	}
+
 	return c.commands, c.commandsErr
 }
 
@@ -895,7 +907,7 @@ func lifecycleSession(t *testing.T, authoritative bool) (*agentSession, *directA
 	client := newDirectAgentClient()
 	agent := NewAgent(testContainmentOption())
 	agent.conn = client
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
 	if authoritative {
 		agent.lifecycle.AuthoritativeQuiescence = true
 		agent.lifecycle.QuiescenceSource = lifecycle.ProofClassProcessContainment
@@ -910,4 +922,41 @@ func lifecycleSession(t *testing.T, authoritative bool) (*agentSession, *directA
 // which is why no fixture may stand one in for a real prompt's correlation.
 func testSubmission() lifecycle.Submission {
 	return lifecycle.Submission{SubmissionID: "submission", ClientNonce: "nonce"}
+}
+
+// launchEnvValue reads a composed launch environment the way the platform
+// stores it. Windows folds environment names to one case, so the key a caller
+// supplied is not always the key the launch carries.
+func launchEnvValue(env map[string]string, key string) string {
+	if value, found := env[key]; found {
+		return value
+	}
+
+	for name, value := range env {
+		if strings.EqualFold(name, key) {
+			return value
+		}
+	}
+
+	return ""
+}
+
+// testSignalTimeout bounds a rendezvous a test waits on. It is generous
+// because it is not measuring anything: it exists only so a signal that will
+// never arrive is reported where it was expected instead of hanging the
+// package until its own timeout.
+const testSignalTimeout = 30 * time.Second
+
+// awaitTestSignal receives one rendezvous signal or fails the test. A signal
+// that never comes almost always means the call meant to reach the point that
+// sends it was refused before it got there, and a bounded wait names that
+// failure instead of leaving a goroutine dump to be read.
+func awaitTestSignal(t *testing.T, signal <-chan struct{}, what string) {
+	t.Helper()
+
+	select {
+	case <-signal:
+	case <-time.After(testSignalTimeout):
+		require.FailNowf(t, "timed out waiting for a test signal", "%s", what)
+	}
 }

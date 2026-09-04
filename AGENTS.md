@@ -124,8 +124,10 @@ Unless explicitly requested, ask before:
   gets an isolated agent directory.
 - Do not log auth material, user secrets, prompts, tool input, tool output,
   or raw pi event bodies by default.
-- Credentials (`auth.json`, provider env keys) are injected at session start
-  and excluded from the session store.
+- Credential files such as `auth.json` are injected at session start and
+  excluded from the session store. Explicit per-session `env`, including any
+  provider keys it carries, is recorded in lifecycle boundary rows, so every
+  session-store implementation must protect those rows as secret material.
 - Reject unsupported ACP extension/provider mutation methods with explicit
   protocol errors unless this agent implements a namespaced extension.
 - Avoid broad filesystem or network behavior in tests unless the test is

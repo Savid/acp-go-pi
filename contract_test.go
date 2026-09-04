@@ -82,14 +82,14 @@ func integrationFakeBinary(t *testing.T) string {
 			return
 		}
 
-		dir := filepath.Join("/tmp/pilfg/b3", fmt.Sprintf("unit-fake-%d", os.Getpid()))
+		dir := filepath.Join(os.TempDir(), fmt.Sprintf("acp-go-pi-unit-fake-%d", os.Getpid()))
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			errUnitFakeBinary = err
 
 			return
 		}
 
-		unitFakeBinaryPath = filepath.Join(dir, "integration.test")
+		unitFakeBinaryPath = filepath.Join(dir, "integration"+unitFakeExecutableSuffix())
 		cmd := exec.Command("go", "test", "-c", "-tags=integration", "-o", unitFakeBinaryPath, "./integration")
 		cmd.Dir = filepath.Dir(file)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -102,22 +102,59 @@ func integrationFakeBinary(t *testing.T) string {
 	return unitFakeBinaryPath
 }
 
+// unitFakeSidecarSuffix names the instruction file the fake harness reads from
+// beside its own image. The harness owns the name; it is spelled again here
+// because this package cannot import one built only under a test tag.
+const unitFakeSidecarSuffix = ".acp-fake-pi.json"
+
+// unitFakeExecutableSuffix is the extension an image needs before the platform
+// will start it, and before the adapter's own PATHEXT-aware resolution admits
+// it.
+func unitFakeExecutableSuffix() string {
+	if runtime.GOOS == windowsGOOS {
+		return ".exe"
+	}
+
+	return ""
+}
+
+// unitFakeSidecar is the instruction file's shape, mirroring what the fake
+// harness decodes.
+type unitFakeSidecar struct {
+	Scenario     unitFakeScenario `json:"scenario"`
+	LaunchRecord string           `json:"launchRecord,omitempty"`
+	CanaryEnv    string           `json:"canaryEnv,omitempty"`
+}
+
+// unitFakeExecutable publishes the fake harness as a pi executable and hands
+// back its path. The harness is the compiled binary itself rather than a script
+// wrapping it: a shebang is not an executable image on every platform this
+// adapter runs on, and the adapter launches this path directly.
 func unitFakeExecutable(t *testing.T, scenario unitFakeScenario) string {
 	t.Helper()
 
-	dir := t.TempDir()
-	scenarioPath := filepath.Join(dir, "scenario.json")
-	data, err := json.Marshal(scenario)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(scenarioPath, data, 0o600))
+	return publishUnitFake(t, unitFakeSidecar{Scenario: scenario})
+}
 
-	path := filepath.Join(dir, "pi")
-	script := fmt.Sprintf(
-		"#!/bin/sh\nACP_GO_PI_FAKE_HELPER=1 ACP_GO_PI_FAKE_MODE=%q exec %q -test.run '^TestFakePiExecutable$' -- \"$@\"\n",
-		scenarioPath,
-		integrationFakeBinary(t),
-	)
-	require.NoError(t, os.WriteFile(path, []byte(script), 0o700))
+// publishUnitFake links the built harness under a pi name and writes the
+// instruction file beside it. Linking rather than copying keeps one image on
+// disk however many fakes a package publishes; a filesystem that refuses the
+// link is answered with a copy.
+func publishUnitFake(t *testing.T, sidecar unitFakeSidecar) string {
+	t.Helper()
+
+	binary := integrationFakeBinary(t)
+	path := filepath.Join(t.TempDir(), "pi"+unitFakeExecutableSuffix())
+
+	if err := os.Link(binary, path); err != nil {
+		data, readErr := os.ReadFile(binary) // #nosec G304 -- built by this test.
+		require.NoError(t, readErr)
+		require.NoError(t, os.WriteFile(path, data, 0o700))
+	}
+
+	encoded, err := json.Marshal(sidecar)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path+unitFakeSidecarSuffix, encoded, 0o600))
 
 	return path
 }
@@ -725,7 +762,7 @@ func lifecycleInitializeRequest() acp.InitializeRequest {
 	return acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		Meta: map[string]any{lifecycleMetaKey: map[string]any{
-			"versions": []any{lifecycle.Version},
+			"version": lifecycle.Version,
 		}},
 	}
 }

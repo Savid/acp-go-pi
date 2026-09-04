@@ -12,19 +12,30 @@ func TestBoundaryTypedCommandsAndPromptFailure(t *testing.T) {
 	t.Run("get state dispatch boundary", func(t *testing.T) {
 		harness := newTestHarness(t)
 		released := false
-		done := make(chan error, 1)
+
+		type boundedState struct {
+			state SessionState
+			err   error
+		}
+
+		done := make(chan boundedState, 1)
+
+		// The assertions stay on the test goroutine: require calls Goexit,
+		// which kills this goroutine before its send and leaves the receive
+		// below waiting for the package timeout.
 		go func() {
 			state, err := harness.client.GetStateWithBoundary(t.Context(), CallBoundary{
 				BeforeDispatch: func() (func(), error) {
 					return func() { released = true }, nil
 				},
 			})
-			require.Equal(t, "bounded", state.SessionID)
-			done <- err
+			done <- boundedState{state: state, err: err}
 		}()
 		command := harness.nextCommand(t)
 		harness.respond(t, commandID(t, command), "get_state", `,"data":{"sessionId":"bounded"}`)
-		require.NoError(t, <-done)
+		bounded := <-done
+		require.NoError(t, bounded.err)
+		require.Equal(t, "bounded", bounded.state.SessionID)
 		require.True(t, released)
 	})
 

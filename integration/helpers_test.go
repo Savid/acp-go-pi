@@ -4,8 +4,6 @@ package integration
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,7 +13,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -38,167 +35,59 @@ const (
 
 var integrationLogger = slog.New(slog.DiscardHandler)
 
-type integrationTargetIdentity struct {
-	uid      uint32
-	gid      uint32
-	username string
-	home     string
-}
-
-func integrationLinuxTargetIdentity(t *testing.T) integrationTargetIdentity {
-	t.Helper()
-
-	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
-		t.Skip("production process-isolation integration requires a Linux root supervisor")
-	}
-	account, err := user.LookupId(strconv.FormatUint(uint64(nativeBrowserCanaryUID), 10))
-	if err != nil {
-		t.Skip("production process-isolation integration requires the provisioned native-canary account")
-	}
-	accountGID, err := strconv.ParseUint(account.Gid, 10, 32)
-	require.NoError(t, err)
-	require.Equal(t, nativeBrowserCanaryGID, uint32(accountGID))
-	require.Equal(t, "native-canary", account.Username)
-	require.Equal(t, "/home/native-canary", filepath.Clean(account.HomeDir))
-
-	return integrationTargetIdentity{
-		uid: nativeBrowserCanaryUID, gid: nativeBrowserCanaryGID,
-		username: account.Username, home: filepath.Clean(account.HomeDir),
-	}
-}
-
-func integrationProductionEnvironment(target integrationTargetIdentity) map[string]string {
-	return map[string]string{
-		"HOME":    target.home,
-		"LANG":    "C.UTF-8",
-		"LOGNAME": target.username,
-		"PATH":    "/usr/local/bin:/usr/local/go/bin:/usr/bin:/bin",
-		"USER":    target.username,
-	}
-}
-
 func integrationScratchDir(t *testing.T) string {
 	t.Helper()
-
 	dir, err := os.MkdirTemp("/tmp", "acp-go-pi-integration-scratch-")
 	require.NoError(t, err)
-	require.NoError(t, os.Chmod(dir, 0o755))
+	require.NoError(t, os.Chmod(dir, 0o700))
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-
 	return dir
 }
 
 func integrationWorkspaceDir(t *testing.T) string {
 	t.Helper()
-
 	dir, err := os.MkdirTemp("/tmp", "acp-go-pi-integration-workspace-")
 	require.NoError(t, err)
-	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
-		target := integrationLinuxTargetIdentity(t)
-		require.NoError(t, os.Chown(dir, int(target.uid), int(target.gid)))
-	}
 	require.NoError(t, os.Chmod(dir, 0o700))
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-
 	return dir
 }
 
 func integrationBaseEnvironment(t *testing.T) map[string]string {
 	t.Helper()
-
-	account, err := user.LookupId(strconv.Itoa(os.Geteuid()))
+	account, err := user.Current()
 	require.NoError(t, err)
-	home := t.TempDir()
-
 	return map[string]string{
-		"HOME":    home,
-		"LANG":    "C.UTF-8",
-		"LOGNAME": account.Username,
-		"PATH":    os.Getenv("PATH"),
-		"USER":    account.Username,
+		"HOME": t.TempDir(), "LANG": "C.UTF-8", "LOGNAME": account.Username,
+		"PATH": os.Getenv("PATH"), "USER": account.Username,
 	}
 }
 
-func integrationProcessIsolationOption(t *testing.T) piacp.Option {
-	t.Helper()
-
-	target := integrationLinuxTargetIdentity(t)
-
-	return piacp.WithProcessIsolation(piacp.ProcessIsolation{
-		UID:                 target.uid,
-		GID:                 target.gid,
-		BaseEnvironment:     integrationProductionEnvironment(target),
-		StandaloneOwnerID:   "acp-go-pi-integration",
-		StandaloneStateRoot: target.home,
-	})
+type integrationRuntime struct {
+	root            string
+	baseEnvironment map[string]string
 }
 
-func integrationContainmentSpec(t *testing.T) internalpi.ContainmentSpec {
+func newIntegrationRuntime(t *testing.T) integrationRuntime {
 	t.Helper()
-	parent := t.TempDir()
-	root, err := os.MkdirTemp(parent, "acp-go-pi-runtime-*")
+	root, err := os.MkdirTemp(t.TempDir(), "acp-go-pi-runtime-*")
 	require.NoError(t, err)
-	identity := make([]byte, 16)
-	_, err = rand.Read(identity)
-	require.NoError(t, err)
-
-	// Explicit isolation is a Linux-only mode with no fallback, so off Linux the
-	// spec carries the ordinary environment instead. Combining it with Darwin
-	// best effort would ask for two containment modes at once, which the launch
-	// boundary refuses rather than silently picking one.
-	base := integrationBaseEnvironment(t)
-
-	var isolation *internalpi.ProcessIsolation
-
-	if runtime.GOOS == "linux" {
-		uid, gid := os.Geteuid(), os.Getegid()
-		if uid == 0 || gid == 0 {
-			uid, gid = 65534, 65534
-		}
-		isolation = &internalpi.ProcessIsolation{
-			UID: uint32(uid), GID: uint32(gid),
-			BaseEnvironment:      base,
-			TestOnlyNoCredential: true,
-		}
-	}
-
-	return internalpi.ContainmentSpec{
-		DarwinBestEffort:    runtime.GOOS == "darwin",
-		ScratchParent:       parent,
-		GenerationRoot:      root,
-		RuntimeID:           hex.EncodeToString(identity),
-		LifecycleKind:       "discovery",
-		Isolation:           isolation,
-		OrdinaryEnvironment: base,
-	}
+	return integrationRuntime{root: root, baseEnvironment: integrationBaseEnvironment(t)}
 }
-
-// integrationContainmentEnvironment is the base environment a spec hands its
-// child, whichever containment mode the platform selected. Tests that pin a
-// native home ask for it here rather than reaching into one mode's field, which
-// is nil on the platforms that use the other.
-func integrationContainmentEnvironment(containment internalpi.ContainmentSpec) map[string]string {
-	if containment.Isolation != nil {
-		return containment.Isolation.BaseEnvironment
-	}
-
-	return containment.OrdinaryEnvironment
-}
-
-func integrationVersionProbeSpec(t *testing.T) (string, internalpi.ContainmentSpec) {
+func integrationVersionProbeSpec(t *testing.T) (string, []string) {
 	t.Helper()
-	containment := integrationContainmentSpec(t)
-	agentDir := filepath.Join(containment.GenerationRoot, "probe-agent")
+	runtime := newIntegrationRuntime(t)
+	agentDir := filepath.Join(runtime.root, "probe-agent")
 	require.NoError(t, (internalpi.AgentDir{Root: agentDir}).Write())
-
-	return agentDir, containment
+	environment := (internalpi.LaunchSpec{AgentDir: agentDir, BaseEnvironment: runtime.baseEnvironment}).Environ()
+	return agentDir, environment
 }
 
 func expectedBuiltinCommandNames(t *testing.T, executable string) []string {
 	t.Helper()
 
-	agentDir, containment := integrationVersionProbeSpec(t)
-	version, err := internalpi.ProbeVersion(t.Context(), executable, agentDir, containment)
+	_, environment := integrationVersionProbeSpec(t)
+	version, err := internalpi.ProbeOrdinaryVersion(t.Context(), executable, environment)
 	require.NoError(t, err)
 	if internalpi.CheckMinimumVersion(version, "0.81.0") == nil {
 		return []string{"llama"}
@@ -207,19 +96,15 @@ func expectedBuiltinCommandNames(t *testing.T, executable string) []string {
 	return []string{}
 }
 
-// integrationContainmentOption opts the in-process agent into Darwin
-// containment. Darwin containment fails closed without it, and the flag the
-// binary tier passes is the same opt-in on the other side of the process
-// boundary.
-func integrationContainmentOption() piacp.Option {
-	if runtime.GOOS == "darwin" {
-		return piacp.WithDarwinBestEffortContainment()
+func TestMain(m *testing.M) {
+	// A copy of this binary published as a pi executable carries its
+	// instructions in a file beside the image. The role is claimed here,
+	// before the test framework looks at arguments that belong to pi.
+	if sidecar, found := loadFakePiSidecar(); found {
+		recordFakePiLaunch(sidecar)
+		os.Exit(runFakePi(os.Args))
 	}
 
-	return func(*piacp.Options) {}
-}
-
-func TestMain(m *testing.M) {
 	previousLogger := slog.Default()
 	slog.SetDefault(integrationLogger)
 
@@ -337,7 +222,7 @@ type agentPipes struct {
 func serveAgentRawForTest(t *testing.T, ctx context.Context, opts ...piacp.Option) agentPipes {
 	t.Helper()
 	baseOptions := []piacp.Option{
-		piacp.WithLogger(integrationLogger), integrationContainmentOption(), integrationProcessIsolationOption(t),
+		piacp.WithLogger(integrationLogger),
 	}
 
 	return serveAgentWithBaseOptionsForTest(t, ctx, baseOptions, opts...)
@@ -348,7 +233,7 @@ func serveAgentRawForTest(t *testing.T, ctx context.Context, opts ...piacp.Optio
 // explicit best-effort containment because native launches fail closed there.
 func serveEmbeddedAgentRawForTest(t *testing.T, ctx context.Context, opts ...piacp.Option) agentPipes {
 	t.Helper()
-	baseOptions := []piacp.Option{piacp.WithLogger(integrationLogger), integrationContainmentOption()}
+	baseOptions := []piacp.Option{piacp.WithLogger(integrationLogger)}
 
 	return serveAgentWithBaseOptionsForTest(t, ctx, baseOptions, opts...)
 }
@@ -535,34 +420,6 @@ func agentCommand(t *testing.T, ctx context.Context, args ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, agentBinaryPath(t), args...) // #nosec G204,G702 -- test-built wrapper binary.
 }
 
-func standaloneAgentCommand(t *testing.T, ctx context.Context, args ...string) *exec.Cmd {
-	t.Helper()
-
-	target := integrationLinuxTargetIdentity(t)
-	policyRoot, err := os.MkdirTemp("/root", "acp-go-pi-integration-policy-")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(policyRoot)) })
-	policyPath := filepath.Join(policyRoot, "policy.json")
-	policy, err := json.Marshal(struct {
-		UID                 uint32            `json:"uid"`
-		GID                 uint32            `json:"gid"`
-		BaseEnvironment     map[string]string `json:"baseEnvironment"`
-		InheritEnvironment  []string          `json:"inheritEnvironment"`
-		StandaloneOwnerID   string            `json:"standaloneOwnerId"`
-		StandaloneStateRoot string            `json:"standaloneStateRoot"`
-	}{
-		UID: target.uid, GID: target.gid,
-		BaseEnvironment: integrationProductionEnvironment(target), InheritEnvironment: []string{},
-		StandaloneOwnerID: "acp-go-pi-integration", StandaloneStateRoot: target.home,
-	})
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(policyPath, policy, 0o600))
-
-	args = append(args, "-process-isolation-config", policyPath)
-
-	return agentCommand(t, ctx, args...)
-}
-
 type liveAgent struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -573,40 +430,11 @@ type liveAgent struct {
 
 func startAgentBinary(t *testing.T, ctx context.Context, args ...string) *liveAgent {
 	t.Helper()
-
-	hasPolicy := false
-	for index, arg := range args {
-		if arg == "-process-isolation-config" && index+1 < len(args) {
-			hasPolicy = true
-
-			break
-		}
-	}
-
-	var cmd *exec.Cmd
-	if hasPolicy {
-		cmd = agentCommand(t, ctx, args...)
-	} else {
-		cmd = standaloneAgentCommand(t, ctx, args...)
-	}
-
-	return startAgentProcess(t, cmd)
+	return startAgentProcess(t, agentCommand(t, ctx, args...))
 }
 
-// startOrdinaryAgentBinary launches the wrapper in ordinary mode: the pi child
-// runs as the identity the adapter already runs as. That is the containment
-// mode this repository's provider-auth surface is defined for — explicit
-// isolation refuses to broker it — and it is also the only mode the binary
-// tier has on Darwin, so fixing it here keeps a provider-auth test from
-// silently degrading into a skip off Linux.
 func startOrdinaryAgentBinary(t *testing.T, ctx context.Context, args ...string) *liveAgent {
 	t.Helper()
-
-	for _, arg := range args {
-		require.NotEqual(t, "-process-isolation-config", arg,
-			"the ordinary launch helper is the no-isolation mode; pass a policy through startAgentBinary instead")
-	}
-
 	return startAgentProcess(t, agentCommand(t, ctx, args...))
 }
 

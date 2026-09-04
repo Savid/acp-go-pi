@@ -4,18 +4,27 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
-func mustCreateResidence(t *testing.T, agentDir string, mcp *MCPConfig) (*SessionResidence, SessionResidenceFiles) {
+func mustCreateResidence(
+	t *testing.T, extRoot string, agentDir string, mcp *MCPConfig,
+) (*SessionResidence, SessionResidenceFiles) {
 	t.Helper()
 
-	residence, files, err := CreateSessionResidence(agentDir, mcp)
+	residence, files, err := CreateSessionResidence(extRoot, agentDir, mcp)
 	require.NoError(t, err)
 
 	return residence, files
+}
+
+// sharedExtensionStoreDir is where the wrapper-owned sources land beneath a
+// store root: one content-addressed directory shared by every session.
+func sharedExtensionStoreDir(extRoot string) string {
+	return filepath.Join(extRoot, sharedExtensionDirName, sharedExtensionDigest(sharedExtensionSources()))
 }
 
 func TestSessionResidencePublishesWrapperExtensions(t *testing.T) {
@@ -24,12 +33,19 @@ func TestSessionResidencePublishesWrapperExtensions(t *testing.T) {
 	t.Run("bridge only", func(t *testing.T) {
 		t.Parallel()
 
-		residence, files := mustCreateResidence(t, filepath.Join(t.TempDir(), "agent"), nil)
+		extRoot := t.TempDir()
+		store := sharedExtensionStoreDir(extRoot)
+		residence, files := mustCreateResidence(t, extRoot, filepath.Join(t.TempDir(), "agent"), nil)
 		require.Equal(t, []string{
-			filepath.Join(residence.Root(), BridgeExtensionFileName),
-			filepath.Join(residence.Root(), PathExtensionFileName),
+			filepath.Join(store, BridgeExtensionFileName),
+			filepath.Join(store, PathExtensionFileName),
 		}, files.ExtensionPaths)
 		require.Empty(t, files.MCPConfigPath)
+
+		// The sources never land in the per-session residence: a path minted
+		// per session is what made pi compile them again on every launch.
+		require.NoFileExists(t, filepath.Join(residence.Root(), BridgeExtensionFileName))
+		require.NoFileExists(t, filepath.Join(residence.Root(), PathExtensionFileName))
 
 		bridge, err := os.ReadFile(files.ExtensionPaths[0]) // #nosec G304 -- test temp dir.
 		require.NoError(t, err)
@@ -71,11 +87,13 @@ func TestSessionResidencePublishesWrapperExtensions(t *testing.T) {
 			},
 		}}
 
-		residence, files := mustCreateResidence(t, filepath.Join(t.TempDir(), "agent"), &config)
+		extRoot := t.TempDir()
+		store := sharedExtensionStoreDir(extRoot)
+		residence, files := mustCreateResidence(t, extRoot, filepath.Join(t.TempDir(), "agent"), &config)
 		require.Equal(t, []string{
-			filepath.Join(residence.Root(), BridgeExtensionFileName),
-			filepath.Join(residence.Root(), PathExtensionFileName),
-			filepath.Join(residence.Root(), MCPExtensionFileName),
+			filepath.Join(store, BridgeExtensionFileName),
+			filepath.Join(store, PathExtensionFileName),
+			filepath.Join(store, MCPExtensionFileName),
 		}, files.ExtensionPaths)
 		require.Equal(t, filepath.Join(residence.Root(), MCPConfigFileName), files.MCPConfigPath)
 
@@ -102,6 +120,7 @@ func TestSessionResidencePublishesWrapperExtensions(t *testing.T) {
 func TestConcurrentSessionResidencesCannotObserveEachOther(t *testing.T) {
 	t.Parallel()
 
+	extRoot := t.TempDir()
 	agentDir := t.TempDir()
 	firstConfig := MCPConfig{Servers: []MCPServer{{
 		Name: "first", Type: "http", URL: "http://127.0.0.1:1/mcp",
@@ -112,12 +131,15 @@ func TestConcurrentSessionResidencesCannotObserveEachOther(t *testing.T) {
 		Headers: map[string]string{"Authorization": "Bearer second-secret"},
 	}}}
 
-	first, firstFiles := mustCreateResidence(t, agentDir, &firstConfig)
-	second, secondFiles := mustCreateResidence(t, agentDir, &secondConfig)
+	first, firstFiles := mustCreateResidence(t, extRoot, agentDir, &firstConfig)
+	second, secondFiles := mustCreateResidence(t, extRoot, agentDir, &secondConfig)
 
 	require.NotEqual(t, first.Root(), second.Root())
 	require.NotEqual(t, firstFiles.MCPConfigPath, secondFiles.MCPConfigPath)
-	require.NotEqual(t, firstFiles.ExtensionPaths, secondFiles.ExtensionPaths)
+
+	// The sources are the same bytes for both sessions, so both address the
+	// one store entry. Only the config each session may read is its own.
+	require.Equal(t, firstFiles.ExtensionPaths, secondFiles.ExtensionPaths)
 
 	firstData, err := os.ReadFile(firstFiles.MCPConfigPath) // #nosec G304 -- test temp dir.
 	require.NoError(t, err)
@@ -142,13 +164,11 @@ func TestConcurrentSessionResidencesCannotObserveEachOther(t *testing.T) {
 func TestSessionResidenceFilesArePublishedOnce(t *testing.T) {
 	t.Parallel()
 
-	residence, files := mustCreateResidence(t, t.TempDir(), &MCPConfig{})
+	residence, files := mustCreateResidence(t, t.TempDir(), t.TempDir(), &MCPConfig{})
 
-	info, err := os.Stat(files.MCPConfigPath)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o400), info.Mode().Perm())
+	requireRestrictedMode(t, files.MCPConfigPath, 0o400)
 
-	_, err = residence.publish(MCPConfigFileName, []byte("replacement"))
+	_, err := residence.publish(MCPConfigFileName, []byte("replacement"))
 	require.ErrorContains(t, err, "publish session residence file")
 	require.NoFileExists(t, files.MCPConfigPath+residenceStagingSuffix)
 
@@ -157,75 +177,115 @@ func TestSessionResidenceFilesArePublishedOnce(t *testing.T) {
 	require.NotContains(t, string(published), "replacement")
 }
 
+// TestSharedExtensionPathsAreStableAcrossAgentDirs pins the property the store
+// exists for: pi keys its compiled-extension cache on the source file's own
+// path, so two sessions in different agent directories must be handed the same
+// extension paths or every launch compiles the sources again.
+func TestSharedExtensionPathsAreStableAcrossAgentDirs(t *testing.T) {
+	t.Parallel()
+
+	extRoot := t.TempDir()
+	_, first := mustCreateResidence(t, extRoot, t.TempDir(), nil)
+	_, second := mustCreateResidence(t, extRoot, t.TempDir(), nil)
+
+	require.Equal(t, first.ExtensionPaths, second.ExtensionPaths)
+	require.Equal(t, []string{
+		filepath.Join(sharedExtensionStoreDir(extRoot), BridgeExtensionFileName),
+		filepath.Join(sharedExtensionStoreDir(extRoot), PathExtensionFileName),
+	}, first.ExtensionPaths)
+}
+
 func TestSessionResidencePublishFaultInjection(t *testing.T) {
-	tests := []struct {
-		name   string
-		failOn string
-	}{
-		{name: "bridge extension", failOn: BridgeExtensionFileName},
-		{name: "path extension", failOn: PathExtensionFileName},
-		{name: "mcp extension", failOn: MCPExtensionFileName},
-		{name: "mcp config", failOn: MCPConfigFileName},
+	restoreAgentDirSeams(t)
+
+	realWrite := fsWriteFile
+	fsWriteFile = func(path string, data []byte, perm os.FileMode) error {
+		if filepath.Base(path) == MCPConfigFileName+residenceStagingSuffix {
+			return os.ErrPermission
+		}
+
+		return realWrite(path, data, perm)
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			restoreAgentDirSeams(t)
+	agentDir := t.TempDir()
+	_, _, err := CreateSessionResidence(t.TempDir(), agentDir, &MCPConfig{})
+	require.ErrorContains(t, err, "stage session residence file")
+	require.ErrorContains(t, err, MCPConfigFileName)
 
-			realWrite := fsWriteFile
-			fsWriteFile = func(path string, data []byte, perm os.FileMode) error {
-				if filepath.Base(path) == test.failOn+residenceStagingSuffix {
-					return os.ErrPermission
-				}
-
-				return realWrite(path, data, perm)
-			}
-
-			agentDir := t.TempDir()
-			_, _, err := CreateSessionResidence(agentDir, &MCPConfig{})
-			require.ErrorContains(t, err, "stage session residence file")
-			require.ErrorContains(t, err, test.failOn)
-
-			// A refused residence leaves nothing behind in a shared agent
-			// directory.
-			entries, readErr := os.ReadDir(filepath.Join(agentDir, sessionResidenceDir))
-			require.NoError(t, readErr)
-			require.Empty(t, entries)
-		})
-	}
+	// A refused residence leaves nothing behind in a shared agent directory.
+	entries, readErr := os.ReadDir(filepath.Join(agentDir, sessionResidenceDir))
+	require.NoError(t, readErr)
+	require.Empty(t, entries)
 }
 
 func TestSessionResidenceCreateAndRemoveFailures(t *testing.T) {
 	restoreAgentDirSeams(t)
 
-	fsMkdirAll = func(string, os.FileMode) error { return os.ErrPermission }
+	// The store and the residence share these seams, so each injection is
+	// scoped to the residence path the case is about.
+	realMkdirAll := fsMkdirAll
+	fsMkdirAll = func(path string, perm os.FileMode) error {
+		if filepath.Base(path) == sessionResidenceDir {
+			return os.ErrPermission
+		}
 
-	_, _, err := CreateSessionResidence(t.TempDir(), nil)
+		return realMkdirAll(path, perm)
+	}
+
+	_, _, err := CreateSessionResidence(t.TempDir(), t.TempDir(), nil)
 	require.ErrorContains(t, err, "create session residence root")
 
-	fsMkdirAll = os.MkdirAll
+	fsMkdirAll = realMkdirAll
 	fsMkdirTemp = func(string, string) (string, error) { return "", os.ErrPermission }
 
-	_, _, err = CreateSessionResidence(t.TempDir(), nil)
+	_, _, err = CreateSessionResidence(t.TempDir(), t.TempDir(), nil)
 	require.ErrorContains(t, err, "create session residence")
 
 	fsMkdirTemp = os.MkdirTemp
-	residence, _ := mustCreateResidence(t, t.TempDir(), nil)
+	residence, _ := mustCreateResidence(t, t.TempDir(), t.TempDir(), nil)
 
 	fsRemoveAll = func(string) error { return os.ErrPermission }
 	require.ErrorContains(t, residence.Remove(), "remove session residence")
 
 	fsRemoveAll = os.RemoveAll
-	fsRemove = func(string) error { return os.ErrPermission }
 
-	_, _, err = CreateSessionResidence(t.TempDir(), nil)
+	realRemove := fsRemove
+	fsRemove = func(path string) error {
+		if strings.HasSuffix(path, MCPConfigFileName+residenceStagingSuffix) {
+			return os.ErrPermission
+		}
+
+		return realRemove(path)
+	}
+
+	_, _, err = CreateSessionResidence(t.TempDir(), t.TempDir(), &MCPConfig{})
 	require.ErrorContains(t, err, "clean session residence staging")
 
-	fsRemove = os.Remove
-	fsLink = func(string, string) error { return os.ErrPermission }
+	fsRemove = realRemove
 
-	_, _, err = CreateSessionResidence(t.TempDir(), nil)
+	realLink := fsLink
+	fsLink = func(oldname string, newname string) error {
+		if strings.HasSuffix(newname, MCPConfigFileName) {
+			return os.ErrPermission
+		}
+
+		return realLink(oldname, newname)
+	}
+
+	_, _, err = CreateSessionResidence(t.TempDir(), t.TempDir(), &MCPConfig{})
 	require.ErrorContains(t, err, "publish session residence file")
+}
+
+func TestSessionResidenceSharedExtensionFailure(t *testing.T) {
+	restoreAgentDirSeams(t)
+
+	agentDir := t.TempDir()
+	_, _, err := CreateSessionResidence("", agentDir, nil)
+	require.ErrorContains(t, err, "shared extension store requires a root")
+
+	// The residence is never created when the store refuses, so nothing is
+	// left in the agent directory to collect.
+	require.NoDirExists(t, filepath.Join(agentDir, sessionResidenceDir))
 }
 
 func TestSessionResidenceMCPConfigEncodeFailure(t *testing.T) {
@@ -236,7 +296,7 @@ func TestSessionResidenceMCPConfigEncodeFailure(t *testing.T) {
 		return nil, os.ErrInvalid
 	}
 
-	_, _, err := CreateSessionResidence(t.TempDir(), &MCPConfig{})
+	_, _, err := CreateSessionResidence(t.TempDir(), t.TempDir(), &MCPConfig{})
 	require.ErrorContains(t, err, "encode mcp config")
 }
 

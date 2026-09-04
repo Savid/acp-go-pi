@@ -179,8 +179,17 @@ func TestAgentFakeSettledCancelMirrorFailureFailsPrompt(t *testing.T) {
 	require.Eventually(t, func() bool { return client.text() != "" },
 		30*time.Second, 20*time.Millisecond, "no streamed chunk before cancel")
 	require.NoError(t, conn.Cancel(ctx, piacp.CancelRequest(sessionID, "test-turn")))
-	require.ErrorContains(t, <-promptDone, "cancel mirror unavailable",
+
+	// The failed durability fence fails the prompt rather than reporting a
+	// cancelled success. Why the store refused is the operator's business, so
+	// the client gets the closed internal error and never the store's own text.
+	var reqErr *acp.RequestError
+	err := <-promptDone
+	require.ErrorAs(t, err, &reqErr,
 		"a cancelled response must not hide its failed durability fence")
+	require.Equal(t, -32603, reqErr.Code)
+	require.Nil(t, reqErr.Data)
+	require.NotContains(t, err.Error(), "cancel mirror unavailable")
 }
 
 func TestAgentFakeProviderErrorTurnFailure(t *testing.T) {
@@ -250,7 +259,7 @@ func TestAgentFakeTurnTimeout(t *testing.T) {
 	requireTurnFailure(t, err, "timeout")
 }
 
-func TestAgentFakeGarbageBurstSurvival(t *testing.T) {
+func TestAgentFakeGarbageBurstTerminalizesTheTurn(t *testing.T) {
 	requireRunIntegration(t)
 	t.Parallel()
 
@@ -266,12 +275,13 @@ func TestAgentFakeGarbageBurstSurvival(t *testing.T) {
 	conn := connectFakeAgentForTest(t, ctx, client, scenario)
 	sessionID := newFakeSession(t, ctx, conn)
 
-	// Malformed stdout records mid-turn are skipped, not fatal: the turn
-	// still completes.
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "burst"))
-	require.NoError(t, err)
-	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
-	require.Contains(t, client.text(), "third")
+	// Native stdout is strict JSONL, so the first malformed record mid-turn is
+	// the transport's terminal fact: the turn fails on it and no later record
+	// is read. Chunks the client already received stand.
+	_, err := conn.Prompt(ctx, piacp.TextPromptRequest(sessionID, "test-turn", "burst"))
+	requireTurnFailure(t, err, "transport")
+	require.Contains(t, client.text(), "first ")
+	require.NotContains(t, client.text(), "third")
 }
 
 func TestAgentFakePermissionOutcomes(t *testing.T) {

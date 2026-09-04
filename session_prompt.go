@@ -196,15 +196,7 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		return acp.PromptResponse{}, err
 	}
 
-	var observationOutbox *sessionOutbox
-
-	defer func() {
-		releaseTurn()
-
-		if observationOutbox != nil && observationOutbox.claimProviderObservation() {
-			_ = s.observeProviderProcessBounded(context.WithoutCancel(ctx), observationOutbox)
-		}
-	}()
+	defer releaseTurn()
 
 	mapped, err := promptToPi(ctx, params.Prompt, s.agent.imageLimits(), s.agent.inputHandoffRoot())
 	if err != nil {
@@ -240,8 +232,6 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 
 		return acp.PromptResponse{}, s.nativeTurnFailure(ctx, reserveErr)
 	}
-
-	observationOutbox = outbox
 
 	s.resetTurnTools()
 

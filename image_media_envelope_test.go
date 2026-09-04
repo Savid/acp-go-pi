@@ -112,24 +112,6 @@ func TestMediaEnvelopeImageFormatsAreTheAllowlist(t *testing.T) {
 	require.False(t, allowedInputImageMIME("image/svg+xml"))
 }
 
-func TestHandoffCapabilityAdvertisedOnlyWithARoot(t *testing.T) {
-	withoutRoot, err := NewAgent().Initialize(t.Context(), defaultInitializeRequest())
-	require.NoError(t, err)
-	require.NotContains(t, withoutRoot.AgentCapabilities.Meta, handoffMetaKey)
-
-	withRoot, err := NewAgent(WithInputHandoffRoot(t.TempDir())).Initialize(t.Context(), defaultInitializeRequest())
-	require.NoError(t, err)
-	require.Equal(t,
-		map[string]any{metaFieldVersions: []int{handoffVersion}},
-		withRoot.AgentCapabilities.Meta[handoffMetaKey],
-	)
-
-	// The envelope is unconditional, so a host cannot infer one key from the
-	// other.
-	require.Contains(t, withoutRoot.AgentCapabilities.Meta, mediaEnvelopeMetaKey)
-	require.Contains(t, withRoot.AgentCapabilities.Meta, mediaEnvelopeMetaKey)
-}
-
 func TestConformanceInitializeAdvertisesMediaKeys(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -166,7 +148,7 @@ func TestConformanceInitializeAdvertisesMediaKeys(t *testing.T) {
 			require.Equal(t, test.handoffRoot, present)
 
 			if test.handoffRoot {
-				require.Equal(t, map[string]any{metaFieldVersions: []any{float64(handoffVersion)}}, handoff)
+				require.Equal(t, map[string]any{metaFieldVersion: float64(handoffVersion)}, handoff)
 			}
 
 			require.True(t, response.AgentCapabilities.PromptCapabilities.Image)

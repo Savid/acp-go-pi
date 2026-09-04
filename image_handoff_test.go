@@ -30,8 +30,21 @@ func handoffFileURI(t *testing.T, root string, name string, data []byte) string 
 	return fileURIFor(path)
 }
 
+// fileURIWithHost names a local path in a file uri that states a host.
+func fileURIWithHost(host string, path string) string {
+	return "file://" + host + strings.TrimPrefix(fileURIFor(path), "file://")
+}
+
+// fileURIFor names a local path the way a host does: a file uri whose path
+// component starts at the root, so a drive-letter path carries one more slash
+// than the filesystem spells it with.
 func fileURIFor(path string) string {
-	return "file://" + filepath.ToSlash(path)
+	slashed := filepath.ToSlash(path)
+	if !strings.HasPrefix(slashed, "/") {
+		slashed = "/" + slashed
+	}
+
+	return "file://" + slashed
 }
 
 func handoffEnvelopeFor(data []byte) map[string]any {
@@ -42,6 +55,32 @@ func handoffEnvelopeFor(data []byte) map[string]any {
 		handoffFieldDigest:    hex.EncodeToString(sum[:]),
 		handoffFieldSizeBytes: len(data),
 	}
+}
+
+func TestHandoffCapabilityScalar(t *testing.T) {
+	withoutRoot, err := NewAgent().Initialize(t.Context(), defaultInitializeRequest())
+	require.NoError(t, err)
+	withoutEncoded, err := json.Marshal(withoutRoot)
+	require.NoError(t, err)
+
+	withRoot, err := NewAgent(WithInputHandoffRoot(t.TempDir())).Initialize(t.Context(), defaultInitializeRequest())
+	require.NoError(t, err)
+	withEncoded, err := json.Marshal(withRoot)
+	require.NoError(t, err)
+
+	decode := func(encoded []byte) map[string]json.RawMessage {
+		var wire struct {
+			AgentCapabilities struct {
+				//nolint:tagliatelle // ACP defines this reserved wire member.
+				Meta map[string]json.RawMessage `json:"_meta"`
+			} `json:"agentCapabilities"`
+		}
+		require.NoError(t, json.Unmarshal(encoded, &wire))
+
+		return wire.AgentCapabilities.Meta
+	}
+	require.NotContains(t, decode(withoutEncoded), "acp-go.dev/handoff")
+	require.Equal(t, `{"version":1}`, string(decode(withEncoded)["acp-go.dev/handoff"]))
 }
 
 // handoffImageBlock builds one handoff-form image block: empty data, a file
@@ -81,7 +120,14 @@ func requireHandoffError(t *testing.T, err error, value string, index int, messa
 func validateHandoffBlock(t *testing.T, root string, block acp.ContentBlock, limits ImageLimits) (string, error) {
 	t.Helper()
 
-	return newPromptImageBudget(limits, root).validateBlock(t.Context(), block.Image)
+	// The prompt mapper closes the read root when the prompt ends; a test that
+	// drives one block directly closes it here. A platform that refuses to
+	// remove a directory something still holds open turns a leaked handle into
+	// a failed temp-directory cleanup rather than a silent leak.
+	budget := newPromptImageBudget(limits, root)
+	t.Cleanup(budget.closeHandoffRoot)
+
+	return budget.validateBlock(t.Context(), block.Image)
 }
 
 func TestHandoffFormSelection(t *testing.T) {
@@ -306,7 +352,7 @@ func TestHandoffURIDefects(t *testing.T) {
 	}
 
 	t.Run("localhost host is local", func(t *testing.T) {
-		uri := "file://" + fileURILocalHost + filepath.ToSlash(filepath.Join(root, "valid.png"))
+		uri := fileURIWithHost(fileURILocalHost, filepath.Join(root, "valid.png"))
 
 		data, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", envelope), defaultImageLimits())
 		require.NoError(t, err)
@@ -365,7 +411,7 @@ func TestHandoffPathNotAllowed(t *testing.T) {
 		nested := fileURIFor(filepath.Join(root, "valid.png", "child.png"))
 
 		_, err := validateHandoffBlock(t, root, handoffImageBlock(nested, "image/png", envelope), defaultImageLimits())
-		requireHandoffError(t, err, imageErrorPathNotAllowed, 0, "cannot be opened")
+		requireHandoffError(t, err, handoffThroughFileError, 0, handoffThroughFileMessage)
 	})
 
 	t.Run("unresolvable root", func(t *testing.T) {
@@ -751,7 +797,7 @@ func TestHandoffTraversalOutOfTheRootIsRefused(t *testing.T) {
 
 	// Percent-encoded traversal decodes before the path is ever cleaned, so it
 	// collapses to a path that was never under the root.
-	uri := "file://" + filepath.ToSlash(root) + "/%2e%2e/" + filepath.Base(filepath.Dir(outside)) + "/secret.png"
+	uri := fileURIFor(root) + "/%2e%2e/" + filepath.Base(filepath.Dir(outside)) + "/secret.png"
 
 	_, err := validateHandoffBlock(t, root, handoffImageBlock(uri, "image/png", handoffEnvelopeFor(png)), defaultImageLimits())
 	requireHandoffError(t, err, imageErrorPathNotAllowed, 0, "outside the handoff root")

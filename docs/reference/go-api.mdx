@@ -1,161 +1,72 @@
 ---
 title: "Go API"
-description: "The public package entry point, options, and helpers at a glance"
+description: "The public package entry point, host authority, options, and helpers"
 ---
 
-The full, authoritative API — signatures, types, and doc comments — is on
-[pkg.go.dev](https://pkg.go.dev/github.com/savid/acp-go-pi). This page indexes
-the public surface; it does not restate godoc.
+The complete API and doc comments are on
+[pkg.go.dev](https://pkg.go.dev/github.com/savid/acp-go-pi).
 
-## Entry point
+## Entry points
 
-`Serve(ctx, input, output, opts...)` runs the agent over a pair of JSON-RPC
-streams:
+`NewAgent(opts...)` constructs an agent for direct method use.
+`Serve(ctx, input, output, opts...)` serves ACP over JSON-RPC
+streams.
 
 ```go
 err := piacp.Serve(ctx, input, output,
-	piacp.WithExecutablePath("/usr/local/bin/pi"),
-	piacp.WithScratchDir("/tmp/pi-scratch"),
-	piacp.WithDefaultModel("openai/gpt-4o"),
-	piacp.WithSessionStore(store),
+    piacp.WithExecutablePath("/usr/local/bin/pi"),
+    piacp.WithScratchDir("/tmp/pi-scratch"),
+    piacp.WithDefaultModel("openai/gpt-4o"),
 )
 ```
 
-Hosts that need direct method access can construct `*Agent` with `NewAgent`;
-stream-based hosts normally use `Serve`. `Options` and `ConcurrencyLimits`
-are the exported configuration value types behind the functional options.
+## Host authority
 
-`ErrProcessContainmentIncomplete` is the stable `errors.Is` discriminator
-returned when the selected native boundary does not complete. `Serve` returns
-an `Agent.Close` error carrying this sentinel even when the stream loop would
-otherwise return normally or with context cancellation. A host that receives
-it must retain or quarantine any resources the native runtime may still
-reach. It does not mean that every descendant can be inventoried on Darwin.
+`WithHostAuthority(HostAuthority)` selects managed execution. The
+public authority contract consists of `HostAuthority`,
+`NativeRequest`, `NativeProcess`,
+`NativeResult`, and these stable `errors.Is` sentinels:
 
-`Agent.ContainmentMode()` returns `RuntimeContainmentSharedIdentity` when
-`ProcessIsolation` is omitted. That portable ordinary mode runs as the current
-root or non-root identity and owns only direct-process liveness; it emits no
-descendant inventory and claims no whole-tree quiescence or identity authority.
-An explicit valid Linux policy returns `RuntimeContainmentAuthoritative`.
-Explicit policies are distinct-identity, trusted-root, Linux-only, and never
-downgrade after failure. `RuntimeContainmentBestEffort` is reserved for the
-separate Darwin opt-in; `RuntimeContainmentUnavailable` reports an invalid
-platform/option combination.
+- `ErrHostAuthorityUnavailable`
+- `ErrContainmentIncomplete`
+- `ErrNativeTreeBusy`
 
-## Process options
+`NativeProcess.Wait` is the terminal containment proof.
+`Revoke` initiates host-owned teardown. A supplied nil or unusable
+authority fails initialization before native mutation or launch. Omitting the
+option selects ordinary same-account execution.
+
+## Agent options
 
 | Option | Purpose |
 | --- | --- |
-| `WithExecutablePath` | Set the pi CLI path (default: search the captured ordinary `PATH`). |
-| `WithProcessIsolation` | Optional explicit hardening. Requires a distinct non-root UID/GID and complete replacement environment. Linux keeps a trusted-root supervisor; only `pi --mode rpc` receives the configured identity, with supplementary groups cleared. Invalid or unsupported policies fail closed. |
-| `WithHome` | Durable per-instance `PI_CODING_AGENT_DIR`. Empty gives sessions ephemeral homes. Every session launches against the one directory, so the adapter restores the operator baseline for pi's `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` before each launch; see [Models and config](/docs/features/models-config). Required with `WithProviderAuthRoot` for provider auth, and refused with explicit distinct-identity isolation. |
-| `WithScratchDir` | Parent directory for all ephemeral on-disk state (isolated per-session agent and session directories, hydration temp files, and the version probe's isolated `PI_CODING_AGENT_DIR`/settings residence). Empty means the system temp directory; created `0700` when missing. |
-| `WithDefaultModel` | Default model for new sessions, as `"provider/id"`. |
-| `WithEnv` | The static agent-scoped environment overlaid on the sanitized ordinary base or `ProcessIsolation.BaseEnvironment`. A `PATH` here is the static native base search path used for executable lookup and native launch, and session `extraPathDirs` are placed ahead of it. Invalid names plus `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `LD_*`, and `DYLD_*` are rejected. |
-| `WithSeedFiles` | Write files into each isolated agent directory. Seeded extensions, prompts, and skills in their conventional subdirectories are loaded by exact path. |
-| `WithSessionStore` | Install durable session storage. |
-| `WithSessionStoreLoadTimeout` | Bound store load/list operations used during resume. |
+| `WithExecutablePath` | Configure the Pi executable selector. Managed mode passes it to the host without local resolution. |
+| `WithHostAuthority` | Route every managed native launch and tree transition through the host. |
+| `WithHome` | Configure a durable ordinary-mode PI_CODING_AGENT_DIR. Managed mode rejects this option before materialization. |
+| `WithScratchDir` | Parent for ephemeral session and probe trees, and for the extension store sessions share. |
+| `WithDefaultModel` | Default model as provider/id. |
+| `WithEnv` | Static filtered environment overlay. |
+| `WithSeedFiles` | Materialize exact files before native-tree prepare. |
+| `WithSessionStore` | Install durable session mirroring. |
+| `WithSessionStoreLoadTimeout` | Bound store load and list operations. |
 | `WithConcurrencyLimits` | Cap active sessions and concurrent client calls. |
-| `WithImageLimits` | Decoded-byte limits for prompt image input and emitted image output (`MaxInputBytesPerImage`, `MaxInputBytesPerPrompt`, `MaxOutputBytesPerImage`, `MaxOutputBytesPerToolCall`); each defaults to 6 MiB, an explicit zero disables that policy limit, and negative values are rejected at construction. |
-| `WithInputHandoffRoot` | Absolute read root for handoff-form prompt images. Omitted (the default) rejects the handoff form; a relative path is rejected at construction. The adapter only reads under it and never writes, moves, or removes anything there. |
-| `WithTurnTimeout` | Bound one prompt turn; expiry fails the turn with cause `timeout` (default: no deadline). |
-| `WithRuntimeResourceHooks` | Host admission hooks for native-process roots and adapter scratch roots. |
-| `WithDarwinBestEffortContainment` | Explicitly accept Darwin process-group containment and its escaped-descendant risk. Invalid on other platforms. |
-
-`ProcessIsolation.IdentityLock` and `ProcessIsolation.AuthorityDomain`
-optionally accept opaque host capabilities with `Duplicate() (*os.File, error)`
-for the already-held canonical UID lock and shared `domain.lock` lease. Each
-capability keeps ownership of its original descriptor; caller-owned duplicates
-reach only the trusted supervisor, which validates the named inodes, held locks,
-and strict matching domain record and protects them with checked `FD_CLOEXEC`.
-Set both fields together for
-host-borrowed authority or leave both nil for standalone domain, disposition,
-and UID-lock acquisition. A mixed nil/non-nil pair fails closed. Native
-processes receive neither capability nor descriptor.
-
-## Pi-specific options
-
-| Option | Purpose |
-| --- | --- |
-| `WithProviderAuthRoot` | Durable root for the values-free provider-auth ledger. Together with `WithHome`, enables all seven `_pi/auth/*` legs in ordinary mode. |
+| `WithImageLimits` | Bound decoded prompt and emitted image bytes. |
+| `WithInputHandoffRoot` | Allow handoff-form prompt images below one absolute read root. |
+| `WithTurnTimeout` | Bound a prompt turn. |
+| `WithProviderAuthRoot` | Enable the values-free provider-auth ledger with WithHome in ordinary mode. |
+| telemetry options | Configure logging and OpenTelemetry providers. |
 
 ## Per-session options
 
-`PiOptions` is the typed builder for `_meta.pi.options`; construct it with
-`NewPiOptions` and attach it with `WithSessionPiOptions`:
+Build `_meta.pi.options` with `NewPiOptions`. Supported
+options select the model, reasoning level, permission mode, automatic retry,
+explicit environment, and additional child search directories.
+`WithPiOutputSchema` is refused because Pi has no native
+structured-output surface.
 
-| Option | Purpose |
-| --- | --- |
-| `WithPiModel` | Session model as `"provider/id"`. |
-| `WithPiEnv` | Extra environment variables for this session's pi process. `PATH` is rejected; `WithPiExtraPathDirs` is the only session `PATH` authority. |
-| `WithPiExtraPathDirs` | Prepend absolute directories, in the order given, to this session's child `PATH`, ahead of the static base `PATH` from `WithEnv` and everything inherited. Order and duplicates are preserved. This launch-only value does not select the pi executable. |
-| `WithPiThinkingLevel` | Non-empty reasoning-level value passed unchanged to pi. `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max` are the advertised host menu, not an accepted-value set. |
-| `WithPiPermission` | Permission mode: `ask` (default) or `allow`. |
-| `WithPiAutoRetry` | Opt in to pi's native automatic retry of transient provider errors (5xx, timeouts). Default `false`: a native failure surfaces once, immediately, with the real cause. |
-| `WithPiOutputSchema` | Reserved for API symmetry; pi has no native structured-output surface, so setting it fails closed at session start. |
+## Request and store helpers
 
-## Identity and observability options
-
-| Option | Purpose |
-| --- | --- |
-| `WithAgentName`, `WithAgentTitle`, `WithAgentVersion` | Values advertised during ACP initialize. |
-| `WithLogger` | Structured diagnostic logger. |
-| `WithTracerProvider`, `WithMeterProvider`, `WithTextMapPropagator` | OpenTelemetry wiring (see [Observability](/docs/operations/observability)). |
-
-## Request helpers and store types
-
-Request builders: `NewSessionRequest`, `LoadSessionRequest`,
-`ResumeSessionRequest`, `ForkSessionRequest`, `CallForkSession`,
-`PromptRequest`, `TextPromptRequest`, `SetConfigOptionRequest`,
-`SetModelRequest`, `DeleteSessionRequest`, `ListSessionsRequest`,
-`WithSessionMCPServers`, `WithSessionAdditionalDirectories`,
-`WithSessionMeta`, `WithSessionRawEvents`, `WithSessionOutputSchema`,
-`WithListSessionsCwd`, `WithListSessionsCursor`, `WithListSessionsMeta`,
-`StdioMCPServer`, `HTTPMCPServer`.
-
-`WithSessionMeta` and `WithListSessionsMeta` take host-supplied metadata. A
-caller key naming a reserved `acp-go.dev/*` literal — `route`, `lifecycle`,
-`handoff`, or `mediaEnvelope` — is refused rather than merged or overwritten:
-those values are minted by the adapter on the surfaces that carry them, so a
-collision is a defect in the calling code and the builder panics rather than
-putting an unvalidated reserved value on the wire. Everything outside the
-closed set is ordinary host metadata and rides untouched.
-
-`PromptRequest(sessionID, turnNonce, blocks...)` and
-`TextPromptRequest(sessionID, turnNonce, text)` require a fresh, unguessable
-nonce per turn. `CancelRequest(sessionID, turnNonce)` must reuse the active
-turn's nonce. A route nonce must be non-empty and at most 4096 bytes. These
-builders fail closed for an invalid nonce by omitting route metadata, so the
-agent rejects the resulting prompt or cancellation.
-
-`RuntimeResourceHooks` exposes `AcquireNativeRoot`, `ReserveScratchRoot`,
-`ObserveProcess`, `ObserveProcessSnapshot`, `ObserveStartupStage`, and
-`ObserveContainment`.
-Admission callbacks receive `runtime`, `session`, `prompt`, or `discovery`; nil
-means unbounded standalone operation. Before `pi --version`, Pi reserves a
-runtime generation below `WithScratchDir`, materializes an empty target-owned
-`probe-agent` directory, and passes that exact path as `PI_CODING_AGENT_DIR`. Pi acquires discovery and per-session native
-permits immediately before their launches, reserves scratch before making each
-isolated agent directory, and releases only after the selected boundary
-completes and directory deletion succeeds; incomplete containment quarantines
-the generation and holds both reservations. Pi holds no cross-process native home lock, so it emits no
-`home_lock_supervisor` count. Provider descendant snapshots are emitted only
-when inventory is authoritative; ordinary shared identity and Darwin best
-effort emit no provider snapshot, including zero. `ObserveContainment` is called once with the
-effective mode. Startup observations distinguish spawn, readiness,
-configuration, and native session setup.
-
-## Provider-auth extension constants
-
-`AuthMethodsMethod`, `AuthAuthorizeMethod`, `AuthCallbackMethod`,
-`AuthStatusMethod`, `AuthCancelMethod`, `AuthInventoryMethod`, and
-`AuthDisconnectMethod` name Pi's seven session-scoped extension legs. The
-broker advertises whenever both durable roots are configured and usable,
-including when no provider credential exists yet. It exposes catalog,
-flow-state, residence-proof, and fenced-disconnect metadata, never credential
-values. See [Authentication](/docs/features/authentication).
-
-Session-store surface: `SessionStore`, `SessionKey`, `SessionSummary`,
-`SessionStoreReplacement`, `InMemorySessionStore`, and the constants
-`SessionStoreFormat`, `SessionStoreMainSubpath`, and
-`SessionStoreLifecycleSubpath`.
+The package provides typed builders for session creation, load, resume, fork,
+prompt, cancel, configuration, list, and delete requests, plus stdio and HTTP
+MCP declarations. `SessionStore` mirrors Pi JSONL rows; lifecycle
+boundary rows remain in their separate current-format subpath.

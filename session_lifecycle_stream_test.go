@@ -128,7 +128,7 @@ func TestLifecycleStreamFailureBranchesAndRequiredActionMembers(t *testing.T) {
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 
 	lifecycleRandRead = original
-	s.agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, ActivityKinds: []lifecycle.ActivityKind{}}
+	s.agent.lifecycle = lifecycle.Negotiated{Version: 1, ActivityKinds: []lifecycle.ActivityKind{}}
 	require.NoError(t, s.openLifecycleStream(t.Context(), 1))
 	lifecycleRandRead = func([]byte) (int, error) { return 0, errors.New("entropy") }
 	require.ErrorContains(t, s.lifecycleAcceptTurn(t.Context(), testSubmission()), "entropy")

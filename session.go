@@ -29,7 +29,6 @@ const (
 	acpFieldValue     = "value"
 
 	optionFieldConcurrencyLimits = "concurrencyLimits"
-	optionFieldContainment       = "containment"
 	optionFieldDefaultModel      = "defaultModel"
 	optionFieldEnv               = "env"
 	optionFieldHome              = "home"
@@ -58,19 +57,26 @@ type agentSession struct {
 	cwd                   string
 	additionalDirectories []string
 	fingerprint           string
+	configuration         sessionConfigurationRecord
 
 	// launch is the spec used to start the pi process; a crashed process is
 	// relaunched lazily on the next turn by re-selecting the same native
 	// session file.
-	launch      pi.LaunchSpec
-	sessionRoot string
+	launch               pi.LaunchSpec
+	sessionRoot          string
+	generationPrepared   bool
+	retainedRoot         string
+	retainedPrepared     bool
+	retainedErr          error
+	managedCommitPending bool
 
 	sessionFilePath string
 	permissionMode  string
 
 	// autoRetry is the session's native auto-retry election, re-applied on
 	// every lazy relaunch so the retry posture survives process death.
-	autoRetry bool
+	autoRetry  bool
+	mcpServers []acp.McpServer
 
 	// mcpRefreshPending forces the first user turn to rebuild pi's fixed
 	// extension-tool registry while that turn's MCP authority is active.
@@ -137,10 +143,7 @@ type agentSession struct {
 	rawEventSequence     int64
 	mirroredRows         int
 	turnImagesEmitted    bool
-	nativeRootRelease    func()
-	scratchRootRelease   func()
 	nativeContainmentErr error
-	providerProcessRoot  *providerProcessRoot
 	nativeBoundary       *nativeBoundaryTracker
 	browserShim          *pi.BrowserShim
 	residence            *pi.SessionResidence
@@ -171,17 +174,16 @@ type sessionCloseAttempt struct {
 // sessionRelaunchAttempt is the exact in-flight successor construction a
 // close election must join when close wins before publication.
 type sessionRelaunchAttempt struct {
-	mu             sync.Mutex
-	finishOnce     sync.Once
-	done           chan struct{}
-	err            error
-	proc           piProcess
-	client         piClient
-	processRoot    *providerProcessRoot
-	generationRoot string
-	nativeRelease  func()
-	outbox         *sessionOutbox
-	nativeBoundary *nativeBoundaryTracker
+	mu                 sync.Mutex
+	finishOnce         sync.Once
+	done               chan struct{}
+	err                error
+	proc               piProcess
+	client             piClient
+	generationRoot     string
+	generationPrepared bool
+	outbox             *sessionOutbox
+	nativeBoundary     *nativeBoundaryTracker
 }
 
 // turnToolCall is the exact-ID lifecycle published for one native tool call.

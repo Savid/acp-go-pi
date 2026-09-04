@@ -2,6 +2,7 @@ package piacp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -103,10 +104,19 @@ func TestTurnScopedNotificationsCarryExactRoute(t *testing.T) {
 	require.Equal(t, turnRouteMeta("turn-old"), client.notified[0]["_meta"])
 }
 
-func TestInitializeAdvertisesRouteV1(t *testing.T) {
+func TestRouteCapabilityScalar(t *testing.T) {
 	resp, err := NewAgent().Initialize(context.Background(), acp.InitializeRequest{})
 	require.NoError(t, err)
-	require.Equal(t, map[string]any{"versions": []int{1}}, resp.AgentCapabilities.Meta[routeMetaKey])
+	encoded, err := json.Marshal(resp)
+	require.NoError(t, err)
+	var wire struct {
+		AgentCapabilities struct {
+			//nolint:tagliatelle // ACP defines this reserved wire member.
+			Meta map[string]json.RawMessage `json:"_meta"`
+		} `json:"agentCapabilities"`
+	}
+	require.NoError(t, json.Unmarshal(encoded, &wire))
+	require.Equal(t, `{"version":1}`, string(wire.AgentCapabilities.Meta["acp-go.dev/route"]))
 
 	piMeta, ok := resp.AgentCapabilities.Meta[piMetaKey].(map[string]any)
 	require.True(t, ok)

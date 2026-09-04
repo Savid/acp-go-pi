@@ -336,7 +336,7 @@ func newAgentCycleSession(t *testing.T) *agentCycleFixture {
 	)
 	agent.conn = client
 	agent.lifecycle = lifecycle.Negotiated{
-		Versions:             []int{1},
+		Version:              1,
 		UpdatesOutsidePrompt: true,
 		ActivityKinds:        []lifecycle.ActivityKind{},
 	}
@@ -1555,7 +1555,7 @@ func TestCancelledHostDoorsStillJoinObservableContainment(t *testing.T) {
 				return nil
 			}
 
-			start := sessionStart{Cwd: "/cwd", ResumeID: "id"}
+			start := sessionStart{Cwd: testCwd, ResumeID: "id"}
 			session := &agentSession{
 				agent:       agent,
 				id:          "id",
@@ -1659,65 +1659,6 @@ func TestCancelledHostDoorsStillJoinObservableContainment(t *testing.T) {
 			}
 			require.Equal(t, 1, process.shutdownCalls)
 			require.Equal(t, 1, process.closeCalls)
-		})
-	}
-}
-
-func TestGenerationContainmentPanicsUnblockJoinersAsIncomplete(t *testing.T) {
-	for _, stage := range []string{"abort", "shutdown", "close", "retirement"} {
-		t.Run(stage, func(t *testing.T) {
-			logs := &strings.Builder{}
-			armed := false
-			agent := NewAgent(
-				WithLogger(slog.New(slog.NewTextHandler(logs, nil))),
-				WithRuntimeResourceHooks(RuntimeResourceHooks{
-					ObserveProcessSnapshot: func(context.Context, RuntimeProcessKind, int) {
-						if armed {
-							panic("provider secret from retirement")
-						}
-					},
-				}),
-			)
-			client := newStubPiClient()
-			process := newStubProcess(false)
-			switch stage {
-			case "abort":
-				client.abortFunc = func(context.Context) error {
-					panic("provider secret from abort")
-				}
-			case "shutdown":
-				process.shutdownFunc = func(context.Context) error {
-					panic("provider secret from shutdown")
-				}
-			case "close":
-				process.closeFunc = func() error {
-					panic("provider secret from close")
-				}
-			}
-
-			session := &agentSession{agent: agent, id: "id", client: client, proc: process}
-			var root *providerProcessRoot
-			if stage == "retirement" {
-				root = agent.processes.register()
-				session.providerProcessRoot = root
-				armed = true
-			}
-			outbox := newTestSessionOutbox(1)
-			bindTestRuntime(outbox, process, client, nil, nil, root)
-			session.outbox = outbox
-			session.pumpGeneration = 1
-
-			session.containGeneration(t.Context(), outbox, "the generation violated its routing invariant")
-			_, err := session.acquireTurn(t.Context())
-			require.ErrorIs(t, err, pi.ErrProcessContainmentIncomplete)
-			var requestErr *acp.RequestError
-			require.ErrorAs(t, err, &requestErr)
-			require.ErrorIs(t, session.nativeContainmentError(), pi.ErrProcessContainmentIncomplete)
-			require.Equal(t, 1, process.shutdownCalls,
-				"an earlier panicked phase suppressed mandatory shutdown")
-			require.Equal(t, 1, process.closeCalls,
-				"an earlier panicked phase suppressed mandatory close")
-			require.NotContains(t, logs.String(), "provider secret")
 		})
 	}
 }

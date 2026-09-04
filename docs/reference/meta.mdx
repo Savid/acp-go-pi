@@ -21,7 +21,7 @@ Initialize advertises capability descriptors under `_meta.pi`:
 | `sessionStore` | Store `format` (`pi-session-jsonl-v1`) and key shape. |
 
 Initialize also advertises the separate reserved capability
-`_meta["acp-go.dev/route"] = {"versions":[1]}`. Prompts and cancellations
+`_meta["acp-go.dev/route"] = {"version":1}`. Prompts and cancellations
 require exactly `{"version":1,"turnNonce":"..."}` under that key. A nonce is
 fresh and unguessable per turn, non-empty, and at most 4096 bytes; missing,
 oversized, extra, unsupported, or stale route data is rejected. A cancel is
@@ -57,7 +57,7 @@ never envelope metadata.
 
 ### Handoff
 
-`_meta["acp-go.dev/handoff"] = {"versions":[1]}` is advertised **only** when
+`_meta["acp-go.dev/handoff"] = {"version":1}` is advertised **only** when
 `WithInputHandoffRoot` is configured. Its absence is the actionable signal
 that no handoff root reached this adapter, so a host never has to guess
 whether its option took effect.
@@ -90,13 +90,13 @@ verdicts.
 
 `acp-go.dev/lifecycle` is the reserved `_meta` key for the session-lifecycle
 extension, alongside `acp-go.dev/route`, `acp-go.dev/mediaEnvelope`, and
-`acp-go.dev/handoff`. When a host offers `{"versions":[1]}` under
-`acp-go.dev/lifecycle` at initialize, the negotiated answer rides
+`acp-go.dev/handoff`. When a host sends `{"version":1}` under
+`acp-go.dev/lifecycle` at initialize, the answer rides
 `InitializeResponse._meta` under the same key:
 
 ```json
 {
-  "versions": [1],
+  "version": 1,
   "updatesOutsidePrompt": true,
   "authoritativeQuiescence": false,
   "activityKinds": []
@@ -105,14 +105,14 @@ extension, alongside `acp-go.dev/route`, `acp-go.dev/mediaEnvelope`, and
 
 `updatesOutsidePrompt` is `true`: this adapter delivers `session/update`
 notifications whether or not a prompt is in flight. `authoritativeQuiescence`
-is `true` only under the Linux supervised containment boundary, where session
-close proves whole-tree vacancy; that answer adds `quiescenceSource:
-"process-containment"`, and every other boundary answers `false` and certifies
-no quiescence fact. `activityKinds` is empty because no native pi event carries a background
+is `true` only with `WithHostAuthority`, where the authority's terminal `Wait`
+result proves the managed generation settled; that answer adds
+`quiescenceSource: "process-containment"`. Ordinary mode answers `false` and
+certifies no quiescence fact. `activityKinds` is empty because no native pi event carries a background
 activity entity: work the harness begins between prompts is still the
 session's one foreground, so it is reported as a foreground cycle and never as
-an `activity_update`. An absent offer, or an offer with no common version,
-omits the key from the response and leaves the extension dormant.
+an `activity_update`. An absent capability omits the key from the response and
+leaves the extension dormant.
 
 Two events open a turn. A client prompt opens one with a `prompt_accepted`
 echoing its submission identity, followed by a `state_update` to `running`
@@ -230,6 +230,11 @@ Session-lifecycle requests accept options and the raw-event opt-in:
 | `permission` | Permission mode: `ask` (default) or `allow`. |
 | `autoRetry` | Opt in to pi's native automatic retry of transient provider errors (5xx, timeouts). Default `false`: a native failure surfaces once, immediately, with the real cause. |
 | `outputSchema` | Accepted in the struct for API symmetry only; presence fails closed with the uniform unsupported error, including an empty `{}` schema. |
+
+The accepted `env` map and ordered `extraPathDirs` list are lifecycle identity
+and are written into each durable session boundary. Load, resume, and fork use
+the stored value when the request omits a field. Supplying a field explicitly,
+including `{}` or `[]`, keeps that value as the requested lifecycle input.
 
 ## Update metadata
 

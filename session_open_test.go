@@ -25,6 +25,30 @@ func (c *cancelAfterOpeningUpdateClient) SessionUpdate(ctx context.Context, noti
 	return c.directAgentClient.SessionUpdate(ctx, notification)
 }
 
+type retireDuringOpeningUpdateClient struct {
+	*directAgentClient
+	outbox *sessionOutbox
+	cancel context.CancelFunc
+	calls  int
+}
+
+func (c *retireDuringOpeningUpdateClient) SessionUpdate(
+	ctx context.Context,
+	notification acp.SessionNotification,
+) error {
+	c.calls++
+	if c.calls == 2 {
+		c.outbox.mu.Lock()
+		c.outbox.claimForCloseLocked()
+		c.outbox.mu.Unlock()
+		c.cancel()
+
+		return context.Canceled
+	}
+
+	return c.directAgentClient.SessionUpdate(ctx, notification)
+}
+
 // TestPublishSessionOpen pins the establishing snapshot: it is emitted exactly
 // once, and a lifecycle stream that cannot open is fenced and recorded rather
 // than continued from a first event that never landed.
@@ -97,7 +121,7 @@ func TestStartupRecordsWaitForSessionIdentityAndOpeningSnapshot(t *testing.T) {
 	client := newRecordingClient()
 	agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
 	agent.conn = client
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 	process := newStubProcess(false)
 	native := newStubPiClient()
 	native.respondFunc = func(pi.UIResponse) {
@@ -144,7 +168,7 @@ func TestFailedStartupContainsBufferedRecordsWithoutEmission(t *testing.T) {
 	client.failOrdinary = true
 	agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
 	agent.conn = client
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 	process := newStubProcess(false)
 	native := newStubPiClient()
 	session := &agentSession{
@@ -215,7 +239,7 @@ func TestPublishSessionOpenCancellationAndLifecycleFailureBoundaries(t *testing.
 		host := &lifecycleFailingClient{directAgentClient: newDirectAgentClient(), err: errors.New("snapshot refused")}
 		agent := NewAgent(testContainmentOption(), WithLogger(slog.New(slog.DiscardHandler)))
 		agent.conn = host
-		agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+		agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 		process := newStubProcess(false)
 		session := &agentSession{agent: agent, id: "snapshot-failure"}
 		bindTestEstablishingOutbox(session, 1, process, newStubPiClient())
@@ -239,7 +263,32 @@ func TestPublishSessionOpenCancellationAndLifecycleFailureBoundaries(t *testing.
 		outbox.claimForCloseLocked()
 		outbox.mu.Unlock()
 
-		require.ErrorIs(t, session.publishSessionOpen(t.Context()), errGenerationRetired)
+		require.NoError(t, session.publishSessionOpen(t.Context()))
+		require.NoError(t, session.poisonedError(), "a closed session is not a poisoned one")
+		require.Zero(t, process.shutdownCalls, "the close ladder owns this generation's containment")
+		require.Zero(t, process.closeCalls)
+		require.Empty(t, logs.String(), "a legal close is not an invariant violation")
+	})
+
+	t.Run("close claimed during lifecycle write retires the opening", func(t *testing.T) {
+		logs := &strings.Builder{}
+		session, _ := lifecycleSession(t, false)
+		process := newStubProcess(false)
+		outbox := bindTestEstablishingOutbox(session, 1, process, newStubPiClient())
+		generationCtx, cancelGeneration := context.WithCancel(t.Context())
+		outbox.generationDone = generationCtx.Done()
+		session.agent.conn = &retireDuringOpeningUpdateClient{
+			directAgentClient: newDirectAgentClient(),
+			outbox:            outbox,
+			cancel:            cancelGeneration,
+		}
+		session.agent.log = slog.New(slog.NewTextHandler(logs, nil))
+
+		hookCtx, release, admitted := session.admitPostResponseHook()
+		require.True(t, admitted)
+		defer release()
+
+		require.NoError(t, session.publishSessionOpen(hookCtx))
 		require.NoError(t, session.poisonedError(), "a closed session is not a poisoned one")
 		require.Zero(t, process.shutdownCalls, "the close ladder owns this generation's containment")
 		require.Zero(t, process.closeCalls)

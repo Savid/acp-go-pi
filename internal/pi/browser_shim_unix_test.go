@@ -15,6 +15,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func writeScript(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-pi")
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o700))
+
+	return path
+}
+
+func startScriptProcess(t *testing.T, spec LaunchSpec) *Process {
+	t.Helper()
+	process, err := StartOrdinaryProcess(t.Context(), spec)
+	require.NoError(t, err)
+
+	return process
+}
+
 func TestNewBrowserShimWritesExecutableNoOps(t *testing.T) {
 	t.Parallel()
 
@@ -38,6 +54,30 @@ func TestNewBrowserShimWritesExecutableNoOps(t *testing.T) {
 
 	require.NoError(t, shim.Remove())
 	require.NoDirExists(t, dir)
+}
+
+func TestLaunchSpecBrowserShimEnvironmentIsCanonicalAndSubtractive(t *testing.T) {
+	shim, err := NewBrowserShim(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, shim.Remove()) })
+
+	environment := (LaunchSpec{
+		AgentDir:    "/agent",
+		BrowserShim: shim,
+		BaseEnvironment: map[string]string{
+			"PATH": "/usr/bin", "HOME": "/native/home", "BASH_ENV": "/tmp/bash",
+			"ENV": "/tmp/sh", "NODE_OPTIONS": "--require=/tmp/node.js", "LD_PRELOAD": "/tmp/ld.so",
+			"DYLD_INSERT_LIBRARIES": "/tmp/dyld.dylib",
+		},
+	}).Environ()
+
+	require.IsIncreasing(t, environment)
+	joined := strings.Join(environment, "\n")
+	for _, forbidden := range []string{"BASH_ENV=", "ENV=", "NODE_OPTIONS=", "LD_PRELOAD=", "DYLD_INSERT_LIBRARIES="} {
+		require.NotContains(t, joined, forbidden)
+	}
+	require.Contains(t, environment, "BROWSER="+filepath.Join(shim.shim.dir, browserLauncherNames[0]))
+	require.Contains(t, environment, "PATH="+shim.shim.dir+string(os.PathListSeparator)+"/usr/bin")
 }
 
 func TestNewBrowserShimFailures(t *testing.T) {
@@ -151,6 +191,17 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 	})
 
 	t.Cleanup(func() { _ = process.Close() })
+	resolvedResult := make(chan struct {
+		data []byte
+		err  error
+	}, 1)
+	go func() {
+		data, readErr := io.ReadAll(process.Stdout())
+		resolvedResult <- struct {
+			data []byte
+			err  error
+		}{data: data, err: readErr}
+	}()
 
 	select {
 	case <-process.Exited():
@@ -164,8 +215,8 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 
 	// The launchers the child did resolve were the shim's, not something further
 	// along PATH that simply happened to be missing.
-	resolved, err := io.ReadAll(process.Stdout())
-	require.NoError(t, err)
+	resolved := <-resolvedResult
+	require.NoError(t, resolved.err)
 
 	dir := browserShimDirIn(t, parent)
 
@@ -174,7 +225,7 @@ func TestLoginNeverExecsABrowserLauncher(t *testing.T) {
 		want = append(want, filepath.Join(dir, name))
 	}
 
-	require.Equal(t, want, strings.Fields(string(resolved)))
+	require.Equal(t, want, strings.Fields(string(resolved.data)))
 
 	require.NoError(t, shim.Remove())
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -70,11 +71,11 @@ func (options PiOptions) Meta() map[string]any {
 		values[metaModelKey] = options.Model
 	}
 
-	if len(options.Env) > 0 {
+	if options.Env != nil {
 		values[metaEnvKey] = cloneStringMap(options.Env)
 	}
 
-	if len(options.ExtraPathDirs) > 0 {
+	if options.ExtraPathDirs != nil {
 		values[metaExtraPathDirsKey] = slices.Clone(options.ExtraPathDirs)
 	}
 
@@ -105,35 +106,55 @@ func (options PiOptions) Meta() map[string]any {
 // session lifecycle request. Unknown own-namespace keys fail closed; foreign
 // namespaces are ignored.
 func piOptionsFromMeta(meta map[string]any) (PiOptions, error) {
+	options, _, err := piOptionsFromMetaWithConfigurationPresence(meta)
+
+	return options, err
+}
+
+type sessionConfigurationPresence struct {
+	Env           bool
+	ExtraPathDirs bool
+}
+
+func piOptionsFromMetaWithConfigurationPresence(
+	meta map[string]any,
+) (PiOptions, sessionConfigurationPresence, error) {
 	options := PiOptions{}
+	presence := sessionConfigurationPresence{}
 
 	// The session lifecycle extension rides no session lifecycle request: the
 	// family literal is never a foreign namespace here and never a no-op.
 	if refusal := refuseLifecycleMeta(meta); refusal != nil {
-		return PiOptions{}, refusal
+		return PiOptions{}, sessionConfigurationPresence{}, refusal
 	}
 
 	piMeta, ok := meta[piMetaKey].(map[string]any)
 	if !ok {
 		if _, exists := meta[piMetaKey]; exists {
-			return PiOptions{}, unsupportedField("_meta." + piMetaKey)
+			return PiOptions{}, sessionConfigurationPresence{}, unsupportedField("_meta." + piMetaKey)
 		}
 	}
 
 	if err := validatePiLifecycleMeta(piMeta); err != nil {
-		return PiOptions{}, err
+		return PiOptions{}, sessionConfigurationPresence{}, err
 	}
 
 	if rawOptions, ok := piMeta[metaOptionsKey]; ok {
 		parsed, err := parsePiOptions(rawOptions)
 		if err != nil {
-			return PiOptions{}, err
+			return PiOptions{}, sessionConfigurationPresence{}, err
 		}
 
 		options = parsed
+
+		// parsePiOptions accepts only this exact representation.
+		values, _ := rawOptions.(map[string]any)
+
+		_, presence.Env = values[metaEnvKey]
+		_, presence.ExtraPathDirs = values[metaExtraPathDirsKey]
 	}
 
-	return options, nil
+	return options, presence, nil
 }
 
 func validatePiLifecycleMeta(piMeta map[string]any) error {
@@ -279,6 +300,15 @@ func validatePiOptions(options PiOptions) (PiOptions, error) {
 }
 
 func validateEnvironment(env map[string]string, path string, blocked func(key string) bool) error {
+	return validateEnvironmentForPlatform(env, path, blocked, runtime.GOOS == "windows")
+}
+
+func validateEnvironmentForPlatform(
+	env map[string]string,
+	path string,
+	blocked func(key string) bool,
+	caseInsensitive bool,
+) error {
 	keys := make([]string, 0, len(env))
 	for key := range env {
 		keys = append(keys, key)
@@ -292,7 +322,7 @@ func validateEnvironment(env map[string]string, path string, blocked func(key st
 			return unsupportedField(path + "." + key)
 		}
 
-		if agentRuntimePlatform == windowsPlatform {
+		if caseInsensitive {
 			canonical := strings.ToUpper(key)
 			if _, ok := seen[canonical]; ok {
 				return unsupportedField(path + "." + key)

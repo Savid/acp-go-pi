@@ -10,16 +10,24 @@ import (
 	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
 
+func TestLifecycleCapabilityStrictScalar(t *testing.T) {
+	for _, raw := range []string{`"1"`, `1.0`, `1.5`, `null`, `true`, `{}`, `[]`, `2`} {
+		var negotiated lifecycle.Negotiated
+		err := json.Unmarshal([]byte(`{"version":`+raw+`}`), &negotiated)
+		require.Error(t, err, raw)
+	}
+}
+
 func TestLifecycleNegotiationPrecisionAndReservedRouting(t *testing.T) {
 	agent := NewAgent(testContainmentOption())
 	require.Equal(t, lifecycle.Negotiated{}, (*Agent)(nil).lifecycleNegotiated())
 
-	answer, err := agent.negotiateLifecycle(map[string]any{lifecycleMetaKey: map[string]any{"versions": []any{json.Number("1")}}})
+	answer, err := agent.negotiateLifecycle(map[string]any{lifecycleMetaKey: map[string]any{"version": json.Number("1")}})
 	require.NoError(t, err)
 	require.Contains(t, answer, lifecycleMetaKey)
 
 	// Values that float64 would round onto one are not equal to protocol 1.
-	_, err = agent.negotiateLifecycle(map[string]any{lifecycleMetaKey: map[string]any{"versions": []any{json.Number("1.0000000000000000001")}}})
+	_, err = agent.negotiateLifecycle(map[string]any{lifecycleMetaKey: map[string]any{"version": json.Number("1.0000000000000000001")}})
 	require.Error(t, err)
 
 	require.NoError(t, refuseLifecycleMeta(nil))
@@ -42,7 +50,7 @@ func TestReservedLifecycleMetaRefusedOnEverySurface(t *testing.T) {
 	agent := NewAgent(testContainmentOption())
 
 	_, err := agent.Initialize(t.Context(), acp.InitializeRequest{
-		Meta: map[string]any{lifecycleMetaKey: map[string]any{"versions": []any{json.Number("1.0000000000000000001")}}},
+		Meta: map[string]any{lifecycleMetaKey: map[string]any{"version": json.Number("1.0000000000000000001")}},
 	})
 	require.Error(t, err, "a malformed offer fails initialize")
 
@@ -170,10 +178,6 @@ func requireRefusedField(t *testing.T, field string, err error) {
 	require.Equal(t, field, data[jsonFieldField])
 }
 
-// TestProvenLifecycleFactsFollowTheContainmentBoundary pins that the
-// authoritative quiescence advertisement is resolved from the active
-// containment configuration, never asserted where the boundary cannot prove
-// whole-tree vacancy.
 func TestProvenLifecycleFactsFollowTheContainmentBoundary(t *testing.T) {
 	shared := NewAgent(testContainmentOption()).provenLifecycleFacts()
 	require.True(t, shared.UpdatesOutsidePrompt)
@@ -181,11 +185,7 @@ func TestProvenLifecycleFactsFollowTheContainmentBoundary(t *testing.T) {
 	require.Empty(t, shared.QuiescenceSource)
 	require.Empty(t, shared.ActivityKinds)
 
-	previous := agentRuntimePlatform
-	agentRuntimePlatform = linuxPlatform
-	t.Cleanup(func() { agentRuntimePlatform = previous })
-
-	authoritative := NewAgent(WithProcessIsolation(*policyForContainmentModeTest())).provenLifecycleFacts()
+	authoritative := (&Agent{options: Options{hostAuthoritySupplied: true}}).provenLifecycleFacts()
 	require.True(t, authoritative.AuthoritativeQuiescence)
 	require.Equal(t, lifecycle.ProofClassProcessContainment, authoritative.QuiescenceSource)
 }

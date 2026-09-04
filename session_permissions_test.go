@@ -363,7 +363,7 @@ func TestRequestPermissionUsesExactNativeToolCallID(t *testing.T) {
 
 func TestPermissionOwnershipFailureSynchronouslyDeniesExactDialog(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	agent.lifecycle = lifecycle.Negotiated{Versions: []int{1}, UpdatesOutsidePrompt: true}
+	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
 	host := newDialogStubClient()
 	agent.setConnection(host)
 	native := newStubPiClient()

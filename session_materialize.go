@@ -21,8 +21,6 @@ var (
 	materializeWriteFile = os.WriteFile
 	materializeStat      = os.Stat
 	materializeReadFile  = os.ReadFile
-	materializeWalkDir   = filepath.WalkDir
-	materializeRel       = filepath.Rel
 )
 
 // sessionDirs is one session's isolated on-disk layout: an agent directory
@@ -39,7 +37,7 @@ type sessionDirs struct {
 // scratch parent. A configured Home replaces only the generated agent
 // directory; session storage and generations remain removable scratch.
 func (a *Agent) createSessionDirs() (sessionDirs, error) {
-	parent, err := ensureScratchParent(a.options.ScratchDir)
+	parent, err := ensureScratchParent(a.scratchParent)
 	if err != nil {
 		return sessionDirs{}, err
 	}
@@ -79,16 +77,11 @@ func (a *Agent) createSessionRuntime() (sessionDirs, *pi.BrowserShim, error) {
 		return sessionDirs{}, nil, err
 	}
 
-	shim, err := a.newOwnedSessionBrowserShim()
-
-	return dirs, shim, err
+	return dirs, a.newSessionBrowserShim(dirs.Root), nil
 }
 
 // durableHome materializes Pi's stable native auth residence and reports its
-// path, or the empty string when no durable home is configured. Hardened
-// distinct-identity sessions refuse it until a proven credential-delivery
-// design exists; ordinary current-identity sessions use it directly and Pi's
-// native cross-process lock serializes auth.json updates.
+// path, or the empty string when no durable home is configured.
 //
 // The refusals are option verdicts about a host-supplied value, so they wear the
 // uniform unsupported-field shape rather than a raw Go error: a host that
@@ -99,10 +92,6 @@ func (a *Agent) durableHome() (string, error) {
 	home := a.options.Home
 	if home == "" {
 		return "", nil
-	}
-
-	if a.options.ProcessIsolation != nil {
-		return "", unsupportedField(optionFieldHome)
 	}
 
 	if !filepath.IsAbs(home) || filepath.Clean(home) != home {
@@ -123,11 +112,11 @@ func (a *Agent) durableHome() (string, error) {
 // reconcileHomeStartupDefaults puts the durable home's settings.json back to
 // the operator baseline for the keys pi reads at process start to choose a
 // model and thinking level. Every session launches against that one file and
-// pi writes its own choice into it whenever a session changes model or
-// thinking level, so without this a launch would start on whatever another
-// session last selected. The restored content is the operator's, identical for
-// every session, so concurrent launches cannot disagree about it. An ephemeral
-// per-session agent directory shares nothing and needs no reconciliation.
+// pi writes a choice into it wherever one is saved as the default, so without
+// this a launch would start on whatever another session last left there. The
+// restored content is the operator's, identical for every session, so
+// concurrent launches cannot disagree about it. An ephemeral per-session agent
+// directory shares nothing and needs no reconciliation.
 func (a *Agent) reconcileHomeStartupDefaults(agentDir string) error {
 	if a.options.Home == "" {
 		return nil
@@ -182,58 +171,6 @@ func createSessionGeneration(sessionRoot string) (sessionDirs, error) {
 	}
 
 	return dirs, nil
-}
-
-func copyGenerationAgentDir(source string, target string) error {
-	return materializeWalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		relative, err := materializeRel(source, path)
-		if err != nil {
-			return err
-		}
-
-		if relative == "." {
-			return nil
-		}
-
-		destination := filepath.Join(target, relative)
-
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-
-		if entry.IsDir() {
-			return materializeMkdirAll(destination, info.Mode().Perm())
-		}
-
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("copy runtime generation agent path %q: non-regular entry", relative)
-		}
-
-		contents, err := materializeReadFile(path)
-		if err != nil {
-			return err
-		}
-
-		return materializeWriteFile(destination, contents, info.Mode().Perm())
-	})
-}
-
-func rebaseGenerationPath(path string, oldRoot string, newRoot string) (string, error) {
-	if path == "" {
-		return "", nil
-	}
-
-	relative, err := materializeRel(oldRoot, path)
-	if err != nil || relative == handoffParentDir || strings.HasPrefix(relative, handoffParentDir+string(filepath.Separator)) {
-		return "", fmt.Errorf("runtime generation path %q is outside %q", path, oldRoot)
-	}
-
-	return filepath.Join(newRoot, relative), nil
 }
 
 // writeHydratedSessionFile materializes stored rows as a native session file

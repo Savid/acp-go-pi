@@ -13,7 +13,7 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 	options := NewPiOptions(
 		WithPiModel("fake/model"),
 		WithPiEnv(map[string]string{"TOKEN": "value"}),
-		WithPiExtraPathDirs("/opt/shim/bin"),
+		WithPiExtraPathDirs(absTestPath("opt", "shim", "bin")),
 		WithPiThinkingLevel("high"),
 		WithPiPermission("ask"),
 		WithPiAutoRetry(true),
@@ -24,9 +24,9 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 	require.Equal(t, options, parsed)
 
 	options.Env["TOKEN"] = "changed"
-	options.ExtraPathDirs[0] = "/opt/changed/bin"
+	options.ExtraPathDirs[0] = absTestPath("opt", "changed", "bin")
 	require.Equal(t, "value", parsed.Env["TOKEN"])
-	require.Equal(t, []string{"/opt/shim/bin"}, parsed.ExtraPathDirs)
+	require.Equal(t, []string{absTestPath("opt", "shim", "bin")}, parsed.ExtraPathDirs)
 
 	valid := []map[string]any{
 		nil,
@@ -37,8 +37,8 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]string{"A": "b"}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"A": "b"}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaAutoRetryKey: false}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []any{"/opt/bin"}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []string{"/opt/bin", "/srv/bin"}}}},
+		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []any{absTestPath("opt", "bin")}}}},
+		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []string{absTestPath("opt", "bin"), absTestPath("srv", "bin")}}}},
 	}
 	for _, value := range valid {
 		_, err := piOptionsFromMeta(value)
@@ -67,12 +67,12 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: true}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: "bad"}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaAutoRetryKey: "yes"}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: "/opt/bin"}}},
+		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: absTestPath("opt", "bin")}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []any{true}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []any{""}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []any{"relative/bin"}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{
-			metaExtraPathDirsKey: []any{"/opt/bin" + string(os.PathListSeparator) + "/srv/bin"},
+			metaExtraPathDirsKey: []any{absTestPath("opt", "bin") + string(os.PathListSeparator) + absTestPath("srv", "bin")},
 		}}},
 	}
 	for _, value := range invalid {
@@ -108,7 +108,7 @@ func TestEnvironmentValidation(t *testing.T) {
 		require.False(t, validEnvName(name))
 	}
 
-	for _, name := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_DARWIN_LAUNCH", "acp_go_pi_internal_turn_supervisor", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
+	for _, name := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_CONTROL", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
 		require.True(t, blockedAgentEnvKey(name))
 		require.True(t, blockedSessionEnvKey(name))
 	}
@@ -124,36 +124,27 @@ func TestEnvironmentValidation(t *testing.T) {
 	requireUnsupportedField(t, validateEnvironment(map[string]string{"PATH": "/raw/bin"}, metaOptionPath(metaEnvKey), blockedSessionEnvKey), metaOptionPath(metaEnvKey)+".PATH")
 	requireUnsupportedField(t, validateEnvironment(map[string]string{pi.EnvExtraPathDirs: "/attacker/bin"}, metaOptionPath(metaEnvKey), blockedSessionEnvKey), metaOptionPath(metaEnvKey)+"."+pi.EnvExtraPathDirs)
 	requireUnsupportedField(t, validateEnvironment(map[string]string{"1A": "x"}, optionFieldEnv, blockedAgentEnvKey), optionFieldEnv+".1A")
-
-	originalPlatform := agentRuntimePlatform
-	agentRuntimePlatform = windowsPlatform
-	t.Cleanup(func() { agentRuntimePlatform = originalPlatform })
-	requireUnsupportedField(
-		t,
-		validateEnvironment(map[string]string{"Provider_Key": "session", "PROVIDER_KEY": "agent"}, metaOptionPath(metaEnvKey), blockedSessionEnvKey),
-		metaOptionPath(metaEnvKey)+".Provider_Key",
-	)
 }
 
 func TestExtraPathDirsValidation(t *testing.T) {
 	t.Parallel()
 
 	require.NoError(t, validateExtraPathDirs(nil, metaExtraPathDirsKey))
-	require.NoError(t, validateExtraPathDirs([]string{"/opt/bin", "/srv/bin"}, metaExtraPathDirsKey))
+	require.NoError(t, validateExtraPathDirs([]string{absTestPath("opt", "bin"), absTestPath("srv", "bin")}, metaExtraPathDirsKey))
 
 	for _, dirs := range [][]string{
 		{""},
 		{"relative/bin"},
 		{"./bin"},
-		{"/opt/bin", "relative/bin"},
-		{"/opt/bin" + string(os.PathListSeparator) + "/srv/bin"},
+		{absTestPath("opt", "bin"), "relative/bin"},
+		{absTestPath("opt", "bin") + string(os.PathListSeparator) + absTestPath("srv", "bin")},
 	} {
 		require.Error(t, validateExtraPathDirs(dirs, metaExtraPathDirsKey))
 	}
 
 	requireUnsupportedField(
 		t,
-		validateExtraPathDirs([]string{"/opt/bin", "relative/bin"}, metaExtraPathDirsKey),
+		validateExtraPathDirs([]string{absTestPath("opt", "bin"), "relative/bin"}, metaExtraPathDirsKey),
 		metaExtraPathDirsKey+"[1]",
 	)
 }
@@ -183,7 +174,7 @@ func TestPiOptionsMeta(t *testing.T) {
 			options: PiOptions{
 				Model:         "openai/gpt-4o",
 				Env:           map[string]string{"K": "V"},
-				ExtraPathDirs: []string{"/opt/bin"},
+				ExtraPathDirs: []string{absTestPath("opt", "bin")},
 				OutputSchema:  map[string]any{"type": "object"},
 				ThinkingLevel: "high",
 				Permission:    "allow",
@@ -192,7 +183,7 @@ func TestPiOptionsMeta(t *testing.T) {
 			want: map[string]any{"pi": map[string]any{"options": map[string]any{
 				"model":         "openai/gpt-4o",
 				"env":           map[string]string{"K": "V"},
-				"extraPathDirs": []string{"/opt/bin"},
+				"extraPathDirs": []string{absTestPath("opt", "bin")},
 				"outputSchema":  map[string]any{"type": "object"},
 				"thinkingLevel": "high",
 				"permission":    "allow",

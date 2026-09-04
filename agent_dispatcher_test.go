@@ -306,7 +306,7 @@ func TestTagPostResponseHookRequestEdges(t *testing.T) {
 func TestPostResponseHookRequestIDSurvivesARealRequestsParams(t *testing.T) {
 	tagged := tagPostResponseHookRequest([]byte(
 		`{"jsonrpc":"2.0","id":9,"method":"session/new","params":` +
-			`{"cwd":"/tmp/work","mcpServers":[],"_meta":{"lifecycle":{"versions":[1]}}}}`,
+			`{"cwd":"/tmp/work","mcpServers":[],"_meta":{"lifecycle":{"version":1}}}}`,
 	))
 
 	var msg struct {
@@ -458,7 +458,7 @@ func TestBlockedPostResponseHookCannotVetoCloseOrContinueAfterRelease(t *testing
 	conn.hooks.runAfterResponseWrite([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
 	<-host.entered
 
-	require.ErrorIs(t, session.Close(t.Context()), pi.ErrProcessContainmentIncomplete)
+	require.ErrorIs(t, session.Close(t.Context()), ErrContainmentIncomplete)
 	require.Equal(t, 1, process.shutdownCalls)
 	require.Equal(t, 1, process.closeCalls)
 	require.Nil(t, session.lc.stream)
