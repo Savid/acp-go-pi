@@ -921,7 +921,9 @@ func (s *agentSession) nextRuntimeLaunch(
 			mcpConfig = &config
 		}
 
-		residence, files, residenceErr := pi.CreateSessionResidence(dirs.AgentDir, mcpConfig)
+		residence, files, residenceErr := pi.CreateSessionResidence(
+			s.agent.scratchParent, dirs.AgentDir, mcpConfig,
+		)
 		if residenceErr != nil {
 			return fail(residenceErr)
 		}

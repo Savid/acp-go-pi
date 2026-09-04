@@ -16,7 +16,7 @@ acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt
 | --- | --- |
 | `-path` | Pi executable; default searches the captured ordinary PATH. |
 | `-home` | Durable per-instance PI_CODING_AGENT_DIR; empty uses ephemeral session state. |
-| `-scratch-dir` | Parent for ephemeral session and version-probe trees. |
+| `-scratch-dir` | Parent for ephemeral session and version-probe trees, and for the extension store sessions share. |
 | `-provider-auth-root` | Durable values-free provider-auth ledger root; requires -home. |
 | `-model` | Default model as provider/id. |
 | `-seed-file` | Materialize relpath=hostpath in each session agent directory; repeatable. |

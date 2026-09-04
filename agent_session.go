@@ -1325,7 +1325,7 @@ func (a *Agent) startSessionConstruction(
 		mcpConfig = &config
 	}
 
-	residence, residenceFiles, err := pi.CreateSessionResidence(dirs.AgentDir, mcpConfig)
+	residence, residenceFiles, err := pi.CreateSessionResidence(a.scratchParent, dirs.AgentDir, mcpConfig)
 	if err != nil {
 		return nil, err
 	}

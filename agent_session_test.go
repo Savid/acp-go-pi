@@ -654,8 +654,19 @@ func TestStartSessionLoadsExplicitSeedResourcesAndProviderEnv(t *testing.T) {
 	require.Equal(t, "explicit-key", launched.Env["OPENAI_API_KEY"])
 	require.Len(t, launched.ExtensionPaths, 3)
 	require.Contains(t, filepath.ToSlash(launched.ExtensionPaths[0]), "/extensions/command.ts")
-	require.Equal(t, filepath.Join(residence, pi.BridgeExtensionFileName), launched.ExtensionPaths[1])
-	require.Equal(t, filepath.Join(residence, pi.PathExtensionFileName), launched.ExtensionPaths[2])
+	// The wrapper-owned sources are the same bytes for every session, so they
+	// are published once under the scratch parent rather than into this
+	// session's residence, where a path minted per session would make pi
+	// compile them again on every launch.
+	require.Equal(t, pi.BridgeExtensionFileName, filepath.Base(launched.ExtensionPaths[1]))
+	require.Equal(t, pi.PathExtensionFileName, filepath.Base(launched.ExtensionPaths[2]))
+	require.NotEqual(t, residence, filepath.Dir(launched.ExtensionPaths[1]))
+
+	for _, path := range launched.ExtensionPaths[1:] {
+		require.Equal(t, filepath.Dir(launched.ExtensionPaths[1]), filepath.Dir(path))
+		require.True(t, strings.HasPrefix(path, agent.scratchParent), path)
+		require.FileExists(t, path)
+	}
 	require.Equal(t, launched.AgentDir, filepath.Dir(filepath.Dir(residence)))
 	require.Equal(t, []string{filepath.Join(launched.AgentDir, "skills", "review", "SKILL.md")}, launched.SkillPaths)
 	require.Equal(t, []string{filepath.Join(launched.AgentDir, "prompts", "review.md")}, launched.PromptTemplatePaths)

@@ -1458,7 +1458,11 @@ func TestSessionResidenceSurvivesRelaunch(t *testing.T) {
 			relaunched := launched
 			require.NotEmpty(t, relaunched.Env[pi.EnvMCPConfig])
 			require.Equal(t, test.sameConfig, started.Env[pi.EnvMCPConfig] == relaunched.Env[pi.EnvMCPConfig])
-			require.Equal(t, filepath.Dir(relaunched.Env[pi.EnvMCPConfig]), filepath.Dir(relaunched.ExtensionPaths[0]))
+			// The session's config moves with its residence; the shared
+			// sources do not move at all, which is what lets pi reuse the
+			// extensions it already compiled.
+			require.NotEqual(t, filepath.Dir(relaunched.Env[pi.EnvMCPConfig]), filepath.Dir(relaunched.ExtensionPaths[0]))
+			require.Equal(t, started.ExtensionPaths, relaunched.ExtensionPaths)
 
 			relaunchedConfig, err := os.ReadFile(relaunched.Env[pi.EnvMCPConfig]) // #nosec G304 -- test temp dir.
 			require.NoError(t, err)

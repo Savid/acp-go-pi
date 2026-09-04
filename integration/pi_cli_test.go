@@ -73,7 +73,7 @@ Use the deterministic seeded skill.
 	require.NoError(t, seed.Write())
 	resources, err := seed.ExplicitResources()
 	require.NoError(t, err)
-	_, wrapper, err := pi.CreateSessionResidence(agentDir, nil)
+	_, wrapper, err := pi.CreateSessionResidence(t.TempDir(), agentDir, nil)
 	require.NoError(t, err)
 
 	process, err := pi.StartOrdinaryProcess(ctx, pi.LaunchSpec{

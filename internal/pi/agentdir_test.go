@@ -359,9 +359,11 @@ func restoreAgentDirSeams(t *testing.T) {
 
 	readFile, writeFile, mkdirAll, stat := fsReadFile, fsWriteFile, fsMkdirAll, fsStat
 	mkdirTemp, link, remove, removeAll := fsMkdirTemp, fsLink, fsRemove, fsRemoveAll
+	createTemp, chmod, lstat := fsCreateTemp, fsChmod, fsLstat
 
 	t.Cleanup(func() {
 		fsReadFile, fsWriteFile, fsMkdirAll, fsStat = readFile, writeFile, mkdirAll, stat
 		fsMkdirTemp, fsLink, fsRemove, fsRemoveAll = mkdirTemp, link, remove, removeAll
+		fsCreateTemp, fsChmod, fsLstat = createTemp, chmod, lstat
 	})
 }
