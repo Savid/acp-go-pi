@@ -49,9 +49,7 @@ method-not-found error.
 
 A native turn failure terminates `session/prompt` with a JSON-RPC error and no
 `PromptResponse`; it is never reported as an ACP stop reason. Every failure
-uses one uniform shape so a host can classify it without vendor parsing, and a
-native **session-start** failure carries that same shape: the causes are the
-same and there is no separate session-start error surface. The
+uses one uniform shape so a host can classify it without vendor parsing. The
 error is JSON-RPC code **`-32603`** with a `data` object:
 
 | Field | Value |
@@ -94,18 +92,25 @@ whose `data` is exactly two keys,
 `session/set_session_config_option`, which no longer echoes the caller's value
 or a native error string back.
 
-An option the embedding host handed `NewAgent` and this adapter refuses is
-answered with those same two keys naming the option, but under **`-32603`**:
-the caller's params were valid, and it is the constructed agent that cannot
-serve them. Both `initialize` and session establishment report it, because an
-embedded host can open a session and prompt without ever handshaking. Why the
-option was refused stays in the adapter log.
-
-The other `-32602` shapes are fixed by the wire contract and are unchanged:
+`unsupported` and `missing` are distinct verdicts and are never collapsed.
+`unsupported` names a value that is present and refused — an unknown option, a
+reserved key on a surface where it has no meaning, a malformed member.
+`missing` names a value the contract requires and the caller left out, and it
+appears on exactly two paths: the reserved route envelope and, while the
+lifecycle capability is enabled, the prompt correlation value. A host reading
+`missing` adds the key; a host reading `unsupported` on the same bare path
+stops sending it on that surface.
 
 | Case | `data` |
 | --- | --- |
 | Unknown or unloaded session | `{"error":"unknown session","field":"sessionId"}` |
+| Relative `cwd` on `session/new`, `session/load`, `session/resume`, or `_pi/session/fork` | `{"error":"unsupported","field":"cwd"}` |
+| `_pi/*` params that cannot be decoded, or fail validation as a whole | `{"error":"unsupported","field":"params"}` (the member instead, when one member is at fault) |
+| Absent `_meta["acp-go.dev/route"]` on `session/prompt` | `{"error":"missing","field":"_meta[\"acp-go.dev/route\"]"}` |
+| Malformed route value | `{"error":"unsupported","field":"_meta[\"acp-go.dev/route\"].<member>"}` |
+| Absent `_meta["acp-go.dev/lifecycle"]` on `session/prompt` while the capability is enabled | `{"error":"missing","field":"_meta[\"acp-go.dev/lifecycle\"]"}` |
+| Malformed lifecycle correlation value | `{"error":"unsupported","field":"_meta[\"acp-go.dev/lifecycle\"].<member path>"}` |
+| Lifecycle key on a surface that carries none | `{"error":"unsupported","field":"_meta[\"acp-go.dev/lifecycle\"]"}` |
 | SSE or ACP MCP transport | `{"error":"unsupported","field":"mcpServers[N]","server":"<name>"}` |
 | MCP entry with no transport | `{"error":"no_transport","field":"mcpServers[<i>]"}` |
 | Empty or duplicate MCP name | `{"mcpServers[<i>].name":"required"}` / `"duplicate"` |
@@ -113,14 +118,57 @@ The other `-32602` shapes are fixed by the wire contract and are unchanged:
 | `authenticate` with an unknown method id | `{"methodId":"<the id you sent>"}` |
 | Fork of an empty session | `{"error":"cannot fork an empty session","field":"sessionId"}` |
 
+Route validation runs before the lifecycle correlation value is read, so a
+prompt wrong in both ways reports the route refusal alone. `session/cancel` is
+a notification and answers nothing, so its refusals are wire-silent; the cancel
+is never applied.
+
 Image rejections carry the structured image data documented in
 [Prompt streaming](/docs/core/prompt-streaming).
 
 A request the client cancels with `$/cancel_request` is answered **`-32800`**
 with no `data`, ahead of whatever error the in-flight handler returned. An
-adapter-internal deadline is never reported as a cancel. Any remaining
-adapter fault, the refused-option verdict above aside, is **`-32603`** with no
-`data`; its detail is in the adapter log.
+adapter-internal deadline is never reported as a cancel.
+
+## Off-prompt internal errors
+
+Every **`-32603`** away from a prompt turn carries exactly one closed
+`pi_`-prefixed token in `data.error`. The JSON-RPC `message` stays the protocol
+constant `Internal error`, `data` is always present, and `data` never carries a
+`message` member: no Go error text and no native text reaches a client on these
+paths. The reason is in the adapter log.
+
+| `data.error` | Raised by |
+| --- | --- |
+| `pi_invalid_options` | An option the embedding host handed `NewAgent` and this adapter refuses. Optional `field` names the option when exactly one is at fault. Delivered on `initialize` and on every session-establishing entry point, because an embedded host can open a session and prompt without ever handshaking. A construction verdict is never `-32602`: the caller's params were valid, and it is the constructed agent that cannot serve them. |
+| `pi_restore_failed` | `session/load`, `session/resume`, or `_pi/session/fork` found a store entry it could not restore — an unreadable store, a native log with no lifecycle boundary, a row count the boundary disagrees with, or a stored image artifact the store can no longer reproduce. The entry is neither deleted nor tombstoned. |
+| `pi_session_poisoned` | A session whose admission is permanently fenced by a native invariant failure. Always carries `cause`, one of the closed tokens below. |
+| `pi_internal_failure` | Everything unclassified. Optional `class` is the closed token `native_start`, which names a native pi process that could not be started or configured for a session — the version probe, the spawn, or the post-spawn command sequence. |
+
+The `pi_session_poisoned` `cause` vocabulary:
+
+| `cause` | Meaning |
+| --- | --- |
+| `command_catalog_undelivered` | The required session-open command catalog was not delivered. |
+| `lifecycle_snapshot_undelivered` | The required session-open lifecycle snapshot was not delivered. |
+| `session_open_gate_unreleased` | The session-open generation gate could not be released. |
+| `native_session_identity_drift` | The native session id stopped matching the ACP session it was opened for. |
+| `native_stream_failed` | The native JSONL event stream failed. |
+| `outbox_retention_exceeded` | An outbox or startup prefix reached its retention bound, so ordering could no longer be guaranteed. |
+| `native_invariant_violated` | pi produced a record its generation cannot place. |
+| `adapter_panic` | An adapter goroutine driving the generation panicked. |
+| `native_relaunch_failed` | The native process relaunch could not be set up. |
+| `lifecycle_stream_failed` | An agent-origin cycle could not be opened on, or delivered to, the lifecycle stream. |
+| `agent_cycle_settlement_failed` | An agent-origin cycle's settlement step failed. |
+| `prompt_acceptance_failed` | The native prompt acceptance boundary failed. |
+| `lifecycle_action_failed` | A lifecycle action request could not be registered, announced, or resolved. |
+| `native_interaction_unsettled` | A native interaction response did not finish before cancellation. |
+
+`pi_turn_failed` above is the prompt-turn token and is unaffected by this rule;
+`pi_auth_failed` is the `-32000` provider-auth token. This adapter runs one pi
+process per ACP session rather than a shared runtime, so it emits no
+runtime-unavailable token at all: a dead process fences its own session and the
+next prompt relaunches it.
 
 <Note>
 This adapter advertises no standard ACP `authenticate` method, so a provider

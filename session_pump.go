@@ -1384,7 +1384,7 @@ func (s *agentSession) pump(ctx context.Context, client piClient, outbox *sessio
 	defer outbox.producers.releaseRoot()
 	defer func() {
 		handleAgentGoroutinePanic(ctx, agentLogger(s.agent), "session event pump", func(any) {
-			s.containGeneration(ctx, outbox, "the native event pump panicked")
+			s.containGeneration(ctx, outbox, poisoned(poisonCausePanic, "the native event pump panicked"))
 		}, recover())
 	}()
 
@@ -1430,7 +1430,7 @@ func (s *agentSession) pump(ctx context.Context, client piClient, outbox *sessio
 	}
 
 	if client.Err() != nil {
-		s.containGeneration(ctx, outbox, "the native JSONL stream failed")
+		s.containGeneration(ctx, outbox, poisoned(poisonCauseStreamFailed, "the native JSONL stream failed"))
 
 		return
 	}
@@ -1518,11 +1518,11 @@ func (s *agentSession) routeNativeEvent(ctx context.Context, outbox *sessionOutb
 
 		return
 	case outboxOverflow:
-		s.containGeneration(ctx, outbox, "the session outbox reached its retention bound")
+		s.containGeneration(ctx, outbox, poisoned(poisonCauseRetentionBound, "the session outbox reached its retention bound"))
 
 		return
 	case outboxViolation:
-		s.containGeneration(ctx, outbox, admitted.violation)
+		s.containGeneration(ctx, outbox, poisoned(poisonCauseNativeInvariant, admitted.violation))
 
 		return
 	case outboxDeliver, outboxOpenCycle, outboxSession, outboxNoted, outboxQueued, outboxDeferred, outboxShutdown:
@@ -1596,7 +1596,7 @@ func (s *agentSession) logUnroutedRecord(ctx context.Context, outbox *sessionOut
 // awaiting containment already joins it. Callers that only need the admission
 // fence discard the join; containGenerationSync waits on it so a synchronous
 // return means the observable half has run too.
-func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOutbox, cause string) <-chan struct{} {
+func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOutbox, reason poisonReason) <-chan struct{} {
 	if outbox == nil {
 		return nil
 	}
@@ -1614,7 +1614,7 @@ func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOut
 
 	s.registerContainmentOutboxLocked(outbox)
 
-	effectiveCause, firstPoison, turnCancel := s.installPoisonLocked(cause)
+	effectiveReason, firstPoison, turnCancel := s.installPoisonLocked(reason)
 	outbox.mu.Unlock()
 	s.mu.Unlock()
 
@@ -1643,7 +1643,7 @@ func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOut
 				}
 
 				s.fenceLifecycleGeneration(outbox.generation)
-				s.reportPoison(context.WithoutCancel(ctx), effectiveCause)
+				s.reportPoison(context.WithoutCancel(ctx), effectiveReason)
 			}()
 
 			return reported
@@ -1691,14 +1691,14 @@ func (s *agentSession) containGeneration(ctx context.Context, outbox *sessionOut
 		s.fenceLifecycleGeneration(outbox.generation)
 
 		if firstPoison {
-			s.reportPoison(containCtx, effectiveCause)
+			s.reportPoison(containCtx, effectiveReason)
 		}
 	}()
 
 	return nil
 }
 
-func (s *agentSession) containGenerationSync(ctx context.Context, outbox *sessionOutbox, cause string) error {
+func (s *agentSession) containGenerationSync(ctx context.Context, outbox *sessionOutbox, reason poisonReason) error {
 	if outbox == nil {
 		err := errors.Join(ErrContainmentIncomplete, errors.New("native generation owner is missing"))
 		s.recordNativeContainment(err)
@@ -1706,7 +1706,7 @@ func (s *agentSession) containGenerationSync(ctx context.Context, outbox *sessio
 		return err
 	}
 
-	reported := s.containGeneration(ctx, outbox, cause)
+	reported := s.containGeneration(ctx, outbox, reason)
 
 	containmentErr, ok := outbox.awaitContainment()
 
@@ -2063,7 +2063,7 @@ func (s *agentSession) routeUIRequest(ctx context.Context, outbox *sessionOutbox
 	if deferred, overflow := outbox.deferStartupUI(request); deferred {
 		return
 	} else if overflow {
-		s.containGeneration(ctx, outbox, "the session startup prefix reached its retention bound")
+		s.containGeneration(ctx, outbox, poisoned(poisonCauseRetentionBound, "the session startup prefix reached its retention bound"))
 
 		return
 	}
@@ -2485,7 +2485,7 @@ func (s *agentSession) acceptPromptResponse(
 		return errors.Join(err, quarantineErr)
 	}
 
-	s.containGeneration(ctx, outbox, "the native prompt acceptance boundary failed")
+	s.containGeneration(ctx, outbox, poisoned(poisonCausePromptAcceptance, "the native prompt acceptance boundary failed"))
 
 	return errors.Join(err, s.poisonedError())
 }

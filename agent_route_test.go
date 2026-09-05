@@ -140,3 +140,80 @@ func TestPromptAndActiveCancelRequireCurrentRoute(t *testing.T) {
 	require.Error(t, agent.Cancel(turnCtx, acp.CancelNotification{SessionId: session.id}))
 	require.Error(t, agent.Cancel(turnCtx, CancelRequest(session.id, "stale-turn")))
 }
+
+// TestReservedRouteEnvelopeRefusals is the conformance table for the reserved
+// turn route on `session/prompt`. A host reads two distinct facts from one
+// field path and they are never collapsed: `missing` when it omitted a key the
+// contract requires, and `unsupported` naming the member at fault when it sent
+// a value that cannot be accepted.
+func TestReservedRouteEnvelopeRefusals(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		value   any
+		present bool
+		verdict string
+		field   string
+	}{
+		{
+			name:    "absent",
+			verdict: validationMissing,
+			field:   routeMetaPath,
+		},
+		{
+			name:    "not an object",
+			value:   "turn-1",
+			present: true,
+			verdict: validationUnsupported,
+			field:   routeMetaPath,
+		},
+		{
+			name:    "wrong version",
+			value:   map[string]any{routeFieldVer: 2, routeFieldTurn: "turn-1"},
+			present: true,
+			verdict: validationUnsupported,
+			field:   routeMetaPath + "." + routeFieldVer,
+		},
+		{
+			name:    "empty nonce",
+			value:   map[string]any{routeFieldVer: 1, routeFieldTurn: ""},
+			present: true,
+			verdict: validationUnsupported,
+			field:   routeMetaPath + "." + routeFieldTurn,
+		},
+		{
+			name: "over-bound nonce",
+			value: map[string]any{
+				routeFieldVer:  1,
+				routeFieldTurn: strings.Repeat("n", routeTurnNonceMaxBytes+1),
+			},
+			present: true,
+			verdict: validationUnsupported,
+			field:   routeMetaPath + "." + routeFieldTurn,
+		},
+		{
+			name:    "unknown member",
+			value:   map[string]any{routeFieldVer: 1, routeFieldTurn: "turn-1", routeFieldID: "s"},
+			present: true,
+			verdict: validationUnsupported,
+			field:   routeMetaPath + "." + routeFieldID,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			session := negotiatedLifecycleSession(t)
+
+			meta := map[string]any{lifecycleMetaKey: testPromptCorrelation(1)}
+			if test.present {
+				meta[routeMetaKey] = test.value
+			}
+
+			_, err := session.Prompt(t.Context(), acp.PromptRequest{Meta: meta})
+			requireRefusal(t, test.verdict, test.field, err)
+		})
+	}
+}

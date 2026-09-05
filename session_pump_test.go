@@ -552,7 +552,7 @@ func TestExistingIncompleteContainmentIsRetainedByFirstPoison(t *testing.T) {
 	session := &agentSession{agent: NewAgent(WithLogger(slog.New(slog.DiscardHandler)))}
 	outbox := newTestSessionOutbox(1)
 	containment, _ := outbox.claimContainmentLocked(containmentOwnerClose)
-	session.containGeneration(t.Context(), outbox, "first poison")
+	session.containGeneration(t.Context(), outbox, poisoned(poisonCausePanic, "first poison"))
 	want := errors.Join(ErrContainmentIncomplete, errors.New("owner incomplete"))
 	outbox.finishContainment(containment, want)
 	require.NoError(t, outbox.producers.waitChildren(t.Context()))
@@ -561,12 +561,12 @@ func TestExistingIncompleteContainmentIsRetainedByFirstPoison(t *testing.T) {
 
 func TestContainmentAndNativeBoundaryFailureEdges(t *testing.T) {
 	session := &agentSession{agent: NewAgent(WithLogger(slog.New(slog.DiscardHandler)))}
-	session.containGeneration(t.Context(), nil, "missing")
-	require.ErrorIs(t, session.containGenerationSync(t.Context(), nil, "missing"), ErrContainmentIncomplete)
+	session.containGeneration(t.Context(), nil, poisoned(poisonCausePanic, "missing"))
+	require.ErrorIs(t, session.containGenerationSync(t.Context(), nil, poisoned(poisonCausePanic, "missing")), ErrContainmentIncomplete)
 
 	outbox := newTestSessionOutbox(1)
 	outbox.producers.releaseRoot()
-	require.ErrorIs(t, session.containGenerationSync(t.Context(), outbox, "closed admission"), ErrContainmentIncomplete)
+	require.ErrorIs(t, session.containGenerationSync(t.Context(), outbox, poisoned(poisonCausePanic, "closed admission")), ErrContainmentIncomplete)
 
 	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -907,7 +907,7 @@ func TestContainmentPanicPublishesImmutableFailure(t *testing.T) {
 	outbox := newTestSessionOutbox(1)
 	bindTestRuntime(outbox, process, native, nil, nil, nil)
 	session := &agentSession{agent: &Agent{}}
-	session.containGeneration(t.Context(), outbox, "panic after containment")
+	session.containGeneration(t.Context(), outbox, poisoned(poisonCausePanic, "panic after containment"))
 	err, ok := outbox.awaitContainment()
 	require.True(t, ok)
 	require.ErrorIs(t, err, ErrContainmentIncomplete)

@@ -1,6 +1,8 @@
 package piacp
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -838,4 +840,161 @@ func TestTurnOutcomeForStopReason(t *testing.T) {
 	require.Equal(t, lifecycle.OutcomeCancelled, turnOutcomeForStopReason(acp.StopReasonCancelled))
 	require.Equal(t, lifecycle.OutcomeRefused, turnOutcomeForStopReason(acp.StopReasonRefusal))
 	require.Equal(t, lifecycle.OutcomeSuccess, turnOutcomeForStopReason(acp.StopReasonEndTurn))
+}
+
+// TestAssistantTextIsAppendOnly is the conformance proof that
+// agent_message_chunk and agent_thought_chunk are append-only deltas. A client
+// renders a turn's assistant text as the in-order concatenation of every chunk
+// it received, so this replays real native fixtures through the same mapper a
+// live turn uses and asserts that concatenation against the native final text.
+//
+// Each fixture is a native JSONL transcript, decoded by the production codec:
+// a scripted Go event list would prove the mapper agrees with itself rather
+// than with what pi actually writes.
+func TestAssistantTextIsAppendOnly(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		// fixture is the native transcript replayed through the mapper.
+		fixture string
+		// text is the exact concatenation of every emitted message chunk.
+		text string
+		// thought is the exact concatenation of every emitted thought chunk.
+		thought string
+		// messageChunks is how many message chunks the turn may emit.
+		messageChunks int
+	}{
+		{
+			// A terminal frame that repeats the streamed text contributes only
+			// the suffix the deltas did not carry.
+			name:          "terminal frame repeats the streamed text",
+			fixture:       "terminal-frame-repeats-stream.jsonl",
+			text:          "Hello, world and the tail the deltas never carried.",
+			thought:       "Weighing the answer. And the unstreamed rest.",
+			messageChunks: 3,
+		},
+		{
+			// A deltas-free harness yields exactly one chunk.
+			name:          "terminal frame with no deltas at all",
+			fixture:       "terminal-frame-only.jsonl",
+			text:          "The whole answer arrived at once.",
+			messageChunks: 1,
+		},
+		{
+			// Deltas that carried everything leave the terminal frame with
+			// nothing to add, and a repeated native identity adds nothing
+			// either: dedup is on identity, never on text.
+			name:          "terminal frame the deltas fully carried, repeated",
+			fixture:       "terminal-frame-fully-streamed.jsonl",
+			text:          "Fully streamed.",
+			messageChunks: 2,
+		},
+		{
+			// Two native messages saying the same thing each emit once: the
+			// second is a different native identity, not a repeat of the first.
+			name:          "multi-message turn emits each message once",
+			fixture:       "multi-message-turn.jsonl",
+			text:          "Same words.Same words.",
+			messageChunks: 3,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			connection := newDirectAgentClient()
+			agent := NewAgent(testContainmentOption())
+			agent.setConnection(connection)
+			session := &agentSession{agent: agent, id: "append-only"}
+			state := &promptTurnState{}
+
+			for _, event := range replayNativeFixture(t, test.fixture) {
+				settled, err := session.handleTurnEvent(t.Context(), event, state)
+				require.NoError(t, err)
+				require.False(t, settled)
+			}
+
+			text, thought, chunks := collectAssistantText(connection.updates)
+
+			require.Equal(t, test.text, text,
+				"the concatenation of every message chunk is the native final text exactly once")
+			require.Equal(t, test.thought, thought,
+				"the concatenation of every thought chunk is the native final thinking exactly once")
+			require.Equal(t, test.messageChunks, chunks)
+		})
+	}
+}
+
+// replayNativeFixture decodes one native JSONL transcript with the production
+// codec, so the fixtures stay wire records rather than Go values.
+func replayNativeFixture(t *testing.T, name string) []pi.Event {
+	t.Helper()
+
+	raw, err := os.ReadFile(filepath.Join("testdata", "append-only", name))
+	require.NoError(t, err)
+
+	events := make([]pi.Event, 0, 8)
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+
+		message, decodeErr := pi.DecodeMessage(line)
+		require.NoError(t, decodeErr)
+		require.Equal(t, pi.MessageKindEvent, message.Kind)
+		events = append(events, message.Event)
+	}
+
+	require.NoError(t, scanner.Err())
+
+	return events
+}
+
+// collectAssistantText renders the turn the way a client does: the in-order
+// concatenation of every text-carrying chunk.
+func collectAssistantText(updates []acp.SessionUpdate) (string, string, int) {
+	var text, thought strings.Builder
+
+	chunks := 0
+
+	for index := range updates {
+		update := updates[index]
+
+		switch {
+		case update.AgentMessageChunk != nil && update.AgentMessageChunk.Content.Text != nil:
+			text.WriteString(update.AgentMessageChunk.Content.Text.Text)
+
+			chunks++
+		case update.AgentThoughtChunk != nil && update.AgentThoughtChunk.Content.Text != nil:
+			thought.WriteString(update.AgentThoughtChunk.Content.Text.Text)
+		}
+	}
+
+	return text.String(), thought.String(), chunks
+}
+
+// TestAssistantTextSuffixFailsTheTurnOnADeliveryFailure pins that a terminal
+// frame whose suffix cannot be delivered fails the turn rather than being
+// dropped: the client would otherwise render a turn missing its last words.
+func TestAssistantTextSuffixFailsTheTurnOnADeliveryFailure(t *testing.T) {
+	t.Parallel()
+
+	connection := newDirectAgentClient()
+	connection.updateErr = errSecret("host refused the chunk")
+
+	agent := NewAgent(testContainmentOption())
+	agent.setConnection(connection)
+	session := &agentSession{agent: agent, id: "append-only-failure"}
+
+	_, err := session.handleTurnEvent(t.Context(), pi.MessageEndEvent{Message: pi.AgentMessage{
+		ACPMessageID: "msg-1",
+		Role:         messageRoleAssistant,
+		Content:      json.RawMessage(`[{"type":"text","text":"Never delivered."}]`),
+	}}, &promptTurnState{})
+	require.Error(t, err)
 }

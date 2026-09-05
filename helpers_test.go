@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -959,4 +960,35 @@ func awaitTestSignal(t *testing.T, signal <-chan struct{}, what string) {
 	case <-time.After(testSignalTimeout):
 		require.FailNowf(t, "timed out waiting for a test signal", "%s", what)
 	}
+}
+
+// negotiatedLifecycleSession builds a session on a connection whose lifecycle
+// capability the host enabled, which is the only state in which the prompt
+// correlation value is required.
+func negotiatedLifecycleSession(t *testing.T) *agentSession {
+	t.Helper()
+
+	agent := NewAgent(testContainmentOption())
+
+	answer, err := agent.negotiateLifecycle(map[string]any{
+		lifecycleMetaKey: map[string]any{"version": json.Number("1")},
+	})
+	require.NoError(t, err)
+	require.Contains(t, answer, lifecycleMetaKey)
+
+	return &agentSession{agent: agent, id: "reserved-keys", cancel: func() {}, turnNonce: "turn-1"}
+}
+
+// testSubmissionValue is one well-formed submission identity in wire form.
+func testSubmissionValue() map[string]any {
+	return map[string]any{"submissionId": "sub-1", "clientNonce": "nonce-1"}
+}
+
+// testPromptCorrelation is one well-formed prompt correlation value in wire
+// form, so a table probing the other reserved key never fails on this one.
+func testPromptCorrelation(n int) map[string]any {
+	return map[string]any{"version": 1, "submission": map[string]any{
+		"submissionId": fmt.Sprintf("sub-%d", n),
+		"clientNonce":  fmt.Sprintf("cn-%d", n),
+	}}
 }

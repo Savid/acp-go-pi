@@ -1,0 +1,5 @@
+{"type":"message_start","message":{"acpMessageId":"msg-1","role":"assistant","model":"glm-5.3-flash","provider":"opencode-go"}}
+{"type":"message_update","message":{"acpMessageId":"msg-1","role":"assistant"},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Fully "}}
+{"type":"message_update","message":{"acpMessageId":"msg-1","role":"assistant"},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"streamed."}}
+{"type":"message_end","message":{"acpMessageId":"msg-1","role":"assistant","stopReason":"stop","content":[{"type":"text","text":"Fully streamed."}]}}
+{"type":"message_end","message":{"acpMessageId":"msg-1","role":"assistant","stopReason":"stop","content":[{"type":"text","text":"Fully streamed."}]}}

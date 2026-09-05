@@ -9,12 +9,21 @@ During a prompt turn, pi RPC events are translated into ACP session updates:
 
 | Update | Source |
 | --- | --- |
-| assistant message chunks | pi assistant text deltas |
-| thought chunks | pi thinking deltas |
+| assistant message chunks | pi assistant text deltas, plus the un-streamed suffix of the terminal `message_end` frame |
+| thought chunks | pi thinking deltas, plus the un-streamed suffix of the terminal `message_end` frame |
 | tool call | pi tool-call start and input |
 | tool call progress and result | pi tool execution events |
 | available commands | pi's discovered command set |
 | usage | per-message usage reported at message end |
+
+Assistant message and thought chunks are **append-only deltas**: the turn's
+text is the in-order concatenation of every chunk, and text already streamed is
+never repeated. pi repeats the assembled message in its terminal `message_end`
+frame, so the adapter contributes only the part the deltas did not carry —
+nothing when they carried all of it, and the whole message when there were no
+deltas at all. Repeated terminal frames are de-duplicated on native message
+identity rather than on text. See
+[Prompt streaming](/docs/core/prompt-streaming).
 
 Usage `size` is the model's harness-reported context window; it is never
 fabricated, and `0` means unknown. `used` and the token breakdown come from

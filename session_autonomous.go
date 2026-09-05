@@ -27,7 +27,9 @@ func (s *agentSession) openAgentCycle(ctx context.Context, outbox *sessionOutbox
 		s.agent.log.ErrorContext(ctx, "open agent-origin cycle on the lifecycle stream failed",
 			slog.String(acpFieldSessionID, string(s.id)),
 		)
-		s.containGeneration(ctx, outbox, "the agent-origin cycle could not be opened on the lifecycle stream")
+		s.containGeneration(ctx, outbox, poisoned(
+			poisonCauseLifecycleStream, "the agent-origin cycle could not be opened on the lifecycle stream",
+		))
 
 		return
 	}
@@ -71,7 +73,9 @@ func (s *agentSession) handleAgentOriginEvent(
 		s.agent.log.ErrorContext(ctx, "project agent-origin cycle output failed",
 			slog.String(acpFieldSessionID, string(s.id)),
 		)
-		s.containGeneration(ctx, outbox, "an agent-origin cycle's update could not be delivered")
+		s.containGeneration(ctx, outbox, poisoned(
+			poisonCauseLifecycleStream, "an agent-origin cycle's update could not be delivered",
+		))
 	}
 }
 
@@ -102,7 +106,9 @@ func (s *agentSession) settleAgentCycle(ctx context.Context, outbox *sessionOutb
 				agentLogger(s.agent),
 				"agent cycle settlement",
 				func(any) {
-					s.containGeneration(settleCtx, outbox, "the agent-origin cycle settlement panicked")
+					s.containGeneration(settleCtx, outbox, poisoned(
+						poisonCausePanic, "the agent-origin cycle settlement panicked",
+					))
 				},
 				recover(),
 			)
@@ -160,13 +166,13 @@ func (s *agentSession) completeAgentCycle(ctx context.Context, outbox *sessionOu
 
 // containAgentCycle ends the generation a settlement step failed on. The fixed
 // cause names the failed stage without carrying native or user content.
-func (s *agentSession) containAgentCycle(ctx context.Context, outbox *sessionOutbox, cause string) {
+func (s *agentSession) containAgentCycle(ctx context.Context, outbox *sessionOutbox, detail string) {
 	s.agent.log.ErrorContext(ctx, "agent-origin cycle settlement failed",
 		slog.String(acpFieldSessionID, string(s.id)),
-		slog.String("cause", cause),
+		slog.String("detail", detail),
 	)
 
-	s.containGeneration(ctx, outbox, cause)
+	s.containGeneration(ctx, outbox, poisoned(poisonCauseAgentCycle, detail))
 }
 
 // agentCycleVerdict records how the cycle ended in the terms its boundary and

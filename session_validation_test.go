@@ -1,8 +1,10 @@
 package piacp
 
 import (
+	"encoding/json"
 	"testing"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 )
 
@@ -55,4 +57,63 @@ func TestConfigurationAndAdmissionEdges(t *testing.T) {
 	path, err := agent.resolveExecutablePath()
 	require.NoError(t, err)
 	require.Equal(t, rawEventSourceValue, path)
+}
+
+// TestRelativeCwdRefusedOnEverySessionStartSurface pins the family's uniform
+// relative-`cwd` rejection on the wire, on every surface that takes one. The
+// refusal is the two-key unsupported shape naming `cwd` — never a pi token and
+// never a message-shaped data object — and it lands before any native process
+// or store entry exists.
+func TestRelativeCwdRefusedOnEverySessionStartSurface(t *testing.T) {
+	t.Parallel()
+
+	agent := NewAgent(testContainmentOption())
+
+	_, err := agent.NewSession(t.Context(), acp.NewSessionRequest{Cwd: "relative"})
+	requireRefusal(t, validationUnsupported, jsonFieldCwd, err)
+
+	_, err = agent.LoadSession(t.Context(), acp.LoadSessionRequest{
+		SessionId: acp.SessionId(validSessionUUID), Cwd: "relative",
+	})
+	requireRefusal(t, validationUnsupported, jsonFieldCwd, err)
+
+	_, err = agent.ResumeSession(t.Context(), acp.ResumeSessionRequest{
+		SessionId: acp.SessionId(validSessionUUID), Cwd: "relative",
+	})
+	requireRefusal(t, validationUnsupported, jsonFieldCwd, err)
+
+	forked := ForkSessionRequest(forkParentID, "relative")
+	_, err = agent.HandleExtensionMethod(t.Context(), ForkSessionMethod, forkRaw(t, forked))
+	requireRefusal(t, validationUnsupported, jsonFieldCwd, err)
+
+	// The same absolute path passes the gate, so the refusals above are the
+	// path rule rather than an unconditional failure.
+	require.NoError(t, validateSessionStartPaths(t.TempDir(), nil))
+}
+
+// TestExtensionParamsRefusedAsAWhole pins the uniform extension-params rule: a
+// `_pi/*` request whose params cannot be decoded, or fail validation as a
+// whole, is refused naming `params`.
+func TestExtensionParamsRefusedAsAWhole(t *testing.T) {
+	t.Parallel()
+
+	client := newStubPiClient()
+	agent := newStubClientAgent(t, client, WithProviderAuthRoot(t.TempDir()), WithHome(t.TempDir()))
+	require.NotNil(t, agent.providerAuth)
+
+	for _, method := range []string{
+		ForkSessionMethod,
+		AuthMethodsMethod,
+		AuthAuthorizeMethod,
+		AuthCallbackMethod,
+		AuthStatusMethod,
+		AuthCancelMethod,
+		AuthInventoryMethod,
+		AuthDisconnectMethod,
+	} {
+		for _, params := range []string{`[]`, `"text"`, `{`, `{} {}`} {
+			_, err := agent.HandleExtensionMethod(t.Context(), method, json.RawMessage(params))
+			requireRefusal(t, validationUnsupported, jsonFieldParams, err)
+		}
+	}
 }

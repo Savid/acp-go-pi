@@ -803,3 +803,18 @@ func TestConstructionOwnershipEdges(t *testing.T) {
 		require.Nil(t, removed)
 	})
 }
+
+// TestConstructionVerdictWithoutAFieldStaysFieldLess pins that a construction
+// refusal that named no option is answered as the bare token rather than with
+// an invented field. The option verdict names exactly one option or none.
+func TestConstructionVerdictWithoutAFieldStaysFieldLess(t *testing.T) {
+	t.Parallel()
+
+	require.Empty(t, optionFailureField(acp.NewInvalidParams("not an object")))
+	require.Empty(t, optionFailureField(acp.NewInvalidParams(map[string]any{})))
+	require.Equal(t, optionFieldHome, optionFailureField(unsupportedField(optionFieldHome)))
+
+	agent := NewAgent(testContainmentOption())
+	agent.optionErr = acp.NewInvalidParams("not an object")
+	requireClosedInternalError(t, agent.optionsError(), invalidOptionsError)
+}

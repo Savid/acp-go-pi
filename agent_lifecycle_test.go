@@ -2,6 +2,7 @@ package piacp
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -129,24 +130,36 @@ func TestRouteValidationPrecedesTheReservedLifecycleRefusal(t *testing.T) {
 	agent := NewAgent(testContainmentOption())
 	session := &agentSession{agent: agent, id: "route-precedence", cancel: func() {}, turnNonce: "active-turn"}
 
-	for name, meta := range map[string]map[string]any{
-		"absent route": {lifecycleMetaKey: map[string]any{}},
+	for name, tc := range map[string]struct {
+		meta    map[string]any
+		verdict string
+		field   string
+	}{
+		"absent route": {
+			meta:    map[string]any{lifecycleMetaKey: map[string]any{}},
+			verdict: validationMissing,
+			field:   routeMetaPath,
+		},
 		"malformed route": {
-			routeMetaKey:     map[string]any{routeFieldVer: 2, routeFieldTurn: "active-turn"},
-			lifecycleMetaKey: map[string]any{},
+			meta: map[string]any{
+				routeMetaKey:     map[string]any{routeFieldVer: 2, routeFieldTurn: "active-turn"},
+				lifecycleMetaKey: map[string]any{},
+			},
+			verdict: validationUnsupported,
+			field:   routeMetaPath + "." + routeFieldVer,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			requireRefusedField(t, routeMetaKey, session.cancelRouted(t.Context(), meta))
+			requireRefusal(t, tc.verdict, tc.field, session.cancelRouted(t.Context(), tc.meta))
 
-			_, promptErr := session.Prompt(t.Context(), acp.PromptRequest{Meta: meta})
-			requireRefusedField(t, routeMetaKey, promptErr)
+			_, promptErr := session.Prompt(t.Context(), acp.PromptRequest{Meta: tc.meta})
+			requireRefusal(t, tc.verdict, tc.field, promptErr)
 		})
 	}
 
 	// A cancel additionally authenticates the nonce against the turn it names,
 	// and that authentication is still the route's verdict.
-	requireRefusedField(t, routeMetaKey,
+	requireRefusal(t, validationUnsupported, routeMetaPath+"."+routeFieldTurn,
 		session.cancelRouted(t.Context(), mergeRouteMeta(turnRouteMeta("stale-turn"), lifecycleMetaKey)))
 
 	// With the route valid the same request reports the lifecycle verdict, so
@@ -178,6 +191,19 @@ func requireRefusedField(t *testing.T, field string, err error) {
 	require.Equal(t, field, data[jsonFieldField])
 }
 
+// requireRefusal asserts both halves of a uniform -32602 refusal: the verdict
+// token and the field path. The two are never collapsed, so a test that pins
+// only the path would pass while the adapter reported the wrong verdict.
+func requireRefusal(t *testing.T, verdict string, field string, err error) {
+	t.Helper()
+
+	var requestError *acp.RequestError
+
+	require.ErrorAs(t, err, &requestError)
+	require.Equal(t, -32602, requestError.Code)
+	require.Equal(t, map[string]any{jsonFieldError: verdict, jsonFieldField: field}, requestError.Data)
+}
+
 func TestProvenLifecycleFactsFollowTheContainmentBoundary(t *testing.T) {
 	shared := NewAgent(testContainmentOption()).provenLifecycleFacts()
 	require.True(t, shared.UpdatesOutsidePrompt)
@@ -188,4 +214,127 @@ func TestProvenLifecycleFactsFollowTheContainmentBoundary(t *testing.T) {
 	authoritative := (&Agent{options: Options{hostAuthoritySupplied: true}}).provenLifecycleFacts()
 	require.True(t, authoritative.AuthoritativeQuiescence)
 	require.Equal(t, lifecycle.ProofClassProcessContainment, authoritative.QuiescenceSource)
+}
+
+// TestReservedLifecycleCorrelationRefusals is the conformance table for the
+// prompt correlation value while the lifecycle capability is enabled. A host
+// reads three distinct facts from one field path: `missing` on the bare path
+// (it forgot a required key), `unsupported` on a member path (it sent a
+// malformed value), and `unsupported` on the bare path (it sent the key where
+// the key has no meaning). The three are never collapsed.
+func TestReservedLifecycleCorrelationRefusals(t *testing.T) {
+	t.Parallel()
+
+	validRoute := map[string]any{routeFieldVer: 1, routeFieldTurn: "turn-1"}
+	value := func(submission any) map[string]any {
+		return map[string]any{"version": 1, "submission": submission}
+	}
+
+	tests := []struct {
+		name    string
+		value   any
+		present bool
+		verdict string
+		field   string
+	}{
+		{
+			name:    "absent",
+			verdict: validationMissing,
+			field:   lifecycle.MetaPath,
+		},
+		{
+			name:    "not an object",
+			value:   "sub-1",
+			present: true,
+			verdict: validationUnsupported,
+			field:   lifecycle.MetaPath,
+		},
+		{
+			name:    "wrong version",
+			value:   map[string]any{"version": 2, "submission": testSubmissionValue()},
+			present: true,
+			verdict: validationUnsupported,
+			field:   lifecycle.MetaPath + ".version",
+		},
+		{
+			name:    "empty identifier",
+			value:   value(map[string]any{"submissionId": "", "clientNonce": "nonce-1"}),
+			present: true,
+			verdict: validationUnsupported,
+			field:   lifecycle.MetaPath + ".submission.submissionId",
+		},
+		{
+			name: "over-bound identifier",
+			value: value(map[string]any{
+				"submissionId": "sub-1",
+				"clientNonce":  strings.Repeat("c", lifecycle.IdentifierBound+1),
+			}),
+			present: true,
+			verdict: validationUnsupported,
+			field:   lifecycle.MetaPath + ".submission.clientNonce",
+		},
+		{
+			name:    "unknown member",
+			value:   map[string]any{"version": 1, "submission": testSubmissionValue(), "extra": true},
+			present: true,
+			verdict: validationUnsupported,
+			field:   lifecycle.MetaPath + ".extra",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			session := negotiatedLifecycleSession(t)
+
+			meta := map[string]any{routeMetaKey: validRoute}
+			if test.present {
+				meta[lifecycleMetaKey] = test.value
+			}
+
+			_, err := session.Prompt(t.Context(), acp.PromptRequest{Meta: meta})
+			requireRefusal(t, test.verdict, test.field, err)
+		})
+	}
+}
+
+// TestPromptFailingBothReservedKeysReportsTheRouteAlone pins the ordering rule
+// on the wire shapes themselves: route validation runs before the lifecycle
+// correlation value is read, so a prompt wrong in both ways never reports two
+// rejections and the order of two failures is never implementation-defined.
+func TestPromptFailingBothReservedKeysReportsTheRouteAlone(t *testing.T) {
+	t.Parallel()
+
+	session := negotiatedLifecycleSession(t)
+
+	_, err := session.Prompt(t.Context(), acp.PromptRequest{Meta: map[string]any{
+		lifecycleMetaKey: map[string]any{"version": 2},
+	}})
+	requireRefusal(t, validationMissing, routeMetaPath, err)
+
+	_, err = session.Prompt(t.Context(), acp.PromptRequest{Meta: map[string]any{
+		routeMetaKey:     map[string]any{routeFieldVer: 1, routeFieldTurn: ""},
+		lifecycleMetaKey: map[string]any{"version": 2},
+	}})
+	requireRefusal(t, validationUnsupported, routeMetaPath+"."+routeFieldTurn, err)
+}
+
+// TestReservedLifecycleKeyOnANonCarrierSurfaceIsUnsupported pins the third
+// fact: on a surface that carries no correlation value the same key is present
+// where it has no meaning, so the verdict is `unsupported` on the bare path
+// rather than `missing`.
+func TestReservedLifecycleKeyOnANonCarrierSurfaceIsUnsupported(t *testing.T) {
+	t.Parallel()
+
+	agent := NewAgent(testContainmentOption())
+	present := map[string]any{lifecycleMetaKey: map[string]any{}}
+
+	_, err := agent.NewSession(t.Context(), acp.NewSessionRequest{Cwd: t.TempDir(), Meta: present})
+	requireRefusal(t, validationUnsupported, lifecycle.MetaPath, err)
+
+	_, err = agent.LoadSession(t.Context(), acp.LoadSessionRequest{
+		SessionId: acp.SessionId(validSessionUUID), Cwd: t.TempDir(), Meta: present,
+	})
+	requireRefusal(t, validationUnsupported, lifecycle.MetaPath, err)
 }

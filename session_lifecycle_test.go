@@ -311,15 +311,15 @@ func TestRepeatedInteractionSettlementJoinsOneMemoizedTracker(t *testing.T) {
 
 	bounded, cancel := context.WithCancel(t.Context())
 	cancel()
-	require.ErrorIs(t, session.settleBoundaryInteractions(bounded, outbox), ErrContainmentIncomplete)
+	require.ErrorIs(t, session.settleBoundaryInteractions(bounded, outbox, true), ErrContainmentIncomplete)
 	require.Equal(t, wantDone, outbox.interactions.done)
-	require.ErrorIs(t, session.settleBoundaryInteractions(bounded, outbox), ErrContainmentIncomplete)
+	require.ErrorIs(t, session.settleBoundaryInteractions(bounded, outbox, true), ErrContainmentIncomplete)
 	require.Equal(t, wantDone, outbox.interactions.done)
 	_, admitted = session.admitDialogHandler(outbox)
 	require.False(t, admitted, "retry reopened interaction admission")
 
 	release()
-	require.NoError(t, session.settleBoundaryInteractions(t.Context(), outbox))
+	require.NoError(t, session.settleBoundaryInteractions(t.Context(), outbox, true))
 }
 
 func TestCancelRetainsTimedOutInteractionOwnerAfterNativeContainment(t *testing.T) {
@@ -2498,7 +2498,7 @@ func TestPumpNativeBoundaryEdges(t *testing.T) {
 	containmentProcess := newStubProcess(true)
 	containmentProcess.close = ErrContainmentIncomplete
 	containmentOutbox.proc = containmentProcess
-	require.ErrorIs(t, session.containGenerationSync(t.Context(), containmentOutbox, "coverage"), ErrContainmentIncomplete)
+	require.ErrorIs(t, session.containGenerationSync(t.Context(), containmentOutbox, poisoned(poisonCausePanic, "coverage")), ErrContainmentIncomplete)
 }
 
 func TestSettlementAndAutonomousRetirementEdges(t *testing.T) {

@@ -328,6 +328,10 @@ func (p *providerAuth) authSession(id string) (*agentSession, error) {
 // a duplicate field, and a non-object body with the offending field path. Every
 // request object on this surface is closed, and encoding/json alone would let a
 // duplicate key silently win.
+//
+// Params this adapter cannot decode as a whole take the uniform extension
+// rejection naming `params`; a member whose own value is at fault keeps naming
+// that member.
 func authParamFields(raw json.RawMessage, allowed ...string) (map[string]json.RawMessage, error) {
 	permitted := make(map[string]struct{}, len(allowed))
 	for _, name := range allowed {
@@ -338,7 +342,7 @@ func authParamFields(raw json.RawMessage, allowed ...string) (map[string]json.Ra
 
 	token, err := decoder.Token()
 	if err != nil || token != json.Delim('{') {
-		return nil, invalidAuthField(authFieldParams)
+		return nil, unsupportedField(authFieldParams)
 	}
 
 	fields := make(map[string]json.RawMessage, len(allowed))
@@ -346,7 +350,7 @@ func authParamFields(raw json.RawMessage, allowed ...string) (map[string]json.Ra
 	for decoder.More() {
 		keyToken, err := decoder.Token()
 		if err != nil {
-			return nil, invalidAuthField(authFieldParams)
+			return nil, unsupportedField(authFieldParams)
 		}
 
 		key, _ := keyToken.(string)
@@ -367,11 +371,11 @@ func authParamFields(raw json.RawMessage, allowed ...string) (map[string]json.Ra
 	}
 
 	if _, err := decoder.Token(); err != nil {
-		return nil, invalidAuthField(authFieldParams)
+		return nil, unsupportedField(authFieldParams)
 	}
 
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		return nil, invalidAuthField(authFieldParams)
+		return nil, unsupportedField(authFieldParams)
 	}
 
 	return fields, nil

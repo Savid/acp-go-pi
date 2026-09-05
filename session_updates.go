@@ -302,6 +302,65 @@ func availableCommandsEqual(left []acp.AvailableCommand, right []acp.AvailableCo
 	return true
 }
 
+// A poisoned session reports exactly one of these closed causes. Each names the
+// structural invariant that failed, in terms a host can branch on; none carries
+// a native path, native text, or a Go error string.
+const (
+	// poisonCauseCommandCatalog: the required session-open command catalog was
+	// not delivered.
+	poisonCauseCommandCatalog = "command_catalog_undelivered"
+	// poisonCauseLifecycleSnapshot: the required session-open lifecycle
+	// snapshot was not delivered.
+	poisonCauseLifecycleSnapshot = "lifecycle_snapshot_undelivered"
+	// poisonCauseOpenGate: the session-open generation gate could not be
+	// released.
+	poisonCauseOpenGate = "session_open_gate_unreleased"
+	// poisonCauseIdentityDrift: the native session id stopped matching the ACP
+	// session it was opened for.
+	poisonCauseIdentityDrift = "native_session_identity_drift"
+	// poisonCauseStreamFailed: the native JSONL event stream failed.
+	poisonCauseStreamFailed = "native_stream_failed"
+	// poisonCauseRetentionBound: an outbox or startup prefix reached its
+	// retention bound, so ordering could no longer be guaranteed.
+	poisonCauseRetentionBound = "outbox_retention_exceeded"
+	// poisonCauseNativeInvariant: the harness produced a record its generation
+	// cannot place.
+	poisonCauseNativeInvariant = "native_invariant_violated"
+	// poisonCausePanic: an adapter goroutine driving this generation panicked.
+	poisonCausePanic = "adapter_panic"
+	// poisonCauseRelaunchFailed: the native process relaunch could not be set
+	// up.
+	poisonCauseRelaunchFailed = "native_relaunch_failed"
+	// poisonCauseLifecycleStream: an agent-origin cycle could not be opened on,
+	// or delivered to, the lifecycle stream.
+	poisonCauseLifecycleStream = "lifecycle_stream_failed"
+	// poisonCauseAgentCycle: an agent-origin cycle's settlement step failed.
+	poisonCauseAgentCycle = "agent_cycle_settlement_failed"
+	// poisonCausePromptAcceptance: the native prompt acceptance boundary
+	// failed.
+	poisonCausePromptAcceptance = "prompt_acceptance_failed"
+	// poisonCauseActionRequest: a lifecycle action request could not be
+	// registered, announced, or resolved, so a pending host request was no
+	// longer answerable on the terms it was published under.
+	poisonCauseActionRequest = "lifecycle_action_failed"
+	// poisonCauseInteractionUnsettled: a native interaction response did not
+	// finish before cancellation, so the harness and the adapter no longer
+	// agree on what the session answered.
+	poisonCauseInteractionUnsettled = "native_interaction_unsettled"
+)
+
+// poisonReason is one permanent admission fence. The cause is the closed token
+// a client reads; the detail is the adapter-authored prose only the operator's
+// log sees, so a wire answer never becomes a transcript.
+type poisonReason struct {
+	cause  string
+	detail string
+}
+
+func poisoned(cause string, detail string) poisonReason {
+	return poisonReason{cause: cause, detail: detail}
+}
+
 func (s *agentSession) poisonedError() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -359,15 +418,15 @@ func awaitGenerationContainments(outboxes []*sessionOutbox) error {
 	return containmentErr
 }
 
-func (s *agentSession) poison(ctx context.Context, cause string) error {
+func (s *agentSession) poison(ctx context.Context, reason poisonReason) error {
 	if outbox := s.outboxRouter(); outbox != nil {
-		s.containGeneration(ctx, outbox, cause)
+		s.containGeneration(ctx, outbox, reason)
 
 		return s.admissionFenceError(ctx)
 	}
 
 	s.mu.Lock()
-	cause, first, cancel := s.installPoisonLocked(cause)
+	effective, first, cancel := s.installPoisonLocked(reason)
 	s.mu.Unlock()
 
 	if cancel != nil {
@@ -375,35 +434,39 @@ func (s *agentSession) poison(ctx context.Context, cause string) error {
 	}
 
 	if first {
-		s.reportPoison(ctx, cause)
+		s.reportPoison(ctx, effective)
 	}
 
-	return poisonedSessionError(cause)
+	return poisonedSessionError(effective.cause)
 }
 
 // installPoisonLocked publishes the permanent admission cause. Callers that
 // also fence a native router do both while holding the session and outbox locks,
 // so no prompt can observe one half of containment without the other.
-func (s *agentSession) installPoisonLocked(cause string) (string, bool, context.CancelFunc) {
+func (s *agentSession) installPoisonLocked(reason poisonReason) (poisonReason, bool, context.CancelFunc) {
 	if s.poisonCause != "" {
-		return s.poisonCause, false, s.cancel
+		return poisonReason{cause: s.poisonCause, detail: s.poisonDetail}, false, s.cancel
 	}
 
-	s.poisonCause = cause
+	s.poisonCause = reason.cause
+	s.poisonDetail = reason.detail
 
-	return cause, true, s.cancel
+	return reason, true, s.cancel
 }
 
 // reportPoison performs the observable, potentially blocking half after the
 // cause is already an admission fence.
-func (s *agentSession) reportPoison(ctx context.Context, cause string) {
+func (s *agentSession) reportPoison(ctx context.Context, reason poisonReason) {
 	if s.agent == nil {
 		return
 	}
 
+	// The closed cause is what a client reads; the prose detail is the
+	// operator's and never leaves this log line.
 	s.agent.log.ErrorContext(ctx, "poison pi session after native invariant violation",
 		slog.String(acpFieldSessionID, string(s.id)),
-		slog.String("cause", cause),
+		slog.String(failureFieldCause, reason.cause),
+		slog.String("detail", reason.detail),
 	)
 
 	if err := s.emitClearAvailableCommandsUpdate(ctx); err != nil {
@@ -413,10 +476,14 @@ func (s *agentSession) reportPoison(ctx context.Context, cause string) {
 	}
 }
 
+// poisonedSessionError answers every method addressed to a session whose
+// admission is permanently fenced. The cause is one of the closed tokens above
+// — never prose, never a Go error string, and never native text. Why the
+// invariant broke is in the adapter log.
 func poisonedSessionError(cause string) error {
 	return acp.NewInternalError(map[string]any{
-		jsonFieldError:   "session poisoned",
-		jsonFieldMessage: cause,
+		jsonFieldError:    sessionPoisonedError,
+		failureFieldCause: cause,
 	})
 }
 

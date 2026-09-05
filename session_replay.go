@@ -52,7 +52,10 @@ func (s *agentSession) replayStoredSession(ctx context.Context, entries []Sessio
 
 		updates, failure := messageReplayUpdates(message, s.agent.imageLimits())
 		if failure != nil {
-			return imageOutputTurnFailure(failure)
+			// Replay is a restore, not a turn: a stored artifact this adapter
+			// can no longer reproduce is an entry it could not restore, and the
+			// verdict a host reads says exactly that.
+			return s.agent.restoreRefused(ctx, string(s.id), "replay stored image artifact failed", nil)
 		}
 
 		if message.Role == messageRoleAssistant && len(updates) == 0 && message.ACPMessageID != "" {

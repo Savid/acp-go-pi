@@ -101,12 +101,9 @@ func (s *agentSession) publishSessionOpen(ctx context.Context) error {
 			slog.String(acpFieldSessionID, string(s.id)),
 		)
 
-		poisonErr := s.poison(
-			context.WithoutCancel(ctx), "the required session-open command catalog was not delivered",
-		)
-		containmentErr := s.containGenerationSync(
-			context.WithoutCancel(ctx), outbox, "the required session-open command catalog was not delivered",
-		)
+		reason := poisoned(poisonCauseCommandCatalog, "the required session-open command catalog was not delivered")
+		poisonErr := s.poison(context.WithoutCancel(ctx), reason)
+		containmentErr := s.containGenerationSync(context.WithoutCancel(ctx), outbox, reason)
 		s.fenceLifecycleGeneration(generation)
 
 		return errors.Join(err, poisonErr, containmentErr)
@@ -134,12 +131,9 @@ func (s *agentSession) publishSessionOpen(ctx context.Context) error {
 			slog.String(acpFieldSessionID, string(s.id)),
 		)
 
-		poisonErr := s.poison(
-			context.WithoutCancel(ctx), "the required session-open lifecycle snapshot was not delivered",
-		)
-		containmentErr := s.containGenerationSync(
-			context.WithoutCancel(ctx), outbox, "the required session-open lifecycle snapshot was not delivered",
-		)
+		reason := poisoned(poisonCauseLifecycleSnapshot, "the required session-open lifecycle snapshot was not delivered")
+		poisonErr := s.poison(context.WithoutCancel(ctx), reason)
+		containmentErr := s.containGenerationSync(context.WithoutCancel(ctx), outbox, reason)
 		s.fenceLifecycleGeneration(generation)
 
 		return errors.Join(err, poisonErr, containmentErr)
@@ -157,7 +151,8 @@ func (s *agentSession) publishSessionOpen(ctx context.Context) error {
 		}
 
 		containmentErr := s.containGenerationSync(
-			context.WithoutCancel(ctx), outbox, "the session-open generation gate could not be released",
+			context.WithoutCancel(ctx), outbox,
+			poisoned(poisonCauseOpenGate, "the session-open generation gate could not be released"),
 		)
 
 		return errors.Join(err, containmentErr)

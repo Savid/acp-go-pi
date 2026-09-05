@@ -170,13 +170,13 @@ func TestSessionUpdateEmissionAndPoisoning(t *testing.T) {
 	cancelled := false
 	session.cancel = func() { cancelled = true }
 	session.advertisedCommands = []acp.AvailableCommand{{Name: "one"}}
-	require.Error(t, session.poison(t.Context(), "broken"))
+	require.Error(t, session.poison(t.Context(), poisoned(poisonCauseNativeInvariant, "broken")))
 	require.True(t, cancelled)
 	require.Error(t, session.poisonedError())
-	require.Error(t, session.poison(t.Context(), "other"))
-	require.Error(t, poisonedSessionError("broken"))
+	require.Error(t, session.poison(t.Context(), poisoned(poisonCauseStreamFailed, "other")))
+	require.Error(t, poisonedSessionError(poisonCauseNativeInvariant))
 	nilAgent := &agentSession{}
-	require.Error(t, nilAgent.poison(t.Context(), "broken"))
+	require.Error(t, nilAgent.poison(t.Context(), poisoned(poisonCauseNativeInvariant, "broken")))
 }
 
 func TestClearCommandsAndPoisonEmitFailures(t *testing.T) {
@@ -188,7 +188,7 @@ func TestClearCommandsAndPoisonEmitFailures(t *testing.T) {
 	session := &agentSession{agent: agent, id: "id", advertisedCommands: []acp.AvailableCommand{{Name: "one"}}}
 	client.updateErr = errors.New(secret)
 	require.Error(t, session.emitClearAvailableCommandsUpdate(t.Context()))
-	require.Error(t, session.poison(t.Context(), "broken"))
+	require.Error(t, session.poison(t.Context(), poisoned(poisonCauseNativeInvariant, "broken")))
 	require.NotContains(t, logs.String(), secret)
 	require.Equal(t, "text", liveSessionTitleFromPrompt([]acp.ContentBlock{{}, acp.TextBlock("text")}))
 }

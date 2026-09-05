@@ -41,8 +41,12 @@ A native record the adapter cannot place — assistant or tool output, a turn or
 agent bracket, a retry or compaction pair, a settle marker, or a second
 `agent_start`, all with no cycle open — is an invariant failure rather than
 something to guess at. The generation is fenced and the session is poisoned;
-later requests report `session poisoned` with a structural cause. Recovering
-means opening a fresh session.
+later requests report `-32603` with
+`{"error":"pi_session_poisoned","cause":"<token>"}`, where `cause` is one of
+the closed structural tokens listed under
+[Off-prompt internal errors](/docs/reference/acp-methods). The prose reason
+never reaches the wire; it is in the adapter log. Recovering means opening a
+fresh session.
 
 ## Forking a fresh session fails
 

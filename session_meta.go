@@ -356,6 +356,18 @@ func unsupportedField(path string) *acp.RequestError {
 	})
 }
 
+// missingField refuses a reserved key the contract requires and the caller left
+// out. It is a distinct verdict from unsupportedField and the two are never
+// collapsed: unsupported names a value that is present and refused, missing
+// names one the request had to carry. A host that reads missing adds the key;
+// a host that reads unsupported on the same bare path stops sending it.
+func missingField(path string) *acp.RequestError {
+	return acp.NewInvalidParams(map[string]any{
+		jsonFieldError: validationMissing,
+		jsonFieldField: path,
+	})
+}
+
 func metaOptionPath(key string) string {
 	return "_meta." + piMetaKey + "." + metaOptionsKey + "." + key
 }

@@ -21,7 +21,28 @@ import (
 const (
 	turnFailedError = "pi_turn_failed"
 
+	// Every -32603 this adapter can emit off the prompt-turn path carries
+	// exactly one of these closed tokens in `data.error`. The JSON-RPC
+	// `message` stays the protocol constant "Internal error", `data` is always
+	// present, and `data` never carries a `message` member: no Go error text
+	// and no native text reaches a client on these paths, and the real reason
+	// goes to the adapter log instead.
+	invalidOptionsError  = "pi_invalid_options"
+	restoreFailedError   = "pi_restore_failed"
+	sessionPoisonedError = "pi_session_poisoned"
+	internalFailureError = "pi_internal_failure"
+
 	failureFieldCause = "cause"
+	// failureFieldClass is the optional closed classifier on
+	// pi_internal_failure. It never carries prose.
+	failureFieldClass = "class"
+
+	// internalClassNativeStart is the one documented pi_internal_failure class.
+	// It names a native pi process that could not be started or configured for
+	// a session — the version probe, the spawn, or the post-spawn command
+	// sequence of session/new, session/load, session/resume, or
+	// _pi/session/fork. The cause text stays in the adapter log.
+	internalClassNativeStart = "native_start"
 
 	failureCauseProcessExit = "process_exit"
 	failureCauseTransport   = "transport"
@@ -188,29 +209,33 @@ func providerTurnFailure(state *promptTurnState) error {
 	return turnFailureError(failureCauseProvider, message)
 }
 
-// nativeStartFailure maps a failed native session start onto the same uniform
-// shape a failed turn uses: the causes are the same, and a host that can
-// classify one can classify the other. A pi that already exited — an MCP
-// server that failed to connect makes pi exit at startup — carries the
-// recovered exit cause; otherwise the stage's own cause stands. Native
-// evidence goes to the adapter log; the client receives the bounded cause.
+// nativeStartFailure maps a failed native session start onto the closed
+// off-prompt internal-failure shape. A session start is not a turn: it is
+// reachable only from initialize's version probe and from session/new,
+// session/load, session/resume, and _pi/session/fork, so it carries no turn
+// token and no cause text. The class names the stage; the real native cause —
+// a pi that exited because an MCP server would not connect, a transport that
+// broke mid-setup — goes to the adapter log.
 func (a *Agent) nativeStartFailure(ctx context.Context, cause string, err error, proc piProcess) error {
+	detail := cause
+
 	if proc != nil {
 		select {
 		case <-proc.Exited():
-			exit := turnFailureError(failureCauseProcessExit, nativeExitCause(ctx, a.log, "pi exited during session start", proc))
-
-			return errors.Join(exit, err)
+			detail = nativeExitCause(ctx, a.log, "pi exited during session start", proc)
 		default:
 		}
 	}
 
-	a.log.ErrorContext(ctx, "pi session start failed", slog.String(failureFieldCause, cause))
+	a.log.ErrorContext(ctx, "pi session start failed",
+		slog.String(failureFieldCause, cause),
+		slog.String("detail", detail),
+	)
 
 	// The driving error is joined rather than discarded: the wire answer is
 	// the RequestError the mapper produces, while adapter-internal callers
 	// still match containment and cancellation identity on the same value.
-	return errors.Join(turnFailureError(cause, err.Error()), err)
+	return errors.Join(internalFailure(internalClassNativeStart), err)
 }
 
 // emptyCloneError reports whether a native command failure names a missing
@@ -219,4 +244,36 @@ func emptyCloneError(err error) bool {
 	var commandErr *pi.CommandError
 
 	return errors.As(err, &commandErr) && strings.Contains(commandErr.Message, "not found")
+}
+
+// invalidOptionsFailure answers the construction verdict. The embedding host
+// built an agent this process cannot serve under, so the caller's params are
+// blameless and the code is -32603 rather than -32602; `field` names the one
+// refused option when exactly one is at fault.
+func invalidOptionsFailure(field string) *acp.RequestError {
+	data := map[string]any{jsonFieldError: invalidOptionsError}
+	if field != "" {
+		data[jsonFieldField] = field
+	}
+
+	return acp.NewInternalError(data)
+}
+
+// restoreFailure answers a session/load, session/resume, or _pi/session/fork
+// that found a store entry it could not restore. The entry is neither deleted
+// nor tombstoned: the store keeps exactly what it held, and the reason the
+// adapter could not replay it is in the log.
+func restoreFailure() *acp.RequestError {
+	return acp.NewInternalError(map[string]any{jsonFieldError: restoreFailedError})
+}
+
+// internalFailure answers everything unclassified. The optional class is a
+// closed documented token, never prose and never a Go error string.
+func internalFailure(class string) *acp.RequestError {
+	data := map[string]any{jsonFieldError: internalFailureError}
+	if class != "" {
+		data[failureFieldClass] = class
+	}
+
+	return acp.NewInternalError(data)
 }

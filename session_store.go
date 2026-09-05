@@ -120,6 +120,13 @@ func (s *InMemorySessionStore) Append(ctx context.Context, key SessionKey, entri
 	return nil
 }
 
+// storeKeyLabel renders one store key for a refusal message, so a caller is
+// told exactly which entry log it addressed wrongly rather than only which
+// session id it named.
+func storeKeyLabel(key SessionKey) string {
+	return fmt.Sprintf("%q subpath %q", key.SessionID, key.Subpath)
+}
+
 // Load returns the latest committed entries for the key in append order.
 func (s *InMemorySessionStore) Load(ctx context.Context, key SessionKey) ([]SessionStoreEntry, error) {
 	if err := ctx.Err(); err != nil {
@@ -162,9 +169,19 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 	next := make(map[SessionKey][]SessionStoreEntry, len(replacements))
 	mainCount := 0
 
+	// Every replacement in a call belongs to the one session the main key
+	// names, and each key appears at most once. Both refusals run over the
+	// whole call before the store lock is taken, so a rejected Replace writes
+	// nothing at all rather than committing the prefix it had already accepted.
 	for _, replacement := range replacements {
+		// A key from another session would let one session's commit rewrite a
+		// second session's rows under a single atomic generation, which no
+		// caller can undo and no reader can attribute.
 		if replacement.Key.SessionID != main.SessionID {
-			return fmt.Errorf("replacement session id %q does not match main session id %q", replacement.Key.SessionID, main.SessionID)
+			return fmt.Errorf(
+				"replacement key %s does not belong to session %q",
+				storeKeyLabel(replacement.Key), main.SessionID,
+			)
 		}
 
 		// Two replacements naming one key describe two different generations of
@@ -172,7 +189,7 @@ func (s *InMemorySessionStore) Replace(ctx context.Context, main SessionKey, rep
 		// that by last-write-wins would silently commit one of them, so the whole
 		// call is refused before any key is written.
 		if _, duplicate := next[replacement.Key]; duplicate {
-			return fmt.Errorf("duplicate replacement key %q subpath %q", replacement.Key.SessionID, replacement.Key.Subpath)
+			return fmt.Errorf("duplicate replacement key %s", storeKeyLabel(replacement.Key))
 		}
 
 		if replacement.Key == main {

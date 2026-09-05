@@ -87,7 +87,10 @@ func requestError(ctx context.Context, log *slog.Logger, err error) *acp.Request
 		return reqErr
 	}
 
+	// Everything that reaches here is unclassified: the reason is a Go error
+	// this adapter did not map to a contract verdict. The client gets the
+	// closed token with no prose, and the reason stays in this log line.
 	log.ErrorContext(ctx, "acp request failed")
 
-	return acp.NewInternalError(nil)
+	return internalFailure("")
 }

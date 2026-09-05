@@ -1424,7 +1424,7 @@ func TestContainmentNamesTheGenerationItWasRaisedOn(t *testing.T) {
 	fixture.session.mu.Unlock()
 	require.NoError(t, fixture.session.openLifecycleStream(t.Context(), 2))
 
-	fixture.session.containGeneration(t.Context(), stale, "a stale generation failed")
+	fixture.session.containGeneration(t.Context(), stale, poisoned(poisonCauseNativeInvariant, "a stale generation failed"))
 	fixture.quiesce()
 
 	require.False(t, fixture.lifecycleFenced(), "the live incarnation is not retired by an older one")
@@ -1473,7 +1473,7 @@ func TestPoisonedHostAdmissionsJoinExactGenerationContainment(t *testing.T) {
 	session.outbox = outbox
 	session.pumpGeneration = 1
 
-	session.containGeneration(t.Context(), outbox, "the generation violated its routing invariant")
+	session.containGeneration(t.Context(), outbox, poisoned(poisonCauseNativeInvariant, "the generation violated its routing invariant"))
 	<-shutdownStarted
 	outbox.mu.Lock()
 	containment := outbox.containment
@@ -1572,7 +1572,7 @@ func TestCancelledHostDoorsStillJoinObservableContainment(t *testing.T) {
 			session.pumpGeneration = 1
 			agent.sessions[session.id] = session
 
-			session.containGeneration(t.Context(), outbox, "the generation violated its routing invariant")
+			session.containGeneration(t.Context(), outbox, poisoned(poisonCauseNativeInvariant, "the generation violated its routing invariant"))
 			<-shutdownEntered
 			outbox.mu.Lock()
 			containment := outbox.containment

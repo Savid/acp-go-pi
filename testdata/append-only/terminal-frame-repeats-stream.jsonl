@@ -1,0 +1,6 @@
+{"type":"message_start","message":{"acpMessageId":"msg-1","role":"assistant","model":"glm-5.3-flash","provider":"opencode-go"}}
+{"type":"message_update","message":{"acpMessageId":"msg-1","role":"assistant"},"assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"Weighing "}}
+{"type":"message_update","message":{"acpMessageId":"msg-1","role":"assistant"},"assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"the answer."}}
+{"type":"message_update","message":{"acpMessageId":"msg-1","role":"assistant"},"assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello"}}
+{"type":"message_update","message":{"acpMessageId":"msg-1","role":"assistant"},"assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":", world"}}
+{"type":"message_end","message":{"acpMessageId":"msg-1","role":"assistant","stopReason":"stop","content":[{"type":"thinking","thinking":"Weighing the answer. And the unstreamed rest."},{"type":"text","text":"Hello, world and the tail the deltas never carried."}]}}

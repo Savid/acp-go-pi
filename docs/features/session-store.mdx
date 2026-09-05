@@ -73,11 +73,39 @@ and can rotate the native generation. Unknown fields, malformed or unsupported
 records, a missing configuration field or journal, or any mismatch between the
 boundary and native row counts fails the request; native rows beyond the last
 valid boundary are not hydrated.
-`Replace` MUST include the main key exactly once, and MUST refuse a call whose
-replacements name one key twice — two generations of one key with nothing to
-say which was meant, so the whole call fails before any key is written rather
-than resolving the collision by last-write-wins. Session summaries report
-`UpdatedAtUnixMilli` in Unix milliseconds.
+
+A stored session this adapter cannot restore — an unreadable store, a native
+log with no lifecycle boundary, a row count the boundary disagrees with, or a
+stored image artifact the bounded artifact window can no longer reproduce —
+fails `session/load`, `session/resume`, and `_pi/session/fork` with `-32603`
+`{"error":"pi_restore_failed"}`. The entry is neither deleted nor tombstoned,
+so the store keeps exactly what it held; why the restore refused is in the
+adapter log. A stored *configuration* this adapter refuses to resume under is a
+different verdict and keeps its `-32602` invalid-params error naming the field.
+Session summaries report `UpdatedAtUnixMilli` in Unix milliseconds.
+
+### `Replace` is one session's generation
+
+Every `Replace` commits exactly one session, addressed by its `main` key. A
+host store MUST enforce all three rules below, and MUST reach each verdict
+**over the whole call before it writes anything**, so a refused `Replace`
+leaves the store byte-for-byte as it was — not even the replacements it had
+already accepted before it reached the offending one.
+
+| Rule | Refusal |
+| --- | --- |
+| The replacements MUST include the `main` key exactly once. | `replacements must include the main key exactly once` |
+| Every replacement key's `SessionID` MUST equal `main.SessionID`. One session's commit may never rewrite another session's rows under a single atomic generation, which no caller can undo and no reader can attribute. | `replacement key "<sessionId>" subpath "<subpath>" does not belong to session "<main sessionId>"` |
+| No `{SessionID, Subpath}` may appear twice. Two replacements naming one key describe two different generations of it and nothing in the call says which was meant, so the collision is refused rather than resolved by last-write-wins. | `duplicate replacement key "<sessionId>" subpath "<subpath>"` |
+
+Both key refusals name the offending key in full, subpath included, so a caller
+is told which entry log it addressed wrongly rather than only which session id
+it named. The bundled `InMemorySessionStore` implements all three;
+`TestReplaceIsOneSessionsGeneration` is the conformance proof and asserts that
+each refused call wrote nothing, including to the unrelated session it named.
+
+A tombstone still outranks every rule here: a `Replace` that lands after
+`Delete` installs nothing and returns without error.
 
 Only conversation rows and adapter-owned lifecycle boundary records are
 durable. A boundary record includes session `env`, which can contain deliberate

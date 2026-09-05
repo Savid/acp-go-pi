@@ -410,7 +410,7 @@ func (s *agentSession) lifecycleSettleTurn(ctx context.Context, stopReason strin
 	if err := s.terminalizeBlockersLocked(ctx); err != nil {
 		s.lcMu.Unlock()
 
-		return errors.Join(err, s.containGenerationSync(ctx, outbox, "terminal lifecycle delivery failed"))
+		return errors.Join(err, s.containGenerationSync(ctx, outbox, poisoned(poisonCauseLifecycleStream, "terminal lifecycle delivery failed")))
 	}
 
 	origin, err := s.lc.turnOriginLocked()
@@ -431,7 +431,7 @@ func (s *agentSession) lifecycleSettleTurn(ctx context.Context, stopReason strin
 	s.lcMu.Unlock()
 
 	if emitErr != nil {
-		return errors.Join(emitErr, s.containGenerationSync(ctx, outbox, "terminal lifecycle delivery failed"))
+		return errors.Join(emitErr, s.containGenerationSync(ctx, outbox, poisoned(poisonCauseLifecycleStream, "terminal lifecycle delivery failed")))
 	}
 
 	return nil
@@ -621,7 +621,7 @@ func (s *agentSession) lifecycleResolveCapturedAction(
 	if err := s.emitLifecycleLocked(ctx, lifecycle.ActionResolvedEvent(actionID, state)); err != nil {
 		s.lcMu.Unlock()
 
-		return errors.Join(err, s.containGenerationSync(ctx, outbox, "action resolution delivery failed"))
+		return errors.Join(err, s.containGenerationSync(ctx, outbox, poisoned(poisonCauseLifecycleStream, "action resolution delivery failed")))
 	}
 
 	delete(s.lc.blockers, actionID)
@@ -636,7 +636,7 @@ func (s *agentSession) lifecycleResolveCapturedAction(
 	s.lcMu.Unlock()
 
 	if err != nil {
-		return errors.Join(err, s.containGenerationSync(ctx, outbox, "action resolution delivery failed"))
+		return errors.Join(err, s.containGenerationSync(ctx, outbox, poisoned(poisonCauseLifecycleStream, "action resolution delivery failed")))
 	}
 
 	return nil

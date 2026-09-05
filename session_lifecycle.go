@@ -795,7 +795,7 @@ func (s *agentSession) containHoistedRelaunch(ctx context.Context, attempt *sess
 	attempt.mu.Unlock()
 
 	if outbox != nil {
-		s.containGeneration(ctx, outbox, "the native process relaunch callback panicked")
+		s.containGeneration(ctx, outbox, poisoned(poisonCausePanic, "the native process relaunch callback panicked"))
 		containmentErr, _ := outbox.awaitContainment()
 
 		return containmentErr
@@ -1010,7 +1010,7 @@ func (s *agentSession) containUnadoptedRelaunch(
 }
 
 func (s *agentSession) cleanupFailedRelaunch(ctx context.Context, outbox *sessionOutbox, cause error) error {
-	s.containGeneration(ctx, outbox, "native process relaunch setup failed")
+	s.containGeneration(ctx, outbox, poisoned(poisonCauseRelaunchFailed, "native process relaunch setup failed"))
 
 	outbox.mu.Lock()
 	containment := outbox.containment
@@ -1072,7 +1072,11 @@ func (s *agentSession) cancelRouted(ctx context.Context, meta map[string]any) er
 	s.mu.Unlock()
 
 	if !active || route.turnNonce != activeNonce {
-		return routeInvalid()
+		// A stale nonce is a value that is present and refused, so it is the
+		// unsupported verdict on the nonce member. The cancel is a
+		// notification, so no host ever reads this frame; the shape is kept
+		// exact anyway so the two surfaces never drift.
+		return routeMemberInvalid(routeFieldTurn)
 	}
 
 	// The reserved family literal then fails the cancel closed before native
@@ -1106,7 +1110,7 @@ func (s *agentSession) cancelNativeLocked(ctx context.Context, commitSettled boo
 	}
 
 	joinCtx, cancelJoin := sessionCloseTurnWaitContext(context.WithoutCancel(ctx))
-	interactionErr := s.settleBoundaryInteractions(joinCtx, outbox)
+	interactionErr := s.settleBoundaryInteractions(joinCtx, outbox, false)
 
 	cancelJoin()
 
@@ -1129,7 +1133,7 @@ func (s *agentSession) cancelNativeLocked(ctx context.Context, commitSettled boo
 		}
 
 		containmentErr := s.containGenerationSync(
-			context.WithoutCancel(ctx), outbox, "a native interaction response did not finish before cancellation",
+			context.WithoutCancel(ctx), outbox, poisoned(poisonCauseInteractionUnsettled, "a native interaction response did not finish before cancellation"),
 		)
 		err = errors.Join(interactionErr, containmentErr)
 		s.quarantineLifecycleGeneration(outbox.generation, err)
@@ -1597,7 +1601,14 @@ func (s *agentSession) cancelPendingInteractions() {
 // flow is ever abandoned to a process already being torn down. Close, delete,
 // and Agent.Close all reach it through here, and it is idempotent — a boundary
 // that already ran it finds nothing pending and nothing nonterminal left.
-func (s *agentSession) settleBoundaryInteractions(ctx context.Context, outbox *sessionOutbox) error {
+//
+// closingSession separates the two boundaries that reach this ladder. A session
+// teardown ends the session, so it closes the session's provider-auth admission
+// along with the flows that admission answered for. A turn cancel ends only the
+// turn: the session stays addressable and keeps serving prompts, so closing its
+// provider-auth admission there would strand every `_pi/auth/*` leg on a session
+// that is demonstrably still alive.
+func (s *agentSession) settleBoundaryInteractions(ctx context.Context, outbox *sessionOutbox, closingSession bool) error {
 	s.mu.Lock()
 
 	var (
@@ -1644,7 +1655,7 @@ func (s *agentSession) settleBoundaryInteractions(ctx context.Context, outbox *s
 		delivery.abandonQueuedDialogs(context.WithoutCancel(ctx), s)
 	}
 
-	if s.agent != nil && s.agent.providerAuth != nil {
+	if closingSession && s.agent != nil && s.agent.providerAuth != nil {
 		s.agent.providerAuth.closeSession(ctx, s)
 	}
 
@@ -1710,7 +1721,7 @@ func (s *agentSession) closeOwned(ctx context.Context, attempt *sessionCloseAtte
 	// A hostile native write may ignore the context, so this bounded attempt
 	// cannot veto the Close ladder; the same sealed tracker is joined again
 	// after native containment has made the write interruptible.
-	_ = s.settleBoundaryInteractions(joinCtx, attempt.outbox)
+	_ = s.settleBoundaryInteractions(joinCtx, attempt.outbox, true)
 
 	cancelJoin()
 
