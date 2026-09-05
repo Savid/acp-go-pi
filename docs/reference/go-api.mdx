@@ -36,6 +36,10 @@ public authority contract consists of `HostAuthority`,
 authority fails initialization before native mutation or launch. Omitting the
 option selects ordinary same-account execution.
 
+The interface includes `ReadNativeAppendLog(context.Context, string, uint64)
+([][]byte, error)` and `WriteNativeAppendLog(context.Context, string, [][]byte)
+error`. This adapter does not invoke either for provider state.
+
 ## Agent options
 
 | Option | Purpose |
