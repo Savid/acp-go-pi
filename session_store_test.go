@@ -130,6 +130,89 @@ func TestListSessionsFallsBackToSessionIDOrder(t *testing.T) {
 	require.Equal(t, "a", summaries[0].SessionID)
 }
 
+// TestReplaceIsOneSessionsGeneration is the store-contract conformance proof
+// that every Replace is exactly one session's. Both refusals name the offending
+// key, and both land before the store lock is taken, so a rejected call writes
+// nothing at all — not even the replacements it had already accepted when it
+// reached the bad one.
+func TestReplaceIsOneSessionsGeneration(t *testing.T) {
+	ctx := t.Context()
+	main := SessionKey{SessionID: "one"}
+	sub := SessionKey{SessionID: "one", Subpath: SessionStoreLifecycleSubpath}
+	foreign := SessionKey{SessionID: "two", Subpath: "branch"}
+	foreignMain := SessionKey{SessionID: "two"}
+
+	store := NewInMemorySessionStore()
+	require.NoError(t, store.Append(ctx, main, []SessionStoreEntry{json.RawMessage(`{"row":"main-original"}`)}))
+	require.NoError(t, store.Append(ctx, sub, []SessionStoreEntry{json.RawMessage(`{"row":"sub-original"}`)}))
+	require.NoError(t, store.Append(ctx, foreign, []SessionStoreEntry{json.RawMessage(`{"row":"foreign-original"}`)}))
+	require.NoError(t, store.Append(ctx, foreignMain, []SessionStoreEntry{json.RawMessage(`{"row":"foreign-main"}`)}))
+
+	unchanged := func(t *testing.T, label string) {
+		t.Helper()
+
+		for key, want := range map[SessionKey]string{
+			main:        `{"row":"main-original"}`,
+			sub:         `{"row":"sub-original"}`,
+			foreign:     `{"row":"foreign-original"}`,
+			foreignMain: `{"row":"foreign-main"}`,
+		} {
+			loaded, err := store.Load(ctx, key)
+			require.NoError(t, err)
+			require.Len(t, loaded, 1, "%s wrote key %v", label, key)
+			require.JSONEq(t, want, string(loaded[0]), "%s wrote key %v", label, key)
+		}
+	}
+
+	// A replacement addressed to another session is refused naming that exact
+	// key, including its subpath: one session's commit may never rewrite a
+	// second session's rows under a single atomic generation.
+	require.EqualError(t, store.Replace(ctx, main, []SessionStoreReplacement{
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"main-new"}`)}},
+		{Key: sub, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"sub-new"}`)}},
+		{Key: foreign, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"foreign-new"}`)}},
+	}), `replacement key "two" subpath "branch" does not belong to session "one"`)
+	unchanged(t, "the cross-session refusal")
+
+	// The same rule with no subpath, so the refusal is about the session id
+	// rather than about the subpath happening to differ.
+	require.EqualError(t, store.Replace(ctx, main, []SessionStoreReplacement{
+		{Key: main}, {Key: foreignMain},
+	}), `replacement key "two" subpath "" does not belong to session "one"`)
+	unchanged(t, "the cross-session refusal without a subpath")
+
+	// A duplicate {SessionID, Subpath} is refused naming that key, on both a
+	// subkey and the main key.
+	require.EqualError(t, store.Replace(ctx, main, []SessionStoreReplacement{
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"main-new"}`)}},
+		{Key: sub, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"first"}`)}},
+		{Key: sub, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"last"}`)}},
+	}), `duplicate replacement key "one" subpath "lifecycle"`)
+	unchanged(t, "the duplicate-subkey refusal")
+
+	require.EqualError(t, store.Replace(ctx, main, []SessionStoreReplacement{
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"main-new"}`)}},
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"main-newer"}`)}},
+	}), `duplicate replacement key "one" subpath ""`)
+	unchanged(t, "the duplicate-main refusal")
+
+	// A well-formed call over the same keys still commits, so the refusals
+	// above are the two rules rather than an unconditional failure.
+	require.NoError(t, store.Replace(ctx, main, []SessionStoreReplacement{
+		{Key: main, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"main-new"}`)}},
+		{Key: sub, Entries: []SessionStoreEntry{json.RawMessage(`{"row":"sub-new"}`)}},
+	}))
+
+	loaded, err := store.Load(ctx, main)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"row":"main-new"}`, string(loaded[0]))
+
+	loaded, err = store.Load(ctx, foreign)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"row":"foreign-original"}`, string(loaded[0]),
+		"an accepted replacement touched another session")
+}
+
 // TestReplaceRefusesDuplicateReplacementKeys pins that two replacements naming
 // one key are refused rather than silently resolved. Each names a whole
 // generation of that key and nothing in the call says which one the caller
