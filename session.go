@@ -32,12 +32,14 @@ const (
 	optionFieldDefaultModel      = "defaultModel"
 	optionFieldEnv               = "env"
 	optionFieldHome              = "home"
+	optionFieldHostAuthority     = "hostAuthority"
 	optionFieldImageLimits       = "imageLimits"
 	optionFieldInputHandoffRoot  = "inputHandoffRoot"
 	optionFieldProviderAuthRoot  = "providerAuthRoot"
 
 	validationRequired    = "required"
 	validationUnsupported = "unsupported"
+	validationMissing     = "missing"
 	validationDuplicate   = "duplicate"
 
 	listSessionsPageSize = 50
@@ -117,6 +119,7 @@ type agentSession struct {
 	availableCommands  []pi.SlashCommand
 	advertisedCommands []acp.AvailableCommand
 	poisonCause        string
+	poisonDetail       string
 	// opened records that the session published its establishing snapshot: the
 	// explicit command catalog and the opening lifecycle stream, exactly once.
 	opened        bool
@@ -222,4 +225,14 @@ type promptTurnState struct {
 	// agentImages de-duplicates assistant image artifacts across the turn's
 	// agent chunks, keyed by native message identity plus fingerprint.
 	agentImages map[string]struct{}
+	// streamedText and streamedThought accumulate exactly what this turn has
+	// already streamed for the assistant message currently open. Chunks are
+	// append-only deltas, so the terminal full-message frame contributes only
+	// the suffix these did not carry.
+	streamedText    string
+	streamedThought string
+	// finalizedMessages de-duplicates terminal assistant frames on native
+	// identity rather than on text, so a repeated native message never
+	// re-emits and two messages carrying identical text each emit once.
+	finalizedMessages map[string]struct{}
 }

@@ -63,7 +63,7 @@ func announcedBoundActionRequest[T any](
 
 		if outbox != nil {
 			prepareErr = errors.Join(prepareErr, session.containGenerationSync(
-				ctx, outbox, "the lifecycle action request had no live owner",
+				ctx, outbox, poisoned(poisonCauseActionRequest, "the lifecycle action request had no live owner"),
 			))
 		}
 
@@ -184,7 +184,7 @@ func announcedBoundActionRequest[T any](
 		containmentErr := session.containGenerationSync(
 			context.WithoutCancel(ctx),
 			action.outbox,
-			"the lifecycle action request failed",
+			poisoned(poisonCauseActionRequest, "the lifecycle action request failed"),
 		)
 
 		var zero T
@@ -233,7 +233,7 @@ func announcedBoundActionRequest[T any](
 		containmentErr := session.containGenerationSync(
 			context.WithoutCancel(ctx),
 			action.outbox,
-			"the lifecycle action announcement failed",
+			poisoned(poisonCauseActionRequest, "the lifecycle action announcement failed"),
 		)
 		// Only a returned (therefore no longer lcMu-owning) announcement may be
 		// fenced here. A timeout or panic leaves the hook quarantined; trying to

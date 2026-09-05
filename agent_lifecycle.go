@@ -101,8 +101,20 @@ func refuseLifecycleRawMeta(params json.RawMessage) error {
 func (a *Agent) lifecyclePromptCorrelation(meta map[string]any) (lifecycle.Submission, error) {
 	submission, refusal := lifecycle.DecodePromptCorrelation(meta, a.lifecycleNegotiated())
 	if refusal != nil {
-		return lifecycle.Submission{}, unsupportedField(refusal.Field)
+		return lifecycle.Submission{}, lifecycleParamRefusal(refusal)
 	}
 
 	return submission, nil
+}
+
+// lifecycleParamRefusal answers a correlation refusal in the verdict the
+// decoder reached. An absent key on an enabled connection is the missing
+// verdict on the bare reserved path; a present value that cannot be accepted is
+// the unsupported verdict naming the member at fault.
+func lifecycleParamRefusal(refusal *lifecycle.ParamError) error {
+	if refusal.Missing {
+		return missingField(refusal.Field)
+	}
+
+	return unsupportedField(refusal.Field)
 }

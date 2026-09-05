@@ -203,8 +203,11 @@ func TestReplayImageFailuresFailTheLoad(t *testing.T) {
 			agent.setConnection(connection)
 			session := &agentSession{agent: agent, id: "session"}
 
+			// Replay is a restore: the stored artifact this adapter can no
+			// longer reproduce fails the load with the closed restore token,
+			// not with a turn failure.
 			err := session.replayStoredSession(t.Context(), []SessionStoreEntry{test.row})
-			requireImageOutputFailure(t, err, test.reason)
+			requireRestoreFailure(t, err)
 
 			updates, err := replayUpdates([]SessionStoreEntry{test.row}, test.limits)
 			require.Error(t, err)

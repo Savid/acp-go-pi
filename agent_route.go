@@ -9,7 +9,11 @@ import (
 )
 
 const (
-	routeMetaKey           = "acp-go.dev/route"
+	routeMetaKey = "acp-go.dev/route"
+	// routeMetaPath is the request path a refusal names. The reserved literal
+	// is read out of `_meta`, so a host is told where in its own request the
+	// value belongs rather than being handed the bare key name.
+	routeMetaPath          = `_meta["` + routeMetaKey + `"]`
 	routeVersion           = 1
 	routeTurnNonceMaxBytes = 4 * 1024
 	routeFieldVer          = "version"
@@ -23,28 +27,36 @@ type turnRouteContextKey struct{}
 
 var routeRandRead = rand.Read
 
+// parseInboundTurnRoute reads the reserved turn route a prompt or an active-turn
+// cancel carries. The two verdicts are distinct and never collapsed: an absent
+// key is `missing` on the bare path, because the host forgot a key the contract
+// requires; a present value that cannot be accepted is `unsupported` naming the
+// offending member — `version`, `turnNonce`, or the unknown key — and the bare
+// path only when the value as a whole is not an object.
 func parseInboundTurnRoute(meta map[string]any) (inboundTurnRoute, error) {
 	value, ok := meta[routeMetaKey]
 	if !ok {
-		return inboundTurnRoute{}, routeInvalid()
+		return inboundTurnRoute{}, missingField(routeMetaPath)
 	}
 
 	object, ok := value.(map[string]any)
-	if !ok || len(object) != 2 {
-		return inboundTurnRoute{}, routeInvalid()
+	if !ok {
+		return inboundTurnRoute{}, routeMemberInvalid()
+	}
+
+	for key := range object {
+		if key != routeFieldVer && key != routeFieldTurn {
+			return inboundTurnRoute{}, routeMemberInvalid(key)
+		}
 	}
 
 	if !routeVersionIsOne(object[routeFieldVer]) {
-		return inboundTurnRoute{}, routeInvalid()
+		return inboundTurnRoute{}, routeMemberInvalid(routeFieldVer)
 	}
 
 	nonce, ok := object[routeFieldTurn].(string)
-	if !ok || strings.TrimSpace(nonce) == "" {
-		return inboundTurnRoute{}, routeInvalid()
-	}
-
-	if len(nonce) > routeTurnNonceMaxBytes {
-		return inboundTurnRoute{}, routeInvalid()
+	if !ok || strings.TrimSpace(nonce) == "" || len(nonce) > routeTurnNonceMaxBytes {
+		return inboundTurnRoute{}, routeMemberInvalid(routeFieldTurn)
 	}
 
 	return inboundTurnRoute{turnNonce: nonce}, nil
@@ -61,8 +73,16 @@ func routeVersionIsOne(value any) bool {
 	}
 }
 
-func routeInvalid() error {
-	return unsupportedField(routeMetaKey)
+// routeMemberInvalid refuses a route value that is present and unacceptable. It
+// names the member at fault, and the bare reserved path when the value as a
+// whole is not an object.
+func routeMemberInvalid(members ...string) error {
+	field := routeMetaPath
+	for _, member := range members {
+		field += "." + member
+	}
+
+	return unsupportedField(field)
 }
 
 func stampRouteMeta(meta map[string]any, scope elicitationScope) (map[string]any, error) {

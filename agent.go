@@ -738,7 +738,10 @@ func (a *Agent) setConnection(conn agentClient) {
 // must not reach a native process.
 func (a *Agent) optionsError() error {
 	if errors.Is(a.optionErr, ErrHostAuthorityUnavailable) {
-		return ErrHostAuthorityUnavailable
+		// The sentinel stays joined so adapter-internal callers keep matching
+		// on it, while the wire answer is the same construction verdict every
+		// other refused option gets.
+		return errors.Join(invalidOptionsFailure(optionFieldHostAuthority), ErrHostAuthorityUnavailable)
 	}
 
 	var reqErr *acp.RequestError
@@ -746,7 +749,21 @@ func (a *Agent) optionsError() error {
 		return nil
 	}
 
-	return acp.NewInternalError(reqErr.Data)
+	return invalidOptionsFailure(optionFailureField(reqErr))
+}
+
+// optionFailureField recovers the option path a construction refusal named, so
+// the internal-error answer keeps naming exactly one refused option. A refusal
+// that named none stays field-less rather than inventing one.
+func optionFailureField(reqErr *acp.RequestError) string {
+	data, ok := reqErr.Data.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	field, _ := data[jsonFieldField].(string)
+
+	return field
 }
 
 // optionFailure answers a construction-time option verdict as the uniform

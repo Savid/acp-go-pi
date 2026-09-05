@@ -1,0 +1,2 @@
+{"type":"message_start","message":{"acpMessageId":"msg-1","role":"assistant","model":"glm-5.3-flash","provider":"opencode-go"}}
+{"type":"message_end","message":{"acpMessageId":"msg-1","role":"assistant","stopReason":"stop","content":[{"type":"text","text":"The whole answer arrived at once."}]}}

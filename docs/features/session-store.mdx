@@ -73,6 +73,15 @@ and can rotate the native generation. Unknown fields, malformed or unsupported
 records, a missing configuration field or journal, or any mismatch between the
 boundary and native row counts fails the request; native rows beyond the last
 valid boundary are not hydrated.
+
+A stored session this adapter cannot restore — an unreadable store, a native
+log with no lifecycle boundary, a row count the boundary disagrees with, or a
+stored image artifact the bounded artifact window can no longer reproduce —
+fails `session/load`, `session/resume`, and `_pi/session/fork` with `-32603`
+`{"error":"pi_restore_failed"}`. The entry is neither deleted nor tombstoned,
+so the store keeps exactly what it held; why the restore refused is in the
+adapter log. A stored *configuration* this adapter refuses to resume under is a
+different verdict and keeps its `-32602` invalid-params error naming the field.
 `Replace` MUST include the main key exactly once, and MUST refuse a call whose
 replacements name one key twice — two generations of one key with nothing to
 say which was meant, so the whole call fails before any key is written rather

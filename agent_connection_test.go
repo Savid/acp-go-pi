@@ -148,7 +148,8 @@ func TestAgentConnectionAndErrorMapping(t *testing.T) {
 
 	internal := requestError(t.Context(), log, errors.New("failure"))
 	require.Equal(t, -32603, internal.Code)
-	require.Nil(t, internal.Data)
+	require.Equal(t, map[string]any{jsonFieldError: internalFailureError}, internal.Data,
+		"an unclassified handler failure always carries the closed token and never a message member")
 }
 
 // An honored $/cancel_request is the only thing that cancels a request context

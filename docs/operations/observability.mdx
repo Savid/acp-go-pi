@@ -44,6 +44,16 @@ shape; use the `cause` to route the investigation:
 | `timeout` | A `WithTurnTimeout` deadline expired; raise the bound or investigate why the turn ran long. |
 | `extension` | A pi extension threw and the cycle failed closed. The wire message is fixed and carries no detail; the extension path, the native event name, and the thrown text are not published and not logged, because an extension's thrown text can carry tool input. Reproduce with the raw-event opt-in if you need the native record. |
 
+A failure **away from** a prompt turn never uses this shape. Session
+establishment, restore, a poisoned session, and every unclassified handler
+fault answer `-32603` with one closed token and no cause text at all: the
+reason is in the adapter log, not on the wire. The tokens, the
+`pi_session_poisoned` `cause` vocabulary, and the `pi_internal_failure` `class`
+are listed under
+[Off-prompt internal errors](/docs/reference/acp-methods). A native session
+start that fails is `{"error":"pi_internal_failure","class":"native_start"}`,
+so grep the log for `pi session start failed` to see which stage broke.
+
 <Note>
 A user cancel that coincides with a `WithTurnTimeout` expiry resolves as a
 successful `cancelled` response, not a `timeout` failure. If you expect

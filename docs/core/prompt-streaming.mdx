@@ -16,6 +16,22 @@ calls, tool results, and usage counters. The full mapping table lives in
 once per accepted prompt, which is the adapter's fence for finishing the turn
 and committing the store mirror.
 
+`agent_message_chunk` and `agent_thought_chunk` are **append-only deltas**. A
+client renders the turn's assistant text as the in-order concatenation of every
+chunk it received, so the adapter never emits text it already streamed in the
+same turn:
+
+- pi streams `message_update` text and thinking deltas, then repeats the
+  assembled message in its terminal `message_end` frame. The adapter emits only
+  the suffix the deltas did not carry, and nothing when they carried all of it.
+- A turn whose message arrives with no deltas at all — only the terminal frame
+  — yields exactly one chunk carrying that text.
+- A turn carrying several native assistant messages yields each message's text
+  once, in native order. Repeats are de-duplicated on native message identity,
+  never on text, so two messages that happen to say the same thing both emit.
+- The rule binds text content only. Agent images ride one chunk each, and
+  `tool_call_update.content` is a whole-array replacement by ACP definition.
+
 The wrapper bridge assigns each finalized assistant message a UUID before pi
 persists it. The adapter publishes that durable message identity immediately,
 returns it in terminal response metadata, and reuses it during history replay.

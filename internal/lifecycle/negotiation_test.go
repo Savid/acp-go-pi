@@ -132,6 +132,13 @@ func correlationMeta(value any) map[string]any {
 
 // TestDecodePromptCorrelationRequiresTheKeyWhileNegotiated pins both halves of
 // the presence rule.
+// TestParamErrorStatesItsVerdict pins that the two verdicts read differently.
+// A refusal a host cannot tell apart from the other is no verdict at all.
+func TestParamErrorStatesItsVerdict(t *testing.T) {
+	require.Equal(t, "missing "+MetaPath, missingParamError().Error())
+	require.Equal(t, "unsupported "+MetaPath+".version", paramError(fieldVersion).Error())
+}
+
 func TestDecodePromptCorrelationRequiresTheKeyWhileNegotiated(t *testing.T) {
 	t.Parallel()
 

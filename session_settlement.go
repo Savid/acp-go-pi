@@ -132,7 +132,7 @@ func (s *agentSession) settlePrompt(
 			containmentErr := s.containGenerationSync(
 				settleCtx,
 				outbox,
-				"prompt settlement failed",
+				poisoned(poisonCausePanic, "prompt settlement panicked"),
 			)
 			if nativeContainmentComplete(containmentErr) {
 				s.fenceLifecycleStream()
@@ -234,7 +234,10 @@ func (s *agentSession) observeSettledSession(
 	// sessions); the session is poisoned rather than mirrored under the
 	// wrong key.
 	if stats != nil && stats.SessionID != "" && stats.SessionID != string(s.id) {
-		return s.poison(ctx, fmt.Sprintf("native session id drift: expected %s, got %s", s.id, stats.SessionID))
+		return s.poison(ctx, poisoned(
+			poisonCauseIdentityDrift,
+			fmt.Sprintf("native session id drift: expected %s, got %s", s.id, stats.SessionID),
+		))
 	}
 
 	s.emitTurnUsageUpdate(ctx, state, stats)

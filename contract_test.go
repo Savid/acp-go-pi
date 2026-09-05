@@ -381,6 +381,39 @@ func newConformanceSession(t *testing.T, ctx context.Context, conn *acp.ClientSi
 	return response.SessionId
 }
 
+// requireRestoreFailure asserts the closed off-prompt restore verdict: -32603
+// whose data is exactly the token. A restore refusal never carries a message
+// member, a Go error string, or native text — the reason is in the log.
+func requireRestoreFailure(t *testing.T, err error) {
+	t.Helper()
+
+	var requestError *acp.RequestError
+
+	require.ErrorAs(t, err, &requestError)
+	require.Equal(t, -32603, requestError.Code)
+	require.Equal(t, "Internal error", requestError.Message)
+	require.Equal(t, map[string]any{jsonFieldError: restoreFailedError}, requestError.Data)
+}
+
+// requireInternalFailure asserts the closed unclassified verdict, with the
+// optional documented class when one is expected.
+func requireInternalFailure(t *testing.T, err error, class string) {
+	t.Helper()
+
+	var requestError *acp.RequestError
+
+	require.ErrorAs(t, err, &requestError)
+	require.Equal(t, -32603, requestError.Code)
+	require.Equal(t, "Internal error", requestError.Message)
+
+	expected := map[string]any{jsonFieldError: internalFailureError}
+	if class != "" {
+		expected[failureFieldClass] = class
+	}
+
+	require.Equal(t, expected, requestError.Data)
+}
+
 func requirePiTurnFailure(t *testing.T, err error, cause string) map[string]any {
 	t.Helper()
 	var requestError *acp.RequestError
@@ -950,8 +983,9 @@ func requireUnsupportedField(t *testing.T, err error, field string) {
 }
 
 // requireUnsupportedOption asserts a construction-time option rejection: the
-// same two contracted keys naming the option, but -32603, because the caller's
-// params were valid and the fault is in the agent the host built.
+// closed construction token naming the option, at -32603, because the caller's
+// params were valid and the fault is in the agent the host built. A
+// construction verdict is never -32602 and never carries a message member.
 func requireUnsupportedOption(t *testing.T, err error, field string) {
 	t.Helper()
 
@@ -959,7 +993,8 @@ func requireUnsupportedOption(t *testing.T, err error, field string) {
 
 	require.ErrorAs(t, err, &requestError)
 	require.Equal(t, -32603, requestError.Code)
-	require.Equal(t, map[string]any{"error": "unsupported", "field": field}, requestError.Data)
+	require.Equal(t, "Internal error", requestError.Message)
+	require.Equal(t, map[string]any{"error": invalidOptionsError, "field": field}, requestError.Data)
 }
 
 func anyMap(t *testing.T, value any) map[string]any {
@@ -969,3 +1004,31 @@ func anyMap(t *testing.T, value any) map[string]any {
 
 	return nested
 }
+
+// requireClosedInternalError asserts the shared shape of every off-prompt
+// -32603 and returns its data for the caller's own token-specific checks.
+func requireClosedInternalError(t *testing.T, err error, token string) map[string]any {
+	t.Helper()
+
+	var requestError *acp.RequestError
+
+	require.ErrorAs(t, err, &requestError)
+	require.Equal(t, -32603, requestError.Code)
+	require.Equal(t, "Internal error", requestError.Message)
+
+	data, ok := requestError.Data.(map[string]any)
+	require.True(t, ok, "data is always present on an off-prompt internal error")
+	require.Equal(t, token, data[jsonFieldError])
+	require.NotContains(t, data, jsonFieldMessage,
+		"an off-prompt internal error never carries a message member")
+
+	return data
+}
+
+// secretError carries a planted sentinel so a test can prove the sentinel
+// reaches the operator's log and never the wire.
+type secretError string
+
+func (e secretError) Error() string { return string(e) }
+
+func errSecret(text string) error { return secretError(text) }

@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
+
+	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-pi/internal/pi"
 )
@@ -29,15 +32,19 @@ var (
 //
 // The bounded image-artifact window is enforced only on the durable prefix:
 // expired output image bytes are reclaimed from the store and the restore
-// fails as storage_failed, as does a restore that finds already-reclaimed
-// artifacts.
+// fails, as does a restore that finds already-reclaimed artifacts.
+//
+// Every failure here is an entry this adapter could not restore, so all of them
+// answer with the one closed restore token. The entry is neither deleted nor
+// tombstoned, and the reason a restore refused is written to the log rather
+// than onto the wire.
 func (a *Agent) loadCurrentStoreEntries(
 	ctx context.Context,
 	sessionID string,
 ) ([]SessionStoreEntry, lifecycleBoundaryRecord, error) {
 	entries, err := a.loadStoreEntries(ctx, a.sessionStore(), SessionKey{SessionID: sessionID})
 	if err != nil {
-		return nil, lifecycleBoundaryRecord{}, err
+		return nil, lifecycleBoundaryRecord{}, a.restoreRefused(ctx, sessionID, "load stored session entries failed", err)
 	}
 
 	if len(entries) == 0 {
@@ -46,34 +53,68 @@ func (a *Agent) loadCurrentStoreEntries(
 
 	boundary, found, err := a.lastLifecycleBoundary(ctx, sessionID)
 	if err != nil {
-		return nil, lifecycleBoundaryRecord{}, err
+		return nil, lifecycleBoundaryRecord{}, a.restoreRefused(ctx, sessionID, "read stored lifecycle boundary failed", err)
 	}
 
 	if !found {
-		return nil, lifecycleBoundaryRecord{}, errors.New("stored session has no lifecycle boundary")
+		return nil, lifecycleBoundaryRecord{}, a.restoreRefused(
+			ctx, sessionID, "stored session has no lifecycle boundary", nil,
+		)
 	}
 
 	if len(entries) != boundary.NativeRows {
-		return nil, lifecycleBoundaryRecord{}, fmt.Errorf(
+		return nil, lifecycleBoundaryRecord{}, a.restoreRefused(ctx, sessionID, fmt.Sprintf(
 			"stored session has %d native rows but lifecycle boundary records %d",
 			len(entries), boundary.NativeRows,
-		)
+		), nil)
 	}
 
 	swept, expired := scanImageArtifactRows(entries)
 	if expired > 0 {
 		if err := a.reclaimExpiredImageRows(ctx, sessionID, entries); err != nil {
-			return nil, lifecycleBoundaryRecord{}, storageFailure(fmt.Sprintf("reclaim expired image artifacts: %v", err))
+			return nil, lifecycleBoundaryRecord{}, a.restoreRefused(
+				ctx, sessionID, "reclaim expired image artifacts failed", err,
+			)
 		}
 
-		return nil, lifecycleBoundaryRecord{}, storageFailure("stored image artifacts outlived the artifact window and were reclaimed")
+		return nil, lifecycleBoundaryRecord{}, a.restoreRefused(
+			ctx, sessionID, "stored image artifacts outlived the artifact window and were reclaimed", nil,
+		)
 	}
 
 	if swept > 0 {
-		return nil, lifecycleBoundaryRecord{}, storageFailure("stored image artifact bytes are no longer available")
+		return nil, lifecycleBoundaryRecord{}, a.restoreRefused(
+			ctx, sessionID, "stored image artifact bytes are no longer available", nil,
+		)
 	}
 
 	return entries, boundary, nil
+}
+
+// restoreRefused records why a stored session could not be restored and answers
+// with the closed restore token. The driving error is joined so
+// adapter-internal callers still match on its identity; only the RequestError
+// reaches the client.
+func (a *Agent) restoreRefused(ctx context.Context, sessionID string, detail string, cause error) error {
+	a.log.ErrorContext(ctx, "restore stored pi session failed",
+		slog.String(acpFieldSessionID, sessionID),
+		slog.String("detail", detail),
+	)
+
+	if cause == nil {
+		return restoreFailure()
+	}
+
+	// A cause that already carries its own contract verdict keeps it: a stored
+	// configuration this adapter refuses to resume under is the caller's
+	// invalid params naming the field, not an entry the store could not
+	// reproduce.
+	var reqErr *acp.RequestError
+	if errors.As(cause, &reqErr) {
+		return cause
+	}
+
+	return errors.Join(restoreFailure(), cause)
 }
 
 // scanImageArtifactRows counts output-provenance image artifacts that were

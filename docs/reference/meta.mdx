@@ -23,11 +23,27 @@ Initialize advertises capability descriptors under `_meta.pi`:
 Initialize also advertises the separate reserved capability
 `_meta["acp-go.dev/route"] = {"version":1}`. Prompts and cancellations
 require exactly `{"version":1,"turnNonce":"..."}` under that key. A nonce is
-fresh and unguessable per turn, non-empty, and at most 4096 bytes; missing,
-oversized, extra, unsupported, or stale route data is rejected. A cancel is
-authorized against the session's current turn before any native interrupt, so
-one that names another turn, or arrives when the session has no current turn,
-is rejected and touches nothing native.
+fresh and unguessable per turn, non-empty, and at most 4096 bytes.
+
+The refusal on `session/prompt` splits by verdict, and the two are never
+collapsed:
+
+- The key is **absent**: `{"error":"missing","field":"_meta[\"acp-go.dev/route\"]"}`.
+  You forgot a key the contract requires; add it.
+- The value is **present and unacceptable** — a non-object, a `version` other
+  than `1`, an empty or over-bound `turnNonce`, or an unknown member:
+  `{"error":"unsupported","field":"_meta[\"acp-go.dev/route\"].<member>"}`,
+  naming `version`, `turnNonce`, or the unknown key. When the value as a whole
+  is not an object the bare `_meta["acp-go.dev/route"]` path is named instead.
+
+A cancel is authorized against the session's current turn before any native
+interrupt, so one that names another turn, or arrives when the session has no
+current turn, is rejected and touches nothing native. `session/cancel` is a
+notification and carries no response frame, so that refusal is wire-silent and
+the cancel is never applied.
+
+Route validation runs before the reserved lifecycle key is read, so a prompt
+wrong in both ways reports the route verdict alone.
 
 ### Media envelope
 
@@ -152,10 +168,25 @@ While negotiated, every lifecycle event rides a `session/update`
 notification's `_meta["acp-go.dev/lifecycle"]` on an identity-only
 `session_info_update` carrier, a prompt's submission identity rides the same
 key on `session/prompt`, and pending permission and elicitation requests carry
-their action correlation under it. On every surface that never carries the
-extension — session lifecycle requests included — the key is refused with an
-invalid-params error naming `_meta["acp-go.dev/lifecycle"]` rather than
-ignored. On the extension surface that refusal precedes method resolution: an
+their action correlation under it.
+
+A host reads three distinct facts from that one field path:
+
+- **`{"error":"missing","field":"_meta[\"acp-go.dev/lifecycle\"]"}`** — the
+  capability is enabled and the `session/prompt` carried no correlation value.
+- **`{"error":"unsupported","field":"_meta[\"acp-go.dev/lifecycle\"].<member path>"}`**
+  — the value is present and malformed: a non-object, a `version` other than
+  `1`, an unknown member, or a `submission` whose `submissionId`,
+  `clientNonce`, or optional `runId` is absent, empty, non-string, or longer
+  than 4096 bytes.
+- **`{"error":"unsupported","field":"_meta[\"acp-go.dev/lifecycle\"]"}`** on
+  the bare path — the key was sent where it has no meaning: any surface that
+  never carries the extension, session lifecycle requests included, or
+  `session/prompt` on a connection that never negotiated the capability. The
+  key is refused rather than ignored.
+
+Both prompt verdicts fire before the prompt is dispatched, so no frame reaches
+the harness. On the extension surface that refusal precedes method resolution: an
 extension call carrying the key is answered about the key even when it names a
 method this adapter implements nowhere, because the key is reserved on every
 inbound surface rather than owned by any one method. Without it, an unknown

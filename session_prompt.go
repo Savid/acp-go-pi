@@ -411,14 +411,22 @@ func (s *agentSession) handleTurnEvent(ctx context.Context, event pi.Event, stat
 		if typed.Message.Role == messageRoleAssistant {
 			state.model = typed.Message.Model
 			state.provider = typed.Message.Provider
+			// A new native message starts its own delta run; what the previous
+			// one streamed can never be a prefix of this one's final text.
+			state.streamedText = ""
+			state.streamedThought = ""
 		}
 
 		return false, nil
 	case pi.MessageUpdateEvent:
-		return false, s.emitAssistantDelta(ctx, typed.AssistantMessageEvent)
+		return false, s.emitAssistantDelta(ctx, typed.AssistantMessageEvent, state)
 	case pi.MessageEndEvent:
 		if typed.Message.Role == messageRoleAssistant {
 			observeAssistantMessageEnd(typed.Message, state)
+
+			if err := s.emitAssistantTextSuffix(ctx, typed.Message, state); err != nil {
+				return false, err
+			}
 
 			if err := s.emitAssistantImages(ctx, typed.Message, state); err != nil {
 				return false, err
@@ -561,12 +569,18 @@ func (s *agentSession) imageAwareMirrorFailure(err error) error {
 	return storageFailure("session mirror commit failed after image output: " + err.Error())
 }
 
-func (s *agentSession) emitAssistantDelta(ctx context.Context, delta pi.AssistantMessageEvent) error {
+func (s *agentSession) emitAssistantDelta(
+	ctx context.Context,
+	delta pi.AssistantMessageEvent,
+	state *promptTurnState,
+) error {
 	switch delta.Type {
 	case assistantEventTextDelta:
 		if delta.Delta == "" {
 			return nil
 		}
+
+		state.streamedText += delta.Delta
 
 		return s.emitUpdates(ctx, []acp.SessionUpdate{acp.UpdateAgentMessageText(delta.Delta)})
 	case assistantEventThinkingDelta:
@@ -574,10 +588,88 @@ func (s *agentSession) emitAssistantDelta(ctx context.Context, delta pi.Assistan
 			return nil
 		}
 
+		state.streamedThought += delta.Delta
+
 		return s.emitUpdates(ctx, []acp.SessionUpdate{acp.UpdateAgentThoughtText(delta.Delta)})
 	default:
 		return nil
 	}
+}
+
+// emitAssistantTextSuffix projects the terminal full-message frame's text as
+// append-only deltas. agent_message_chunk and agent_thought_chunk are never
+// snapshots: a client renders the turn as the in-order concatenation of every
+// chunk, so text already streamed is never sent twice.
+//
+//   - A harness that streamed deltas and then repeats the assembled text in its
+//     terminal frame contributes only the suffix the deltas did not carry, and
+//     nothing when they carried all of it.
+//   - A harness that delivers only a terminal frame — no deltas at all —
+//     produces exactly one chunk carrying that text.
+//   - A turn carrying several native assistant messages emits each message's
+//     text once, in native order, de-duplicated on native identity rather than
+//     on text, so two messages that happen to say the same thing both emit.
+//
+// A terminal frame whose text diverges from what was already streamed emits
+// nothing: the streamed prefix is already with the client, and re-sending a
+// corrected whole would break the append-only rule the client renders under.
+func (s *agentSession) emitAssistantTextSuffix(
+	ctx context.Context,
+	message pi.AgentMessage,
+	state *promptTurnState,
+) error {
+	if state.finalizedMessages == nil {
+		state.finalizedMessages = make(map[string]struct{}, 1)
+	}
+
+	if message.ACPMessageID != "" {
+		if _, seen := state.finalizedMessages[message.ACPMessageID]; seen {
+			return nil
+		}
+
+		state.finalizedMessages[message.ACPMessageID] = struct{}{}
+	}
+
+	blocks, _ := message.ContentBlocks()
+
+	var text, thinking strings.Builder
+
+	for index := range blocks {
+		switch blocks[index].Type {
+		case contentBlockTypeText:
+			text.WriteString(blocks[index].Text)
+		case contentBlockTypeThinking:
+			thinking.WriteString(blocks[index].Thinking)
+		}
+	}
+
+	updates := make([]acp.SessionUpdate, 0, 2)
+	if suffix := unstreamedSuffix(state.streamedThought, thinking.String()); suffix != "" {
+		updates = append(updates, acp.UpdateAgentThoughtText(suffix))
+	}
+
+	if suffix := unstreamedSuffix(state.streamedText, text.String()); suffix != "" {
+		updates = append(updates, acp.UpdateAgentMessageText(suffix))
+	}
+
+	state.streamedText = ""
+	state.streamedThought = ""
+
+	return s.emitUpdatesWithNativeMessageID(ctx, updates, message.ACPMessageID)
+}
+
+// unstreamedSuffix reports the part of a terminal frame's text no delta of this
+// message already carried.
+func unstreamedSuffix(streamed string, full string) string {
+	if streamed == "" {
+		return full
+	}
+
+	if !strings.HasPrefix(full, streamed) {
+		return ""
+	}
+
+	return full[len(streamed):]
 }
 
 func observeAssistantMessageEnd(message pi.AgentMessage, state *promptTurnState) {

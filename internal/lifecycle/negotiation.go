@@ -17,10 +17,21 @@ type ParamError struct {
 	// Field is the full request path, from MetaPath down to the offending
 	// member.
 	Field string
+	// Missing reports that the key the contract requires was absent rather
+	// than present and refused. The two verdicts are distinct: a host reading
+	// the missing verdict adds the key, and a host reading the unsupported
+	// verdict on the same bare path stops sending it on that surface.
+	Missing bool
 }
 
 // Error implements error.
-func (e *ParamError) Error() string { return "unsupported " + e.Field }
+func (e *ParamError) Error() string {
+	if e.Missing {
+		return "missing " + e.Field
+	}
+
+	return "unsupported " + e.Field
+}
 
 func paramError(members ...string) *ParamError {
 	field := MetaPath
@@ -29,6 +40,12 @@ func paramError(members ...string) *ParamError {
 	}
 
 	return &ParamError{Field: field}
+}
+
+// missingParamError refuses the reserved key a surface required and the host
+// omitted. It never names a member: nothing below an absent key exists.
+func missingParamError() *ParamError {
+	return &ParamError{Field: MetaPath, Missing: true}
 }
 
 // DecodeCapability reads the capability from `InitializeRequest._meta`. An absent value is
@@ -82,7 +99,7 @@ func DecodePromptCorrelation(meta map[string]any, negotiated Negotiated) (Submis
 	case !negotiated.Present():
 		return Submission{}, nil
 	case !present:
-		return Submission{}, paramError()
+		return Submission{}, missingParamError()
 	}
 
 	fields, ok := raw.(map[string]any)

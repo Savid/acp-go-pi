@@ -732,3 +732,34 @@ func TestReloadedSessionIsAdmittedAfresh(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, authInteractionSecret, authorizeResult(t, authorized).Interaction)
 }
+
+// TestTurnCancelKeepsProviderAuthAdmissionOpen pins the boundary distinction the
+// settle ladder makes: a cancelled turn ends the turn, not the session, so the
+// session keeps answering every `_pi/auth/*` leg. Only a session teardown closes
+// the admission those legs are checked against.
+func TestTurnCancelKeepsProviderAuthAdmissionOpen(t *testing.T) {
+	harness := newAuthHarness(t)
+
+	_, err := harness.broker.authSession(string(harness.session.id))
+	require.NoError(t, err)
+
+	require.NoError(t, harness.session.cancelNativeLocked(t.Context(), true))
+
+	harness.broker.mu.Lock()
+	cancelledAdmissionClosed := harness.session.authClosed
+	harness.broker.mu.Unlock()
+	require.False(t, cancelledAdmissionClosed, "turn cancel closed the session's provider-auth admission")
+
+	_, err = harness.broker.authSession(string(harness.session.id))
+	require.NoError(t, err, "provider-auth leg refused a session a cancel left addressable")
+
+	require.NoError(t, harness.session.Close(context.WithoutCancel(t.Context())))
+
+	harness.broker.mu.Lock()
+	closedAdmissionClosed := harness.session.authClosed
+	harness.broker.mu.Unlock()
+	require.True(t, closedAdmissionClosed, "session close left the provider-auth admission open")
+
+	_, err = harness.broker.authSession(string(harness.session.id))
+	requireUnknownSession(t, err)
+}
