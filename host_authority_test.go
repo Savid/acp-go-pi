@@ -76,6 +76,10 @@ func (a *deterministicHostAuthority) PrepareNativeTree(_ context.Context, root s
 	return prepareErr
 }
 
+func (*deterministicHostAuthority) WriteNativeAppendLog(context.Context, string, [][]byte) error {
+	return ErrHostAuthorityUnavailable
+}
+
 func (*deterministicHostAuthority) ReadNativeAppendLog(context.Context, string, uint64) ([][]byte, error) {
 	return nil, nil
 }

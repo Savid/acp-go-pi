@@ -38,6 +38,10 @@ func (a *edgeHostAuthority) PrepareNativeTree(ctx context.Context, root string) 
 	return nil
 }
 
+func (*edgeHostAuthority) WriteNativeAppendLog(context.Context, string, [][]byte) error {
+	return ErrHostAuthorityUnavailable
+}
+
 func (*edgeHostAuthority) ReadNativeAppendLog(context.Context, string, uint64) ([][]byte, error) {
 	return nil, nil
 }
@@ -73,6 +77,10 @@ type valueAuthority struct{}
 func (valueAuthority) NativeEnvironment() map[string]string { return map[string]string{} }
 
 func (valueAuthority) PrepareNativeTree(context.Context, string) error { return nil }
+
+func (valueAuthority) WriteNativeAppendLog(context.Context, string, [][]byte) error {
+	return ErrHostAuthorityUnavailable
+}
 
 func (valueAuthority) ReadNativeAppendLog(context.Context, string, uint64) ([][]byte, error) {
 	return nil, nil
