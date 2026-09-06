@@ -812,7 +812,7 @@ func TestConstructionVerdictWithoutAFieldStaysFieldLess(t *testing.T) {
 
 	require.Empty(t, optionFailureField(acp.NewInvalidParams("not an object")))
 	require.Empty(t, optionFailureField(acp.NewInvalidParams(map[string]any{})))
-	require.Equal(t, optionFieldHome, optionFailureField(unsupportedField(optionFieldHome)))
+	require.Equal(t, optionFieldHome, optionFailureField(unsupportedRequest(optionFieldHome)))
 
 	agent := NewAgent(testContainmentOption())
 	agent.optionErr = acp.NewInvalidParams("not an object")

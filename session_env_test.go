@@ -12,10 +12,10 @@ import (
 func simulateSessionEnvPlatform(t *testing.T, platform string) {
 	t.Helper()
 
-	previous := sessionEnvPlatform
-	t.Cleanup(func() { sessionEnvPlatform = previous })
+	previous := pi.Platform
+	t.Cleanup(func() { pi.Platform = previous })
 
-	sessionEnvPlatform = platform
+	pi.Platform = platform
 }
 
 func envMeta(env map[string]any) map[string]any {
@@ -68,7 +68,7 @@ func TestSessionEnvRefusesBlockedNamesUnderThePlatformIdentity(t *testing.T) {
 	blocked := []string{envKeyPath, envKeyNodeOptions, envKeyBashEnv, envKeyEnv, "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"}
 	folded := []string{privateEnvPrefix + "CONTROL", strings.ToLower(privateEnvPrefix) + "control", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)}
 
-	for _, platform := range []string{"linux", platformWindows} {
+	for _, platform := range []string{"linux", "windows"} {
 		simulateSessionEnvPlatform(t, platform)
 
 		for _, key := range append(blocked, folded...) {
@@ -83,7 +83,7 @@ func TestSessionEnvRefusesBlockedNamesUnderThePlatformIdentity(t *testing.T) {
 		require.False(t, blockedAgentEnvKey(envKeyPath))
 	}
 
-	simulateSessionEnvPlatform(t, platformWindows)
+	simulateSessionEnvPlatform(t, "windows")
 
 	for _, key := range []string{"path", "Node_Options", "bash_env", "env", "ld_preload", "dyld_insert_libraries"} {
 		_, err := piOptionsFromMeta(envMeta(map[string]any{key: "x"}))
@@ -111,7 +111,7 @@ func TestSessionEnvRefusesTwoSpellingsOfOneWindowsVariable(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, options.Env, 2)
 
-	simulateSessionEnvPlatform(t, platformWindows)
+	simulateSessionEnvPlatform(t, "windows")
 
 	_, err = piOptionsFromMeta(envMeta(env))
 	require.Equal(t, ambiguousField(metaOptionPath(metaEnvKey)+".https_proxy"), err)

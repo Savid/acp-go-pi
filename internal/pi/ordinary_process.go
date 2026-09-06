@@ -81,14 +81,7 @@ func (spec LaunchSpec) Environ() []string {
 		}
 	}
 
-	explicit := make(map[string]string, len(spec.Env))
-	for key, value := range spec.Env {
-		if safeExplicitEnvKey(key) {
-			explicit[key] = value
-		}
-	}
-
-	env := ComposeEnvironment(base, explicit)
+	env := ComposeEnvironment(base, spec.Env)
 	if search := prependPathDirs(env[envPath], spec.ExtraPathDirs); search != "" {
 		env[envPath] = search
 	}
@@ -118,23 +111,6 @@ func prependPathDirs(search string, dirs []string) string {
 	}
 
 	return strings.Join(entries, string(os.PathListSeparator))
-}
-
-// safeExplicitEnvKey reports whether an explicit environment entry may reach
-// the child. The adapter's private namespace is refused under every spelling;
-// the loader, node, and shell injection names are read under an exact
-// platform spelling, so they compare through the platform identity.
-func safeExplicitEnvKey(key string) bool {
-	if key == "" || strings.ContainsAny(key, "=\x00") || strings.HasPrefix(strings.ToUpper(key), privateEnvPrefix) {
-		return false
-	}
-
-	switch name := canonicalEnvironmentKey(key); name {
-	case envNodeOptions, envBashEnv, envShellEnv:
-		return false
-	default:
-		return !strings.HasPrefix(name, "LD_") && !strings.HasPrefix(name, "DYLD_")
-	}
 }
 
 type Process struct {

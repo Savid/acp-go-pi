@@ -1740,13 +1740,13 @@ func validateMCPServers(servers []acp.McpServer) error {
 			name = server.Http.Name
 		case server.Sse != nil:
 			return acp.NewInvalidParams(map[string]any{
-				jsonFieldError:  validationUnsupported,
+				jsonFieldError:  valUnsupported,
 				jsonFieldField:  fmt.Sprintf("mcpServers[%d]", index),
 				jsonFieldServer: server.Sse.Name,
 			})
 		case server.Acp != nil:
 			return acp.NewInvalidParams(map[string]any{
-				jsonFieldError:  validationUnsupported,
+				jsonFieldError:  valUnsupported,
 				jsonFieldField:  fmt.Sprintf("mcpServers[%d]", index),
 				jsonFieldServer: server.Acp.Name,
 			})
@@ -1758,11 +1758,11 @@ func validateMCPServers(servers []acp.McpServer) error {
 		}
 
 		if strings.TrimSpace(name) == "" {
-			return acp.NewInvalidParams(map[string]any{mcpServerNameField(index): validationRequired})
+			return acp.NewInvalidParams(map[string]any{mcpServerNameField(index): valRequired})
 		}
 
 		if _, exists := seen[name]; exists {
-			return acp.NewInvalidParams(map[string]any{mcpServerNameField(index): validationDuplicate})
+			return acp.NewInvalidParams(map[string]any{mcpServerNameField(index): valDuplicate})
 		}
 
 		seen[name] = struct{}{}

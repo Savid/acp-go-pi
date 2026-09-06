@@ -372,7 +372,7 @@ func TestNonImageBlobResourceRefused(t *testing.T) {
 				return
 			}
 
-			require.Equal(t, validationUnsupported, data[jsonFieldError])
+			require.Equal(t, valUnsupported, data[jsonFieldError])
 		})
 	}
 }

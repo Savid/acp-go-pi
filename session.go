@@ -37,10 +37,10 @@ const (
 	optionFieldInputHandoffRoot  = "inputHandoffRoot"
 	optionFieldProviderAuthRoot  = "providerAuthRoot"
 
-	validationRequired    = "required"
-	validationUnsupported = "unsupported"
-	validationMissing     = "missing"
-	validationDuplicate   = "duplicate"
+	valRequired    = "required"
+	valUnsupported = "unsupported"
+	valMissing     = "missing"
+	valDuplicate   = "duplicate"
 
 	listSessionsPageSize = 50
 

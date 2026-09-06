@@ -137,7 +137,7 @@ func TestRouteValidationPrecedesTheReservedLifecycleRefusal(t *testing.T) {
 	}{
 		"absent route": {
 			meta:    map[string]any{lifecycleMetaKey: map[string]any{}},
-			verdict: validationMissing,
+			verdict: valMissing,
 			field:   routeMetaPath,
 		},
 		"malformed route": {
@@ -145,7 +145,7 @@ func TestRouteValidationPrecedesTheReservedLifecycleRefusal(t *testing.T) {
 				routeMetaKey:     map[string]any{routeFieldVer: 2, routeFieldTurn: "active-turn"},
 				lifecycleMetaKey: map[string]any{},
 			},
-			verdict: validationUnsupported,
+			verdict: valUnsupported,
 			field:   routeMetaPath + "." + routeFieldVer,
 		},
 	} {
@@ -159,7 +159,7 @@ func TestRouteValidationPrecedesTheReservedLifecycleRefusal(t *testing.T) {
 
 	// A cancel additionally authenticates the nonce against the turn it names,
 	// and that authentication is still the route's verdict.
-	requireRefusal(t, validationUnsupported, routeMetaPath+"."+routeFieldTurn,
+	requireRefusal(t, valUnsupported, routeMetaPath+"."+routeFieldTurn,
 		session.cancelRouted(t.Context(), mergeRouteMeta(turnRouteMeta("stale-turn"), lifecycleMetaKey)))
 
 	// With the route valid the same request reports the lifecycle verdict, so
@@ -239,28 +239,28 @@ func TestReservedLifecycleCorrelationRefusals(t *testing.T) {
 	}{
 		{
 			name:    "absent",
-			verdict: validationMissing,
+			verdict: valMissing,
 			field:   lifecycle.MetaPath,
 		},
 		{
 			name:    "not an object",
 			value:   "sub-1",
 			present: true,
-			verdict: validationUnsupported,
+			verdict: valUnsupported,
 			field:   lifecycle.MetaPath,
 		},
 		{
 			name:    "wrong version",
 			value:   map[string]any{"version": 2, "submission": testSubmissionValue()},
 			present: true,
-			verdict: validationUnsupported,
+			verdict: valUnsupported,
 			field:   lifecycle.MetaPath + ".version",
 		},
 		{
 			name:    "empty identifier",
 			value:   value(map[string]any{"submissionId": "", "clientNonce": "nonce-1"}),
 			present: true,
-			verdict: validationUnsupported,
+			verdict: valUnsupported,
 			field:   lifecycle.MetaPath + ".submission.submissionId",
 		},
 		{
@@ -270,14 +270,14 @@ func TestReservedLifecycleCorrelationRefusals(t *testing.T) {
 				"clientNonce":  strings.Repeat("c", lifecycle.IdentifierBound+1),
 			}),
 			present: true,
-			verdict: validationUnsupported,
+			verdict: valUnsupported,
 			field:   lifecycle.MetaPath + ".submission.clientNonce",
 		},
 		{
 			name:    "unknown member",
 			value:   map[string]any{"version": 1, "submission": testSubmissionValue(), "extra": true},
 			present: true,
-			verdict: validationUnsupported,
+			verdict: valUnsupported,
 			field:   lifecycle.MetaPath + ".extra",
 		},
 	}
@@ -311,13 +311,13 @@ func TestPromptFailingBothReservedKeysReportsTheRouteAlone(t *testing.T) {
 	_, err := session.Prompt(t.Context(), acp.PromptRequest{Meta: map[string]any{
 		lifecycleMetaKey: map[string]any{"version": 2},
 	}})
-	requireRefusal(t, validationMissing, routeMetaPath, err)
+	requireRefusal(t, valMissing, routeMetaPath, err)
 
 	_, err = session.Prompt(t.Context(), acp.PromptRequest{Meta: map[string]any{
 		routeMetaKey:     map[string]any{routeFieldVer: 1, routeFieldTurn: ""},
 		lifecycleMetaKey: map[string]any{"version": 2},
 	}})
-	requireRefusal(t, validationUnsupported, routeMetaPath+"."+routeFieldTurn, err)
+	requireRefusal(t, valUnsupported, routeMetaPath+"."+routeFieldTurn, err)
 }
 
 // TestReservedLifecycleKeyOnANonCarrierSurfaceIsUnsupported pins the third
@@ -331,10 +331,10 @@ func TestReservedLifecycleKeyOnANonCarrierSurfaceIsUnsupported(t *testing.T) {
 	present := map[string]any{lifecycleMetaKey: map[string]any{}}
 
 	_, err := agent.NewSession(t.Context(), acp.NewSessionRequest{Cwd: t.TempDir(), Meta: present})
-	requireRefusal(t, validationUnsupported, lifecycle.MetaPath, err)
+	requireRefusal(t, valUnsupported, lifecycle.MetaPath, err)
 
 	_, err = agent.LoadSession(t.Context(), acp.LoadSessionRequest{
 		SessionId: acp.SessionId(validSessionUUID), Cwd: t.TempDir(), Meta: present,
 	})
-	requireRefusal(t, validationUnsupported, lifecycle.MetaPath, err)
+	requireRefusal(t, valUnsupported, lifecycle.MetaPath, err)
 }

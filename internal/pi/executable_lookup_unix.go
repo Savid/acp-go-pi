@@ -10,8 +10,6 @@ import (
 	"strings"
 )
 
-func canonicalEnvironmentKey(key string) string { return key }
-
 func environmentKeyEqual(left string, right string) bool { return left == right }
 
 func lookPathInOrdinaryEnvironment(file string, environment []string) (string, error) {

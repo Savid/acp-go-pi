@@ -304,9 +304,15 @@ func validateExtraPathDirs(dirs []string, path string) error {
 	return nil
 }
 
-func unsupportedField(path string) *acp.RequestError {
+func unsupportedField(path string) error {
+	return unsupportedRequest(path)
+}
+
+// unsupportedRequest is the uniform refusal of one request member, typed for
+// the in-process handlers that answer with the JSON-RPC error directly.
+func unsupportedRequest(path string) *acp.RequestError {
 	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: validationUnsupported,
+		jsonFieldError: valUnsupported,
 		jsonFieldField: path,
 	})
 }
@@ -316,9 +322,9 @@ func unsupportedField(path string) *acp.RequestError {
 // collapsed: unsupported names a value that is present and refused, missing
 // names one the request had to carry. A host that reads missing adds the key;
 // a host that reads unsupported on the same bare path stops sending it.
-func missingField(path string) *acp.RequestError {
+func missingField(path string) error {
 	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: validationMissing,
+		jsonFieldError: valMissing,
 		jsonFieldField: path,
 	})
 }

@@ -158,28 +158,28 @@ func TestReservedRouteEnvelopeRefusals(t *testing.T) {
 	}{
 		{
 			name:    "absent",
-			verdict: validationMissing,
+			verdict: valMissing,
 			field:   routeMetaPath,
 		},
 		{
 			name:    "not an object",
 			value:   "turn-1",
 			present: true,
-			verdict: validationUnsupported,
+			verdict: valUnsupported,
 			field:   routeMetaPath,
 		},
 		{
 			name:    "wrong version",
 			value:   map[string]any{routeFieldVer: 2, routeFieldTurn: "turn-1"},
 			present: true,
-			verdict: validationUnsupported,
+			verdict: valUnsupported,
 			field:   routeMetaPath + "." + routeFieldVer,
 		},
 		{
 			name:    "empty nonce",
 			value:   map[string]any{routeFieldVer: 1, routeFieldTurn: ""},
 			present: true,
-			verdict: validationUnsupported,
+			verdict: valUnsupported,
 			field:   routeMetaPath + "." + routeFieldTurn,
 		},
 		{
@@ -189,14 +189,14 @@ func TestReservedRouteEnvelopeRefusals(t *testing.T) {
 				routeFieldTurn: strings.Repeat("n", routeTurnNonceMaxBytes+1),
 			},
 			present: true,
-			verdict: validationUnsupported,
+			verdict: valUnsupported,
 			field:   routeMetaPath + "." + routeFieldTurn,
 		},
 		{
 			name:    "unknown member",
 			value:   map[string]any{routeFieldVer: 1, routeFieldTurn: "turn-1", routeFieldID: "s"},
 			present: true,
-			verdict: validationUnsupported,
+			verdict: valUnsupported,
 			field:   routeMetaPath + "." + routeFieldID,
 		},
 	}

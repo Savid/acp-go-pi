@@ -49,8 +49,7 @@ func TestLaunchSpecEnviron(t *testing.T) {
 		ExtraPathDirs:   []string{absTestPath("session", "bin")},
 		Env: map[string]string{
 			"OPENAI_API_KEY": "explicit",
-			"NODE_OPTIONS":   "--require=/tmp/inject.js",
-			"LD_PRELOAD":     "/tmp/inject.so",
+			"https_proxy":    "",
 			"PI_OFFLINE":     "0",
 		},
 	}
@@ -60,10 +59,9 @@ func TestLaunchSpecEnviron(t *testing.T) {
 	require.Contains(t, environment, "PATH="+absTestPath("session", "bin")+separator+absTestPath("usr", "bin"))
 	require.Contains(t, environment, "HOME=/home/native")
 	require.Contains(t, environment, "OPENAI_API_KEY=explicit")
+	require.Contains(t, environment, "https_proxy=")
 	require.Contains(t, environment, "PI_OFFLINE=1")
 	require.Contains(t, environment, "PI_CODING_AGENT_DIR=/agent")
-	require.NotContains(t, strings.Join(environment, "\n"), "NODE_OPTIONS")
-	require.NotContains(t, strings.Join(environment, "\n"), "LD_PRELOAD")
 }
 
 func TestPrependPathDirsDropsUnusableEntries(t *testing.T) {
@@ -76,17 +74,6 @@ func TestPrependPathDirsDropsUnusableEntries(t *testing.T) {
 	require.Equal(t, base, prependPathDirs(base, []string{"relative", ""}))
 	require.Equal(t, extra+separator+base, prependPathDirs(base, []string{extra}))
 	require.Equal(t, base, prependPathDirs(base, []string{absTestPath("a") + separator + absTestPath("b")}))
-}
-
-func TestSafeExplicitEnvKeyBoundary(t *testing.T) {
-	t.Parallel()
-
-	for _, key := range []string{"A1", "PATH", "https_proxy", "BASH_FUNC_x%%"} {
-		require.True(t, safeExplicitEnvKey(key), key)
-	}
-	for _, key := range []string{"", "A=B", "A\x00B", "NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "ACP_GO_PI_INTERNAL_X", "acp_go_pi_internal_x"} {
-		require.False(t, safeExplicitEnvKey(key), key)
-	}
 }
 
 func startOrdinaryChild(t *testing.T, mode string, step time.Duration) *Process {

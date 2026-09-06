@@ -49,7 +49,7 @@ error`. This adapter does not invoke either for provider state.
 | `WithHome` | Configure a durable ordinary-mode PI_CODING_AGENT_DIR. Managed mode rejects this option before materialization. |
 | `WithScratchDir` | Parent for ephemeral session and probe trees, and for the extension store sessions share. |
 | `WithDefaultModel` | Default model as provider/id. |
-| `WithEnv` | Static filtered environment overlay. |
+| `WithEnv` | Static environment overlay for every pi process. `ACP_GO_PI_EXTRA_PATH_DIRS` is refused under every spelling. Names follow the session `env` rule with `PATH` allowed: a key is non-empty and free of `=` and NUL, the value is free of NUL, the injection names `NODE_OPTIONS`, `BASH_ENV`, `ENV`, and any `LD_` or `DYLD_` prefix are refused under the platform identity, the private adapter namespace is refused under every spelling, and two spellings of one Windows variable are refused; a refusal fails Agent construction. |
 | `WithSeedFiles` | Materialize exact files before native-tree prepare. |
 | `WithSessionStore` | Install durable session mirroring. |
 | `WithSessionStoreLoadTimeout` | Bound store load and list operations. |

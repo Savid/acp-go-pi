@@ -56,21 +56,21 @@ func TestRelativeCwdRefusedOnEverySessionStartSurface(t *testing.T) {
 	agent := NewAgent(testContainmentOption())
 
 	_, err := agent.NewSession(t.Context(), acp.NewSessionRequest{Cwd: "relative"})
-	requireRefusal(t, validationUnsupported, jsonFieldCwd, err)
+	requireRefusal(t, valUnsupported, jsonFieldCwd, err)
 
 	_, err = agent.LoadSession(t.Context(), acp.LoadSessionRequest{
 		SessionId: acp.SessionId(validSessionUUID), Cwd: "relative",
 	})
-	requireRefusal(t, validationUnsupported, jsonFieldCwd, err)
+	requireRefusal(t, valUnsupported, jsonFieldCwd, err)
 
 	_, err = agent.ResumeSession(t.Context(), acp.ResumeSessionRequest{
 		SessionId: acp.SessionId(validSessionUUID), Cwd: "relative",
 	})
-	requireRefusal(t, validationUnsupported, jsonFieldCwd, err)
+	requireRefusal(t, valUnsupported, jsonFieldCwd, err)
 
 	forked := ForkSessionRequest(forkParentID, "relative")
 	_, err = agent.HandleExtensionMethod(t.Context(), ForkSessionMethod, forkRaw(t, forked))
-	requireRefusal(t, validationUnsupported, jsonFieldCwd, err)
+	requireRefusal(t, valUnsupported, jsonFieldCwd, err)
 
 	// The same absolute path passes the gate, so the refusals above are the
 	// path rule rather than an unconditional failure.
@@ -99,7 +99,7 @@ func TestExtensionParamsRefusedAsAWhole(t *testing.T) {
 	} {
 		for _, params := range []string{`[]`, `"text"`, `{`, `{} {}`} {
 			_, err := agent.HandleExtensionMethod(t.Context(), method, json.RawMessage(params))
-			requireRefusal(t, validationUnsupported, jsonFieldParams, err)
+			requireRefusal(t, valUnsupported, jsonFieldParams, err)
 		}
 	}
 }

@@ -46,7 +46,7 @@ func ComposeEnvironment(phases ...map[string]string) map[string]string {
 
 	for _, phase := range phases {
 		for key, value := range phase {
-			result[canonicalEnvironmentKey(key)] = value
+			result[EnvironmentKey(key)] = value
 		}
 	}
 

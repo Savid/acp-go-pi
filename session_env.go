@@ -2,7 +2,6 @@ package piacp
 
 import (
 	"maps"
-	"runtime"
 	"slices"
 	"strings"
 
@@ -12,28 +11,13 @@ import (
 )
 
 const (
-	validationAmbiguous = "ambiguous"
-
-	platformWindows = "windows"
+	valAmbiguous = "ambiguous"
 
 	envKeyPath        = "PATH"
 	envKeyNodeOptions = "NODE_OPTIONS"
 	envKeyBashEnv     = "BASH_ENV"
 	envKeyEnv         = "ENV"
 )
-
-var sessionEnvPlatform = runtime.GOOS
-
-// sessionEnvIdentity is the name the target platform resolves an environment
-// key by: the exact bytes on Unix, where PATH and path are two variables, and
-// the upper-cased spelling on Windows, where they are one.
-func sessionEnvIdentity(key string) string {
-	if sessionEnvPlatform == platformWindows {
-		return strings.ToUpper(key)
-	}
-
-	return key
-}
 
 func validEnvName(key string) bool {
 	return key != "" && !strings.ContainsAny(key, "=\x00")
@@ -51,7 +35,7 @@ func blockedAgentEnvKey(key string) bool {
 		return true
 	}
 
-	switch name := sessionEnvIdentity(key); name {
+	switch name := pi.EnvironmentKey(key); name {
 	case envKeyNodeOptions, envKeyBashEnv, envKeyEnv:
 		return true
 	default:
@@ -63,7 +47,7 @@ func blockedAgentEnvKey(key string) bool {
 // option is the only session-scoped PATH authority; a second session owner
 // would make the effective search order depend on merge order.
 func blockedSessionEnvKey(key string) bool {
-	return blockedAgentEnvKey(key) || sessionEnvIdentity(key) == envKeyPath
+	return blockedAgentEnvKey(key) || pi.EnvironmentKey(key) == envKeyPath
 }
 
 // validateEnvironment checks an environment in sorted key order, so the first
@@ -80,7 +64,7 @@ func validateEnvironment(env map[string]string, path string, blocked func(key st
 			return unsupportedField(path + "." + key)
 		}
 
-		identity := sessionEnvIdentity(key)
+		identity := pi.EnvironmentKey(key)
 		if _, duplicate := seen[identity]; duplicate {
 			return ambiguousField(path + "." + key)
 		}
@@ -91,9 +75,9 @@ func validateEnvironment(env map[string]string, path string, blocked func(key st
 	return nil
 }
 
-func ambiguousField(path string) *acp.RequestError {
+func ambiguousField(path string) error {
 	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: validationAmbiguous,
+		jsonFieldError: valAmbiguous,
 		jsonFieldField: path,
 	})
 }
