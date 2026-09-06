@@ -255,7 +255,7 @@ Session-lifecycle requests accept options and the raw-event opt-in:
 | Key | Meaning |
 | --- | --- |
 | `model` | Session model as `"provider/id"`; catalog-validated. |
-| `env` | Extra environment variables for this session's pi process. `PATH` is rejected: `extraPathDirs` is the only session `PATH` authority. |
+| `env` | Extra environment variables for this session's pi process. `PATH` is rejected: `extraPathDirs` is the only session `PATH` authority. Blocked names are listed below. |
 | `extraPathDirs` | Absolute directories prepended, in the order given, to this session's child `PATH`, ahead of the static base `PATH` from `WithEnv` and everything inherited. Order and duplicates are preserved. This launch-only field does not select the pi executable. Each entry must be absolute and free of the platform list separator. |
 | `thinkingLevel` | Non-empty reasoning-level value passed unchanged to pi. `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max` are the advertised host menu, not an accepted-value set. The session then advertises the level read back from pi, which is the one pi applied rather than the one requested. |
 | `permission` | Permission mode: `ask` (default) or `allow`. |
@@ -266,6 +266,20 @@ The accepted `env` map and ordered `extraPathDirs` list are lifecycle identity
 and are written into each durable session boundary. Load, resume, and fork use
 the stored value when the request omits a field. Supplying a field explicitly,
 including `{}` or `[]`, keeps that value as the requested lifecycle input.
+
+Session `env` names are checked in sorted key order on every establishing
+request, so the first refusal is the same each time. A key is accepted when
+it is non-empty and free of `=` and NUL and its value is free of NUL; case is
+not a rule, so `https_proxy` and `HTTPS_PROXY` are two ordinary variables.
+Blocked names fail as `{"error":"unsupported","field":"_meta.pi.options.env.<key>"}`
+naming the key exactly as sent: `PATH`, `NODE_OPTIONS`, `BASH_ENV`, `ENV`, any `LD_` or `DYLD_` prefix, `ACP_GO_PI_EXTRA_PATH_DIRS`, and `ACP_GO_PI_INTERNAL_*`. All but the adapter's own
+namespace compare through the platform identity, exact on Unix and
+case-insensitive on Windows; the adapter namespace is refused under every
+spelling. Two keys that resolve to one variable under that identity fail as
+`{"error":"ambiguous","field":"_meta.pi.options.env.<later key in sorted order>"}`.
+An empty value is delivered as `KEY=`. `ValidatePiSessionMeta` runs this
+parsing on a `_meta` map without an agent, so a host can check a request
+before sending it.
 
 ## Update metadata
 

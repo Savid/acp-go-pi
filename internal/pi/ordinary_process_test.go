@@ -81,9 +81,10 @@ func TestPrependPathDirsDropsUnusableEntries(t *testing.T) {
 func TestSafeExplicitEnvKeyBoundary(t *testing.T) {
 	t.Parallel()
 
-	require.True(t, safeExplicitEnvKey("A1"))
-	require.True(t, safeExplicitEnvKey("PATH"))
-	for _, key := range []string{"", "BAD-NAME", "NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "ACP_GO_PI_INTERNAL_X"} {
+	for _, key := range []string{"A1", "PATH", "https_proxy", "BASH_FUNC_x%%"} {
+		require.True(t, safeExplicitEnvKey(key), key)
+	}
+	for _, key := range []string{"", "A=B", "A\x00B", "NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "ACP_GO_PI_INTERNAL_X", "acp_go_pi_internal_x"} {
 		require.False(t, safeExplicitEnvKey(key), key)
 	}
 }

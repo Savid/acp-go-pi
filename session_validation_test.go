@@ -33,20 +33,6 @@ func TestConfigurationAndAdmissionEdges(t *testing.T) {
 	})
 	require.Error(t, err)
 
-	err = validateEnvironmentForPlatform(
-		map[string]string{"Token": "one", "TOKEN": "two"},
-		"env",
-		func(string) bool { return false },
-		true,
-	)
-	require.Error(t, err)
-	require.NoError(t, validateEnvironmentForPlatform(
-		map[string]string{"TOKEN": "one"},
-		"env",
-		func(string) bool { return false },
-		true,
-	))
-
 	agent := NewAgent()
 	agent.options.ProviderAuthRoot = "/provider-auth"
 	agent.options.hostAuthoritySupplied = true

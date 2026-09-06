@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 
@@ -27,11 +26,7 @@ const (
 	metaRawEventKey        = "rawEvent"
 	metaRawEventEnabledKey = "enabled"
 
-	envKeyPath        = "PATH"
-	envKeyNodeOptions = "NODE_OPTIONS"
-	envKeyBashEnv     = "BASH_ENV"
-	envKeyEnv         = "ENV"
-	privateEnvPrefix  = "ACP_" + "GO_PI_INTERNAL_"
+	privateEnvPrefix = "ACP_" + "GO_PI_INTERNAL_"
 )
 
 // PiOptions is the stable, supported pi-specific subset accepted at
@@ -299,46 +294,6 @@ func validatePiOptions(options PiOptions) (PiOptions, error) {
 	return options, nil
 }
 
-func validateEnvironment(env map[string]string, path string, blocked func(key string) bool) error {
-	return validateEnvironmentForPlatform(env, path, blocked, runtime.GOOS == "windows")
-}
-
-func validateEnvironmentForPlatform(
-	env map[string]string,
-	path string,
-	blocked func(key string) bool,
-	caseInsensitive bool,
-) error {
-	keys := make([]string, 0, len(env))
-	for key := range env {
-		keys = append(keys, key)
-	}
-
-	slices.Sort(keys)
-
-	seen := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		if !validEnvName(key) || blocked(key) {
-			return unsupportedField(path + "." + key)
-		}
-
-		if caseInsensitive {
-			canonical := strings.ToUpper(key)
-			if _, ok := seen[canonical]; ok {
-				return unsupportedField(path + "." + key)
-			}
-
-			seen[canonical] = struct{}{}
-		}
-	}
-
-	return nil
-}
-
-// validateExtraPathDirs rejects every entry that could not be prepended to the
-// child's PATH as exactly one search directory. A relative entry resolves
-// against a working directory this adapter does not own, and an embedded list
-// separator would splice in directories the caller never named.
 func validateExtraPathDirs(dirs []string, path string) error {
 	for index, dir := range dirs {
 		if !filepath.IsAbs(dir) || strings.ContainsRune(dir, os.PathListSeparator) {
@@ -412,51 +367,6 @@ func stringSliceOption(value any, path string) ([]string, error) {
 	default:
 		return nil, unsupportedField(path)
 	}
-}
-
-func validEnvName(name string) bool {
-	if name == "" {
-		return false
-	}
-
-	for index, r := range name {
-		switch {
-		case r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'):
-		case r >= '0' && r <= '9':
-			if index == 0 {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-
-	return true
-}
-
-// blockedAgentEnvKey rejects env names that could hijack the pi child process
-// (loader/preload and node/shell injection vectors). PATH is absent: the
-// agent-scoped environment is where the static native base search path is
-// established.
-func blockedAgentEnvKey(key string) bool {
-	upper := strings.ToUpper(key)
-	if strings.HasPrefix(upper, privateEnvPrefix) {
-		return true
-	}
-
-	switch upper {
-	case envKeyNodeOptions, envKeyBashEnv, envKeyEnv, pi.EnvExtraPathDirs:
-		return true
-	default:
-		return strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_")
-	}
-}
-
-// blockedSessionEnvKey additionally rejects PATH. The ordered extraPathDirs
-// option is the only session-scoped PATH authority; a second session owner
-// would make the effective search order depend on merge order.
-func blockedSessionEnvKey(key string) bool {
-	return blockedAgentEnvKey(key) || strings.EqualFold(key, envKeyPath)
 }
 
 func sessionAdditionalDirectories(primary []string) []string {

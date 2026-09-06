@@ -66,7 +66,9 @@ Build `_meta.pi.options` with `NewPiOptions`. Supported
 options select the model, reasoning level, permission mode, automatic retry,
 explicit environment, and additional child search directories.
 `WithPiOutputSchema` is refused because Pi has no native
-structured-output surface.
+structured-output surface. `ValidatePiSessionMeta(meta)` returns the refusal
+a session-establishing request carrying that `_meta` map would receive, or
+nil, without an agent; see [Metadata](/docs/reference/meta).
 
 ## Request and store helpers
 

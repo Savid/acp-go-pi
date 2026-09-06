@@ -2,10 +2,8 @@ package piacp
 
 import (
 	"os"
-	"strings"
 	"testing"
 
-	"github.com/savid/acp-go-pi/internal/pi"
 	"github.com/stretchr/testify/require"
 )
 
@@ -58,7 +56,7 @@ func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaModelKey: "invalid"}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: true}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"A": true}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"1BAD": "x"}}}},
+		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"A=B": "x"}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: true}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{}}}},
 		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{"type": "object"}}}},
@@ -94,36 +92,6 @@ func TestPiOptionsThinkingLevelPassesThrough(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, level, options.ThinkingLevel)
 	}
-}
-
-func TestEnvironmentValidation(t *testing.T) {
-	valid := []string{"A", "_A", "a1", "A_B_2"}
-	for _, name := range valid {
-		require.True(t, validEnvName(name))
-		require.False(t, blockedAgentEnvKey(name))
-		require.False(t, blockedSessionEnvKey(name))
-	}
-
-	for _, name := range []string{"", "1A", "A-B", "A B", "é"} {
-		require.False(t, validEnvName(name))
-	}
-
-	for _, name := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "dyld_insert_libraries", "ACP_GO_PI_INTERNAL_CONTROL", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
-		require.True(t, blockedAgentEnvKey(name))
-		require.True(t, blockedSessionEnvKey(name))
-	}
-
-	// The dedicated ordered option is the only session PATH authority, while
-	// the agent-scoped environment is where the static base PATH is set.
-	for _, name := range []string{"PATH", "Path"} {
-		require.False(t, blockedAgentEnvKey(name))
-		require.True(t, blockedSessionEnvKey(name))
-	}
-
-	require.NoError(t, validateEnvironment(map[string]string{"PATH": "/base/bin"}, optionFieldEnv, blockedAgentEnvKey))
-	requireUnsupportedField(t, validateEnvironment(map[string]string{"PATH": "/raw/bin"}, metaOptionPath(metaEnvKey), blockedSessionEnvKey), metaOptionPath(metaEnvKey)+".PATH")
-	requireUnsupportedField(t, validateEnvironment(map[string]string{pi.EnvExtraPathDirs: "/attacker/bin"}, metaOptionPath(metaEnvKey), blockedSessionEnvKey), metaOptionPath(metaEnvKey)+"."+pi.EnvExtraPathDirs)
-	requireUnsupportedField(t, validateEnvironment(map[string]string{"1A": "x"}, optionFieldEnv, blockedAgentEnvKey), optionFieldEnv+".1A")
 }
 
 func TestExtraPathDirsValidation(t *testing.T) {

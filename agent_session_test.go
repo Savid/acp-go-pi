@@ -518,7 +518,7 @@ func TestRestoreActiveSessionReleasesGateOnStoreFailure(t *testing.T) {
 }
 
 func TestStartSessionRejectsUnsafeGlobalEnvironment(t *testing.T) {
-	for _, key := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BAD-NAME", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
+	for _, key := range []string{"NODE_OPTIONS", "BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "A=B", "A\x00B", pi.EnvExtraPathDirs, strings.ToLower(pi.EnvExtraPathDirs)} {
 		t.Run(key, func(t *testing.T) {
 			client := newStubPiClient()
 			agent := newStubClientAgent(t, client, WithEnv(map[string]string{key: "unsafe"}))

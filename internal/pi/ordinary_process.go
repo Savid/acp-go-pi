@@ -120,26 +120,21 @@ func prependPathDirs(search string, dirs []string) string {
 	return strings.Join(entries, string(os.PathListSeparator))
 }
 
+// safeExplicitEnvKey reports whether an explicit environment entry may reach
+// the child. The adapter's private namespace is refused under every spelling;
+// the loader, node, and shell injection names are read under an exact
+// platform spelling, so they compare through the platform identity.
 func safeExplicitEnvKey(key string) bool {
-	if key == "" {
+	if key == "" || strings.ContainsAny(key, "=\x00") || strings.HasPrefix(strings.ToUpper(key), privateEnvPrefix) {
 		return false
 	}
 
-	for index, r := range key {
-		switch {
-		case r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'):
-		case r >= '0' && r <= '9' && index > 0:
-		default:
-			return false
-		}
-	}
-
-	upper := strings.ToUpper(key)
-	if upper == envNodeOptions || upper == envBashEnv || upper == envShellEnv || strings.HasPrefix(upper, privateEnvPrefix) {
+	switch name := canonicalEnvironmentKey(key); name {
+	case envNodeOptions, envBashEnv, envShellEnv:
 		return false
+	default:
+		return !strings.HasPrefix(name, "LD_") && !strings.HasPrefix(name, "DYLD_")
 	}
-
-	return !strings.HasPrefix(upper, "LD_") && !strings.HasPrefix(upper, "DYLD_")
 }
 
 type Process struct {
