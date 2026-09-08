@@ -50,7 +50,7 @@ supply it. Use `make test-integration-smoke` for the tier without model spend,
 `make test-integration-live` for token-spending prompts, and
 `make test-integration-cover` for compiled command coverage. Attended,
 keystore, and native-browser targets have separate execution prerequisites;
-see [Development](README.md#development). Honor authorization already given.
+see the Development section in `README.md`. Honor authorization already given.
 
 ## Coding Rules
 
