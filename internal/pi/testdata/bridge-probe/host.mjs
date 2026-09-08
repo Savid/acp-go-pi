@@ -28,6 +28,7 @@ const AUTH_MARKER = "acp-go-pi:auth:";
 
 export const raised = [];
 export const pending = new Map();
+export const hooks = new Map();
 
 let nextDialog = 0;
 
@@ -49,7 +50,7 @@ function select(title, _options, opts) {
 			);
 		}
 
-		if (payload?.kind === "cancel") {
+		if (payload?.kind === "cancel" || payload?.kind === "quota_cancel") {
 			pending.set(id, resolve);
 
 			return;
@@ -88,7 +89,7 @@ export async function loadAuthCommand(extensionPath) {
 			if (name === "acp-auth") command = spec.handler;
 		},
 		registerTool() {},
-		on() {},
+		on(name, handler) { hooks.set(name, handler); },
 	});
 
 	if (typeof command !== "function") {

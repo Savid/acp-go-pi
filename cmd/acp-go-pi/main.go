@@ -82,6 +82,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral session scratch; empty means the system temp directory")
 	providerAuthRoot := flags.String("provider-auth-root", "", "durable root for the values-free provider-auth ledger; empty leaves provider auth unadvertised")
 	model := flags.String("model", "", "default pi model as provider/id")
+	directAPI := flags.Bool("pi-direct-api", true, "allow direct provider quota reads from the native bridge")
 	seedFiles := &seedFileFlag{}
 	flags.Var(seedFiles, "seed-file", "seed file written into each session's pi agent dir as <relpath>=<hostpath>; repeatable")
 	debug := flags.Bool("debug", false, "write debug logs to stderr")
@@ -145,6 +146,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 		piacp.WithScratchDir(*scratchDir),
 		piacp.WithProviderAuthRoot(*providerAuthRoot),
 		piacp.WithDefaultModel(*model),
+		piacp.WithPiDirectAPI(*directAPI),
 		piacp.WithLogger(logger),
 	)
 

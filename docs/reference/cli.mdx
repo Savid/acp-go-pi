@@ -19,6 +19,7 @@ acp-go-pi -path /usr/local/bin/pi -scratch-dir /tmp/pi-scratch -model openai/gpt
 | `-scratch-dir` | Parent for ephemeral session and version-probe trees, and for the extension store sessions share. |
 | `-provider-auth-root` | Durable values-free provider-auth ledger root; requires -home. |
 | `-model` | Default model as provider/id. |
+| `-pi-direct-api` | Allow direct provider quota reads inside Pi; true by default. Use -pi-direct-api=false to disable them. |
 | `-seed-file` | Materialize relpath=hostpath in each session agent directory; repeatable. |
 | `-debug` | Emit debug logs to stderr. |
 | `-version` | Print adapter version and exit. |

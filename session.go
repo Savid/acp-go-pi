@@ -151,6 +151,7 @@ type agentSession struct {
 	browserShim          *pi.BrowserShim
 	residence            *pi.SessionResidence
 	authClosed           bool
+	quotaExchanges       map[string]*quotaExchange
 
 	// closing is the session's admission fence: from the moment a close is
 	// requested the session admits no prompt, relaunch, or MCP-tool refresh

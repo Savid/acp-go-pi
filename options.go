@@ -40,6 +40,10 @@ type Options struct {
 	// DefaultModel selects the model for newly created pi sessions when
 	// non-empty, as "provider/id" (for example "openai/gpt-4o").
 	DefaultModel string
+	// DirectAPI permits read-only quota requests from the native bridge to
+	// supported providers. It defaults to true; set WithPiDirectAPI(false)
+	// to disable every direct account endpoint.
+	DirectAPI bool
 	// Env is the static agent-scoped addition to every launched pi process
 	// environment. pi children run with a scrubbed environment, so provider API
 	// keys must travel here (or per session) rather than relying on ambient
@@ -105,6 +109,7 @@ func applyOptions(opts []Option) Options {
 		AgentName:    "acp-go-pi",
 		AgentTitle:   "acp-go-pi",
 		AgentVersion: "0.1.0",
+		DirectAPI:    true,
 	}
 
 	for _, opt := range opts {
@@ -116,6 +121,11 @@ func applyOptions(opts []Option) Options {
 	}
 
 	return options
+}
+
+// WithPiDirectAPI enables or disables the native bridge's direct quota reads.
+func WithPiDirectAPI(enabled bool) Option {
+	return func(options *Options) { options.DirectAPI = enabled }
 }
 
 // WithLogger configures structured diagnostic logging.

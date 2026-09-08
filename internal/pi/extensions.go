@@ -86,6 +86,8 @@ const (
 	AuthOpProbe   = "probe"
 	AuthOpLogin   = "login"
 	AuthOpRemove  = "remove"
+	// AuthOpQuota reads account observations inside the native credential scope.
+	AuthOpQuota = "quota"
 )
 
 // Provider-auth message kinds the bridge extension reports.
@@ -98,6 +100,9 @@ const (
 	// AuthKindCancel names the one dialog the wrapper leaves unanswered while a
 	// native login runs. Answering it aborts that login.
 	AuthKindCancel = "cancel"
+	// AuthKindQuota and AuthKindQuotaCancel are values-free quota bridge dialogs.
+	AuthKindQuota       = "quota"
+	AuthKindQuotaCancel = "quota_cancel"
 )
 
 // Native login method discriminators carried on an AuthRequest.

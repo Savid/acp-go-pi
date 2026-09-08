@@ -728,6 +728,9 @@ func TestAgentCloseAndAuthorityFenceEdges(t *testing.T) {
 	require.False(t, retained)
 
 	fenced := NewAgent()
+	// This test invokes the authority-loss worker synchronously, after the
+	// once that starts that worker in production has already been consumed.
+	fenced.authorityLossOnce.Do(func() {})
 	shared := &agentSession{agent: fenced, id: acp.SessionId("shared")}
 	retainedOnly := &agentSession{agent: fenced, id: acp.SessionId("retained")}
 	fenced.sessions[shared.id] = shared

@@ -126,6 +126,7 @@ func TestRunOptionsCancellationAndSignal(t *testing.T) {
 		require.Equal(t, "/agent/scratch", options.ScratchDir)
 		require.Equal(t, "/agent/auth-ledger", options.ProviderAuthRoot)
 		require.Equal(t, "provider/model", options.DefaultModel)
+		require.False(t, options.DirectAPI)
 		require.Equal(t, `{"theme":"dark"}`, options.SeedFiles["settings.json"])
 		require.NotNil(t, options.Logger)
 		require.NotNil(t, options.TextMapPropagator)
@@ -141,6 +142,7 @@ func TestRunOptionsCancellationAndSignal(t *testing.T) {
 		"-scratch-dir", "/agent/scratch",
 		"-provider-auth-root", "/agent/auth-ledger",
 		"-model", "provider/model",
+		"-pi-direct-api=false",
 		"-seed-file", "settings.json=" + seedPath,
 	}, bytes.NewReader(nil), io.Discard, &stderr)
 	require.Zero(t, code)

@@ -2084,6 +2084,10 @@ func (s *agentSession) routeUIRequestEstablished(ctx context.Context, outbox *se
 		return
 	}
 
+	if s.routeQuotaDialog(ctx, outbox, request, releaseDialog) {
+		return
+	}
+
 	if broker := s.agent.providerAuth; broker != nil && strings.HasPrefix(request.Title, pi.AuthTitleMarker) {
 		go func() {
 			defer recoverAgentGoroutine(ctx, agentLogger(s.agent), "provider auth dialog")

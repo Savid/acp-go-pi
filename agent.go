@@ -939,6 +939,8 @@ func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params
 	}
 
 	switch method {
+	case RateLimitsMethod:
+		return a.handleRateLimits(ctx, params)
 	case ForkSessionMethod:
 		return a.handleForkSession(ctx, params)
 	default:

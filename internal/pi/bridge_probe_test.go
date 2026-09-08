@@ -114,6 +114,22 @@ func TestBridgeExtensionStoresABrokeredCredential(t *testing.T) {
 	}, record["settle"])
 }
 
+func TestBridgeExtensionReadsQuotaInNativeCredentialScope(t *testing.T) {
+	t.Parallel()
+
+	extension, stubs := bridgeProbeExtension(t)
+	command := exec.CommandContext(t.Context(), requireNode(t), "--experimental-strip-types", filepath.Join(stubs, "quota.mjs"), extension)
+	command.Env = append(os.Environ(),
+		"ACP_GO_PI_PERMISSION=allow",
+		"PROBE_PACKAGE_DIR="+bridgeProbeInstallRoot(t, stubs),
+		"PI_CODING_AGENT_DIR="+t.TempDir(),
+	)
+
+	output, err := command.CombinedOutput()
+	require.NoError(t, err, string(output))
+	require.Contains(t, string(output), "QUOTA_OK")
+}
+
 // bridgeProbeInstallRoot assembles the fixture pi install root the extension
 // resolves its storage module under. The layout is built here rather than
 // tracked, because the path the extension composes runs through a "dist"
@@ -130,6 +146,9 @@ func bridgeProbeInstallRoot(t *testing.T, stubs string) string {
 	storage, err := os.ReadFile(filepath.Join(stubs, "auth-storage.mjs"))
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(core, "auth-storage.js"), storage, 0o600))
+	resolver, err := os.ReadFile(filepath.Join(stubs, "resolve-config-value.mjs"))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(core, "resolve-config-value.js"), resolver, 0o600))
 
 	return root
 }
