@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -227,9 +228,7 @@ func (c *Client) call(ctx context.Context, fields map[string]any, boundary CallB
 	id := fmt.Sprintf("acp-%d", c.nextID.Add(1))
 
 	payload := make(map[string]any, len(fields)+1)
-	for key, value := range fields {
-		payload[key] = value
-	}
+	maps.Copy(payload, fields)
 
 	payload["id"] = id
 

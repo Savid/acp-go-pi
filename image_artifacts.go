@@ -88,6 +88,21 @@ func (a *Agent) loadCurrentStoreEntries(
 		)
 	}
 
+	// Resume and fork hydrate the same artifacts as load, even though they
+	// do not replay them to the client. Validate before any native launch.
+	for _, entry := range entries {
+		message, _, ok := outputImageMessage(entry)
+		if !ok {
+			continue
+		}
+
+		if _, failure := messageReplayUpdates(message, a.imageLimits()); failure != nil {
+			return nil, lifecycleBoundaryRecord{}, a.restoreRefused(
+				ctx, sessionID, "stored image artifact failed validation", nil,
+			)
+		}
+	}
+
 	return entries, boundary, nil
 }
 

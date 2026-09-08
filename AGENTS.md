@@ -1,134 +1,129 @@
 # AGENTS.md
 
-Shared instructions for automated coding agents working in this repository.
-
 ## Purpose
 
-This project is a Go implementation of an ACP agent for the pi coding agent.
-It wraps the local `pi` CLI in RPC mode and builds directly on
-`github.com/coder/acp-go-sdk`.
+This Go ACP agent wraps the local `pi` CLI in RPC mode and builds on
+`github.com/coder/acp-go-sdk`. Each ACP session owns a pi RPC process;
+ordinary execution supports an explicitly configured durable native `Home`.
 
 ## Project Map
 
-Organized by domain. Public surface lives in the root package; implementation
-details live in `internal/`.
-
-- **Entrypoint** (`cmd/acp-go-pi`): process entrypoint, ACP stdio mode,
-  tracing setup, and signal handling.
-- **ACP agent surface** (root package, e.g. `agent.go`, `options.go`,
-  `ids.go`, `request_builders.go`): ACP method handlers, agent options,
-  request builders, and extension method constants.
-- **Session orchestration** (`session.go`, `session_meta.go`,
-  `session_store.go`, `raw_events.go`): pi turn lifecycle, prompts,
-  cancellation, permissions, elicitation, usage updates, session storage, and
-  raw event handling.
-- **pi CLI internals** (`internal/pi`): RPC-mode process management, JSONL
-  codec and event decoding, per-session agent directory authoring, embedded
-  wrapper-owned TypeScript extensions (permission bridge, MCP client),
-  version probing, and model/thinking-level validation.
-- **Live tests** (`integration`): integration tests that launch the real
-  local `pi` CLI in isolated agent directories.
-- **Docs** (`docs/`, `docs.json`): Mintlify guide. Update alongside public
-  API, CLI flag, ACP method, or `_meta` field changes.
+- `cmd/acp-go-pi`: ACP stdio entrypoint, tracing, signals, and CLI flags.
+- Root `agent*.go`, `options.go`, `ids.go`, `request_builders.go`: public ACP
+  surface, validation, configuration, and extension dispatch.
+- Root `session*.go`, `raw_events.go`, `image*.go`: turn ownership, cancellation,
+  permissions, elicitation, lifecycle updates, persistence, and media.
+- Root `auth*.go`, `host_authority*.go`, `native_process.go`: provider-auth
+  brokerage and the embedded host-authority boundary.
+- `internal/pi`: native process management, JSONL codec, agent directories,
+  version/model validation, and embedded TypeScript extensions in `ext/`.
+- `internal/lifecycle`, `testdata/lifecycle`: lifecycle reducer and canonical
+  fixture battery.
+- `integration`: gated fake-backed wrapper tests and real-native compatibility
+  tests. `examples/` contains runnable ACP clients.
+- `docs/`, `docs.json`, `README.md`: local public guide and navigation. Update
+  them alongside changes to the supported API, CLI, ACP methods, or `_meta`.
 
 ## Commands
 
 ```sh
 go build ./...
 go test ./...
-go test -race ./...
-```
-
-Lint details live in `.golangci.yml`.
-
-The Makefile wraps the main development checks:
-
-```sh
 make test
+make coverage-check
 make lint
+make docs-audit
+make fmt-check
+make modernize-check
 make audit
 ```
 
-Run live integration tests only when a local `pi` CLI (v0.80.6 or newer) is
-installed:
+`make test` uses race detection, shuffled order, and the configured timeout.
+`make lint` uses the Makefile's pinned linter. `make modernize-check` checks
+`go fix -diff ./...` without writing. `make audit` is the full local gate;
+choose checks for the task and run the combined gate once changes settle.
+Prose-only edits need instruction/source review and relevant docs checks.
 
-```sh
-ACP_GO_PI_RUN_INTEGRATION=1 go test -race -count=1 -tags=integration -timeout=300s -parallel=4 -v ./integration/...
-```
-
-`ACP_GO_PI_RUN_INTEGRATION=1` gates the integration tier;
-`ACP_GO_PI_RUN_LIVE_TOKENS=1` additionally opts in to tests that spend model
-tokens (`make test-integration-smoke` omits it). Use
-`make test-integration-cover` for compiled
-`acp-go-pi` coverage through `GOCOVERDIR`. Integration tests always launch pi
-with an isolated temp `PI_CODING_AGENT_DIR` and a scrubbed environment;
-provider credentials for the live tier are injected into that isolated
-directory, never read from a shared mutable pi home.
+Native execution requires explicit task authorization, including smoke and
+credential-free probes; installed binaries and environment gates alone do not
+supply it. Use `make test-integration-smoke` for the tier without model spend,
+`make test-integration-live` for token-spending prompts, and
+`make test-integration-cover` for compiled command coverage. Attended,
+keystore, and native-browser targets have separate execution prerequisites;
+see the Development section in `README.md`. Honor authorization already given.
 
 ## Coding Rules
 
-- Follow standard Go idioms: `ctx` first, no `ctx` in structs, and `%w` for
-  wrapped errors.
-- Keep the public root package small; implementation details belong in
-  `internal/` unless they are part of the public API.
-- Prefer structured protocol types and JSON decoding over ad hoc string
-  parsing; pi RPC records are strict LF-delimited JSONL.
-- Preserve ACP method names, request/response shapes, and validation
-  behavior.
-- Keep protocol glue narrow, documented, and close to the ACP method it
-  serves.
-- Keep shared code next to the domain it serves; avoid generic catch-all
-  packages such as `utils`, `helpers`, or `common`.
-- The wrapper-owned TypeScript extensions under `internal/pi/ext/` are part
-  of the native boundary: they must stay dependency-free (node built-ins,
-  `typebox`, and the pi extension API) and any protocol change there needs a
-  matching change in the Go code that parses its output.
-- Follow existing package patterns before introducing new abstractions.
-
-## Ask Before
-
-Unless explicitly requested, ask before:
-
-- Changing the permission or elicitation flow shape.
-- Adding new ACP extension methods or `_meta` fields.
-- Changing the session-store contract or store format.
-- Weakening the child-environment scrubbing (ambient provider API keys are
-  live auth for pi).
+- Follow Go idioms: `ctx` first, no stored contexts, and `%w` for wrapped errors.
+  Preserve public shapes, validation order, error identities, and state ownership.
+- Keep native implementation in `internal/pi`, protocol glue near its ACP
+  handler, and shared code beside its domain. Follow existing patterns; avoid
+  generic helper packages or unnecessary abstractions.
+- Use structured protocol types and JSON decoding. Native RPC records are
+  strictly LF-delimited JSONL; keep stdout reserved for ACP.
+- Keep the Go parser and embedded TypeScript protocol changes synchronized.
+  Extensions use Node built-ins and packages supplied by pi, including
+  `typebox`, the pi extension API, and `@earendil-works/pi-ai/providers/all`;
+  do not add external runtime dependencies.
+- Preserve native cleanup and owed durable commits through cancellation and
+  replacement. Advertise vacancy/quiescence only when the configured authority
+  proves it; follow [sessions](docs/core/sessions.mdx) and
+  [session storage](docs/features/session-store.mdx).
+- Unless already authorized by the task, ask before changing permission or
+  elicitation flow shape, adding ACP extension methods or `_meta` fields,
+  changing the store contract/format, or weakening environment scrubbing.
 
 ## Testing Rules
 
-- Use `testify/require` for assertions.
-- Prefer table-driven tests for codec/protocol cases.
-- Run `go test ./...` for ordinary changes.
-- Run `go test -race ./...` or `make test` for session, MCP, concurrency, or
-  cancellation changes.
-- Run `make lint` before considering work complete.
-- Unit tests fake the process boundary (in-memory pipes, scripted
-  responses); they never launch a real `pi`.
-- Integration tests launch the actual `pi` binary from `PATH` (or
-  `-path`-style overrides) in isolated temp agent directories only.
-- Keep live prompts deterministic with exact sentinel replies, and assert
-  the ACP stop reason plus streamed updates where practical.
-- Local helper processes in integration tests are MCP servers with
-  deterministic responses.
+- Use `testify/require` and focused regression tests for observable behavior or
+  concrete failure boundaries. Prefer small tables for protocol cases; do not
+  add production seams, unreachable branches, or coverage-only scaffolding.
+- Synchronize concurrent tests with explicit barriers or observable state;
+  deadlines bound failure and sleeps do not prove ordering. Parallel tests own
+  their state and avoid process-global environment or directory mutation.
+- Ordinary tests use deterministic fake process/authority boundaries and never
+  require an installed pi, credentials, containers, or external network.
+  Fake-backed integration tests prove wrapper and transport behavior; only
+  tests executing the real pi establish native compatibility.
+- Run `go test ./...` for ordinary behavior changes and `make test` for session,
+  MCP, concurrency, or cancellation changes. Use `make lint` for Go edits.
+  Reuse passing checks unless changes or failures justify repeating them.
+- Run the complete behavioral suite with race detection and review the statement
+  coverage reported by `make coverage-check`; it has no percentage threshold.
+  Preserve `testdata/lifecycle/manifest.json` and every canonical fixture it names
+  byte-for-byte, and keep the complete battery exercised.
+  Coverage and fake authority traces do not prove physical containment or
+  unexecuted platform/native behavior.
+- For an authorized native probe, use a throwaway `PI_CODING_AGENT_DIR` with a
+  scrubbed environment. Native tests use only temporary test-owned homes;
+  select credential sources explicitly and copy into the isolated residence.
+  Keep live prompts deterministic with exact sentinels, stop reasons, and
+  streamed-update assertions. Inspect the selected target's gates first.
 
 ## Security And Boundaries
 
-- **IMPORTANT**: Do not silently bypass permission prompts. The permission
-  bridge extension is the permission system for pi sessions; it is
-  load-bearing for user trust in this agent.
-- **IMPORTANT**: Launch pi children only with the scrubbed environment. pi
-  honors ambient provider API keys as live auth, so environment leaks are
-  credential leaks.
-- Never read from or write to the operator's real `~/.pi`; every session
-  gets an isolated agent directory.
-- Do not log auth material, user secrets, prompts, tool input, tool output,
-  or raw pi event bodies by default.
-- Credential files such as `auth.json` are injected at session start and
-  excluded from the session store. Explicit per-session `env`, including any
-  provider keys it carries, is recorded in lifecycle boundary rows, so every
-  session-store implementation must protect those rows as secret material.
+- The permission bridge is the session permission system. Never silently
+  bypass its prompts or fail-open on denied/cancelled dialogs.
+- Launch every pi child with the scrubbed environment. Ambient provider keys
+  are live authentication; preserve the allowlist and deliberate overlays.
+- Never discover the operator's `~/.pi` implicitly. Without `WithHome`, agent
+  directories are ephemeral. Ordinary execution supports a host-selected,
+  protected durable `Home`, shared under pi's native cross-process credential
+  lock; managed execution rejects it.
+- With a supplied `HostAuthority`, every native launch uses that authority and
+  never falls back to ordinary execution. Fully materialize before prepare;
+  prepared trees remain opaque until successful reclaim after terminal `Wait`.
+  Failed preparation remains host-owned. Pin managed handoff reads to a directory
+  disjoint from the complete scratch allocation domain before native work;
+  preserve the host filesystem assumptions in [security](docs/operations/security.mdx).
+- Keep the content-addressed extension source cache separate from secret-bearing
+  session configuration. Preserve source-byte, file-type, and POSIX ownership/
+  write-mode checks; Windows scratch protection is host-owned, without adapter
+  ACL inspection. See [cache rules](docs/operations/security.mdx#extension-source-cache).
+- Do not log auth material, secrets, prompts, tool input/output, or raw native
+  event bodies by default. `auth.json` is excluded from session storage, but
+  explicit per-session `env` is stored in lifecycle rows and may contain provider
+  keys; every store must protect those rows as secret material.
 - Reject unsupported ACP extension/provider mutation methods with explicit
-  protocol errors unless this agent implements a namespaced extension.
-- Avoid broad filesystem or network behavior in tests unless the test is
-  explicitly about that boundary.
+  protocol errors. Avoid broad test filesystem or network access unrelated to
+  the boundary being tested.

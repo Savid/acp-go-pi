@@ -54,17 +54,17 @@ func TestCaptureStartupDefaults(t *testing.T) {
 		},
 		{
 			name:     "empty file is pi's own defaults",
-			contents: ptr(""),
+			contents: new(""),
 			captured: map[string]json.RawMessage{},
 		},
 		{
 			name:     "null document is pi's own defaults",
-			contents: ptr("null"),
+			contents: new("null"),
 			captured: map[string]json.RawMessage{},
 		},
 		{
 			name:     "only the startup keys are captured",
-			contents: ptr(`{"defaultProvider":"openai","defaultModel":"gpt-5","theme":"dark"}`),
+			contents: new(`{"defaultProvider":"openai","defaultModel":"gpt-5","theme":"dark"}`),
 			captured: map[string]json.RawMessage{
 				"defaultProvider": json.RawMessage(`"openai"`),
 				"defaultModel":    json.RawMessage(`"gpt-5"`),
@@ -72,7 +72,7 @@ func TestCaptureStartupDefaults(t *testing.T) {
 		},
 		{
 			name:     "malformed settings fail closed",
-			contents: ptr(`{"defaultModel":`),
+			contents: new(`{"defaultModel":`),
 			wantErr:  "decode pi settings",
 		},
 	}
@@ -97,10 +97,6 @@ func TestCaptureStartupDefaults(t *testing.T) {
 			require.Equal(t, test.captured, captured.values)
 		})
 	}
-}
-
-func ptr(value string) *string {
-	return &value
 }
 
 // A launch must start on what the operator configured, so the keys pi persists

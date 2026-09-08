@@ -4,7 +4,19 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+
+	"github.com/savid/acp-go-pi/internal/pi"
 )
+
+func validateDefaultModel(model string) error {
+	if model == "" {
+		return nil
+	}
+
+	_, err := pi.ParseModelRef(model)
+
+	return err
+}
 
 func validateManagedHome(options Options) error {
 	if options.hostAuthoritySupplied && options.Home != "" {

@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -26,14 +27,16 @@ func TestSessionEnvAcceptsEveryStructurallyValidName(t *testing.T) {
 	simulateSessionEnvPlatform(t, "linux")
 
 	env := map[string]any{
-		"https_proxy":   "",
-		"no_proxy":      "",
-		"WAGIE_API_URL": "http://127.0.0.1:1",
-		"BASH_FUNC_x%%": "() { :; }",
-		"1A":            "leading digit",
-		"path":          "/not/the/search/path",
-		"env":           "/not/the/shell/init",
-		"ld_preload":    "/not/the/loader",
+		"https_proxy":         "",
+		"no_proxy":            "",
+		"WAGIE_API_URL":       "http://127.0.0.1:1",
+		"BASH_FUNC_x%%":       "() { :; }",
+		"1A":                  "leading digit",
+		"path":                "/not/the/search/path",
+		"env":                 "/not/the/shell/init",
+		"ld_preload":          "/not/the/loader",
+		"pi_coding_agent_dir": "/not/the/state/root",
+		"PI_OFFLINE":          "0",
 	}
 
 	options, err := piOptionsFromMeta(envMeta(env))
@@ -42,6 +45,40 @@ func TestSessionEnvAcceptsEveryStructurallyValidName(t *testing.T) {
 	require.Equal(t, "", options.Env["https_proxy"])
 	require.NoError(t, ValidatePiSessionMeta(envMeta(env)))
 	require.NoError(t, validateEnvironment(map[string]string{"PATH": "/base/bin", "path": "/own"}, optionFieldEnv, blockedAgentEnvKey))
+	require.NoError(t, validateEnvironment(map[string]string{envKeyAgentDir: "/ignored", "PI_OFFLINE": "0"}, optionFieldEnv, blockedAgentEnvKey))
+}
+
+func TestSessionEnvRejectsStateRootBeforeNativeLaunch(t *testing.T) {
+	for _, test := range []struct {
+		platform string
+		key      string
+	}{
+		{"linux", "PI_CODING_AGENT_DIR"},
+		{"windows", "PI_CODING_AGENT_DIR"},
+		{"windows", "pi_coding_agent_dir"},
+		{"windows", "Pi_Coding_Agent_Dir"},
+	} {
+		t.Run(test.platform+"/"+test.key, func(t *testing.T) {
+			simulateSessionEnvPlatform(t, test.platform)
+			client := newStubPiClient()
+			agent := newStubClientAgent(t, client)
+			starts := 0
+			agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+				starts++
+
+				return newStubProcess(false), client, nil
+			}
+
+			request := NewSessionRequest(testCwd, WithSessionPiOptions(NewPiOptions(
+				WithPiEnv(map[string]string{test.key: absTestPath("caller", "state")}),
+			)))
+			field := metaOptionPath(metaEnvKey) + "." + test.key
+			requireUnsupportedField(t, ValidatePiSessionMeta(request.Meta), field)
+			_, err := agent.NewSession(t.Context(), request)
+			requireUnsupportedField(t, err, field)
+			require.Zero(t, starts)
+		})
+	}
 }
 
 func TestSessionEnvRefusesStructurallyInvalidEntries(t *testing.T) {

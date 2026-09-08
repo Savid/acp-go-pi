@@ -130,6 +130,47 @@ func TestLoadCurrentStoreEntriesRequiresTheLastDurableBoundary(t *testing.T) {
 	})
 }
 
+func TestRestoreRejectsCorruptImageBeforeNativeLaunch(t *testing.T) {
+	for _, role := range []string{messageRoleAssistant, messageRoleToolResult} {
+		for _, method := range []string{"load", "resume", "fork"} {
+			t.Run(role+"/"+method, func(t *testing.T) {
+				store := NewInMemorySessionStore()
+				rows := []SessionStoreEntry{
+					json.RawMessage(`{"type":"session","id":"` + validSessionUUID + `"}`),
+					messageRow(t, pi.AgentMessage{
+						Role: role, ToolCallID: "tool",
+						Content: json.RawMessage(`[{"type":"image","data":"corrupt","mimeType":"image/png"}]`),
+					}),
+				}
+				require.NoError(t, store.Append(t.Context(), SessionKey{SessionID: validSessionUUID}, rows))
+				appendLifecycleBoundaryForRows(t, store, validSessionUUID, len(rows))
+				agent := NewAgent(WithSessionStore(store), WithLogger(slog.New(slog.DiscardHandler)))
+				agent.lookPath = func(string) (string, error) {
+					t.Fatal("corrupt artifact reached executable resolution")
+
+					return "", nil
+				}
+				var err error
+				switch method {
+				case "load":
+					_, err = agent.LoadSession(t.Context(), LoadSessionRequest(validSessionUUID, t.TempDir()))
+				case "resume":
+					_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest(validSessionUUID, t.TempDir()))
+				case "fork":
+					params, encodeErr := json.Marshal(ForkSessionRequest(validSessionUUID, t.TempDir()))
+					require.NoError(t, encodeErr)
+					_, err = agent.HandleExtensionMethod(t.Context(), ForkSessionMethod, params)
+				}
+				requireRestoreFailure(t, err)
+				stored, loadErr := store.Load(t.Context(), SessionKey{SessionID: validSessionUUID})
+				require.NoError(t, loadErr)
+				require.Equal(t, rows, stored)
+				require.NoError(t, agent.Close())
+			})
+		}
+	}
+}
+
 func TestLoadCurrentStoreEntriesReclaimsExpiredArtifacts(t *testing.T) {
 	now := time.Now().Truncate(time.Millisecond)
 	freezeImageArtifactClock(t, now)

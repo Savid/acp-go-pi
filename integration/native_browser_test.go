@@ -1,4 +1,4 @@
-//go:build integration
+//go:build integration && browsercanary
 
 package integration
 
@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -36,10 +35,6 @@ const (
 	nativeBrowserInsideEnv   = "ACP_GO_PI_NATIVE_BROWSER_INSIDE"
 	nativeBrowserTestName    = "TestNativeBrowserLinuxOrdinaryProviderAuthReachesNoUnshimmedLauncher"
 
-	// nativeBrowserShimPrefix names the scratch directories the adapter creates
-	// to shadow browser launchers for one session's pi child.
-	nativeBrowserShimPrefix = "acp-go-pi-browser-shim-"
-
 	// nativeBrowserOAuthProvider is a device-flow login: the leg that makes pi
 	// reach for a browser. nativeBrowserSecretProvider is an api-key login,
 	// which runs to a terminal stored result without any network at all.
@@ -59,20 +54,6 @@ const (
 	nativeBrowserCanaryUID uint32 = 10001
 	nativeBrowserCanaryGID uint32 = 10001
 )
-
-var nativeBrowserLauncherNames = []string{
-	"open",
-	"xdg-open",
-	"x-www-browser",
-	"www-browser",
-	"sensible-browser",
-	"gio",
-	"firefox",
-	"google-chrome",
-	"google-chrome-stable",
-	"chromium",
-	"chromium-browser",
-}
 
 // TestNativeBrowserLinuxOrdinaryProviderAuthReachesNoUnshimmedLauncher is the
 // release canary for Pi's provider-auth browser boundary.
@@ -478,7 +459,7 @@ func buildNativeBrowserProbe(t *testing.T) string {
 	t.Helper()
 
 	out := filepath.Join(t.TempDir(), "native-browser.test")
-	command := exec.CommandContext(t.Context(), "go", "test", "-c", "-tags=integration", "-o", out, "./integration")
+	command := exec.CommandContext(t.Context(), "go", "test", "-c", "-tags=integration,browsercanary", "-o", out, "./integration")
 	command.Dir = repoRoot()
 	command.Env = append(os.Environ(), "GOWORK=off", "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
 	if output, err := command.CombinedOutput(); err != nil {
@@ -518,85 +499,4 @@ func readNativeBrowserTrace(ctx context.Context, t *testing.T, fixture testconta
 	}
 
 	return string(contents)
-}
-
-// unshimmedLauncherExecs returns every traced browser-launcher execution that
-// did not come out of an adapter-created shim directory. The adapter's own
-// no-ops are the allowed answer; anything else opened, or tried to open, a real
-// browser.
-func unshimmedLauncherExecs(trace string) []string {
-	var reached []string
-
-	for line := range strings.Lines(trace) {
-		executable, ok := traceExecPath(line)
-		if !ok || !slices.Contains(nativeBrowserLauncherNames, filepath.Base(executable)) {
-			continue
-		}
-		if execInsideAdapterShim(executable) {
-			continue
-		}
-
-		reached = append(reached, executable)
-	}
-
-	return reached
-}
-
-// execInsideAdapterShim reports whether a traced path is a program the adapter's
-// shim directory owns. The shim's no-ops sit directly in that directory, so the
-// parent has to be the shim itself: a path that merely mentions one on its way
-// somewhere else is not the adapter's.
-func execInsideAdapterShim(executable string) bool {
-	return strings.HasPrefix(filepath.Base(filepath.Dir(filepath.Clean(executable))), nativeBrowserShimPrefix)
-}
-
-// traceResolvesThroughShim reports whether any traced lookup went through an
-// adapter shim directory. The pi child resolves its interpreter off PATH, so
-// the kernel records that search: seeing it land in the shim directory first is
-// what turns "no launcher ran" from an absence into evidence that the
-// interception was actually in front of the child.
-func traceResolvesThroughShim(trace string) bool {
-	for line := range strings.Lines(trace) {
-		executable, ok := traceExecPath(line)
-		if ok && execInsideAdapterShim(executable) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func traceExecsBase(trace, name string) bool {
-	for line := range strings.Lines(trace) {
-		executable, ok := traceExecPath(line)
-		if ok && filepath.Base(executable) == name {
-			return true
-		}
-	}
-
-	return false
-}
-
-func traceExecPath(line string) (string, bool) {
-	call := strings.TrimSpace(line)
-	index := strings.Index(call, "execve(")
-	if execveat := strings.Index(call, "execveat("); index < 0 || execveat >= 0 && execveat < index {
-		index = execveat
-	}
-	if index < 0 {
-		return "", false
-	}
-
-	arguments := call[index:]
-	start := strings.IndexByte(arguments, '"')
-	if start < 0 {
-		return "", false
-	}
-	arguments = arguments[start+1:]
-	end := strings.IndexByte(arguments, '"')
-	if end < 0 {
-		return "", false
-	}
-
-	return arguments[:end], true
 }

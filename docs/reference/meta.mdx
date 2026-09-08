@@ -130,6 +130,19 @@ session's one foreground, so it is reported as a foreground cycle and never as
 an `activity_update`. An absent capability omits the key from the response and
 leaves the extension dormant.
 
+Wire offers and prompt correlations require the exact integer token `1` for
+`version`. Repeated lifecycle members, including submission identifiers, are
+refused at the affected member path. A repeated lifecycle namespace or repeated
+`_meta` envelopes carrying it are ambiguous and fail at the bare lifecycle path,
+even if a later envelope would erase the earlier value. Foreign metadata keeps
+its normal decoding behavior. Construction errors retain precedence at
+initialize, and route errors retain precedence on prompts.
+
+Route and handoff numeric members are also read without rounding: versions must
+equal `1`, and handoff `sizeBytes` must be a nonnegative integer. Their integral
+decimal or exponent spellings remain accepted; lifecycle's exact-token and
+duplicate-member rules apply only to lifecycle metadata.
+
 Two events open a turn. A client prompt opens one with a `prompt_accepted`
 echoing its submission identity, followed by a `state_update` to `running`
 with `cause: "submission"`. Work pi begins on its own between prompts opens
@@ -272,7 +285,9 @@ request, so the first refusal is the same each time. A key is accepted when
 it is non-empty and free of `=` and NUL and its value is free of NUL; case is
 not a rule, so `https_proxy` and `HTTPS_PROXY` are two ordinary variables.
 Blocked names fail as `{"error":"unsupported","field":"_meta.pi.options.env.<key>"}`
-naming the key exactly as sent: `PATH`, `NODE_OPTIONS`, `BASH_ENV`, `ENV`, any `LD_` or `DYLD_` prefix, `ACP_GO_PI_EXTRA_PATH_DIRS`, and `ACP_GO_PI_INTERNAL_*`. All but the adapter's own
+naming the key exactly as sent: `PATH`, `PI_CODING_AGENT_DIR`, `NODE_OPTIONS`,
+`BASH_ENV`, `ENV`, any `LD_` or `DYLD_` prefix, `ACP_GO_PI_EXTRA_PATH_DIRS`, and
+`ACP_GO_PI_INTERNAL_*`. All but the adapter's own
 namespace compare through the platform identity, exact on Unix and
 case-insensitive on Windows; the adapter namespace is refused under every
 spelling. Two keys that resolve to one variable under that identity fail as
@@ -280,6 +295,11 @@ spelling. Two keys that resolve to one variable under that identity fail as
 An empty value is delivered as `KEY=`. `ValidatePiSessionMeta` runs this
 parsing on a `_meta` map without an agent, so a host can check a request
 before sending it.
+
+The adapter owns the final `PI_CODING_AGENT_DIR`; session metadata cannot
+select a different state root. Static `WithEnv` can carry that name, but the
+launcher replaces it with the adapter's selected directory. `PI_OFFLINE` is
+accepted in either overlay and is always replaced with `1` at launch.
 
 ## Update metadata
 

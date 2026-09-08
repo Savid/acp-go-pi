@@ -75,6 +75,8 @@ func (a *Agent) prepareNativeTree(ctx context.Context, root string) (err error) 
 		a.recordNativeContainment(err)
 	}()
 
+	a.managedHandoff.freeze()
+
 	err = a.options.HostAuthority.PrepareNativeTree(ctx, root)
 	if err != nil {
 		err = errors.Join(err, ErrContainmentIncomplete)

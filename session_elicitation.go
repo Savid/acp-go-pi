@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
@@ -115,13 +116,7 @@ func dialogAnswer(request pi.UIRequest, content map[string]any) (pi.UIResponse, 
 }
 
 func containsOption(options []string, value string) bool {
-	for _, option := range options {
-		if option == value {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(options, value)
 }
 
 func elicitationMessage(request pi.UIRequest) string {

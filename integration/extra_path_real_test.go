@@ -105,14 +105,15 @@ func TestPiRealExtraPathDirsSurviveNativeBashRewrite(t *testing.T) {
 
 func writePathCarrier(t *testing.T, dir string, marker string, forbidden ...string) {
 	t.Helper()
-	command := "#!/bin/sh\n" +
+	var command strings.Builder
+	command.WriteString("#!/bin/sh\n" +
 		"test \"${PATH%%:*}\" = " + shellSingleQuote(dir) + " || exit 91\n" +
-		"path_list=\":${PATH}:\"\n"
+		"path_list=\":${PATH}:\"\n")
 	for _, forbiddenDir := range forbidden {
-		command += "case \"${path_list}\" in *" + shellSingleQuote(":"+forbiddenDir+":") + "*) exit 92 ;; esac\n"
+		command.WriteString("case \"${path_list}\" in *" + shellSingleQuote(":"+forbiddenDir+":") + "*) exit 92 ;; esac\n")
 	}
-	command += "printf '%s' " + shellSingleQuote(marker) + "\n"
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "carrier-probe"), []byte(command), 0o700))
+	command.WriteString("printf '%s' " + shellSingleQuote(marker) + "\n")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "carrier-probe"), []byte(command.String()), 0o700))
 }
 
 func shellSingleQuote(value string) string {

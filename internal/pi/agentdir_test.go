@@ -150,6 +150,9 @@ func TestWriteSeedFilesPathValidation(t *testing.T) {
 		{name: "dot segment", path: "./settings.json"},
 		{name: "nul byte", path: "bad\x00name"},
 		{name: "colon segment", path: "c:evil"},
+		{name: "provenance manifest", path: seedManifestFileName},
+		{name: "backup sidecar", path: "settings.json" + seedBackupSuffix},
+		{name: "backup sidecar path alias", path: "settings.json" + seedBackupSuffix + "/"},
 	}
 
 	for _, test := range tests {
@@ -162,6 +165,9 @@ func TestWriteSeedFilesPathValidation(t *testing.T) {
 
 			err := writeSeedFiles(dir, map[string]string{test.path: "x"})
 			require.ErrorAs(t, err, &seedErr)
+			entries, readErr := os.ReadDir(dir)
+			require.NoError(t, readErr)
+			require.Empty(t, entries)
 		})
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,7 +49,8 @@ func TestStoreStartedSessionCloseErrorBranches(t *testing.T) {
 	replaceAgent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	replaceAgent.sessions["shared"] = attachTestNativeBoundary(&agentSession{agent: replaceAgent, id: "shared", proc: newFailingCloseProcess(), turn: make(chan struct{}, sessionTurnCapacity)})
 	replacement := &agentSession{agent: replaceAgent, id: "shared", turn: make(chan struct{}, sessionTurnCapacity)}
-	require.NoError(t, replaceAgent.storeStartedSession(t.Context(), replacement))
+	require.Error(t, replaceAgent.storeStartedSession(t.Context(), replacement))
+	require.NotSame(t, replacement, replaceAgent.sessions["shared"])
 }
 
 func TestRemoveSessionCloseError(t *testing.T) {
@@ -975,10 +977,10 @@ func TestCurrentUsageAndListPaginationHelpers(t *testing.T) {
 	past := encodeListCursor(len(infos) + 1)
 	_, _, err = paginateSessionInfos(infos, &past)
 	requireInvalidParams(t, err)
-	decoded, err = decodeListCursor(acp.Ptr(""))
+	decoded, err = decodeListCursor(new(""))
 	require.NoError(t, err)
 	require.Zero(t, decoded)
-	_, err = decodeListCursor(acp.Ptr("%%%"))
+	_, err = decodeListCursor(new("%%%"))
 	require.Error(t, err)
 }
 
@@ -1213,9 +1215,7 @@ func nativeSettingsWriter(t *testing.T, home string) (func(provider string, id s
 			require.NoError(t, json.Unmarshal(data, &settings))
 		}
 
-		for key, value := range values {
-			settings[key] = value
-		}
+		maps.Copy(settings, values)
 
 		encoded, err := json.Marshal(settings)
 		require.NoError(t, err)

@@ -144,6 +144,29 @@ func TestForkExtensionStoreLimitAfterNativeClone(t *testing.T) {
 	close(client.uiRequests)
 }
 
+func TestForkRejectsUnchangedNativeSessionID(t *testing.T) {
+	store := newFaultySessionStore()
+	rows := []SessionStoreEntry{
+		json.RawMessage(`{"type":"session","id":"` + string(forkParentID) + `"}`),
+		messageRow(t, pi.AgentMessage{Role: messageRoleUser, Content: json.RawMessage(`"hi"`)}),
+	}
+	appendForkParentRows(t, store, rows...)
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: string(forkParentID)}
+	agent := newStubClientAgent(t, client, WithSessionStore(store))
+	parent := &agentSession{agent: agent, id: forkParentID}
+	agent.sessions[parent.id] = parent
+
+	_, err := agent.handleForkSession(t.Context(), forkRaw(t, forkParams(t)))
+	requireInternalFailure(t, err, internalClassNativeStart)
+	require.Same(t, parent, agent.sessions[parent.id], "failed clone replaced its parent")
+	require.Len(t, agent.sessions, 1)
+	stored, err := store.Load(t.Context(), SessionKey{SessionID: string(parent.id)})
+	require.NoError(t, err)
+	require.Equal(t, rows, stored)
+	require.NoError(t, agent.Close())
+}
+
 func TestForkFailsClosedWhenOpeningCatalogIsRejected(t *testing.T) {
 	store := newFaultySessionStore()
 	appendForkParentRows(t, store,

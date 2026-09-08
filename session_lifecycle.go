@@ -155,10 +155,8 @@ func (s *agentSession) turnQueueLocked() chan struct{} {
 }
 
 func (s *agentSession) registerContainmentOutboxLocked(outbox *sessionOutbox) {
-	for _, registered := range s.containmentOutboxes {
-		if registered == outbox {
-			return
-		}
+	if slices.Contains(s.containmentOutboxes, outbox) {
+		return
 	}
 
 	s.containmentOutboxes = append(s.containmentOutboxes, outbox)

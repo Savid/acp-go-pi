@@ -52,10 +52,8 @@ type SessionStoreReplacement struct {
 //
 // A tombstone is final. Once Delete returns for a session's main key, no later
 // Append or Replace may make that session's rows readable again: an
-// implementation either refuses the write or keeps the tombstone standing
-// through it. The adapter serializes a delete after the settlement that could
-// still be writing, so a store that resurrected a tombstoned row would be
-// answering for a session the host was told is gone.
+// implementation writes nothing and returns success. Delete may race an
+// in-flight settlement, so the store itself must enforce the tombstone.
 type SessionStore interface {
 	Append(ctx context.Context, key SessionKey, entries []SessionStoreEntry) error
 	Load(ctx context.Context, key SessionKey) ([]SessionStoreEntry, error)

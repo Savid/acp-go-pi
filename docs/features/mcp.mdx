@@ -4,8 +4,8 @@ description: "Declare MCP servers on a session and control how they reach pi"
 ---
 
 pi deliberately ships no built-in MCP client — that too is left to extensions.
-The adapter supplies its own: a wrapper-owned, dependency-free pi extension
-(Node built-ins only, no package installs) that connects the session's
+The adapter supplies its own pi extension, using Node built-ins and packages
+supplied by the native installation, that connects the session's
 declared servers, discovers their tools, and registers each one as a pi tool.
 A host attaches MCP servers to a session by including them in the ACP session
 request; the adapter validates the declarations before pi launches.
@@ -38,14 +38,14 @@ servers := []acp.McpServer{
 
 ## How servers reach pi
 
-The adapter gives every session a private residence under its agent directory
-and writes that session's MCP config and wrapper extensions into it. Each file
-is published once and left read-only, and the residence is removed with the
-session. In ordinary mode, a configured `WithHome` makes every session share
-one agent directory, so the residence is what keeps one session's server commands,
-arguments, environment, and credential-bearing headers unreadable and
-unreplaceable by another. The extension connects to every declared server
-during lifecycle establishment.
+Each session's MCP config lives in its own `.acp-session/session-*` residence
+under the agent directory. It is published once, left read-only, and removed
+with that session. Wrapper extension sources instead live in the immutable
+content-addressed cache under `WithScratchDir`. Separate residences prevent
+sessions from overwriting one another's configuration; ordinary processes share
+the adapter account and are not isolated from one another's reads. Protect
+scratch and durable homes as described in [Security](/docs/operations/security).
+The extension connects to every declared server during lifecycle establishment.
 Because some hosts deliberately expose only a side-effect-free readiness
 surface until an operation is authorized, the adapter rebuilds pi's fixed
 extension-tool registry once more at the first user turn. Every tool then
@@ -57,16 +57,22 @@ authorized turn and discovers the active surface directly.
 Declared env vars are forwarded to stdio children and declared headers to HTTP
 servers. MCP tool calls run under the same
 [permission gate](/docs/features/permissions) as built-in tools, and an aborted
-turn cancels an in-flight MCP call promptly.
+turn cancels an in-flight MCP call promptly. Stdio cancellation sends a
+best-effort MCP cancellation notification; HTTP cancellation aborts the fetch.
+Both request transports have a 60-second timeout.
 
 A server that fails to connect at session start — an unreachable command, an
-HTTP 401 — fails the session request loudly with the real cause; the adapter
-never starts a session with a silently missing server.
+HTTP 401 — fails establishment with `pi_internal_failure`, class `native_start`.
+Native refusal text is not included in that closed wire error. A startup failure
+closes already-opened MCP transports.
 
 ## Scope
 
 Forwarding is tools-only, with one fixed registry established for user turns:
 
+- Discovery registers the first `tools/list` page; pagination is not followed.
+- HTTP accepts JSON or a completed SSE response body. It does not consume
+  indefinitely open event streams.
 - MCP **resources** and **prompts** are not projected into the session.
 - **Server-initiated requests** (sampling, server-side elicitation, roots) are
   not answered; a server that sends them will see them time out on its side.

@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 
 	"github.com/coder/acp-go-sdk"
+
+	"github.com/savid/acp-go-pi/internal/lifecycle"
 )
 
 const postResponseHookIDParam = "_acp_go_pi_post_response_hook_id"
@@ -234,6 +236,13 @@ func (c *localAgentConnection) enqueueLifecycleCommandHook(ctx context.Context, 
 				return
 			}
 
+			// Containment can cancel an admitted hook before it starts or
+			// between its opening updates. That retirement is normal; a
+			// deadline or a failed publication still reports its own error.
+			if err == context.Canceled && hookCtx.Err() == context.Canceled {
+				return
+			}
+
 			c.agent.log.ErrorContext(hookCtx, "post-response session open failed closed",
 				slog.String(jsonFieldMethod, method),
 				slog.String(acpFieldSessionID, string(sessionID)),
@@ -332,8 +341,18 @@ func tagPostResponseHookRequest(line []byte) []byte {
 	}
 
 	hookID, _ := json.Marshal(responseHookID(msg.ID))
-	params[postResponseHookIDParam] = hookID
-	msg.Params, _ = json.Marshal(params)
+	// Append the private tag without re-encoding request members: repeated
+	// metadata envelopes must remain visible to their owned validators.
+	rawParams := bytes.TrimSpace(msg.Params)
+
+	separator := ""
+	if len(params) > 0 {
+		separator = ","
+	}
+
+	msg.Params = append(bytes.Clone(rawParams[:len(rawParams)-1]), []byte(separator+`"`+postResponseHookIDParam+`":`)...)
+	msg.Params = append(msg.Params, hookID...)
+	msg.Params = append(msg.Params, '}')
 
 	tagged, _ := json.Marshal(msg)
 	if bytes.HasSuffix(line, []byte("\n")) {
@@ -501,7 +520,7 @@ func localNotification[Req any, ReqPtr localAgentParams[Req]](
 
 func decodeLocalAgentParams[Req any, ReqPtr localAgentParams[Req]](params json.RawMessage) (Req, *acp.RequestError) {
 	var value Req
-	if err := json.Unmarshal(params, &value); err != nil {
+	if err := json.Unmarshal(maskOwnedRequestParams(params, &value), &value); err != nil {
 		return value, unsupportedRequest(jsonFieldParams)
 	}
 
@@ -509,7 +528,51 @@ func decodeLocalAgentParams[Req any, ReqPtr localAgentParams[Req]](params json.R
 		return value, unsupportedRequest(jsonFieldParams)
 	}
 
+	preserveLifecycleRequestMeta(params, &value)
+
 	return value, nil
+}
+
+func preserveLifecycleRequestMeta(params json.RawMessage, value any) {
+	var meta *map[string]any
+
+	switch request := value.(type) {
+	case *acp.InitializeRequest:
+		meta = &request.Meta
+	case *acp.PromptRequest:
+		meta = &request.Meta
+		restoreWireNamespace(params, request.Meta, routeMetaKey)
+		restoreWireImages(params, request.Prompt)
+	case *acp.AuthenticateRequest:
+		meta = &request.Meta
+	case *acp.LogoutRequest:
+		meta = &request.Meta
+	case *acp.CancelNotification:
+		meta = &request.Meta
+		restoreWireNamespace(params, request.Meta, routeMetaKey)
+	case *acp.CloseSessionRequest:
+		meta = &request.Meta
+	case *acp.UnstableDeleteSessionRequest:
+		meta = &request.Meta
+	case *acp.ListSessionsRequest:
+		meta = &request.Meta
+	case *acp.LoadSessionRequest:
+		meta = &request.Meta
+	case *acp.NewSessionRequest:
+		meta = &request.Meta
+	case *acp.ResumeSessionRequest:
+		meta = &request.Meta
+	case *acp.SetSessionConfigOptionRequest:
+		if request.Boolean != nil {
+			meta = &request.Boolean.Meta
+		} else if request.ValueId != nil {
+			meta = &request.ValueId.Meta
+		}
+	}
+
+	if meta != nil {
+		*meta = lifecycle.PreserveRequestMeta(params, *meta)
+	}
 }
 
 func (c *localAgentConnection) CreateElicitation(

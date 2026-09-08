@@ -22,7 +22,7 @@ var marshalMCPConfig = json.MarshalIndent
 
 const (
 	// BridgeExtensionFileName is the wrapper-owned permission bridge
-	// extension written into each per-session agent directory.
+	// extension published in the shared source cache.
 	BridgeExtensionFileName = "acp-bridge.ts"
 	// MCPExtensionFileName is the wrapper-owned MCP client extension written
 	// when the session declares MCP servers.
@@ -232,9 +232,8 @@ type SessionResidenceFiles struct {
 // publishes everything it holds. The extension sources are the same bytes for
 // every session, so they live in the content-addressed store under extRoot
 // rather than here: a path minted per session would make pi compile them again
-// on every launch. What stays is the session's own MCP config, which no other
-// session may read. The residence is complete when it returns, so nothing ever
-// writes into it again.
+// on every launch. What stays is the session's own MCP config. The residence
+// is complete when it returns, so nothing ever writes into it again.
 func CreateSessionResidence(
 	extRoot string, agentDir string, mcp *MCPConfig,
 ) (*SessionResidence, SessionResidenceFiles, error) {

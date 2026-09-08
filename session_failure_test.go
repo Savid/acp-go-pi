@@ -38,7 +38,7 @@ func TestNativeFailureClassification(t *testing.T) {
 
 	process := newStubProcess(true)
 	process.waitErr = errors.New("exit 2")
-	process.stderr = " " + secret + " "
+	process.stderr = "earlier native diagnostic\n " + secret + " \n"
 	session.proc = process
 	data := requirePiTurnFailure(t, session.nativeTurnFailure(t.Context(), io.EOF), failureCauseProcessExit)
 	require.Equal(t, "pi process exited: exit 2: "+secret, data[jsonFieldMessage])
@@ -54,7 +54,7 @@ func TestNativeFailureClassification(t *testing.T) {
 
 // A native session start is off the prompt-turn path, so it carries the closed
 // internal-failure token with its documented class and no cause text at all.
-// The real native cause reaches the operator's log instead.
+// The operator's log also excludes native stderr and caller-owned error text.
 func TestNativeStartFailureUsesTheClosedInternalFailureShape(t *testing.T) {
 	const secret = "native-start-cause-secret-sentinel"
 
@@ -76,14 +76,15 @@ func TestNativeStartFailureUsesTheClosedInternalFailureShape(t *testing.T) {
 	startErr := agent.nativeStartFailure(t.Context(), failureCauseTransport, errors.New("start"), process)
 	requireInternalFailure(t, startErr, internalClassNativeStart)
 
-	// The driving error stays joined for adapter-internal callers, and the
-	// native cause is in the log rather than on the wire.
+	// The driving error stays joined for adapter-internal callers. Native
+	// stderr appears in neither the closed wire response nor the log.
 	require.ErrorContains(t, startErr, "start")
 
 	encoded, marshalErr := json.Marshal(startErr)
 	require.NoError(t, marshalErr)
 	require.NotContains(t, string(encoded), secret)
-	require.Contains(t, logs.String(), secret)
+	require.NotContains(t, logs.String(), secret)
+	require.Contains(t, logs.String(), failureCauseProcessExit)
 }
 
 // The client is told the native cause, never the unbounded stderr transcript

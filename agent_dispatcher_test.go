@@ -7,14 +7,17 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
+	"github.com/savid/acp-go-pi/internal/lifecycle"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -424,6 +427,27 @@ func TestLifecycleCommandHookErrors(t *testing.T) {
 	require.False(t, admitted)
 }
 
+func TestPostResponseOpenRetiredBeforeHookRuns(t *testing.T) {
+	logs := &lockedLogBuffer{}
+	agent := NewAgent(WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
+	generationCtx, cancelGeneration := context.WithCancel(t.Context())
+	defer cancelGeneration()
+	session := &agentSession{agent: agent, id: "session", outbox: newTestSessionOutbox(1)}
+	session.outbox.generationDone = generationCtx.Done()
+	agent.sessions[session.id] = session
+	conn := &localAgentConnection{agent: agent, hooks: &postResponseHooks{}}
+	conn.enqueueLifecycleCommandHook(t.Context(), acp.AgentMethodSessionLoad, json.RawMessage(
+		`{"sessionId":"session","_acp_go_pi_post_response_hook_id":"response"}`,
+	), nil)
+	cancelGeneration()
+	run, admitted := conn.hooks.all[0].admit()
+	require.True(t, admitted)
+	run()
+	require.Empty(t, logs.String())
+	require.False(t, session.opened)
+	require.NoError(t, session.outbox.producers.waitChildren(t.Context()))
+}
+
 func TestBlockedPostResponseHookCannotVetoCloseOrContinueAfterRelease(t *testing.T) {
 	originalWait := sessionCloseTurnWaitContext
 	sessionCloseTurnWaitContext = func(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -649,4 +673,217 @@ func TestLocalActionRequestsFailClosedAtTheWriteBarrier(t *testing.T) {
 			require.ErrorIs(t, <-acked, writeErr)
 		})
 	}
+}
+
+// lifecycleWireConnection exercises Serve and the SDK decoder over pipes. The
+// addressable session has no native process; every case stops at validation.
+func lifecycleWireConnection(t *testing.T, opts ...Option) *acp.Connection {
+	t.Helper()
+	previous := newServeAgent
+	t.Cleanup(func() { newServeAgent = previous })
+	var starts atomic.Int32
+	newServeAgent = func(options ...Option) *Agent {
+		agent := NewAgent(options...)
+		agent.sessions["session"] = &agentSession{agent: agent, id: "session"}
+		agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+			starts.Add(1)
+
+			return nil, nil, errAgentClosed
+		}
+
+		return agent
+	}
+
+	input, write := io.Pipe()
+	read, output := io.Pipe()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+	done := make(chan error, 1)
+	options := append([]Option{WithLogger(slog.New(slog.DiscardHandler)), WithScratchDir(t.TempDir())}, opts...)
+	go func() { done <- Serve(ctx, input, output, options...) }()
+	connection := acp.NewConnection(func(context.Context, string, json.RawMessage) (any, *acp.RequestError) {
+		return nil, nil
+	}, write, read)
+	connection.SetLogger(slog.New(slog.DiscardHandler))
+	t.Cleanup(func() {
+		_ = write.Close()
+		_ = input.Close()
+		_ = output.Close()
+		_ = read.Close()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			t.Error("Serve did not stop")
+		}
+		cancel()
+		require.Zero(t, starts.Load(), "validation launched a native process")
+	})
+
+	return connection
+}
+
+func TestServeLifecycleOfferRetainsWireValues(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		members string
+		field   string
+		offered bool
+	}{
+		{"valid", `"_meta":{"acp-go.dev/lifecycle":{"version":1}}`, "", true},
+		{"absent", `"_meta":{"foreign":{"version":2,"version":1}}`, "", false},
+		{"foreign duplicate envelopes", `"_meta":{"foreign":1},"_meta":{"foreign":2}`, "", false},
+		{"foreign duplicate beside offer", `"_meta":{"foreign":1,"foreign":2,"acp-go.dev/lifecycle":{"version":1}}`, "", true},
+		{"duplicate version", `"_meta":{"acp-go.dev/lifecycle":{"version":2,"version":1}}`, lifecycle.MetaPath + ".version", false},
+		{"rounded fraction", `"_meta":{"acp-go.dev/lifecycle":{"version":1.0000000000000001}}`, lifecycle.MetaPath + ".version", false},
+		{"overflow", `"_meta":{"acp-go.dev/lifecycle":{"version":1e400}}`, lifecycle.MetaPath + ".version", false},
+		{"SDK case alias", `"_META":{"acp-go.dev/lifecycle":{"version":2,"version":1}}`, lifecycle.MetaPath + ".version", false},
+		{"mixed case erased envelope", `"_META":{"acp-go.dev/lifecycle":{"version":1}},"_meta":null`, lifecycle.MetaPath, false},
+		{"decimal", `"_meta":{"acp-go.dev/lifecycle":{"version":1.0}}`, lifecycle.MetaPath + ".version", false},
+		{"exponent", `"_meta":{"acp-go.dev/lifecycle":{"version":1e0}}`, lifecycle.MetaPath + ".version", false},
+		{"unknown member", `"_meta":{"acp-go.dev/lifecycle":{"version":1,"extra":true}}`, lifecycle.MetaPath + ".extra", false},
+		{"nonobject", `"_meta":{"acp-go.dev/lifecycle":null}`, lifecycle.MetaPath, false},
+		{"duplicate namespace", `"_meta":{"acp-go.dev/lifecycle":{"version":2},"acp-go.dev/lifecycle":{"version":1}}`, lifecycle.MetaPath, false},
+		{"duplicate envelopes", `"_meta":{"acp-go.dev/lifecycle":{"version":2}},"_meta":{"acp-go.dev/lifecycle":{"version":1}}`, lifecycle.MetaPath, false},
+		{"erased envelope", `"_meta":{"acp-go.dev/lifecycle":{"version":1}},"_meta":null`, lifecycle.MetaPath, false},
+		{"offer after foreign envelope", `"_meta":{"foreign":1},"_meta":{"acp-go.dev/lifecycle":{"version":1}}`, lifecycle.MetaPath, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			connection := lifecycleWireConnection(t)
+			response, err := acp.SendRequest[acp.InitializeResponse](connection, t.Context(), acp.AgentMethodInitialize,
+				json.RawMessage(`{"protocolVersion":1,`+test.members+`}`))
+			if test.field != "" {
+				requireUnsupportedField(t, err, test.field)
+
+				return
+			}
+			require.NoError(t, err)
+			_, offered := response.Meta[lifecycleMetaKey]
+			require.Equal(t, test.offered, offered)
+		})
+	}
+}
+
+func TestServeLifecyclePromptRetainsWireValues(t *testing.T) {
+	const route = `"acp-go.dev/route":{"version":1,"turnNonce":"turn"}`
+	const submission = `"submission":{"submissionId":"submission","clientNonce":"nonce"}`
+	for _, test := range []struct {
+		name    string
+		members string
+		field   string
+	}{
+		{"valid reaches prompt validation", `"_meta":{` + route + `,"acp-go.dev/lifecycle":{"version":1,` + submission + `}}`, fieldPrompt},
+		{"rounded fraction", `"_meta":{` + route + `,"acp-go.dev/lifecycle":{"version":1.0000000000000001,` + submission + `}}`, lifecycle.MetaPath + ".version"},
+		{"duplicate version", `"_meta":{` + route + `,"acp-go.dev/lifecycle":{"version":2,"version":1,` + submission + `}}`, lifecycle.MetaPath + ".version"},
+		{"duplicate submission", `"_meta":{` + route + `,"acp-go.dev/lifecycle":{"version":1,"submission":null,` + submission + `}}`, lifecycle.MetaPath + ".submission"},
+		{"duplicate identifier", `"_meta":{` + route + `,"acp-go.dev/lifecycle":{"version":1,"submission":{"submissionId":"first","submissionId":"second","clientNonce":"nonce"}}}`, lifecycle.MetaPath + ".submission.submissionId"},
+		{"duplicate namespace", `"_meta":{` + route + `,"acp-go.dev/lifecycle":null,"acp-go.dev/lifecycle":{"version":1,` + submission + `}}`, lifecycle.MetaPath},
+		{"erased envelope", `"_meta":{"acp-go.dev/lifecycle":{"version":1,` + submission + `}},"_meta":null,"_meta":{` + route + `}`, lifecycle.MetaPath},
+		{"route wins", `"_meta":{"acp-go.dev/route":{"version":2,"turnNonce":"turn"},"acp-go.dev/lifecycle":{"version":2,"version":1}}`, routeMetaPath + ".version"},
+		{"route wins over overflow", `"_meta":{"acp-go.dev/route":{"version":2,"turnNonce":"turn"},"acp-go.dev/lifecycle":{"version":1e400}}`, routeMetaPath + ".version"},
+		{"foreign duplicate", `"_meta":{` + route + `,"foreign":{"x":1,"x":2},"acp-go.dev/lifecycle":{"version":1,` + submission + `}}`, fieldPrompt},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			connection := lifecycleWireConnection(t)
+			_, err := acp.SendRequest[acp.InitializeResponse](connection, t.Context(), acp.AgentMethodInitialize, lifecycleInitializeRequest())
+			require.NoError(t, err)
+			_, err = acp.SendRequest[acp.PromptResponse](connection, t.Context(), acp.AgentMethodSessionPrompt,
+				json.RawMessage(`{"sessionId":"session","prompt":[],`+test.members+`}`))
+			requireUnsupportedField(t, err, test.field)
+		})
+	}
+}
+
+func TestServeLifecycleWirePreservesConstructionPrecedence(t *testing.T) {
+	connection := lifecycleWireConnection(t, WithDefaultModel("malformed"))
+	_, err := acp.SendRequest[acp.InitializeResponse](connection, t.Context(), acp.AgentMethodInitialize,
+		json.RawMessage(`{"protocolVersion":1,"_meta":{"acp-go.dev/lifecycle":{"version":1e400}}}`))
+	requireClosedInternalError(t, err, invalidOptionsError)
+}
+
+func TestServeLifecycleCannotBeErasedOnForbiddenSurfaces(t *testing.T) {
+	for _, test := range []struct {
+		method string
+		fields string
+	}{
+		{acp.AgentMethodAuthenticate, `"methodId":"provider",`},
+		{acp.AgentMethodLogout, ""},
+		{acp.AgentMethodSessionClose, `"sessionId":"session",`},
+		{acp.AgentMethodSessionDelete, `"sessionId":"session",`},
+		{acp.AgentMethodSessionList, ""},
+		{acp.AgentMethodSessionNew, `"cwd":"/workspace","mcpServers":[],`},
+		{acp.AgentMethodSessionLoad, `"sessionId":"session","cwd":"/workspace","mcpServers":[],`},
+		{acp.AgentMethodSessionResume, `"sessionId":"session","cwd":"/workspace","mcpServers":[],`},
+		{acp.AgentMethodSessionSetConfigOption, `"sessionId":"session","configId":"model","value":"provider/model",`},
+		{ForkSessionMethod, `"sessionId":"session","cwd":"/workspace","mcpServers":[],`},
+		{"_unknown", ""},
+	} {
+		t.Run(test.method, func(t *testing.T) {
+			connection := lifecycleWireConnection(t)
+			_, err := acp.SendRequest[acp.InitializeResponse](connection, t.Context(), acp.AgentMethodInitialize, defaultInitializeRequest())
+			require.NoError(t, err)
+			_, err = acp.SendRequest[json.RawMessage](connection, t.Context(), test.method,
+				json.RawMessage(`{`+test.fields+`"_meta":{"acp-go.dev/lifecycle":{"version":1}},"_meta":null}`))
+			requireUnsupportedField(t, err, lifecycle.MetaPath)
+		})
+	}
+}
+
+func TestServeRouteNumbersRemainExact(t *testing.T) {
+	for _, version := range []string{"1", "1.0", "1e0", "0.1e1", "1.0000000000000001", "1e400", "-1e-400"} {
+		t.Run(version, func(t *testing.T) {
+			connection := lifecycleWireConnection(t)
+			_, err := acp.SendRequest[acp.InitializeResponse](connection, t.Context(), acp.AgentMethodInitialize, defaultInitializeRequest())
+			require.NoError(t, err)
+			_, err = acp.SendRequest[acp.PromptResponse](connection, t.Context(), acp.AgentMethodSessionPrompt,
+				json.RawMessage(`{"sessionId":"session","prompt":[],"_meta":{"acp-go.dev/route":{"version":`+version+`,"turnNonce":"turn"}}}`))
+			field := routeMetaPath + ".version"
+			if version == "1" || version == "1.0" || version == "1e0" || version == "0.1e1" {
+				field = fieldPrompt
+			}
+			requireUnsupportedField(t, err, field)
+		})
+	}
+}
+
+func TestServeHandoffNumbersRemainExact(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		version string
+		size    string
+		data    string
+		verdict string
+	}{
+		{"fractional version", "1.0000000000000001", "1", "", imageErrorInvalidHandoff},
+		{"overflow version", "1e400", "1", "", imageErrorInvalidHandoff},
+		{"fractional size", "1", "1.0000000000000001", "", imageErrorInvalidHandoff},
+		{"negative underflow", "1", "-1e-400", "", imageErrorInvalidHandoff},
+		{"overflow size", "1", "1e400", "", imageErrorInvalidHandoff},
+		{"decimal integer spellings", "1.0", "1.0", "", imageErrorMissingFile},
+		{"exponent integer spellings", "1e0", "1e0", "", imageErrorMissingFile},
+		{"duplicate versions keep SDK behavior", `2,"version":1`, "1", "", imageErrorMissingFile},
+		{"duplicate sizes keep SDK behavior", "1", `2,"sizeBytes":1`, "", imageErrorMissingFile},
+		{"largest integer reaches size gate", "1", "9223372036854775807", "", imageErrorTooLarge},
+		{"integer beyond size representation", "1", "9223372036854775808", "", imageErrorInvalidHandoff},
+		{"embedded data dominates", "1e400", "-1e-400", "!invalid!", imageErrorInvalidBase64},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			connection := lifecycleWireConnection(t, WithInputHandoffRoot(root))
+			_, err := acp.SendRequest[acp.InitializeResponse](connection, t.Context(), acp.AgentMethodInitialize, defaultInitializeRequest())
+			require.NoError(t, err)
+			uri, err := json.Marshal(fileURIFor(filepath.Join(root, "missing.png")))
+			require.NoError(t, err)
+			_, err = acp.SendRequest[acp.PromptResponse](connection, t.Context(), acp.AgentMethodSessionPrompt,
+				json.RawMessage(`{"sessionId":"session","_meta":{"acp-go.dev/route":{"version":1,"turnNonce":"turn"}},`+
+					`"prompt":[{"type":"image","mimeType":"image/png","data":"`+test.data+`","uri":`+string(uri)+
+					`,"_meta":{"acp-go.dev/handoff":{"version":`+test.version+`,"sizeBytes":`+test.size+`,"digest":"`+strings.Repeat("0", 64)+`"}}}]}`))
+			requireImageParamError(t, err, test.verdict, 0)
+		})
+	}
+}
+
+func TestServeForeignNumericOverflowKeepsSDKRefusal(t *testing.T) {
+	connection := lifecycleWireConnection(t)
+	_, err := acp.SendRequest[acp.InitializeResponse](connection, t.Context(), acp.AgentMethodInitialize,
+		json.RawMessage(`{"protocolVersion":1,"_meta":{"foreign":{"version":1e400}}}`))
+	requireUnsupportedField(t, err, jsonFieldParams)
 }

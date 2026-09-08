@@ -110,6 +110,9 @@ type promptImageBudget struct {
 	// every handoff open in that prompt is relative to one kernel-checked
 	// descriptor.
 	root *os.Root
+	// Managed mappings borrow the Agent's disjoint root until mapping finishes.
+	managedHandoff     *managedHandoffRoot
+	releaseHandoffRoot func()
 }
 
 func newPromptImageBudget(limits ImageLimits, handoffRoot string) *promptImageBudget {

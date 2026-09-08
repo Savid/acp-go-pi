@@ -37,7 +37,8 @@ The adapter launches `pi` from `PATH` unless a host provides `-path`
 parent directory under which the adapter creates ephemeral session state. By
 default each session receives a private Pi agent directory. Configure `-home`
 only when the instance needs a durable Pi-native credential residence, such as
-for the provider-auth broker; never point it at the operator's real `~/.pi`.
+for the provider-auth broker. The host must explicitly select and protect that
+durable directory; the adapter never discovers the operator's Pi home.
 The launched CLI must be pi **0.80.6 or newer**; the adapter probes
 `pi --version` at startup and fails fast on older builds. Install pi itself
 from npm:

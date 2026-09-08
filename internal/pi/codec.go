@@ -1,7 +1,7 @@
 // Package pi implements the native boundary to the pi coding agent CLI:
-// launching `pi --mode rpc` processes with isolated per-session agent
-// directories, speaking pi's LF-delimited JSONL RPC protocol, and authoring
-// the wrapper-owned extension and configuration files each session needs.
+// launching per-session `pi --mode rpc` processes with ephemeral or explicitly
+// configured durable agent directories, speaking LF-delimited JSONL RPC, and
+// authoring the wrapper-owned extension and configuration files each session needs.
 package pi
 
 import (

@@ -329,12 +329,16 @@ func resolveSeedFilePath(dir string, name string) (string, error) {
 }
 
 func validSeedFilePath(name string) bool {
+	cleanName := filepath.Clean(filepath.FromSlash(name))
+
 	if strings.TrimSpace(name) == "" ||
 		filepath.IsAbs(name) ||
 		strings.HasPrefix(name, "/") ||
 		strings.HasPrefix(name, "\\") ||
 		strings.Contains(name, "\x00") ||
-		filepath.VolumeName(name) != "" {
+		filepath.VolumeName(name) != "" ||
+		cleanName == seedManifestFileName ||
+		strings.HasSuffix(cleanName, seedBackupSuffix) {
 		return false
 	}
 

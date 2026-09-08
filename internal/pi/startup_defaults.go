@@ -179,7 +179,7 @@ func readAgentSettings(path string) (map[string]json.RawMessage, error) {
 func lockAgentSettings(path string) (func(), error) {
 	lock := path + settingsLockSuffix
 
-	for attempt := 0; attempt < settingsLockAttempts; attempt++ {
+	for range settingsLockAttempts {
 		err := fsMkdir(lock, 0o700)
 		if err == nil {
 			return func() { _ = fsRemove(lock) }, nil
