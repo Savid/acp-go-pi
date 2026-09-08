@@ -18,8 +18,9 @@ agent := piacp.NewAgent(
 )
 ```
 
-The CLI equivalents are `-home` and `-provider-auth-root`. Both paths must be
-owned by the service deployment, never the operator's real `~/.pi`. The home is
+The CLI equivalents are `-home` and `-provider-auth-root`. Choose durable paths
+the host explicitly owns and protects; the adapter never discovers a Pi home
+implicitly. The home is
 Pi's `PI_CODING_AGENT_DIR`, including its native `auth.json`, catalog behavior,
 and cross-process credential lock. The ledger records only provider,
 connection, revision, binding generation, flow identifiers, state, and

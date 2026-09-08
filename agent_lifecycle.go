@@ -88,7 +88,7 @@ func refuseLifecycleRawMeta(params json.RawMessage) error {
 		return nil //nolint:nilerr // The route's decoder reports malformed JSON.
 	}
 
-	if _, present := envelope.Meta[lifecycleMetaKey]; !present {
+	if _, present := lifecycle.PreserveRequestMeta(params, nil)[lifecycleMetaKey]; !present {
 		return nil
 	}
 

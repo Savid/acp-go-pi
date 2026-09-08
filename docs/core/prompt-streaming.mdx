@@ -109,8 +109,8 @@ An image block's bytes arrive in one of two forms, chosen per block:
   `WithInputHandoffRoot` is configured, which is also the condition under
   which the handoff capability is advertised.
 
-A block with empty `data` and neither signal is `missing_data`, exactly as
-before; `invalid_handoff` never claims a plain empty-data block.
+A block with empty `data` and neither signal is `missing_data`;
+`invalid_handoff` never claims a plain empty-data block.
 
 Handoff blocks resolve and verify before any embedded-form gate runs, first
 failure winning:

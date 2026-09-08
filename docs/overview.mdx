@@ -14,15 +14,16 @@ terminal UI.
 The adapter is a thin translation layer between ACP and the local `pi` CLI in
 RPC mode. It owns:
 
-- ACP protocol mapping and the pi subprocess lifecycle (one long-lived
-  `pi --mode rpc` process per ACP session, each in an isolated per-session
-  agent directory with a scrubbed environment).
+- ACP protocol mapping and per-session `pi --mode rpc` processes with scrubbed
+  environments. Agent directories are ephemeral by default; ordinary execution
+  can use an explicitly configured durable `Home`.
 - Streaming pi's JSONL RPC events into ACP session updates.
 - The permission and elicitation dialogs themselves — pi deliberately ships no
   built-in permission system, so the adapter supplies one through a
   wrapper-owned pi extension.
 - The MCP client — pi deliberately ships no built-in MCP support, so the
-  adapter supplies a dependency-free pi extension that connects the session's
+  adapter supplies a pi extension using the native installation's dependencies
+  to connect the session's
   declared MCP servers.
 - Model configuration, slash-command projection, optional raw events, and
   optional durable session storage.

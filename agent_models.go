@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -290,7 +291,7 @@ func sessionConfigOptions(session *agentSession) []acp.SessionConfigOption {
 				Select: &acp.SessionConfigOptionSelect{
 					Id:           configModel,
 					Name:         "Model",
-					Category:     configCategory(acp.SessionConfigOptionCategoryModel),
+					Category:     new(acp.SessionConfigOptionCategoryModel),
 					CurrentValue: acp.SessionConfigValueId(model),
 					Options: acp.SessionConfigSelectOptions{
 						Ungrouped: &values,
@@ -306,7 +307,7 @@ func sessionConfigOptions(session *agentSession) []acp.SessionConfigOption {
 			Select: &acp.SessionConfigOptionSelect{
 				Id:           configThoughtLevel,
 				Name:         "Thought Level",
-				Category:     configCategory(acp.SessionConfigOptionCategoryThoughtLevel),
+				Category:     new(acp.SessionConfigOptionCategoryThoughtLevel),
 				CurrentValue: acp.SessionConfigValueId(thinkingLevel),
 				Options: acp.SessionConfigSelectOptions{
 					Ungrouped: &values,
@@ -334,7 +335,7 @@ func sessionUnstableConfigOptions(session *agentSession) []acp.UnstableSessionCo
 					Id:           configModel,
 					Name:         "Model",
 					Type:         configTypeSelect,
-					Category:     configCategory(acp.SessionConfigOptionCategoryModel),
+					Category:     new(acp.SessionConfigOptionCategoryModel),
 					CurrentValue: acp.SessionConfigValueId(model),
 					Options: acp.SessionConfigSelectOptions{
 						Ungrouped: &values,
@@ -351,7 +352,7 @@ func sessionUnstableConfigOptions(session *agentSession) []acp.UnstableSessionCo
 				Id:           configThoughtLevel,
 				Name:         "Thought Level",
 				Type:         configTypeSelect,
-				Category:     configCategory(acp.SessionConfigOptionCategoryThoughtLevel),
+				Category:     new(acp.SessionConfigOptionCategoryThoughtLevel),
 				CurrentValue: acp.SessionConfigValueId(thinkingLevel),
 				Options: acp.SessionConfigSelectOptions{
 					Ungrouped: &values,
@@ -460,21 +461,13 @@ func piModelInfoMeta(info *pi.Model) map[string]any {
 	return map[string]any{piMetaKey: piMeta}
 }
 
-func configCategory(category acp.SessionConfigOptionCategory) *acp.SessionConfigOptionCategory {
-	return &category
-}
-
 func selectPositionEncoding(encodings []acp.PositionEncodingKind) acp.PositionEncodingKind {
-	for _, encoding := range encodings {
-		if encoding == acp.PositionEncodingKindUtf8 {
-			return acp.PositionEncodingKindUtf8
-		}
+	if slices.Contains(encodings, acp.PositionEncodingKindUtf8) {
+		return acp.PositionEncodingKindUtf8
 	}
 
-	for _, encoding := range encodings {
-		if encoding == acp.PositionEncodingKindUtf16 {
-			return acp.PositionEncodingKindUtf16
-		}
+	if slices.Contains(encodings, acp.PositionEncodingKindUtf16) {
+		return acp.PositionEncodingKindUtf16
 	}
 
 	return acp.PositionEncodingKindUtf16

@@ -46,6 +46,10 @@ type piPrompt struct {
 // path itself never leaves the validation read. Image validation is
 // deterministic and stops on the first failing block in request order.
 func promptToPi(ctx context.Context, prompt []acp.ContentBlock, limits ImageLimits, handoffRoot string) (piPrompt, error) {
+	return mapPiPrompt(ctx, prompt, newPromptImageBudget(limits, handoffRoot))
+}
+
+func mapPiPrompt(ctx context.Context, prompt []acp.ContentBlock, budget *promptImageBudget) (piPrompt, error) {
 	if len(prompt) == 0 {
 		return piPrompt{}, unsupportedField(fieldPrompt)
 	}
@@ -53,7 +57,6 @@ func promptToPi(ctx context.Context, prompt []acp.ContentBlock, limits ImageLimi
 	textParts := make([]string, 0, len(prompt))
 	contextParts := make([]string, 0)
 	images := make([]pi.ImageContent, 0)
-	budget := newPromptImageBudget(limits, handoffRoot)
 
 	defer budget.closeHandoffRoot()
 
@@ -198,7 +201,10 @@ func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 
 	defer releaseTurn()
 
-	mapped, err := promptToPi(ctx, params.Prompt, s.agent.imageLimits(), s.agent.inputHandoffRoot())
+	budget := newPromptImageBudget(s.agent.imageLimits(), s.agent.inputHandoffRoot())
+	budget.managedHandoff = s.agent.managedHandoff
+
+	mapped, err := mapPiPrompt(ctx, params.Prompt, budget)
 	if err != nil {
 		return acp.PromptResponse{}, err
 	}
@@ -709,8 +715,8 @@ func mergeTurnUsage(total *acp.Usage, next *pi.Usage) *acp.Usage {
 
 	if total == nil {
 		total = &acp.Usage{
-			CachedReadTokens:  acp.Ptr(0),
-			CachedWriteTokens: acp.Ptr(0),
+			CachedReadTokens:  new(0),
+			CachedWriteTokens: new(0),
 		}
 	}
 

@@ -12,6 +12,7 @@ package piacp
 import (
 	"context"
 	"errors"
+	"maps"
 	"testing"
 	"time"
 
@@ -652,9 +653,7 @@ func TestCallbackAddressingFailures(t *testing.T) {
 		func(p map[string]any) { p["extra"] = 1 },
 	} {
 		params := map[string]any{}
-		for key, value := range base {
-			params[key] = value
-		}
+		maps.Copy(params, base)
 
 		mutate(params)
 
@@ -663,9 +662,7 @@ func TestCallbackAddressingFailures(t *testing.T) {
 	}
 
 	unknownSession := map[string]any{}
-	for key, value := range base {
-		unknownSession[key] = value
-	}
+	maps.Copy(unknownSession, base)
 
 	unknownSession[authFieldSessionID] = "missing"
 	_, err := harness.call(t.Context(), AuthCallbackMethod, unknownSession)
@@ -738,9 +735,7 @@ func TestStatusRejectsBadParams(t *testing.T) {
 
 	for _, field := range []string{authFieldSessionID, authFieldProviderID, authFieldFlowID} {
 		params := map[string]any{}
-		for key, value := range base {
-			params[key] = value
-		}
+		maps.Copy(params, base)
 
 		delete(params, field)
 

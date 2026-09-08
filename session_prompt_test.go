@@ -403,31 +403,23 @@ func TestPromptTransportEndReturnsContainmentProofFailure(t *testing.T) {
 func TestPromptHandleTurnEventEmitFailure(t *testing.T) {
 	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
 	connection := newDirectAgentClient()
-	connection.updateErr = errors.New("emit")
+	want := errors.New("emit")
+	connection.updateErr = want
 	agent.setConnection(connection)
-	client := newStubPiClient()
-	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
-	startTestPump(session, client)
-	t.Cleanup(session.stopPump)
+	session := &agentSession{agent: agent, id: "id"}
+	delivery := &turnDelivery{events: make(chan pi.Event, 1)}
+	delivery.events <- pi.ToolExecutionStartEvent{ToolCallID: "call", ToolName: "bash"}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
 
-	go func() {
-		deadline := time.Now().Add(2 * time.Second)
-		for session.activeTurnDelivery() == nil {
-			if time.Now().After(deadline) {
-				return
-			}
-
-			time.Sleep(time.Millisecond)
-		}
-
-		select {
-		case client.events <- pi.ToolExecutionStartEvent{ToolCallID: "call", ToolName: "bash"}:
-		case <-time.After(2 * time.Second):
-		}
-	}()
-
-	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "test-turn", "hi"))
-	require.Error(t, err)
+	outcome := session.runPromptTurn(ctx, nil, delivery, &promptTurnState{})
+	require.ErrorIs(t, outcome.failure, want)
+	require.False(t, outcome.settled)
+	require.False(t, outcome.transportEnded)
+	state := session.lockToolCallState("call")
+	defer state.mu.Unlock()
+	require.False(t, state.published, "failed tool start was marked delivered")
+	require.False(t, state.nativeStartPublished)
 }
 
 func TestMessageEndIdentityEmitFailure(t *testing.T) {

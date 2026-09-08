@@ -52,6 +52,8 @@ func (a *Agent) startAuthorityPiProcess(ctx context.Context, spec pi.LaunchSpec)
 		return nil, nil, errors.Join(boundary, ErrContainmentIncomplete)
 	}
 
+	a.managedHandoff.freeze()
+
 	request := NativeRequest{
 		Executable: spec.ExecutablePath, Arguments: spec.Args(), Environment: spec.Environ(), WorkingDirectory: spec.Cwd,
 	}

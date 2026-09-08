@@ -11,12 +11,8 @@ import (
 )
 
 // TestPublishSharedExtensionsAdmitsModesWindowsCannotDescribe is the Windows
-// half of the store's write rule. Go reports 0777 for every writable directory
-// on this platform and 0666 for every writable file, so a group-and-world
-// write-bit test refused every path the store creates, and since every session
-// launch publishes these sources first, no session could open at all.
-// Confinement here is the ACL the scratch parent inherits from the user
-// profile, which is the standing the ownership check already has.
+// mode-compatibility proof. Go's synthetic writable mode bits must not refuse
+// cache reuse. This test does not inspect ACLs or prove write exclusivity.
 func TestPublishSharedExtensionsAdmitsModesWindowsCannotDescribe(t *testing.T) {
 	t.Parallel()
 
@@ -28,7 +24,7 @@ func TestPublishSharedExtensionsAdmitsModesWindowsCannotDescribe(t *testing.T) {
 	info, err := os.Stat(filepath.Dir(published.bridge))
 	require.NoError(t, err)
 	require.NotZero(t, info.Mode().Perm()&sharedExtensionLooseModeBits,
-		"the mode this platform reports is what the removed comparison read")
+		"Windows reports synthetic group/world write bits")
 
 	// Republishing re-runs the guard over what the first call left behind, so
 	// a reused store is admitted rather than refused.

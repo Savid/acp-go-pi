@@ -2,11 +2,38 @@ package piacp
 
 import (
 	"encoding/json"
+	"log/slog"
+	"path/filepath"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 )
+
+func TestInvalidConstructionPrecedesNativeMaterialization(t *testing.T) {
+	for _, option := range []Option{
+		WithDefaultModel("invalid-model"),
+		WithEnv(map[string]string{"NODE_OPTIONS": "forbidden"}),
+	} {
+		root := t.TempDir()
+		home := filepath.Join(root, "native")
+		ledger := filepath.Join(root, "ledger")
+		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithHome(home), WithProviderAuthRoot(ledger), option)
+		_, err := agent.Initialize(t.Context(), defaultInitializeRequest())
+		requireClosedInternalError(t, err, invalidOptionsError)
+		_, err = agent.NewSession(t.Context(), NewSessionRequest(root))
+		requireClosedInternalError(t, err, invalidOptionsError)
+		_, err = agent.LoadSession(t.Context(), LoadSessionRequest(validSessionUUID, root))
+		requireClosedInternalError(t, err, invalidOptionsError)
+		_, err = agent.ResumeSession(t.Context(), ResumeSessionRequest(validSessionUUID, root))
+		requireClosedInternalError(t, err, invalidOptionsError)
+		_, err = agent.HandleExtensionMethod(t.Context(), ForkSessionMethod, forkRaw(t, ForkSessionRequest(validSessionUUID, root)))
+		requireClosedInternalError(t, err, invalidOptionsError)
+		require.NoDirExists(t, home)
+		require.NoDirExists(t, ledger)
+		require.NoError(t, agent.Close())
+	}
+}
 
 func TestPathValidationHelpers(t *testing.T) {
 	require.Error(t, validateRequiredAbsolutePath("cwd", ""))

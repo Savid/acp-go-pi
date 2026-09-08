@@ -191,11 +191,9 @@ func TestAgentCloseIsSingleflightAndMemoizesResult(t *testing.T) {
 	errs := make(chan error, callers)
 	var group sync.WaitGroup
 	for range callers {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			errs <- agent.Close()
-		}()
+		})
 	}
 	group.Wait()
 	close(errs)
@@ -594,7 +592,7 @@ func ordinaryLaunches(t *testing.T, record string) []ordinaryLaunch {
 
 	launches := make([]ordinaryLaunch, 0, 4)
 
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
 		if line == "" {
 			continue
 		}

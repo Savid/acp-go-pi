@@ -3,10 +3,10 @@ title: "Session Store"
 description: "Wire a durable store so pi sessions survive beyond their isolated session directories"
 ---
 
-By default a session's pi session file lives only in that session's isolated
-directory. Provide a `SessionStore` when the host needs sessions to resume
-from its own storage — for example a database or object store on a different
-machine.
+Every agent has a `SessionStore`; the default is a fresh in-memory store.
+Provide a durable implementation when sessions must survive an adapter restart
+or resume on another machine. Native session files are a cache, and a file
+without a live store entry is not a discoverable or resumable session.
 
 ## Wiring a store
 
@@ -24,11 +24,14 @@ err := piacp.Serve(ctx, input, output,
 ```
 
 After each native `agent_settled` fence the adapter appends the session file's new JSONL rows
-to the store verbatim — the raw native bytes, header row first — backs
+to the store, trimming surrounding whitespace and retaining each JSON value,
+header row first. The adapter backs
 `session/list` from the store, and hydrates stored rows back into an isolated
 session directory when the local file is missing. Because the ACP session id
 is pi's own session UUID (it lives in the header row), a restored session
-keeps its id and full history.
+keeps its id and full history. Managed execution contains and reclaims the
+generation before reading its session file. `agent_settled` describes the
+foreground loop; it does not prove background-work quiescence.
 
 The fence applies to natively settled success, provider-error, and explicit
 user-cancel turns: their durable state is mirrored before the ACP terminal
@@ -59,7 +62,7 @@ A store implements six methods:
 | `Append` | Append session JSONL rows for a key. |
 | `Load` | Read all rows for a key. |
 | `Replace` | Atomically replace a full generation of a session's files. |
-| `Delete` | Remove a key (and its subkeys for the main key). |
+| `Delete` | Durably tombstone a key, cascading to all subkeys for the main key. |
 | `ListSessions` | Enumerate sessions for `session/list`. |
 | `ListSubkeys` | Enumerate a session's non-main subpaths. |
 
@@ -79,33 +82,29 @@ log with no lifecycle boundary, a row count the boundary disagrees with, or a
 stored image artifact the bounded artifact window can no longer reproduce —
 fails `session/load`, `session/resume`, and `_pi/session/fork` with `-32603`
 `{"error":"pi_restore_failed"}`. The entry is neither deleted nor tombstoned,
-so the store keeps exactly what it held; why the restore refused is in the
-adapter log. A stored *configuration* this adapter refuses to resume under is a
+and corrupt artifacts are not rewritten. Expired output bytes are reclaimed
+from their existing rows on access, and the restore fails. All three restore
+routes validate output images before native launch. A stored configuration
+this adapter refuses to resume under is a
 different verdict and keeps its `-32602` invalid-params error naming the field.
 Session summaries report `UpdatedAtUnixMilli` in Unix milliseconds.
 
 ### `Replace` is one session's generation
 
-Every `Replace` commits exactly one session, addressed by its `main` key. A
-host store MUST enforce all three rules below, and MUST reach each verdict
-**over the whole call before it writes anything**, so a refused `Replace`
-leaves the store byte-for-byte as it was — not even the replacements it had
-already accepted before it reached the offending one.
+Every `Replace` commits exactly one session, addressed by its `main` key.
+A host store must validate the whole replacement before writing anything.
+The main key must use the empty subpath, and these rules apply:
 
 | Rule | Refusal |
 | --- | --- |
 | The replacements MUST include the `main` key exactly once. | `replacements must include the main key exactly once` |
-| Every replacement key's `SessionID` MUST equal `main.SessionID`. One session's commit may never rewrite another session's rows under a single atomic generation, which no caller can undo and no reader can attribute. | `replacement key "<sessionId>" subpath "<subpath>" does not belong to session "<main sessionId>"` |
-| No `{SessionID, Subpath}` may appear twice. Two replacements naming one key describe two different generations of it and nothing in the call says which was meant, so the collision is refused rather than resolved by last-write-wins. | `duplicate replacement key "<sessionId>" subpath "<subpath>"` |
+| Every replacement key's `SessionID` MUST equal `main.SessionID`. | `replacement key "<sessionId>" subpath "<subpath>" does not belong to session "<main sessionId>"` |
+| No `{SessionID, Subpath}` may appear twice. | `duplicate replacement key "<sessionId>" subpath "<subpath>"` |
 
-Both key refusals name the offending key in full, subpath included, so a caller
-is told which entry log it addressed wrongly rather than only which session id
-it named. The bundled `InMemorySessionStore` implements all three;
-`TestReplaceIsOneSessionsGeneration` is the conformance proof and asserts that
-each refused call wrote nothing, including to the unrelated session it named.
-
-A tombstone still outranks every rule here: a `Replace` that lands after
-`Delete` installs nothing and returns without error.
+Exactly the listed keys survive a successful replacement. Listed empty subkeys
+remain visible; omitted subkeys are tombstoned. A listed subkey can become live
+again, but a main tombstone is final: a valid `Replace` or `Append` after main
+`Delete` writes nothing and returns success. Shape validation still applies.
 
 Only conversation rows and adapter-owned lifecycle boundary records are
 durable. A boundary record includes session `env`, which can contain deliberate

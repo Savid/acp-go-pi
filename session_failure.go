@@ -213,16 +213,15 @@ func providerTurnFailure(state *promptTurnState) error {
 // off-prompt internal-failure shape. A session start is not a turn: it is
 // reachable only from initialize's version probe and from session/new,
 // session/load, session/resume, and _pi/session/fork, so it carries no turn
-// token and no cause text. The class names the stage; the real native cause —
-// a pi that exited because an MCP server would not connect, a transport that
-// broke mid-setup — goes to the adapter log.
+// token and no cause text. Logs retain only fixed classifications, since
+// startup stderr can contain MCP credentials or other caller-owned content.
 func (a *Agent) nativeStartFailure(ctx context.Context, cause string, err error, proc piProcess) error {
 	detail := cause
 
 	if proc != nil {
 		select {
 		case <-proc.Exited():
-			detail = nativeExitCause(ctx, a.log, "pi exited during session start", proc)
+			detail = failureCauseProcessExit
 		default:
 		}
 	}

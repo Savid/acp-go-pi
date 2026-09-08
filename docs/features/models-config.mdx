@@ -67,8 +67,9 @@ session launches against, before the pi process starts, so the CLI reads them
 as its own config. Without `WithHome` that directory is isolated and seeds
 never touch a durable pi home. Managed mode creates it fresh for every native
 generation. In ordinary mode, `WithHome` selects the one durable directory
-every session launches against, and each launch writes the seeds there again,
-so the operator's files are what pi reads however a previous session left them.
+every session launches against. `.seed-manifest.json` records wrapper-managed
+paths: an existing unlisted target is refused before any seed is written.
+Managed files can be updated, preserving changed prior bytes in `.seed.bak`.
 
 Every seed, `settings.json` included, is written verbatim. A seeded
 `settings.json` that is not valid JSON fails closed at session start, because
@@ -78,7 +79,8 @@ pi would otherwise discard it in silence. Seeded resources under
 ambient and project discovery disabled while making the operator's explicit
 resources reachable, including their slash commands. Paths are confined to
 the agent directory: absolute paths, `..` escapes, and empty keys fail closed
-at session start.
+at session start. The provenance manifest and `*.seed.bak` sidecars are reserved
+and cannot themselves be seeds.
 
 ```go
 err := piacp.Serve(ctx, input, output,
@@ -96,8 +98,7 @@ Keep secrets in `WithEnv` rather than in seeded files; see
 pi reads `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` from
 `settings.json` once at process start to choose what a session begins on, and
 writes a selection back into those same keys wherever one is saved as the
-default: pi's own explicit save, and — on pi before 0.84.3 — every session
-change of model or thinking level. In ordinary mode, `WithHome` gives every
+default. In ordinary mode, `WithHome` gives every
 session one shared agent directory, so those three keys are the one channel
 through which a session's runtime choice could reach another session's startup.
 

@@ -46,6 +46,10 @@ func (a *Agent) handleForkSession(
 		return acp.UnstableForkSessionResponse{}, validationErr
 	}
 
+	if configErr := a.sessionStartConfigurationError(); configErr != nil {
+		return acp.UnstableForkSessionResponse{}, configErr
+	}
+
 	mcpServers := stableMCPServers(params.McpServers)
 
 	if a.isDeleted(params.SessionId) {

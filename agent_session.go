@@ -189,6 +189,10 @@ func (a *Agent) restoreSession(
 	start sessionStart,
 	meta map[string]any,
 ) (restoredSession, error) {
+	if configErr := a.sessionStartConfigurationError(); configErr != nil {
+		return restoredSession{}, configErr
+	}
+
 	releaseTransition, err := a.acquireSessionCarrier(ctx, sessionID)
 	if err != nil {
 		// Cancellation may refuse a queued carrier transition, but an already
@@ -271,7 +275,7 @@ func (a *Agent) restoreSession(
 	// it is detached before any successor process is constructed. A failed
 	// close leaves that exact predecessor installed with its immutable result.
 	if previous := a.activeSession(sessionID); previous != nil {
-		if closeErr := previous.Close(ctx); !nativeContainmentComplete(closeErr) {
+		if closeErr := previous.Close(ctx); closeErr != nil {
 			a.retainIncompleteSession(previous, closeErr)
 
 			return restoredSession{}, closeErr
@@ -810,7 +814,7 @@ func (a *Agent) storeStartedSession(ctx context.Context, session *agentSession) 
 	closeErr := previous.Close(ctx)
 	a.retainIncompleteSession(previous, closeErr)
 
-	if !nativeContainmentComplete(closeErr) {
+	if closeErr != nil {
 		replacementCloseErr := session.Close(context.WithoutCancel(ctx))
 		a.retainIncompleteSession(session, replacementCloseErr)
 
@@ -1259,6 +1263,10 @@ func (a *Agent) startSessionConstruction(
 		return nil, configErr
 	}
 
+	if mcpErr := validateMCPServers(start.McpServers); mcpErr != nil {
+		return nil, mcpErr
+	}
+
 	versionErr := a.ensureVersion(ctx)
 
 	if closedErr := a.ensureOpen(); closedErr != nil {
@@ -1267,10 +1275,6 @@ func (a *Agent) startSessionConstruction(
 
 	if versionErr != nil {
 		return nil, versionErr
-	}
-
-	if mcpErr := validateMCPServers(start.McpServers); mcpErr != nil {
-		return nil, mcpErr
 	}
 
 	executable, err := a.resolveExecutablePath()
@@ -1526,7 +1530,7 @@ func (a *Agent) startSessionConstruction(
 // setUpNativeSession drives the post-spawn command sequence. Any transport
 // failure here means pi exited during startup (for example an MCP server
 // connect failure), so errors are recovered into a structured session-start
-// failure naming the real stderr cause.
+// failure with a closed native_start class.
 func (a *Agent) setUpNativeSession(
 	ctx context.Context,
 	session *agentSession,
@@ -1566,6 +1570,10 @@ func (a *Agent) setUpNativeSession(
 
 	if start.ResumeID != "" && !start.ForkSession && state.SessionID != start.ResumeID {
 		return a.nativeStartFailure(ctx, failureCauseTransport, fmt.Errorf("native session id drift: expected %s, got %s", start.ResumeID, state.SessionID), proc)
+	}
+
+	if start.ForkSession && state.SessionID == start.ResumeID {
+		return a.nativeStartFailure(ctx, failureCauseTransport, errors.New("native clone retained its parent session id"), proc)
 	}
 
 	session.id = acp.SessionId(state.SessionID)

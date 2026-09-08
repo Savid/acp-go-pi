@@ -352,6 +352,38 @@ func TestChangedActiveCarrierContainmentFailurePublishesNothing(t *testing.T) {
 	require.ErrorIs(t, agent.Close(), ErrContainmentIncomplete)
 }
 
+func TestChangedActiveCarrierRetainsFailedCloseCommit(t *testing.T) {
+	store := newFaultySessionStore()
+	appendStoredSessionWithConfiguration(t, store, validSessionUUID, sessionConfigurationRecord{
+		Env: map[string]string{"TOKEN": "old"}, ExtraPathDirs: []string{},
+	})
+	client := newStubPiClient()
+	client.state = pi.SessionState{SessionID: validSessionUUID}
+	agent := newStubClientAgent(t, client, WithSessionStore(store))
+	start := sessionStart{Cwd: t.TempDir(), ResumeID: validSessionUUID}
+	initial, err := agent.restoreSession(t.Context(), validSessionUUID, start, nil)
+	require.NoError(t, err)
+	initial.finish()
+
+	want := errors.New("close boundary store refused")
+	store.appendErr = want
+	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
+		t.Fatal("replacement launched after a failed close commit")
+
+		return nil, nil, nil
+	}
+
+	_, err = agent.restoreSession(t.Context(), validSessionUUID, start,
+		PiOptions{Env: map[string]string{"TOKEN": "new"}}.Meta())
+	require.ErrorIs(t, err, want)
+	addressed, err := agent.session(validSessionUUID)
+	require.NoError(t, err)
+	require.Same(t, initial.session, addressed)
+	require.DirExists(t, addressed.sessionRoot, "failed commit must retain its native state")
+	require.Contains(t, agent.retainedSessions, addressed)
+	require.ErrorIs(t, agent.Close(), want)
+}
+
 func appendStoredSessionWithConfiguration(
 	t *testing.T,
 	store SessionStore,

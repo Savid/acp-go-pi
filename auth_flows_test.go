@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -635,9 +636,7 @@ func TestDisconnectRejectsBadParams(t *testing.T) {
 		authFieldSessionID, authFieldProviderID, authFieldConnectionID, authFieldBindingGeneration,
 	} {
 		params := map[string]any{}
-		for key, value := range base {
-			params[key] = value
-		}
+		maps.Copy(params, base)
 
 		delete(params, field)
 
@@ -646,9 +645,7 @@ func TestDisconnectRejectsBadParams(t *testing.T) {
 	}
 
 	unknown := map[string]any{}
-	for key, value := range base {
-		unknown[key] = value
-	}
+	maps.Copy(unknown, base)
 
 	unknown[authFieldSessionID] = "missing"
 	_, err := harness.call(t.Context(), AuthDisconnectMethod, unknown)

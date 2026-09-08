@@ -3,10 +3,12 @@ title: "Sessions"
 description: "The session lifecycle model and how pi session files map to durable keys"
 ---
 
-An ACP session maps one-to-one to a long-lived `pi --mode rpc` process. The
-adapter creates that process on demand inside an isolated per-session agent
-directory, keeps it alive across prompt turns, and tears it down when the
-session closes.
+An ACP session owns one `pi --mode rpc` process generation at a time. The
+adapter creates it on demand, replaces it at recovery or configuration
+boundaries, and tears it down when the session closes. Conversation files live
+in session scratch. The agent directory is ephemeral by default; ordinary
+execution can share an explicitly configured durable `Home` for native settings
+and credentials. Managed generations always use fresh private residences.
 
 ## Lifecycle
 

@@ -3,10 +3,11 @@ title: "Troubleshooting"
 description: "Route common failures to their cause: busy rejections, fork errors, blocked dialogs, and stale MCP tools"
 ---
 
-Each symptom below names the behavior that produces it and the test in this
-repository that reproduces it. Tests named `TestFakePi*` run against a fake pi
-that speaks the exact RPC protocol observed from the real binary; the other
-integration tests launch the real `pi` CLI.
+Each symptom below names the behavior that produces it and a local regression
+test. Fake-backed tests, including `TestFakePi*` and compiled-wrapper tests,
+exercise scripted RPC fixtures and prove wrapper behavior. Tests that execute
+the real `pi` CLI establish native compatibility for that run; a fake fixture
+does not renew native evidence.
 
 ## A concurrent prompt is rejected as busy
 
@@ -17,7 +18,8 @@ with an invalid-request error carrying `"error": "backpressure"` and
 `"limit": "session_prompt"`; it is never queued. At the native surface pi
 refuses a second bare prompt while streaming and acknowledges a steer of the
 active turn only after queuing it. `TestFakePiBusyRejectionAndSteerAck`
-(`integration/fake_pi_protocol_test.go`) reproduces both native behaviors.
+(`integration/fake_pi_protocol_test.go`) scripts those responses to pin wrapper
+handling.
 Wait for the active turn to settle, or cancel it, before prompting again; the
 adapter does not expose pi's steering queue.
 
@@ -98,7 +100,7 @@ fence. A turn that never settles can be bounded with `WithTurnTimeout` — see
 ## The MCP tool set is stale after changing servers
 
 The pi RPC process fixes its MCP configuration at launch: the adapter writes
-a per-session MCP config into the session's isolated agent directory, and
+MCP config into the session's private configuration residence, and
 pi's extension-tool registry is established for that process. Changing a
 session's MCP servers therefore means closing the session's RPC process and
 relaunching it with the new declaration — there is no in-place mutation. The
@@ -117,16 +119,17 @@ session that refreshes the registry again before continuing.
 Every pi child launches with `PI_OFFLINE=1` and answers its state probes
 without provider credentials: `get_state`, `get_commands`, and
 `get_session_stats` succeed on a credential-less RPC process
-(`internal/pi/command.go`, `internal/pi/process.go`). That split routes the
+(`internal/pi/command.go`, `internal/pi/ordinary_process.go`). That split routes the
 diagnosis:
 
 | Observation | Conclusion |
 | --- | --- |
-| Session creation or the state probes fail | pi install or wiring problem — confirm `pi` is on `PATH` and is version 0.80.6 or newer, and inspect the bounded `process_exit` wire cause. Adapter logs intentionally contain only fixed classifications and stages. |
+| Session creation or its startup state probes fail | Confirm `pi` is on `PATH` and is version 0.80.6 or newer. Native startup failures carry `pi_internal_failure`, class `native_start`; adapter logs contain fixed classifications and stages. |
 | Session creation and probes succeed; prompts fail with cause `provider` | Credential problem — credentials were not injected for the session (ambient shell keys are scrubbed) or the provider refused them. |
 
 <Note>
-`pi --mode rpc` answers `get_state` and `get_commands` credential-free even
-outside this adapter, so a throwaway agent directory and the bare CLI
-reproduce the probe half of the table without any ACP host.
+For an explicitly authorized native probe, launch `pi --mode rpc` in a
+throwaway `PI_CODING_AGENT_DIR` with a scrubbed environment. `get_state` and
+`get_commands` need no provider credentials. Source inspection and ordinary
+fake-backed tests can diagnose wrapper handling without launching pi.
 </Note>

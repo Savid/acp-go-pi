@@ -2,6 +2,7 @@ package piacp
 
 import (
 	"log/slog"
+	"maps"
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
@@ -44,7 +45,7 @@ type Options struct {
 	// keys must travel here (or per session) rather than relying on ambient
 	// variables. PATH here is the static native base search path every session
 	// resolves against. Process-loader, shell-loader, and Node loader keys are
-	// rejected at session start.
+	// rejected at construction.
 	Env map[string]string
 
 	// Logger receives structured diagnostic logs. If nil, the default logger is used.
@@ -81,7 +82,8 @@ type Options struct {
 	// InputHandoffRoot is the absolute directory under which handoff-form
 	// prompt images are read. Empty (the default) rejects the handoff form.
 	// The adapter only reads under it and never writes, moves, or removes
-	// anything there.
+	// anything there. Managed execution pins a root disjoint from the complete
+	// scratch parent before native work; the host must preserve that separation.
 	InputHandoffRoot string
 	// ProviderAuthRoot is the absolute host-owned directory containing Pi's
 	// values-free provider-auth ledger. Empty leaves every _pi/auth/* leg
@@ -214,7 +216,7 @@ func WithDefaultModel(model string) Option {
 // used for executable lookup, version probing, and native launch; per-session
 // directories from WithPiExtraPathDirs are prepended ahead of it.
 // NODE_OPTIONS, BASH_ENV, ENV, LD_*, DYLD_*, and invalid names are rejected at
-// session start.
+// construction.
 func WithEnv(env map[string]string) Option {
 	return func(options *Options) {
 		options.Env = cloneStringMap(env)
@@ -305,9 +307,7 @@ func cloneStringMap(values map[string]string) map[string]string {
 	}
 
 	cloned := make(map[string]string, len(values))
-	for key, value := range values {
-		cloned[key] = value
-	}
+	maps.Copy(cloned, values)
 
 	return cloned
 }

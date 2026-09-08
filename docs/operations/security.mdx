@@ -12,12 +12,15 @@ vacancy. Hosts requiring a stronger boundary must provide one explicitly.
 The environment is captured once. Ambient provider credentials, loader hooks,
 shell hooks, Node hooks, and adapter-private values are removed.
 `WithEnv` and per-session Pi options are deliberate overlays.
-Session PATH replacement is rejected; absolute
-`WithPiExtraPathDirs` entries are prepended to the child search path.
+Session `PATH` and `PI_CODING_AGENT_DIR` replacement are rejected under the
+platform's key identity; absolute `WithPiExtraPathDirs` entries are prepended
+to the child search path. Static `WithEnv` state-root values are accepted but
+replaced with the adapter-owned directory at launch. The launcher also fixes
+`PI_OFFLINE=1` after all overlays.
 
 ## Borrowed host authority
 
-`WithHostAuthority` borrows four operations from the embedding host:
+Pi invokes four operations on the borrowed `HostAuthority`:
 `NativeEnvironment`, `PrepareNativeTree`,
 `StartNative`, and `ReclaimNativeTree`. The adapter never
 selects accounts or changes filesystem ownership itself.
@@ -33,11 +36,27 @@ After prepare succeeds, the adapter performs no read, write, stat, walk,
 resolution, or removal below that tree. Natural completion or shutdown must
 settle through `NativeProcess.Wait`; only then may
 `ReclaimNativeTree` return it to the adapter. Removal occurs only
-after successful reclaim.
+after successful reclaim. A failed prepare attempt also leaves the tree opaque;
+only the host's registered cleanup may recover it.
 
 `ErrNativeTreeBusy` means reclaim changed nothing because a process
 handle is still live. Failed or uncertain reclaim wraps
 `ErrContainmentIncomplete` and leaves host cleanup registered.
+
+Managed handoff reads use one retained directory handle, pinned before the first
+native prepare or launch. Its directory identity and ancestors must be disjoint
+from the complete scratch allocation parent, which contains every managed
+session and probe generation. An overlapping or unavailable handoff root is
+refused as `path_not_allowed` at the handoff read gate. Use a dedicated disjoint
+directory; a broad system-temp or scratch root is unsuitable. The handle survives
+generation reclaim and closes with the Agent. Failed preparation also freezes
+discovery, so a later prompt never resolves a new ambient read root.
+
+The host must keep those allocation and read directory identities disjoint for
+their full lifetime, including existing mount or volume aliases, and prevent
+native work from replacing roots or ancestors or introducing mount aliases.
+Initial directory-identity checks and confined descriptor reads rely on that host
+filesystem boundary. Ordinary execution keeps its per-prompt handoff root.
 
 ## Cancellation and authority loss
 
@@ -61,3 +80,12 @@ with both `WithHome` and `WithProviderAuthRoot`. Under
 `WithHostAuthority` the capability is omitted and those methods
 follow the ordinary method-not-found path. Browser launchers remain shadowed by
 the session browser shim.
+
+## Extension source cache
+
+The three embedded extensions share a content-addressed source directory under
+`WithScratchDir`. Cache reuse checks exact source bytes and rejects non-regular
+files. On POSIX it also checks the caller's ownership and group/world write
+bits. Windows mode bits do not describe ACLs, and this adapter performs no ACL
+inspection there. The Windows host must protect scratch from other writers;
+source-byte checks alone do not prove write exclusivity.

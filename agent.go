@@ -75,6 +75,7 @@ type Agent struct {
 	ordinaryEnvironment map[string]string
 	nativeEnvironment   map[string]string
 	scratchParent       string
+	managedHandoff      *managedHandoffRoot
 
 	// Lock order: acquire mu before any session lock. Do not call session
 	// close methods while holding mu.
@@ -178,6 +179,7 @@ func NewAgent(opts ...Option) *Agent {
 		optionErr: errors.Join(
 			authorityErr,
 			optionFailure(log, optionFieldHome, validateManagedHome(options)),
+			optionFailure(log, optionFieldDefaultModel, validateDefaultModel(options.DefaultModel)),
 			optionFailure(log, optionFieldEnv, validateEnvironment(options.Env, optionFieldEnv, blockedAgentEnvKey)),
 			optionFailure(log, optionFieldConcurrencyLimits, validateConcurrencyLimits(options.ConcurrencyLimits)),
 			optionFailure(log, optionFieldImageLimits, validateImageLimits(options.ImageLimits)),
@@ -190,10 +192,13 @@ func NewAgent(opts ...Option) *Agent {
 	agent.startPiProcess = agent.startRealPiProcess
 	agent.probeVersion = agent.probeNativeVersion
 
-	agent.optionErr = errors.Join(
-		agent.optionErr,
-		optionFailure(log, optionFieldProviderAuthRoot, configureProviderAuth(agent)),
-	)
+	if options.hostAuthoritySupplied && options.InputHandoffRoot != "" {
+		agent.managedHandoff = &managedHandoffRoot{scratch: agent.scratchParent, path: options.InputHandoffRoot}
+	}
+
+	if agent.optionErr == nil {
+		agent.optionErr = optionFailure(log, optionFieldProviderAuthRoot, configureProviderAuth(agent))
+	}
 
 	return agent
 }
@@ -370,6 +375,8 @@ func (a *Agent) awaitClose(attempt *agentCloseAttempt) error {
 }
 
 func (a *Agent) close(attempt *agentCloseAttempt) error {
+	defer a.managedHandoff.close()
+
 	constructionErr := a.awaitNativeConstructions()
 	if !nativeContainmentComplete(constructionErr) {
 		a.recordNativeContainment(constructionErr)

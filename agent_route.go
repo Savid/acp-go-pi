@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -68,6 +69,10 @@ func routeVersionIsOne(value any) bool {
 		return version == routeVersion
 	case float64:
 		return version == routeVersion
+	case json.Number:
+		number, ok := wireIntegerValue(version)
+
+		return ok && number == routeVersion
 	default:
 		return false
 	}
@@ -77,12 +82,14 @@ func routeVersionIsOne(value any) bool {
 // names the member at fault, and the bare reserved path when the value as a
 // whole is not an object.
 func routeMemberInvalid(members ...string) error {
-	field := routeMetaPath
+	var field strings.Builder
+	field.WriteString(routeMetaPath)
+
 	for _, member := range members {
-		field += "." + member
+		field.WriteString("." + member)
 	}
 
-	return unsupportedField(field)
+	return unsupportedField(field.String())
 }
 
 func stampRouteMeta(meta map[string]any, scope elicitationScope) (map[string]any, error) {

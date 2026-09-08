@@ -206,25 +206,23 @@ func parseHandoffEnvelope(meta map[string]any) (handoffEnvelope, *handoffError) 
 }
 
 func handoffVersionIsOne(value any) bool {
+	if number, ok := value.(json.Number); ok {
+		version, valid := wireIntegerValue(number)
+
+		return valid && version == handoffVersion
+	}
+
 	version, ok := handoffNumber(value)
 
 	return ok && version == handoffVersion
 }
 
-// handoffNumber reads an envelope numeric as a float64 whatever shape it arrived
-// in. A JSON number decodes to float64 under the pinned SDK and to json.Number
-// if the decoder is ever asked for one, and an in-process host builds its own
-// block metadata with a Go int. All three are the same number, and reading them
-// as a float64 is what keeps the range check off an int64 conversion whose
-// out-of-range behaviour Go does not define.
+// handoffNumber handles in-process numeric values after exact wire numbers have
+// been checked separately. The range gate precedes any float-to-int conversion.
 func handoffNumber(value any) (float64, bool) {
 	switch number := value.(type) {
 	case float64:
 		return number, true
-	case json.Number:
-		parsed, err := number.Float64()
-
-		return parsed, err == nil
 	case int:
 		return float64(number), true
 	default:
@@ -251,6 +249,12 @@ func validHandoffDigest(digest string) bool {
 // converting an out-of-range float64 to int64 is undefined in Go and wraps on
 // one architecture while saturating on another.
 func handoffSizeBytes(value any) (int64, bool) {
+	if number, ok := value.(json.Number); ok {
+		size, valid := wireIntegerValue(number)
+
+		return size, valid && size >= 0
+	}
+
 	size, ok := handoffNumber(value)
 	if !ok || size < 0 || size != math.Trunc(size) || size >= handoffSizeBytesExclusiveMax {
 		return 0, false
@@ -360,12 +364,23 @@ func verifyHandoffDigest(envelope handoffEnvelope, data []byte) *handoffError {
 	return nil
 }
 
-// handoffRootHandle opens the read root once per prompt. A root that cannot be
-// opened is a deployment defect rather than a host cleaning a file up early, so
-// it is path_not_allowed.
+// handoffRootHandle borrows the pinned managed root or opens an ordinary root
+// once per prompt. An unavailable root is a deployment defect rather than a
+// host cleaning a file up early, so it is path_not_allowed.
 func (b *promptImageBudget) handoffRootHandle() (*os.Root, *handoffError) {
 	if b.root != nil {
 		return b.root, nil
+	}
+
+	if b.managedHandoff != nil {
+		root, release, failure := b.managedHandoff.acquire()
+		if failure != nil {
+			return nil, failure
+		}
+
+		b.root, b.releaseHandoffRoot = root, release
+
+		return root, nil
 	}
 
 	root, err := openHandoffRoot(b.handoffRoot)
@@ -378,11 +393,16 @@ func (b *promptImageBudget) handoffRootHandle() (*os.Root, *handoffError) {
 	return root, nil
 }
 
-// closeHandoffRoot releases the read root's descriptor at the end of the prompt
-// mapping that opened it.
+// closeHandoffRoot releases the prompt's borrowed or privately opened root.
 func (b *promptImageBudget) closeHandoffRoot() {
 	if b.root != nil {
-		_ = b.root.Close()
+		if b.releaseHandoffRoot != nil {
+			b.releaseHandoffRoot()
+			b.releaseHandoffRoot = nil
+		} else {
+			_ = b.root.Close()
+		}
+
 		b.root = nil
 	}
 }

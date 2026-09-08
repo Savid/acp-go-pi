@@ -17,6 +17,7 @@ const (
 	envKeyNodeOptions = "NODE_OPTIONS"
 	envKeyBashEnv     = "BASH_ENV"
 	envKeyEnv         = "ENV"
+	envKeyAgentDir    = "PI_CODING_AGENT_DIR"
 )
 
 func validEnvName(key string) bool {
@@ -43,11 +44,12 @@ func blockedAgentEnvKey(key string) bool {
 	}
 }
 
-// blockedSessionEnvKey additionally rejects PATH. The ordered extraPathDirs
-// option is the only session-scoped PATH authority; a second session owner
-// would make the effective search order depend on merge order.
+// blockedSessionEnvKey additionally rejects PATH and the native state root.
+// extraPathDirs owns the session search order; the adapter owns AgentDir.
 func blockedSessionEnvKey(key string) bool {
-	return blockedAgentEnvKey(key) || pi.EnvironmentKey(key) == envKeyPath
+	name := pi.EnvironmentKey(key)
+
+	return blockedAgentEnvKey(key) || name == envKeyPath || name == envKeyAgentDir
 }
 
 // validateEnvironment checks an environment in sorted key order, so the first

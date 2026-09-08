@@ -3,7 +3,7 @@ set -euo pipefail
 
 provider=pi
 packages=(./internal/pi)
-selector='^(TestOrdinaryWindowsExecutableResolutionExecutesSuppliedPATHEXTChild|TestWindowsEnvironmentCompositionIsCaseInsensitiveLastWins)$'
+selector='^(TestOrdinaryEnvironmentAndExecutableResolutionEdges|TestOrdinaryProcessStdinEOFAndOutput|TestOrdinaryProcessShutdownAndKill|TestOrdinaryProcessStderrAndEnvironment)$'
 
 # The hosted image supplies MinGW-w64; Go's race runtime requires its
 # synchronization library (https://go.dev/doc/articles/race_detector).

@@ -203,7 +203,7 @@ func (s *fakePiServer) runReplyTurn(turn *fakeTurn) bool {
 		Message: s.assistantJSON(streamed, "", ""),
 		AssistantMessageEvent: fakeDelta{
 			Type:         "text_end",
-			ContentIndex: fakeIntPtr(0),
+			ContentIndex: new(0),
 			Content:      full,
 		},
 	})
@@ -267,7 +267,7 @@ func (s *fakePiServer) runToolTurn(turn *fakeTurn) []json.RawMessage {
 		Message: callMessage,
 		AssistantMessageEvent: fakeDelta{
 			Type:         "toolcall_end",
-			ContentIndex: fakeIntPtr(0),
+			ContentIndex: new(0),
 			ToolCall:     toolCall,
 		},
 	})
@@ -388,7 +388,7 @@ func (s *fakePiServer) emitStartDelta() {
 		Message: s.assistantJSON(nil, "", ""),
 		AssistantMessageEvent: fakeDelta{
 			Type:         "text_start",
-			ContentIndex: fakeIntPtr(0),
+			ContentIndex: new(0),
 		},
 	})
 }
@@ -399,7 +399,7 @@ func (s *fakePiServer) emitTextDelta(delta string, partial json.RawMessage) {
 		Message: partial,
 		AssistantMessageEvent: fakeDelta{
 			Type:         "text_delta",
-			ContentIndex: fakeIntPtr(0),
+			ContentIndex: new(0),
 			Delta:        delta,
 		},
 	})
@@ -546,10 +546,6 @@ func fakeUUID() string {
 	b[8] = (b[8] & 0x3f) | 0x80
 
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
-
-func fakeIntPtr(v int) *int {
-	return &v
 }
 
 func mustJSON(v any) json.RawMessage {

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -132,19 +133,13 @@ func (a *deterministicHostAuthority) StartNative(_ context.Context, request Nati
 }
 
 func slicesContains(values []string, value string) bool {
-	for _, candidate := range values {
-		if candidate == value {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(values, value)
 }
 
 func (a *deterministicHostAuthority) rootForRequest(request NativeRequest) string {
 	for _, entry := range request.Environment {
-		if strings.HasPrefix(entry, "PI_CODING_AGENT_DIR=") {
-			return filepath.Dir(strings.TrimPrefix(entry, "PI_CODING_AGENT_DIR="))
+		if after, ok := strings.CutPrefix(entry, "PI_CODING_AGENT_DIR="); ok {
+			return filepath.Dir(after)
 		}
 	}
 	a.mu.Lock()

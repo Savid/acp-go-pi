@@ -1,14 +1,36 @@
 package pi
 
 import (
+	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestMCPExtensionTransportLifecycle(t *testing.T) {
+	t.Parallel()
+
+	node := requireNode(t)
+	root := t.TempDir()
+	extension := filepath.Join(root, MCPExtensionFileName)
+	require.NoError(t, os.WriteFile(extension, mcpExtensionSource, 0o600))
+	driver, err := filepath.Abs(filepath.Join("testdata", "mcp-probe.mjs"))
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	command := exec.CommandContext(ctx, node, driver, extension, root)
+	command.Env = environmentEntries(CaptureOrdinaryEnvironment())
+	output, err := command.CombinedOutput()
+	require.NoError(t, err, string(output))
+	require.Contains(t, string(output), "MCP_TRANSPORT_OK")
+}
 
 func mustCreateResidence(
 	t *testing.T, extRoot string, agentDir string, mcp *MCPConfig,
