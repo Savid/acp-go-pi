@@ -23,6 +23,8 @@ err := piacp.Serve(ctx, input, output,
 )
 ```
 
+Before publishing a new session ID, the adapter stores the native header and
+entry prefix captured at `session_start`, together with a lifecycle boundary.
 After each native `agent_settled` fence the adapter appends the session file's new JSONL rows
 to the store, trimming surrounding whitespace and retaining each JSON value,
 header row first. The adapter backs

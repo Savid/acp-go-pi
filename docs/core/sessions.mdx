@@ -46,9 +46,10 @@ when it opens a session only to read the agent's metadata. That close is
 answered as a close: the opening stops where it is, the close ladder owns the
 generation's teardown, and nothing is reported as a failure.
 
-pi creates its session file lazily: a brand-new session has no file (and
-nothing to mirror) until the first conversation entry lands. Listing sessions
-right after `session/new` therefore reflects the store, not a native file.
+Before `session/new` returns, the bridge captures pi's native session header
+and initial entries, and the adapter commits them with a lifecycle boundary.
+Recovery from that store preserves the native UUID even if the process dies
+before the first prompt and pi has not written its lazy session file yet.
 
 ## Closing
 

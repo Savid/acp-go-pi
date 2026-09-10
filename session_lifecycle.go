@@ -891,6 +891,7 @@ func (s *agentSession) nextRuntimeLaunch(
 
 	result.spec = previous
 	result.spec.Env = cloneStringMap(previous.Env)
+	delete(result.spec.Env, pi.EnvSessionInitialization)
 
 	if result.spec.Env == nil {
 		result.spec.Env = make(map[string]string)

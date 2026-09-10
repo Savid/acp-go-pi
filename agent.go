@@ -40,6 +40,7 @@ type piProcess interface {
 // piClient is the RPC seam over one pi child's JSONL protocol. *pi.Client
 // implements it; tests substitute a scripted fake harness.
 type piClient interface {
+	InitialSession(context.Context) ([]json.RawMessage, error)
 	Start(ctx context.Context) error
 	Events() <-chan pi.Event
 	UIRequests() <-chan pi.UIRequest

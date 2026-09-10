@@ -370,6 +370,15 @@ func (p *managedRPCNativeProcess) finish() {
 }
 
 func (p *managedRPCNativeProcess) serve() {
+	rows := []json.RawMessage{json.RawMessage(`{"type":"session","version":3,"id":"managed-parent"}`)}
+	encoded, _ := json.Marshal(rows)
+	if !p.writeJSON(map[string]any{
+		"type": "extension_ui_request", "id": "initialization", jsonFieldMethod: "notify",
+		"message": "acp-go-pi:session-initialization:" + string(encoded), "notifyType": "info",
+	}) {
+		return
+	}
+
 	scanner := bufio.NewScanner(p.input)
 	for scanner.Scan() {
 		var command map[string]any

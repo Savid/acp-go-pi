@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,11 +43,12 @@ type Client struct {
 	strayResponses atomic.Uint64
 	started        atomic.Bool
 
-	events     chan Event
-	uiRequests chan UIRequest
-	boundaries chan ResponseBoundary
-	done       chan struct{}
-	wg         sync.WaitGroup
+	events         chan Event
+	uiRequests     chan UIRequest
+	boundaries     chan ResponseBoundary
+	initialSession chan []json.RawMessage
+	done           chan struct{}
+	wg             sync.WaitGroup
 }
 
 // CallBoundary supplies command boundaries that must be linearized with the
@@ -117,13 +119,14 @@ func (b ResponseBoundary) resolveOwned(ctx context.Context) {
 // NewClient constructs a client over pi's stdin writer and stdout reader.
 func NewClient(stdin io.Writer, stdout io.Reader) *Client {
 	return &Client{
-		stdin:      stdin,
-		lines:      NewLineReader(stdout),
-		pending:    make(map[string]*pendingCall, 4),
-		events:     make(chan Event),
-		uiRequests: make(chan UIRequest),
-		boundaries: make(chan ResponseBoundary, 1),
-		done:       make(chan struct{}),
+		stdin:          stdin,
+		lines:          NewLineReader(stdout),
+		pending:        make(map[string]*pendingCall, 4),
+		events:         make(chan Event),
+		uiRequests:     make(chan UIRequest),
+		boundaries:     make(chan ResponseBoundary, 1),
+		initialSession: make(chan []json.RawMessage, 1),
+		done:           make(chan struct{}),
 	}
 }
 
@@ -459,6 +462,20 @@ func (c *Client) dispatch(ctx context.Context, line []byte) error {
 
 	switch message.Kind {
 	case MessageKindUIRequest:
+		if payload, ok := strings.CutPrefix(message.UIRequest.Message, sessionInitializationMarker); ok && message.UIRequest.Method == "notify" {
+			var entries []json.RawMessage
+			if err := json.Unmarshal([]byte(payload), &entries); err != nil {
+				return ErrJSONLStructural
+			}
+
+			select {
+			case c.initialSession <- entries:
+			default:
+			}
+
+			return nil
+		}
+
 		select {
 		case c.uiRequests <- message.UIRequest:
 			return nil

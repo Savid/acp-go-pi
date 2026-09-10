@@ -353,8 +353,8 @@ func storeSessionCwd(entries []SessionStoreEntry) string {
 	return ""
 }
 
-// storeSessionHasContent reports whether the mirrored rows contain anything
-// beyond the native header row; pi rejects cloning a session with no entries.
+// storeSessionHasContent reports whether the native session has conversation
+// content. Initialization and configuration entries alone cannot be cloned.
 func storeSessionHasContent(entries []SessionStoreEntry) bool {
 	for _, entry := range entries {
 		row, ok := decodeStoreRow(entry)
@@ -362,7 +362,7 @@ func storeSessionHasContent(entries []SessionStoreEntry) bool {
 			continue
 		}
 
-		if row.Type != storeRowTypeSession {
+		if row.Type == storeRowTypeMessage {
 			return true
 		}
 	}

@@ -374,6 +374,13 @@ func runFakePi(args []string) int {
 	}
 
 	server.startSession(sessionPath, sessionID)
+	for _, path := range server.extensionPaths {
+		if filepath.Base(path) == "acp-bridge.ts" && os.Getenv(pi.EnvSessionInitialization) == "1" {
+			server.announceInitialization()
+
+			break
+		}
+	}
 
 	return server.serve()
 }
@@ -442,6 +449,7 @@ type fakeEntryMeta struct {
 
 type fakeSessionState struct {
 	id            string
+	timestamp     string
 	file          string
 	name          string
 	parentSession string
@@ -557,6 +565,7 @@ func (s *fakePiServer) resetSession(id string, file string, parentSession string
 
 	s.session = fakeSessionState{
 		id:            id,
+		timestamp:     fakeEntryTimestamp(),
 		file:          file,
 		parentSession: parentSession,
 		thinkingLevel: "off",
@@ -592,6 +601,7 @@ func (s *fakePiServer) loadSessionFile(path string) bool {
 
 	s.session = fakeSessionState{
 		id:            header.ID,
+		timestamp:     header.Timestamp,
 		file:          path,
 		parentSession: header.ParentSession,
 		thinkingLevel: "off",

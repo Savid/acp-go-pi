@@ -500,6 +500,14 @@ async function runAuthCommand(args: string, ctx: ExtensionCommandContext) {
 }
 
 export default function (pi: ExtensionAPI) {
+	pi.on("session_start", (_event, ctx) => {
+		if (process.env.ACP_GO_PI_INTERNAL_SESSION_INITIALIZATION !== "1") return;
+
+		ctx.ui.notify("acp-go-pi:session-initialization:" + JSON.stringify([
+			ctx.sessionManager.getHeader(), ...ctx.sessionManager.getEntries(),
+		]), "info");
+	});
+
 	pi.on("model_select", () => { quotaModelRevision++; });
 	// The wrapper drives every provider-auth leg through this command: pi's RPC
 	// surface has no verb that invokes an extension, and prompt() runs a
