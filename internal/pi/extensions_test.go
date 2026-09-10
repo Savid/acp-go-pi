@@ -17,7 +17,8 @@ func TestMCPExtensionTransportLifecycle(t *testing.T) {
 	t.Parallel()
 
 	node := requireNode(t)
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
 	extension := filepath.Join(root, MCPExtensionFileName)
 	require.NoError(t, os.WriteFile(extension, mcpExtensionSource, 0o600))
 	driver, err := filepath.Abs(filepath.Join("testdata", "mcp-probe.mjs"))

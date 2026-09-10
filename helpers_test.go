@@ -782,6 +782,15 @@ func (c *stubPiClient) Abort(ctx context.Context) error {
 	return c.abortErr
 }
 func (c *stubPiClient) Clone(context.Context) (bool, error) { return c.cloneCancel, c.cloneErr }
+func (c *stubPiClient) InitialSession(context.Context) ([]json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	header, err := json.Marshal(map[string]any{"type": "session", "version": 3, "id": c.state.SessionID, "cwd": testCwd})
+
+	return []json.RawMessage{header}, err
+}
+
 func (c *stubPiClient) GetState(context.Context) (pi.SessionState, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -1351,6 +1351,10 @@ func (a *Agent) startSessionConstruction(
 		pi.EnvPermissionMode: permission,
 		envAgentVersion:      a.options.AgentVersion,
 	}
+	if start.ResumeID == "" {
+		managedEnv[pi.EnvSessionInitialization] = "1"
+	}
+
 	if len(extraPathDirs) > 0 {
 		managedEnv[pi.EnvExtraPathDirs] = strings.Join(extraPathDirs, string(os.PathListSeparator))
 	}
@@ -1651,6 +1655,12 @@ func (a *Agent) setUpNativeSession(
 	session.availableModels = models
 	session.availableCommands = commands
 	session.mu.Unlock()
+
+	if start.ResumeID == "" {
+		if err := session.initializeDurability(ctx); err != nil {
+			return err
+		}
+	}
 
 	if start.ForkSession {
 		session.mu.Lock()

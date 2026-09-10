@@ -16,7 +16,9 @@ import (
 // BROWSER names one of them.
 func TestSessionLaunchesPiBehindTheBrowserShim(t *testing.T) {
 	scratch := t.TempDir()
-	agent := newStubClientAgent(t, newStubPiClient(), WithScratchDir(scratch))
+	client := newStubPiClient()
+	client.state.SessionID = "browser-shim"
+	agent := newStubClientAgent(t, client, WithScratchDir(scratch))
 
 	session, err := agent.startSession(t.Context(), sessionStart{Cwd: t.TempDir()})
 	require.NoError(t, err)

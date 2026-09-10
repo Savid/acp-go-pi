@@ -505,7 +505,7 @@ func (s *fakePiServer) persistLocked() {
 		Type:          "session",
 		Version:       3,
 		ID:            s.session.id,
-		Timestamp:     fakeEntryTimestamp(),
+		Timestamp:     s.session.timestamp,
 		Cwd:           s.cwd,
 		ParentSession: s.session.parentSession,
 	}))
