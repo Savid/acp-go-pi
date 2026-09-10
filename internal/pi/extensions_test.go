@@ -26,7 +26,7 @@ func TestMCPExtensionTransportLifecycle(t *testing.T) {
 	defer cancel()
 
 	command := exec.CommandContext(ctx, node, driver, extension, root)
-	command.Env = environmentEntries(CaptureOrdinaryEnvironment())
+	command.Env = environmentEntries(CaptureOrdinaryEnvironment(os.Environ()))
 	output, err := command.CombinedOutput()
 	require.NoError(t, err, string(output))
 	require.Contains(t, string(output), "MCP_TRANSPORT_OK")

@@ -63,7 +63,8 @@ authorize replays so a late completion cannot resurrect a removed binding.
 
 ## Explicit credential injection
 
-Ordinary mode captures a narrow base environment once and scrubs ambient
+Ordinary mode captures a narrow base environment once, from the adapter's
+process or from `WithAmbientEnvironment`, and scrubs ambient
 provider keys, `NODE_OPTIONS`, shell hooks, loader variables, and adapter-private
 state. Pass deliberate provider variables with `WithEnv` for all sessions or
 `WithPiEnv` for one session. Explicit maps still reject invalid names and

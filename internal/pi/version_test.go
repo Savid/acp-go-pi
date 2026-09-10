@@ -2,6 +2,7 @@ package pi
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ func TestProbeOrdinaryVersion(t *testing.T) {
 }
 
 func CaptureOrdinaryEnvironmentEntries() []string {
-	return environmentEntries(CaptureOrdinaryEnvironment())
+	return environmentEntries(CaptureOrdinaryEnvironment(os.Environ()))
 }
 
 // childProbeEnvironment is a captured ordinary environment with the fake

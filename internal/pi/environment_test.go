@@ -29,3 +29,17 @@ func TestComposeEnvironmentPlatformIdentityAndPrecedence(t *testing.T) {
 		})
 	}
 }
+
+func TestCaptureOrdinaryEnvironmentFoldsKeysUnderThePlatformIdentity(t *testing.T) {
+	previous := Platform
+	t.Cleanup(func() { Platform = previous })
+
+	entries := []string{"Path=/first", "PATH=/last", "HOME=/home/pi", "OPENAI_API_KEY=secret"}
+
+	Platform = "windows"
+	require.Equal(t, map[string]string{"PATH": "/last", "HOME": "/home/pi"}, CaptureOrdinaryEnvironment(entries),
+		"the later spelling in block order wins where the platform folds names")
+
+	Platform = "linux"
+	require.Equal(t, map[string]string{"Path": "/first", "PATH": "/last", "HOME": "/home/pi"}, CaptureOrdinaryEnvironment(entries))
+}

@@ -2,7 +2,6 @@ package pi
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -10,13 +9,13 @@ import (
 
 var ordinaryExecutableAbs = filepath.Abs
 
-func CaptureOrdinaryEnvironment() map[string]string {
+func CaptureOrdinaryEnvironment(entries []string) map[string]string {
 	environment := make(map[string]string)
 
-	for _, entry := range os.Environ() {
+	for _, entry := range entries {
 		key, value, ok := strings.Cut(entry, "=")
 		if ok && ordinaryEnvironmentKey(key) {
-			environment[key] = value
+			environment[EnvironmentKey(key)] = value
 		}
 	}
 

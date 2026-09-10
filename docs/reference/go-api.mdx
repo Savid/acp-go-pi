@@ -51,6 +51,7 @@ error`. This adapter does not invoke either for provider state.
 | `WithDefaultModel` | Default model as provider/id. |
 | `WithPiDirectAPI` | Enable direct quota reads inside Pi; true by default. False returns unavailable/disabled for supported providers. |
 | `WithEnv` | Static environment overlay for every pi process. `ACP_GO_PI_EXTRA_PATH_DIRS` is refused under every spelling. Names follow the session `env` rule with `PATH` allowed: a key is non-empty and free of `=` and NUL, the value is free of NUL, the injection names `NODE_OPTIONS`, `BASH_ENV`, `ENV`, and any `LD_` or `DYLD_` prefix are refused under the platform identity, the private adapter namespace is refused under every spelling, and two spellings of one Windows variable are refused; a refusal fails Agent construction. |
+| `WithAmbientEnvironment` | Replaces the adapter's own process environment as the block ordinary execution inherits from. The same allowlist and scrub apply to it, and `WithEnv` and session `env` overlay it; a supplied map is folded in sorted key order. Nil inherits from the adapter's process; an empty map inherits nothing. An entry that could not be an environment entry fails Agent construction. Every mode validates it; managed execution reads nothing from it. |
 | `WithSeedFiles` | Materialize exact files before native-tree prepare. |
 | `WithSessionStore` | Install durable session mirroring. |
 | `WithSessionStoreLoadTimeout` | Bound store load and list operations. |

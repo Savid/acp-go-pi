@@ -9,8 +9,10 @@ Without `WithHostAuthority`, Pi runs as the adapter account. The
 adapter owns the direct process lifecycle but does not claim whole-containment
 vacancy. Hosts requiring a stronger boundary must provide one explicitly.
 
-The environment is captured once. Ambient provider credentials, loader hooks,
-shell hooks, Node hooks, and adapter-private values are removed.
+The environment is captured once, from the adapter's own process or from the
+block `WithAmbientEnvironment` supplies in its place. Ambient provider
+credentials, loader hooks, shell hooks, Node hooks, and adapter-private values
+are removed.
 `WithEnv` and per-session Pi options are deliberate overlays.
 Session `PATH` and `PI_CODING_AGENT_DIR` replacement are rejected under the
 platform's key identity; absolute `WithPiExtraPathDirs` entries are prepended

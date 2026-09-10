@@ -151,7 +151,7 @@ func NewAgent(opts ...Option) *Agent {
 		TracerProvider: options.TracerProvider,
 		Version:        options.AgentVersion,
 	})
-	ordinaryEnvironment := pi.CaptureOrdinaryEnvironment()
+	ordinaryEnvironment := pi.CaptureOrdinaryEnvironment(ambientEnvironmentEntries(options))
 
 	var nativeEnvironment map[string]string
 
@@ -181,6 +181,7 @@ func NewAgent(opts ...Option) *Agent {
 			optionFailure(log, optionFieldHome, validateManagedHome(options)),
 			optionFailure(log, optionFieldDefaultModel, validateDefaultModel(options.DefaultModel)),
 			optionFailure(log, optionFieldEnv, validateEnvironment(options.Env, optionFieldEnv, blockedAgentEnvKey)),
+			optionFailure(log, optionFieldAmbientEnvironment, validateAmbientEnvironment(options.AmbientEnvironment)),
 			optionFailure(log, optionFieldConcurrencyLimits, validateConcurrencyLimits(options.ConcurrencyLimits)),
 			optionFailure(log, optionFieldImageLimits, validateImageLimits(options.ImageLimits)),
 			optionFailure(log, optionFieldInputHandoffRoot, validateInputHandoffRoot(options.InputHandoffRoot)),
