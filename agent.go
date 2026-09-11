@@ -64,10 +64,11 @@ type Agent struct {
 	positionEncoding   acp.PositionEncodingKind
 	// lifecycle is the answer this connection gave at initialize. An absent
 	// answer leaves the extension dormant for every session on it.
-	lifecycle   lifecycle.Negotiated
-	sessions    map[acp.SessionId]*session
-	deleted     map[acp.SessionId]struct{}
-	clientCalls chan struct{}
+	lifecycle    lifecycle.Negotiated
+	sessions     map[acp.SessionId]*session
+	deleted      map[acp.SessionId]struct{}
+	clientCalls  chan struct{}
+	incarnations uint64
 
 	versionOnce sync.Once
 	versionErr  error
@@ -454,6 +455,17 @@ func (a *Agent) clientSupportsFormElicitation() bool {
 	defer a.mu.Unlock()
 
 	return a.clientCapabilities.Elicitation != nil && a.clientCapabilities.Elicitation.Form != nil
+}
+
+// nextIncarnation mints a stream identity no earlier incarnation of any
+// session on this agent used.
+func (a *Agent) nextIncarnation() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.incarnations++
+
+	return a.incarnations
 }
 
 // acquireClientCall takes one slot of the server-to-client call budget

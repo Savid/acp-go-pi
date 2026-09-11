@@ -31,7 +31,8 @@ func (s *session) nextLifecycleID(kind string) string {
 }
 
 // openStream opens the incarnation for the live process generation with an
-// idle snapshot. It is a no-op while the host negotiated no lifecycle.
+// idle snapshot. Its identity is minted by the agent so no earlier
+// incarnation of the session, including one before a close, shares it. It is a no-op while the host negotiated no lifecycle.
 func (s *session) openStream(ctx context.Context) error {
 	negotiated := s.lifecycleNegotiated()
 	if !negotiated.Present() {
@@ -45,11 +46,7 @@ func (s *session) openStream(ctx context.Context) error {
 		return nil
 	}
 
-	s.mu.Lock()
-	epoch := s.epoch
-	s.mu.Unlock()
-
-	s.lc.stream = lifecycle.NewStream(fmt.Sprintf("%s:%d", s.id, epoch), negotiated)
+	s.lc.stream = lifecycle.NewStream(fmt.Sprintf("%s:%d", s.id, s.agent.nextIncarnation()), negotiated)
 	s.lc.cycleID = s.nextLifecycleID("cycle")
 	s.lc.blockers = make(map[string]struct{})
 
