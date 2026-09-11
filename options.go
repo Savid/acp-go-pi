@@ -3,6 +3,7 @@ package piacp
 import (
 	"log/slog"
 	"maps"
+	"slices"
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
@@ -40,6 +41,11 @@ type Options struct {
 	// DefaultModel selects the model for newly created pi sessions when
 	// non-empty, as "provider/id" (for example "openai/gpt-4o").
 	DefaultModel string
+	// ConfiguredModels are the model ids the host lists explicitly, each as
+	// "provider/id". Each is a configured catalog entry: published after the
+	// native rows on every route, standing aside for a native row of the same
+	// value, and carrying no invented facts.
+	ConfiguredModels []string
 	// DirectAPI permits read-only quota requests from the native bridge to
 	// supported providers. It defaults to true; set WithPiDirectAPI(false)
 	// to disable every direct account endpoint.
@@ -222,6 +228,13 @@ func WithInputHandoffRoot(dir string) Option {
 func WithDefaultModel(model string) Option {
 	return func(options *Options) {
 		options.DefaultModel = model
+	}
+}
+
+// WithConfiguredModels names the models the host lists explicitly.
+func WithConfiguredModels(ids []string) Option {
+	return func(options *Options) {
+		options.ConfiguredModels = slices.Clone(ids)
 	}
 }
 

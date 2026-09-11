@@ -286,7 +286,7 @@ func sessionConfigOptions(session *agentSession) []acp.SessionConfigOption {
 	options := make([]acp.SessionConfigOption, 0, 2)
 
 	if model != "" {
-		if values := modelSelectOptions(model, available); len(values) > 0 {
+		if values := modelSelectOptions(model, available, session.agent.options.ConfiguredModels); len(values) > 0 {
 			options = append(options, acp.SessionConfigOption{
 				Select: &acp.SessionConfigOptionSelect{
 					Id:           configModel,
@@ -329,7 +329,7 @@ func sessionUnstableConfigOptions(session *agentSession) []acp.UnstableSessionCo
 	options := make([]acp.UnstableSessionConfigOption, 0, 2)
 
 	if model != "" {
-		if values := modelSelectOptions(model, available); len(values) > 0 {
+		if values := modelSelectOptions(model, available, session.agent.options.ConfiguredModels); len(values) > 0 {
 			options = append(options, acp.UnstableSessionConfigOption{
 				Select: &acp.UnstableSessionConfigOptionSelect{
 					Id:           configModel,
@@ -364,7 +364,7 @@ func sessionUnstableConfigOptions(session *agentSession) []acp.UnstableSessionCo
 	return options
 }
 
-func modelSelectOptions(model string, available []pi.Model) acp.SessionConfigSelectOptionsUngrouped {
+func modelSelectOptions(model string, available []pi.Model, hostListed []string) acp.SessionConfigSelectOptionsUngrouped {
 	values := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(available)+1)
 	seen := make(map[string]struct{}, len(available)+1)
 
@@ -386,6 +386,20 @@ func modelSelectOptions(model string, available []pi.Model) acp.SessionConfigSel
 			Meta:  piModelInfoMeta(info),
 		})
 		seen[ref] = struct{}{}
+	}
+
+	// A host-listed id follows the native rows as the id alone; a native row of
+	// the same value stands and the host entry adds nothing.
+	for _, id := range hostListed {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+
+		values = append(values, acp.SessionConfigSelectOption{
+			Name:  id,
+			Value: acp.SessionConfigValueId(id),
+		})
+		seen[id] = struct{}{}
 	}
 
 	if _, ok := seen[model]; !ok {

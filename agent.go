@@ -180,6 +180,7 @@ func NewAgent(opts ...Option) *Agent {
 			authorityErr,
 			optionFailure(log, optionFieldHome, validateManagedHome(options)),
 			optionFailure(log, optionFieldDefaultModel, validateDefaultModel(options.DefaultModel)),
+			optionFailure(log, optionFieldConfiguredModels, validateConfiguredModels(options.ConfiguredModels)),
 			optionFailure(log, optionFieldEnv, validateEnvironment(options.Env, optionFieldEnv, blockedAgentEnvKey)),
 			optionFailure(log, optionFieldAmbientEnvironment, validateAmbientEnvironment(options.AmbientEnvironment)),
 			optionFailure(log, optionFieldConcurrencyLimits, validateConcurrencyLimits(options.ConcurrencyLimits)),

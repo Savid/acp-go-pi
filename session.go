@@ -29,6 +29,7 @@ const (
 	acpFieldValue     = "value"
 
 	optionFieldAmbientEnvironment = "ambientEnvironment"
+	optionFieldConfiguredModels   = "configuredModels"
 	optionFieldConcurrencyLimits  = "concurrencyLimits"
 	optionFieldDefaultModel       = "defaultModel"
 	optionFieldEnv                = "env"

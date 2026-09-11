@@ -60,6 +60,15 @@ req := piacp.NewSessionRequest(cwd,
 The same values travel on the wire as `_meta.pi.options.model` and
 `_meta.pi.options.thinkingLevel`; see [Metadata](/docs/reference/meta).
 
+## Host-listed models
+
+A host that knows what its endpoint serves lists those ids with
+`WithConfiguredModels`, each as `provider/id`. Each id follows the native rows
+on every route as the id alone, with no metadata, so a session can carry a
+menu for a provider whose models pi did not enumerate. An id pi already
+reports keeps its native row and facts. An empty, whitespace, malformed, or
+duplicate id fails construction.
+
 ## Seeding pi settings
 
 `WithSeedFiles` (CLI: `-seed-file`) writes files into the pi agent directory a

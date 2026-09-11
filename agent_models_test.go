@@ -37,7 +37,7 @@ func TestModelMetadataMapping(t *testing.T) {
 		{Provider: "", ID: "bad"},
 		{Provider: "p", ID: "two"},
 	}
-	options := modelSelectOptions("p/missing", models)
+	options := modelSelectOptions("p/missing", models, nil)
 	require.Len(t, options, 3)
 	require.Equal(t, "One", options[0].Name)
 	require.Equal(t, "p/two", modelDisplayName(&models[3]))
@@ -52,7 +52,7 @@ func TestModelMetadataMapping(t *testing.T) {
 		`{"pi":{"modelId":"p/one","contextWindow":100,"maxOutputTokens":10}}`,
 		string(encodedMeta))
 
-	encodedOptions, err := json.Marshal(modelSelectOptions("p/one", models))
+	encodedOptions, err := json.Marshal(modelSelectOptions("p/one", models, nil))
 	require.NoError(t, err)
 	require.NotContains(t, string(encodedOptions), `"capabilities"`)
 	require.NotContains(t, string(encodedOptions), `"input"`)
