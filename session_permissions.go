@@ -2,11 +2,14 @@ package piacp
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/coder/acp-go-sdk"
 
+	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-pi/internal/observer"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
@@ -20,161 +23,106 @@ const (
 	uiMethodInput   = "input"
 	uiMethodEditor  = "editor"
 
-	toolNameRead     = "read"
-	toolNameEdit     = "edit"
-	toolNameWrite    = "write"
-	toolNameBash     = "bash"
-	toolNameGrep     = "grep"
-	toolNameFind     = "find"
-	toolNameGlob     = "glob"
-	toolNameLs       = "ls"
-	toolNameFetch    = "fetch"
-	toolNameWebFetch = "web_fetch"
+	elicitationFieldChoice    = "choice"
+	elicitationFieldConfirmed = "confirmed"
+	elicitationFieldValue     = "value"
+
+	schemaFieldType  = "type"
+	schemaFieldTitle = "title"
 )
 
-// handleNativeUIDialog answers one blocking extension UI dialog. A dialog whose
-// select title carries the bridge permission marker is a tool-call permission
-// request; every other dialog is a non-permission question relayed as
-// elicitation. Exactly one UIResponse is always written back so the bridge
-// extension never hangs.
-func (s *agentSession) handleNativeUIDialog(ctx context.Context, dialog *nativeDialog) {
-	if dialog == nil {
+// handleUIRequest routes one extension UI request. Dialogs run on their own
+// goroutine so the pump keeps draining; fire-and-forget methods are ignored.
+func (s *session) handleUIRequest(rt *runtime, request pi.UIRequest) {
+	if !request.IsDialog() {
 		return
 	}
 
-	request := dialog.request
+	go s.handleDialog(rt, request)
+}
+
+// handleDialog answers one blocking dialog. A select whose title carries the
+// permission marker is a tool-call permission; every other dialog is a
+// question relayed as elicitation. Exactly one response reaches pi.
+func (s *session) handleDialog(rt *runtime, request pi.UIRequest) {
+	var c *cycle
+
+	s.mu.Lock()
+
+	switch {
+	case s.turn != nil:
+		c = &s.turn.cycle
+	case s.cycle != nil:
+		c = s.cycle
+	}
+
+	closing := s.closing
+	s.mu.Unlock()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+
+	unregister := s.registerDialog(request.ID, cancel)
+	defer unregister()
+
+	if c == nil || closing {
+		s.respond(rt, pi.UICancelResponse(request.ID))
+
+		return
+	}
+
 	if strings.HasPrefix(request.Title, pi.PermissionTitleMarker) {
 		prompt, ok := pi.ParsePermissionTitle(request.Title)
 		if request.Method != uiMethodSelect || !ok {
-			dialog.answer(ctx, s, pi.UICancelResponse(request.ID))
+			s.respond(rt, pi.UICancelResponse(request.ID))
 
 			return
 		}
 
-		s.handlePermissionDialog(ctx, dialog, prompt)
+		s.respond(rt, s.permissionDialog(ctx, c, request, prompt))
 
 		return
 	}
 
-	s.handleNativeElicitationDialog(ctx, dialog)
+	s.respond(rt, s.elicitationDialog(ctx, c, request))
 }
 
-// registerDialog wraps ctx in a tracked cancellable context so that
-// session/cancel and teardown can resolve a pending dialog as cancelled
-// instead of leaving pi's extension blocked.
-func (s *agentSession) registerDialog(ctx context.Context, id string) (context.Context, func()) {
-	dialogCtx, cancel := context.WithCancelCause(ctx)
-	entry := &dialogCancel{cancel: cancel}
-
-	s.mu.Lock()
-	if s.pendingDialogs == nil {
-		s.pendingDialogs = make(map[string]*dialogCancel)
-	}
-
-	s.pendingDialogs[id] = entry
-	turnCancelled := s.turnCancelled
-	s.mu.Unlock()
-
-	if turnCancelled {
-		cancel(errSessionInteractionClosed)
-	}
-
-	return dialogCtx, func() {
-		s.mu.Lock()
-		if s.pendingDialogs[id] == entry {
-			delete(s.pendingDialogs, id)
-		}
-		s.mu.Unlock()
-
-		cancel(context.Canceled)
+func (s *session) respond(rt *runtime, response pi.UIResponse) {
+	if err := rt.client.RespondUI(response); err != nil {
+		s.agent.log.DebugContext(context.Background(), "respond to pi dialog failed", slog.String("session_id", string(s.id)))
 	}
 }
 
-// handlePermissionDialog maps one bridge permission dialog to ACP
-// session/request_permission. Deny, a cancelled dialog, and every error path
-// fail closed: the bridge blocks the tool call and the turn continues.
-func (s *agentSession) handlePermissionDialog(ctx context.Context, dialog *nativeDialog, prompt pi.PermissionPrompt) {
-	request := dialog.request
-	ctx, finish := s.agent.observe.StartPermission(ctx, prompt.ToolName, s.permissionMode)
+// permissionDialog maps one bridge permission dialog to session/request_permission.
+// Deny, a cancelled dialog, and every failure fail closed.
+func (s *session) permissionDialog(ctx context.Context, c *cycle, request pi.UIRequest, prompt pi.PermissionPrompt) pi.UIResponse {
+	deny := pi.UIValueResponse(request.ID, pi.PermissionOptionDeny)
 
-	answer := s.requestBoundPermissionAnswer(ctx, dialog, prompt)
-	finish(observer.PermissionResult{
-		Behavior: answer,
-		Mode:     s.permissionMode,
-		ToolName: prompt.ToolName,
-	})
+	ctx, finish := s.agent.observe.StartPermission(ctx, prompt.ToolName, s.permissionMode())
 
-	var response pi.UIResponse
-	if answer == string(permissionOptionAllow) {
-		response = pi.UIValueResponse(request.ID, pi.PermissionOptionAllow)
-	} else {
-		response = pi.UIValueResponse(request.ID, pi.PermissionOptionDeny)
+	answer := s.requestPermission(ctx, c, prompt)
+	finish(observer.PermissionResult{Behavior: string(answer), Mode: s.permissionMode(), ToolName: prompt.ToolName})
+
+	if answer == permissionOptionAllow {
+		return pi.UIValueResponse(request.ID, pi.PermissionOptionAllow)
 	}
 
-	dialog.answer(ctx, s, response)
+	return deny
 }
 
-func (s *agentSession) requestBoundPermissionAnswer(ctx context.Context, dialog *nativeDialog, prompt pi.PermissionPrompt) string {
-	request := dialog.request
-
-	if strings.TrimSpace(prompt.ToolCallID) == "" {
-		return string(permissionOptionDeny)
-	}
-
+func (s *session) requestPermission(ctx context.Context, c *cycle, prompt pi.PermissionPrompt) acp.PermissionOptionId {
 	conn := s.agent.connection()
 	if conn == nil {
-		return string(permissionOptionDeny)
+		return permissionOptionDeny
 	}
 
-	dialogCtx, finishDialog := s.registerDialog(ctx, request.ID)
-	defer finishDialog()
-
-	// UI requests and native tool events arrive on independent channels. Hold
-	// the exact-ID tool lock from the claim through the permission call:
-	// a native start or terminal can neither overtake pending publication nor
-	// invalidate the call before the ACP client admits the request.
-	state := s.lockToolCallState(prompt.ToolCallID)
-	defer state.mu.Unlock()
-
-	turnNonce, active := s.permissionTurnNonce(dialogCtx)
-	if !active {
-		return string(permissionOptionDeny)
+	if err := s.publishPendingTool(ctx, &c.state, prompt); err != nil {
+		return permissionOptionDeny
 	}
-
-	if state.permissionRequested || state.terminalPublished {
-		return string(permissionOptionDeny)
-	}
-
-	state.permissionRequested = true
-
-	title := prompt.ToolName
 
 	kind := toolKindForName(prompt.ToolName)
-	if !state.published {
-		startOpts := []acp.ToolCallStartOpt{
-			acp.WithStartKind(kind),
-			acp.WithStartStatus(acp.ToolCallStatusPending),
-		}
-		if len(prompt.Input) > 0 {
-			startOpts = append(startOpts, acp.WithStartRawInput(prompt.Input))
-		}
-
-		pendingCtx := withTurnRoute(dialogCtx, turnNonce)
-		if err := s.emitUpdates(pendingCtx, []acp.SessionUpdate{
-			acp.StartToolCall(acp.ToolCallId(prompt.ToolCallID), prompt.ToolName, startOpts...),
-		}); err != nil {
-			s.agent.log.DebugContext(ctx, "publish pending permission tool call failed closed",
-				slog.String(acpFieldSessionID, string(s.id)),
-			)
-
-			return string(permissionOptionDeny)
-		}
-
-		state.published = true
-		state.status = acp.ToolCallStatusPending
-	}
-
-	status := state.status
+	status := acp.ToolCallStatusPending
+	title := prompt.ToolName
 
 	toolCall := acp.ToolCallUpdate{
 		ToolCallId: acp.ToolCallId(prompt.ToolCallID),
@@ -186,137 +134,254 @@ func (s *agentSession) requestBoundPermissionAnswer(ctx context.Context, dialog 
 		toolCall.RawInput = prompt.Input
 	}
 
-	resp, err := s.requestAnnouncedPermission(dialogCtx, conn, acp.RequestPermissionRequest{
-		SessionId: s.id,
-		ToolCall:  toolCall,
-		Options: []acp.PermissionOption{
-			{OptionId: permissionOptionAllow, Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
-			{OptionId: permissionOptionDeny, Name: "Deny", Kind: acp.PermissionOptionKindRejectOnce},
+	resp, err := announcedRequest(ctx, s, c, lifecycle.ActionPermission,
+		func(requestCtx context.Context, meta map[string]any) (acp.RequestPermissionResponse, error) {
+			return conn.RequestPermission(requestCtx, acp.RequestPermissionRequest{
+				Meta:      meta,
+				SessionId: s.id,
+				ToolCall:  toolCall,
+				Options: []acp.PermissionOption{
+					{OptionId: permissionOptionAllow, Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
+					{OptionId: permissionOptionDeny, Name: "Deny", Kind: acp.PermissionOptionKindRejectOnce},
+				},
+			})
 		},
-	}, dialogActionBinding{outbox: dialog.outbox, failNative: func() {
-		dialog.answer(context.WithoutCancel(ctx), s, pi.UIValueResponse(request.ID, pi.PermissionOptionDeny))
-	}})
-	if err != nil {
-		s.agent.log.DebugContext(ctx, "permission request failed closed",
-			slog.String(acpFieldSessionID, string(s.id)),
-		)
-
-		return string(permissionOptionDeny)
-	}
-
-	if resp.Outcome.Selected == nil {
-		return string(permissionOptionDeny)
-	}
-
-	if resp.Outcome.Selected.OptionId == permissionOptionAllow {
-		return string(permissionOptionAllow)
-	}
-
-	return string(permissionOptionDeny)
-}
-
-// permissionTurnNonce captures the active prompt route for a bridge dialog.
-// The dialog context and session must name the same active turn. Cancellation,
-// missing routes, teardown, and stale dialog goroutines all fail closed instead
-// of being rebound to a later turn.
-func (s *agentSession) permissionTurnNonce(ctx context.Context) (string, bool) {
-	if ctx.Err() != nil {
-		return "", false
-	}
-
-	contextNonce := turnNonceFromContext(ctx)
-
-	s.mu.Lock()
-	activeNonce := s.turnNonce
-	active := s.cancel != nil && activeNonce != ""
-	s.mu.Unlock()
-
-	if !active || contextNonce == "" || contextNonce != activeNonce {
-		return "", false
-	}
-
-	return activeNonce, true
-}
-
-// respondExactUIDialog writes one answer to the client captured from the
-// generation that emitted it. There is intentionally no current-client
-// fallback: a successor must never receive an ancestor's dialog response.
-func (s *agentSession) respondExactUIDialog(
-	ctx context.Context,
-	outbox *sessionOutbox,
-	client piClient,
-	response pi.UIResponse,
-) {
-	if client == nil || outbox == nil || outbox.client != client {
-		return
-	}
-
-	responseCtx, cancelResponse := context.WithTimeout(ctx, sessionInterruptTimeout)
-	defer cancelResponse()
-
-	if err := outbox.dispatchMu.lock(responseCtx); err != nil {
-		return
-	}
-	defer outbox.dispatchMu.Unlock()
-
-	outbox.mu.Lock()
-	current := outbox.client == client && !outbox.ended && !outbox.fenced
-	outbox.mu.Unlock()
-
-	if !current {
-		return
-	}
-
-	if err := client.RespondUI(response); err != nil {
-		s.agent.log.DebugContext(ctx, "respond to pi UI dialog failed",
-			slog.String(acpFieldSessionID, string(s.id)),
-		)
-	}
-}
-
-// respondExactClientUIDialog resolves the generation owner by exact client
-// identity for deferred provider-auth replies whose flow retained the emitter
-// but not the outbox pointer. A client is construction-owned by one generation
-// and is never reused by a successor.
-func (s *agentSession) respondExactClientUIDialog(
-	ctx context.Context,
-	client piClient,
-	response pi.UIResponse,
-) {
-	if client == nil {
-		return
-	}
-
-	s.mu.Lock()
-
-	var exact *sessionOutbox
-	if s.outbox != nil && s.outbox.client == client {
-		exact = s.outbox
-	} else {
-		for _, retained := range s.containmentOutboxes {
-			if retained != nil && retained.client == client {
-				exact = retained
-
-				break
+		func(resp acp.RequestPermissionResponse, err error) lifecycle.ActionState {
+			switch {
+			case err != nil:
+				return lifecycle.ActionFailed
+			case resp.Outcome.Selected == nil:
+				return lifecycle.ActionCancelled
+			case resp.Outcome.Selected.OptionId == permissionOptionAllow:
+				return lifecycle.ActionAccepted
+			default:
+				return lifecycle.ActionDeclined
 			}
+		})
+	if err != nil || resp.Outcome.Selected == nil || resp.Outcome.Selected.OptionId != permissionOptionAllow {
+		return permissionOptionDeny
+	}
+
+	return permissionOptionAllow
+}
+
+// elicitationDialog relays one non-permission dialog as a form elicitation.
+// Without form support on the client the dialog is cancelled natively.
+func (s *session) elicitationDialog(ctx context.Context, c *cycle, request pi.UIRequest) pi.UIResponse {
+	conn := s.agent.connection()
+	if conn == nil || !s.agent.clientSupportsFormElicitation() {
+		return pi.UICancelResponse(request.ID)
+	}
+
+	ctx, finish := s.agent.observe.StartElicitation(ctx)
+
+	resp, err := announcedRequest(ctx, s, c, lifecycle.ActionElicitation,
+		func(requestCtx context.Context, meta map[string]any) (acp.UnstableCreateElicitationResponse, error) {
+			return conn.UnstableCreateElicitation(requestCtx, acp.UnstableCreateElicitationRequest{
+				Form: &acp.UnstableCreateElicitationForm{
+					Meta:            meta,
+					Message:         elicitationMessage(request),
+					Mode:            "form",
+					RequestedSchema: elicitationSchema(request),
+				},
+			})
+		},
+		func(resp acp.UnstableCreateElicitationResponse, err error) lifecycle.ActionState {
+			switch {
+			case err != nil:
+				return lifecycle.ActionFailed
+			case resp.Accept != nil:
+				return lifecycle.ActionAccepted
+			case resp.Decline != nil:
+				return lifecycle.ActionDeclined
+			default:
+				return lifecycle.ActionCancelled
+			}
+		})
+
+	finish(observer.ElicitationResult{Accepted: err == nil && resp.Accept != nil, Err: err})
+
+	if err != nil || resp.Accept == nil {
+		return pi.UICancelResponse(request.ID)
+	}
+
+	return dialogAnswer(request, resp.Accept.Content)
+}
+
+// announcedRequest sends one client request that holds native work, announces
+// the action it answers once the request is on the wire, and resolves that
+// action exactly once.
+func announcedRequest[T any](
+	ctx context.Context,
+	s *session,
+	c *cycle,
+	kind lifecycle.ActionKind,
+	send func(context.Context, map[string]any) (T, error),
+	resolved func(T, error) lifecycle.ActionState,
+) (T, error) {
+	var zero T
+
+	releaseCall, err := s.agent.acquireClientCall()
+	if err != nil {
+		return zero, err
+	}
+	defer releaseCall()
+
+	actionID, err := s.reserveAction(c)
+	if err != nil {
+		return zero, err
+	}
+
+	if actionID == "" {
+		return send(ctx, nil)
+	}
+
+	type answer struct {
+		value T
+		err   error
+	}
+
+	answers := make(chan answer, 1)
+
+	var written <-chan struct{}
+	if t := s.agent.transportRef(); t != nil {
+		written = t.awaitRequestWrite(actionID)
+	}
+
+	go func() {
+		value, err := send(ctx, s.actionCorrelation(c, actionID))
+		answers <- answer{value: value, err: err}
+	}()
+
+	if written != nil {
+		select {
+		case <-written:
+		case result := <-answers:
+			answers <- result
 		}
 	}
-	s.mu.Unlock()
 
-	s.respondExactUIDialog(ctx, exact, client, response)
+	if err := s.lcActionPendingWithID(ctx, c, actionID, kind); err != nil {
+		s.agent.log.ErrorContext(ctx, "announce lifecycle action failed",
+			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
+	}
+
+	result := <-answers
+	state := resolved(result.value, result.err)
+
+	if result.err != nil && errors.Is(context.Cause(ctx), errDialogCancelled) {
+		state = lifecycle.ActionCancelled
+	}
+
+	if err := s.lcActionResolved(context.WithoutCancel(ctx), c, actionID, state); err != nil {
+		s.agent.log.ErrorContext(ctx, "resolve lifecycle action failed",
+			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
+	}
+
+	return result.value, result.err
+}
+
+func (s *session) reserveAction(c *cycle) (string, error) {
+	s.lcMu.Lock()
+	defer s.lcMu.Unlock()
+
+	if s.lc.stream == nil || s.lc.stream.Fenced() || c.turnID == "" {
+		return "", nil
+	}
+
+	return s.nextLifecycleID("action"), nil
+}
+
+// dialogAnswer converts an accepted elicitation form into the native dialog
+// response; an answer that does not fit the dialog dismisses it.
+func dialogAnswer(request pi.UIRequest, content map[string]any) pi.UIResponse {
+	switch request.Method {
+	case uiMethodSelect:
+		choice, _ := content[elicitationFieldChoice].(string)
+		if choice == "" || !slices.Contains(request.Options, choice) {
+			return pi.UICancelResponse(request.ID)
+		}
+
+		return pi.UIValueResponse(request.ID, choice)
+	case uiMethodConfirm:
+		confirmed, ok := content[elicitationFieldConfirmed].(bool)
+		if !ok {
+			return pi.UICancelResponse(request.ID)
+		}
+
+		return pi.UIConfirmResponse(request.ID, confirmed)
+	case uiMethodInput, uiMethodEditor:
+		value, ok := content[elicitationFieldValue].(string)
+		if !ok {
+			return pi.UICancelResponse(request.ID)
+		}
+
+		return pi.UIValueResponse(request.ID, value)
+	default:
+		return pi.UICancelResponse(request.ID)
+	}
+}
+
+func elicitationMessage(request pi.UIRequest) string {
+	parts := make([]string, 0, 2)
+	if strings.TrimSpace(request.Title) != "" {
+		parts = append(parts, request.Title)
+	}
+
+	if strings.TrimSpace(request.Message) != "" {
+		parts = append(parts, request.Message)
+	}
+
+	if len(parts) == 0 {
+		return "pi needs more input."
+	}
+
+	return strings.Join(parts, "\n\n")
+}
+
+func elicitationSchema(request pi.UIRequest) acp.UnstableElicitationSchema {
+	schema := acp.UnstableElicitationSchema{Properties: map[string]any{}, Type: acp.UnstableElicitationSchemaTypeObject}
+
+	switch request.Method {
+	case uiMethodSelect:
+		oneOf := make([]map[string]any, 0, len(request.Options))
+		for _, option := range request.Options {
+			oneOf = append(oneOf, map[string]any{"const": option, schemaFieldTitle: option})
+		}
+
+		schema.Properties[elicitationFieldChoice] = map[string]any{schemaFieldType: "string", "oneOf": oneOf}
+		schema.Required = []string{elicitationFieldChoice}
+	case uiMethodConfirm:
+		schema.Properties[elicitationFieldConfirmed] = map[string]any{schemaFieldType: "boolean"}
+		schema.Required = []string{elicitationFieldConfirmed}
+	default:
+		property := map[string]any{schemaFieldType: "string"}
+		if request.Placeholder != "" {
+			property["description"] = request.Placeholder
+		}
+
+		if request.Prefill != "" {
+			property["default"] = request.Prefill
+		}
+
+		schema.Properties[elicitationFieldValue] = property
+		schema.Required = []string{elicitationFieldValue}
+	}
+
+	return schema
 }
 
 func toolKindForName(toolName string) acp.ToolKind {
 	switch toolName {
-	case toolNameRead:
+	case "read":
 		return acp.ToolKindRead
-	case toolNameEdit, toolNameWrite:
+	case "edit", "write":
 		return acp.ToolKindEdit
-	case toolNameBash:
+	case "bash":
 		return acp.ToolKindExecute
-	case toolNameGrep, toolNameFind, toolNameGlob, toolNameLs:
+	case "grep", "find", "glob", "ls":
 		return acp.ToolKindSearch
-	case toolNameFetch, toolNameWebFetch:
+	case "fetch", "web_fetch":
 		return acp.ToolKindFetch
 	default:
 		return acp.ToolKindOther

@@ -7,194 +7,76 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestLineReaderFraming(t *testing.T) {
+func TestLineReaderStrictLF(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name    string
-		input   string
-		want    []string
-		wantErr error
-	}{
-		{
-			name:  "lf delimited records",
-			input: "{\"a\":1}\n{\"b\":2}\n",
-			want:  []string{`{"a":1}`, `{"b":2}`},
-		},
-		{
-			name:  "crlf stripped",
-			input: "{\"a\":1}\r\n{\"b\":2}\r\n",
-			want:  []string{`{"a":1}`, `{"b":2}`},
-		},
-		{
-			name:  "unicode separators are not delimiters",
-			input: "{\"text\":\"a b c\"}\n",
-			want:  []string{"{\"text\":\"a b c\"}"},
-		},
-		{
-			name:    "final unterminated record",
-			input:   "{\"a\":1}\n{\"b\":2}",
-			want:    []string{`{"a":1}`},
-			wantErr: ErrJSONLStructural,
-		},
-		{
-			name:  "record larger than the reader buffer",
-			input: `{"text":"` + strings.Repeat("x", 256<<10) + `"}` + "\n",
-			want:  []string{`{"text":"` + strings.Repeat("x", 256<<10) + `"}`},
-		},
-	}
+	reader := NewLineReader(strings.NewReader("{\"a\":1}\r\n{\"b\":\"x y\"}\n"))
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
+	line, err := reader.Next()
+	require.NoError(t, err)
+	require.Equal(t, `{"a":1}`, string(line))
 
-			reader := NewLineReader(strings.NewReader(test.input))
+	line, err = reader.Next()
+	require.NoError(t, err)
+	require.Equal(t, "{\"b\":\"x y\"}", string(line))
 
-			got := make([]string, 0, len(test.want))
-
-			for {
-				line, err := reader.Next()
-				if len(line) > 0 {
-					got = append(got, string(line))
-				}
-
-				if err != nil {
-					if test.wantErr != nil {
-						require.ErrorIs(t, err, test.wantErr)
-					} else {
-						require.ErrorContains(t, err, "EOF")
-					}
-
-					break
-				}
-			}
-
-			require.Equal(t, test.want, got)
-		})
-	}
+	_, err = reader.Next()
+	require.Error(t, err)
 }
 
-func TestLineReaderRejectsOversizeRecord(t *testing.T) {
+func TestLineReaderUnterminatedRecordIsStructural(t *testing.T) {
 	t.Parallel()
 
-	reader := NewLineReader(strings.NewReader(strings.Repeat("x", maxLineBytes+1)))
-	line, err := reader.Next()
-	require.Nil(t, line)
+	reader := NewLineReader(strings.NewReader(`{"a":1}`))
+
+	_, err := reader.Next()
 	require.ErrorIs(t, err, ErrJSONLStructural)
 }
 
-func TestDecodeMessageClassification(t *testing.T) {
+func TestDecodeMessage(t *testing.T) {
 	t.Parallel()
 
-	t.Run("response", func(t *testing.T) {
-		t.Parallel()
+	message, err := DecodeMessage([]byte(`{"type":"response","id":"1","command":"prompt","success":false,"error":"no"}`))
+	require.NoError(t, err)
+	require.Equal(t, MessageKindResponse, message.Kind)
+	require.EqualError(t, message.Response.Err(), "pi command prompt failed: no")
+	require.NotEmpty(t, message.Response.RawJSON())
 
-		line := `{"id":"acp-1","type":"response","command":"get_state","success":true,"data":{"sessionId":"abc"}}`
+	message, err = DecodeMessage([]byte(`{"type":"extension_ui_request","id":"u","method":"select","title":"t","options":["a"]}`))
+	require.NoError(t, err)
+	require.Equal(t, MessageKindUIRequest, message.Kind)
+	require.True(t, message.UIRequest.IsDialog())
+	require.NotEmpty(t, message.UIRequest.RawJSON())
 
-		message, err := DecodeMessage([]byte(line))
-		require.NoError(t, err)
-		require.Equal(t, MessageKindResponse, message.Kind)
-		require.Equal(t, "acp-1", message.Response.ID)
-		require.Equal(t, "get_state", message.Response.Command)
-		require.True(t, message.Response.Success)
-		require.NoError(t, message.Response.Err())
-		require.JSONEq(t, line, string(message.Response.RawJSON()))
-	})
+	message, err = DecodeMessage([]byte(`{"type":"extension_ui_request","id":"u","method":"notify"}`))
+	require.NoError(t, err)
+	require.False(t, message.UIRequest.IsDialog())
 
-	t.Run("failed response yields command error", func(t *testing.T) {
-		t.Parallel()
+	message, err = DecodeMessage([]byte(`{"type":"agent_start"}`))
+	require.NoError(t, err)
+	require.Equal(t, MessageKindEvent, message.Kind)
+	require.Equal(t, EventTypeAgentStart, message.Event.Kind())
 
-		line := `{"type":"response","command":"set_model","success":false,"error":"Model not found: nope/missing"}`
+	message, err = DecodeMessage([]byte(`{"type":"something_new","x":1}`))
+	require.NoError(t, err)
+	require.Equal(t, "something_new", message.Event.Kind())
 
-		message, err := DecodeMessage([]byte(line))
-		require.NoError(t, err)
+	_, err = DecodeMessage([]byte(`not json`))
+	require.Error(t, err)
 
-		commandErr := message.Response.Err()
-		require.Error(t, commandErr)
-
-		var typed *CommandError
-
-		require.ErrorAs(t, commandErr, &typed)
-		require.Equal(t, "set_model", typed.Command)
-		require.Equal(t, "Model not found: nope/missing", typed.Message)
-		require.Contains(t, commandErr.Error(), "Model not found")
-	})
-
-	t.Run("extension ui request", func(t *testing.T) {
-		t.Parallel()
-
-		line := `{"type":"extension_ui_request","id":"uuid-1","method":"select",` +
-			`"title":"Allow?","options":["allow","deny"],"timeout":10000}`
-
-		message, err := DecodeMessage([]byte(line))
-		require.NoError(t, err)
-		require.Equal(t, MessageKindUIRequest, message.Kind)
-		require.Equal(t, "uuid-1", message.UIRequest.ID)
-		require.Equal(t, "select", message.UIRequest.Method)
-		require.Equal(t, []string{"allow", "deny"}, message.UIRequest.Options)
-		require.NotNil(t, message.UIRequest.TimeoutMs)
-		require.InDelta(t, 10000.0, *message.UIRequest.TimeoutMs, 0)
-		require.True(t, message.UIRequest.IsDialog())
-		require.JSONEq(t, line, string(message.UIRequest.RawJSON()))
-	})
-
-	t.Run("fire and forget ui request is not a dialog", func(t *testing.T) {
-		t.Parallel()
-
-		line := `{"type":"extension_ui_request","id":"uuid-2","method":"notify","message":"hi","notifyType":"info"}`
-
-		message, err := DecodeMessage([]byte(line))
-		require.NoError(t, err)
-		require.False(t, message.UIRequest.IsDialog())
-		require.Equal(t, "info", message.UIRequest.NotifyType)
-	})
-
-	t.Run("event", func(t *testing.T) {
-		t.Parallel()
-
-		message, err := DecodeMessage([]byte(`{"type":"agent_settled"}`))
-		require.NoError(t, err)
-		require.Equal(t, MessageKindEvent, message.Kind)
-		require.Equal(t, "agent_settled", message.Event.Kind())
-	})
-
-	t.Run("malformed json", func(t *testing.T) {
-		t.Parallel()
-
-		_, err := DecodeMessage([]byte(`{"type":`))
-		require.Error(t, err)
-	})
-
-	t.Run("malformed response body", func(t *testing.T) {
-		t.Parallel()
-
-		_, err := DecodeMessage([]byte(`{"type":"response","success":"nope"}`))
-		require.Error(t, err)
-	})
-
-	t.Run("malformed ui request body", func(t *testing.T) {
-		t.Parallel()
-
-		_, err := DecodeMessage([]byte(`{"type":"extension_ui_request","options":"nope"}`))
-		require.Error(t, err)
-	})
+	_, err = DecodeMessage([]byte(`{"type":"tool_execution_end","toolCallId":1}`))
+	require.Error(t, err)
 }
 
-func TestUIResponseBuilders(t *testing.T) {
+func TestUIResponses(t *testing.T) {
 	t.Parallel()
 
-	value := UIValueResponse("id-1", "allow")
-	require.Equal(t, "extension_ui_response", value.Type)
-	require.Equal(t, "id-1", value.ID)
-	require.NotNil(t, value.Value)
-	require.Equal(t, "allow", *value.Value)
+	value := UIValueResponse("1", "v")
+	require.Equal(t, "v", *value.Value)
+	require.Equal(t, uiResponseType, value.Type)
 
-	confirmed := UIConfirmResponse("id-2", true)
-	require.NotNil(t, confirmed.Confirmed)
-	require.True(t, *confirmed.Confirmed)
+	confirm := UIConfirmResponse("1", false)
+	require.False(t, *confirm.Confirmed)
 
-	cancelled := UICancelResponse("id-3")
-	require.True(t, cancelled.Cancelled)
-	require.Nil(t, cancelled.Value)
-	require.Nil(t, cancelled.Confirmed)
+	require.True(t, UICancelResponse("1").Cancelled)
 }

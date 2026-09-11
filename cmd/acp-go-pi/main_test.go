@@ -1,223 +1,76 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"io"
-	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
-	piacp "github.com/savid/acp-go-pi"
 	"github.com/stretchr/testify/require"
 )
 
-func disableTelemetry(t *testing.T) {
-	t.Helper()
+func TestRunVersionFlag(t *testing.T) {
+	t.Parallel()
 
-	t.Setenv("OTEL_TRACES_EXPORTER", "none")
-	t.Setenv("OTEL_METRICS_EXPORTER", "none")
-	t.Setenv("OTEL_LOGS_EXPORTER", "none")
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "")
-	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "")
-	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "")
-	t.Setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "")
+	var stdout, stderr bytes.Buffer
+
+	code := run(context.Background(), []string{"-version"}, strings.NewReader(""), &stdout, &stderr)
+	require.Equal(t, 0, code)
+	require.Equal(t, "dev\n", stdout.String())
 }
 
-func restoreMainSeams(t *testing.T) {
-	t.Helper()
+func TestRunBadFlag(t *testing.T) {
+	t.Parallel()
 
-	realServe := serve
-	realShutdown := shutdownOpenTelemetry
-	realVersion := agentVersion
-	realExit := exit
-	realArgs := os.Args
+	var stdout, stderr bytes.Buffer
 
-	t.Cleanup(func() {
-		serve = realServe
-		shutdownOpenTelemetry = realShutdown
-		agentVersion = realVersion
-		exit = realExit
-		os.Args = realArgs
-	})
+	code := run(context.Background(), []string{"-bogus"}, strings.NewReader(""), &stdout, &stderr)
+	require.Equal(t, 2, code)
+	require.Contains(t, stderr.String(), "flag provided but not defined")
 }
 
 func TestSeedFileFlag(t *testing.T) {
-	dir := t.TempDir()
-	path := dir + "/seed.json"
-	require.NoError(t, os.WriteFile(path, []byte("seed contents"), 0o600))
+	t.Parallel()
 
-	var flag seedFileFlag
-	require.Empty(t, flag.String())
-	require.Empty(t, (*seedFileFlag)(nil).String())
-	require.ErrorContains(t, flag.Set("missing-separator"), "expected <relpath>=<hostpath>")
-	require.ErrorContains(t, flag.Set(" = "+path), "expected <relpath>=<hostpath>")
-	require.ErrorContains(t, flag.Set("config= "), "expected <relpath>=<hostpath>")
-	require.ErrorContains(t, flag.Set("config=/missing/file"), "read seed file")
-	require.NoError(t, flag.Set(" z.json = "+path))
-	require.NoError(t, flag.Set("a.json="+path))
-	require.Equal(t, "a.json,z.json", flag.String())
-	require.Equal(t, "seed contents", flag.files["a.json"])
+	path := filepath.Join(t.TempDir(), "settings.json")
+	require.NoError(t, os.WriteFile(path, []byte("{}"), 0o600))
+
+	flag := &seedFileFlag{}
+	require.Equal(t, "", flag.String())
+	require.NoError(t, flag.Set("settings.json="+path))
+	require.Equal(t, "settings.json", flag.String())
+	require.Equal(t, "{}", flag.files["settings.json"])
+	require.Error(t, flag.Set("nope"))
+	require.Error(t, flag.Set("=x"))
+	require.Error(t, flag.Set("a="+filepath.Join(t.TempDir(), "missing")))
 }
 
-func TestRunSuccessAndFailures(t *testing.T) {
-	disableTelemetry(t)
-	restoreMainSeams(t)
+func TestRunServesUntilPeerCloses(t *testing.T) {
+	t.Parallel()
 
-	agentVersion = func() string { return "test-version" }
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	require.Equal(t, 2, run(t.Context(), []string{"-unknown"}, bytes.NewReader(nil), &stdout, &stderr))
-	require.Contains(t, stderr.String(), "flag provided but not defined")
-
-	stdout.Reset()
-	stderr.Reset()
-	require.Equal(t, 0, run(t.Context(), []string{"-version"}, bytes.NewReader(nil), &stdout, &stderr))
-	require.Equal(t, "test-version\n", stdout.String())
-
-	serve = func(context.Context, io.Reader, io.Writer, ...piacp.Option) error {
-		return errors.New("serve failed")
-	}
-	stdout.Reset()
-	stderr.Reset()
-	require.Equal(t, 1, run(t.Context(), nil, bytes.NewReader(nil), &stdout, &stderr))
-	require.Contains(t, stderr.String(), "serve failed")
-
-	serve = func(context.Context, io.Reader, io.Writer, ...piacp.Option) error { return nil }
-	shutdownOpenTelemetry = func(context.Context, func(context.Context) error) error {
-		return errors.New("shutdown failed")
-	}
-	stderr.Reset()
-	require.Equal(t, 1, run(t.Context(), nil, bytes.NewReader(nil), &stdout, &stderr))
-	require.Contains(t, stderr.String(), "shutdown OpenTelemetry")
-}
-
-func TestRunTelemetryFailure(t *testing.T) {
-	disableTelemetry(t)
-	t.Setenv("OTEL_TRACES_EXPORTER", "unknown")
-	restoreMainSeams(t)
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
 
 	var stderr bytes.Buffer
-	require.Equal(t, 1, run(t.Context(), nil, bytes.NewReader(nil), io.Discard, &stderr))
-	require.Contains(t, stderr.String(), "configure OpenTelemetry")
-}
 
-func TestRunOptionsCancellationAndSignal(t *testing.T) {
-	disableTelemetry(t)
-	restoreMainSeams(t)
+	codes := make(chan int, 1)
 
-	seedPath := t.TempDir() + "/settings.json"
-	require.NoError(t, os.WriteFile(seedPath, []byte(`{"theme":"dark"}`), 0o600))
+	go func() {
+		codes <- run(context.Background(), []string{"-path", "/nonexistent/pi", "-scratch-dir", t.TempDir()}, stdinReader, stdoutWriter, &stderr)
+		_ = stdoutWriter.Close()
+	}()
 
-	agentVersion = func() string { return "1.0.0" }
-	shutdownOpenTelemetry = shutdownTelemetry
-	serve = func(_ context.Context, _ io.Reader, _ io.Writer, opts ...piacp.Option) error {
-		options := piacp.Options{}
-		for _, opt := range opts {
-			opt(&options)
-		}
+	_, err := io.WriteString(stdinWriter, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`+"\n")
+	require.NoError(t, err)
 
-		require.Equal(t, "1.0.0", options.AgentVersion)
-		require.Equal(t, "/custom/pi", options.ExecutablePath)
-		require.Equal(t, "/agent/home", options.Home)
-		require.Equal(t, "/agent/scratch", options.ScratchDir)
-		require.Equal(t, "/agent/auth-ledger", options.ProviderAuthRoot)
-		require.Equal(t, "provider/model", options.DefaultModel)
-		require.False(t, options.DirectAPI)
-		require.Equal(t, `{"theme":"dark"}`, options.SeedFiles["settings.json"])
-		require.NotNil(t, options.Logger)
-		require.NotNil(t, options.TextMapPropagator)
+	line, err := bufio.NewReader(stdoutReader).ReadString('\n')
+	require.NoError(t, err)
+	require.Contains(t, line, `"protocolVersion"`)
 
-		return nil
-	}
-
-	var stderr bytes.Buffer
-	code := run(t.Context(), []string{
-		"-debug",
-		"-path", "/custom/pi",
-		"-home", "/agent/home",
-		"-scratch-dir", "/agent/scratch",
-		"-provider-auth-root", "/agent/auth-ledger",
-		"-model", "provider/model",
-		"-pi-direct-api=false",
-		"-seed-file", "settings.json=" + seedPath,
-	}, bytes.NewReader(nil), io.Discard, &stderr)
-	require.Zero(t, code)
-
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	serve = func(context.Context, io.Reader, io.Writer, ...piacp.Option) error {
-		return errors.New("ignored after cancellation")
-	}
-	require.Zero(t, run(ctx, nil, bytes.NewReader(nil), io.Discard, io.Discard))
-}
-
-type namedSignal string
-
-func (s namedSignal) String() string { return string(s) }
-func (namedSignal) Signal()          {}
-
-func TestSignalsAndPendingSignal(t *testing.T) {
-	require.Equal(t, 1, signalCode(namedSignal("other")))
-
-	ch := make(chan os.Signal, 1)
-	require.Nil(t, pendingSignal(ch))
-	ch <- namedSignal("pending")
-	require.Equal(t, namedSignal("pending"), pendingSignal(ch))
-}
-
-func TestMain(t *testing.T) {
-	disableTelemetry(t)
-	restoreMainSeams(t)
-
-	agentVersion = func() string { return "main-test" }
-	os.Args = []string{"acp-go-pi", "-version"}
-	main()
-
-	exitCode := 0
-	exit = func(code int) { exitCode = code }
-	os.Args = []string{"acp-go-pi", "-invalid"}
-	main()
-	require.Equal(t, 2, exitCode)
-}
-
-func TestVersion(t *testing.T) {
-	realVersion := buildVersion
-	t.Cleanup(func() { buildVersion = realVersion })
-
-	buildVersion = ""
-	require.Equal(t, "dev", version())
-	buildVersion = "v1.2.3"
-	require.Equal(t, "v1.2.3", version())
-}
-
-type testHandler struct {
-	enabled bool
-	err     error
-	handled *int
-	attrs   []slog.Attr
-	groups  []string
-}
-
-func (h testHandler) Enabled(context.Context, slog.Level) bool { return h.enabled }
-
-func (h testHandler) Handle(context.Context, slog.Record) error {
-	*h.handled++
-
-	return h.err
-}
-
-func (h testHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	h.attrs = append(h.attrs, attrs...)
-
-	return h
-}
-
-func (h testHandler) WithGroup(name string) slog.Handler {
-	h.groups = append(h.groups, name)
-
-	return h
+	require.NoError(t, stdinWriter.Close())
+	require.Equal(t, 0, <-codes)
 }

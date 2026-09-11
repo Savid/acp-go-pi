@@ -3,7 +3,6 @@ package piacp
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"strings"
 	"time"
@@ -15,51 +14,53 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
-var (
-	errAgentClosed              = errors.New("ACP agent is closed")
-	errACPConnectionNotAttached = errors.New("ACP connection is not attached")
+const (
+	messageRoleUser       = "user"
+	messageRoleAssistant  = "assistant"
+	messageRoleToolResult = "toolResult"
+	messageRoleCustom     = "custom"
+
+	rowTypeMessage = "message"
+
+	contentBlockTypeText     = "text"
+	contentBlockTypeThinking = "thinking"
+	contentBlockTypeToolCall = "toolCall"
+	contentBlockTypeImage    = "image"
+
+	assistantEventTextDelta     = "text_delta"
+	assistantEventThinkingDelta = "thinking_delta"
+
+	sessionTitleMaxRunes = 256
 )
 
-const liveSessionTitleMaxRunes = 256
-
-func (s *agentSession) emitUpdates(ctx context.Context, updates []acp.SessionUpdate) error {
-	return s.emitUpdatesWithNativeMessageID(ctx, updates, "")
+// cycleState accumulates what one cycle streamed.
+type cycleState struct {
+	usage         *acp.Usage
+	cost          *pi.UsageCost
+	stopReason    string
+	errorMessage  string
+	imagesEmitted bool
+	// streamedText and streamedThought hold what the open assistant message
+	// already streamed, so its terminal frame contributes only the suffix.
+	streamedText    string
+	streamedThought string
+	finalized       map[string]struct{}
+	agentImages     map[string]struct{}
+	tools           map[string]*toolState
 }
 
-// emitUpdatesWithNativeMessageID stamps the wrapper-persisted assistant
-// message identity onto the notification envelope. The id lives in pi's
-// native transcript and is replayed unchanged by session/load.
-func (s *agentSession) emitUpdatesWithNativeMessageID(
-	ctx context.Context,
-	updates []acp.SessionUpdate,
-	messageID string,
-) error {
-	if len(updates) == 0 {
+// emit delivers session updates to the host. A session with no attached
+// connection delivers nothing. Delivery never rides a request's cancellation.
+func (s *session) emit(ctx context.Context, updates ...acp.SessionUpdate) error {
+	conn := s.agent.connection()
+	if conn == nil {
 		return nil
 	}
 
-	s.agent.observe.ObserveFirstPromptUpdate(ctx)
-
-	s.agent.mu.Lock()
-	if s.agent.closed {
-		s.agent.mu.Unlock()
-
-		return errAgentClosed
-	}
-
-	conn := s.agent.conn
-	s.agent.mu.Unlock()
-
-	if conn == nil {
-		return errACPConnectionNotAttached
-	}
+	ctx = context.WithoutCancel(ctx)
 
 	for _, update := range updates {
-		if err := conn.SessionUpdate(ctx, acp.SessionNotification{
-			Meta:      nativeMessageNotificationMeta(ctx, messageID),
-			SessionId: s.id,
-			Update:    update,
-		}); err != nil {
+		if err := conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: s.id, Update: update}); err != nil {
 			return err
 		}
 	}
@@ -67,192 +68,404 @@ func (s *agentSession) emitUpdatesWithNativeMessageID(
 	return nil
 }
 
-func nativeMessageNotificationMeta(ctx context.Context, messageID string) map[string]any {
-	meta := turnRouteMetaFromContext(ctx)
-	if messageID == "" {
-		return meta
-	}
+// projectEvent maps one native event of a cycle to session updates and
+// reports whether the run settled. An update the host refused is returned so
+// the cycle can record it, but the native run keeps draining to its settle
+// marker.
+func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event pi.Event) (bool, error) {
+	state := &c.state
 
-	if meta == nil {
-		meta = make(map[string]any, 1)
-	} else {
-		meta = cloneAnyMap(meta)
-	}
-
-	piMeta, _ := meta[piMetaKey].(map[string]any)
-
-	piMeta = cloneAnyMap(piMeta)
-	if piMeta == nil {
-		piMeta = make(map[string]any, 1)
-	}
-
-	piMeta[jsonFieldMessageID] = messageID
-	meta[piMetaKey] = piMeta
-
-	return meta
-}
-
-func nativeMessageResponseMeta(messageID string) map[string]any {
-	if messageID == "" {
-		return nil
-	}
-
-	return map[string]any{
-		piMetaKey: map[string]any{jsonFieldMessageID: messageID},
-	}
-}
-
-// emitNativeMessageIdentity publishes a checkpointable update as soon as a
-// finalized assistant message reaches the wrapper. The session-info payload
-// is intentionally empty: the durable correlation belongs to the
-// notification envelope, while ordinary title/time updates remain fenced by
-// agent_settled.
-func (s *agentSession) emitNativeMessageIdentity(ctx context.Context, messageID string) error {
-	if messageID == "" {
-		return nil
-	}
-
-	return s.emitUpdatesWithNativeMessageID(ctx, []acp.SessionUpdate{{
-		SessionInfoUpdate: &acp.SessionSessionInfoUpdate{},
-	}}, messageID)
-}
-
-func (s *agentSession) emitOptionalUpdates(ctx context.Context, updates []acp.SessionUpdate) error {
-	if len(updates) == 0 {
-		return nil
-	}
-
-	err := s.emitUpdates(ctx, updates)
-	if errors.Is(err, errAgentClosed) || errors.Is(err, errACPConnectionNotAttached) {
-		return nil
-	}
-
-	return err
-}
-
-func (s *agentSession) emitAvailableCommandsUpdate(ctx context.Context, force bool) error {
-	return s.emitAvailableCommandsUpdateWith(ctx, force, s.emitOptionalUpdates)
-}
-
-// emitRequiredAvailableCommandsUpdate is the construction/opening form. The
-// explicit catalog, including an empty one, is part of the session-open
-// snapshot and cannot be suppressed merely because the connection refused it.
-func (s *agentSession) emitRequiredAvailableCommandsUpdate(ctx context.Context) error {
-	return s.emitAvailableCommandsUpdateWith(ctx, true, func(ctx context.Context, updates []acp.SessionUpdate) error {
-		err := s.emitUpdates(ctx, updates)
-		// Direct embedded callers have no ACP notification transport to receive
-		// the catalog on. That is absence of a delivery surface, not refusal by
-		// an attached host; once a connection exists, every failure is required.
-		if errors.Is(err, errACPConnectionNotAttached) {
-			return nil
+	switch typed := event.(type) {
+	case pi.AgentSettledEvent:
+		return true, nil
+	case pi.MessageStartEvent:
+		if typed.Message.Role == messageRoleAssistant {
+			state.streamedText = ""
+			state.streamedThought = ""
 		}
 
-		return err
-	})
-}
-
-func (s *agentSession) emitAvailableCommandsUpdateWith(
-	ctx context.Context,
-	force bool,
-	emitUpdates func(context.Context, []acp.SessionUpdate) error,
-) error {
-	current := availableCommandsFromNative(s.commands())
-
-	s.mu.Lock()
-	previous := cloneAvailableCommands(s.advertisedCommands)
-	s.mu.Unlock()
-
-	var emit []acp.SessionUpdate
-
-	switch {
-	case len(current) > 0:
-		if !force && availableCommandsEqual(previous, current) {
-			return nil
+		return false, nil
+	case pi.MessageUpdateEvent:
+		return false, s.emitAssistantDelta(ctx, typed.AssistantMessageEvent, state)
+	case pi.MessageEndEvent:
+		if typed.Message.Role != messageRoleAssistant {
+			return false, nil
 		}
 
-		emit = []acp.SessionUpdate{{
-			AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{AvailableCommands: cloneAvailableCommands(current)},
-		}}
-	case len(previous) > 0, force:
-		// A host cannot tell "no catalog yet" from "no commands" without being
-		// told, and it may not substitute a timer or an optimistic fallback for
-		// the answer. The explicit empty snapshot is that answer.
-		emit = emptyAvailableCommandsUpdate()
+		observeAssistantMessageEnd(typed.Message, state)
+
+		if err := s.emitAssistantTextSuffix(ctx, typed.Message, state); err != nil {
+			return false, err
+		}
+
+		return false, s.emitAssistantImages(ctx, typed.Message, state)
+	case pi.ToolExecutionStartEvent:
+		return false, s.publishToolStart(ctx, state, typed)
+	case pi.ToolExecutionUpdateEvent:
+		if typed.PartialResult == nil {
+			return false, nil
+		}
+
+		return false, s.publishToolUpdate(ctx, state, typed.ToolCallID, typed.PartialResult.Content)
+	case pi.ToolExecutionEndEvent:
+		status := acp.ToolCallStatusCompleted
+		if typed.IsError {
+			status = acp.ToolCallStatusFailed
+		}
+
+		return false, s.publishToolTerminal(ctx, state, typed.ToolCallID, status, typed.Result)
+	case pi.ExtensionErrorEvent:
+		// A failure in the wrapper's own extensions means the permission gate
+		// or question tool is no longer running under the admission the host
+		// granted, so the cycle fails closed. Any other extension is the
+		// operator's, and pi reports it natively.
+		if s.agent.extensions.IsWrapperExtension(typed.ExtensionPath) {
+			s.agent.log.ErrorContext(ctx, "wrapper extension failed",
+				slog.String("session_id", string(s.id)), slog.String("event", typed.Event))
+			go s.abort(ctx, rt)
+
+			return false, turnFailure("extension", extensionFailureMessage)
+		}
+
+		return false, nil
+	default:
+		return false, nil
+	}
+}
+
+func (s *session) emitAssistantDelta(ctx context.Context, delta pi.AssistantMessageEvent, state *cycleState) error {
+	if delta.Delta == "" {
+		return nil
+	}
+
+	switch delta.Type {
+	case assistantEventTextDelta:
+		state.streamedText += delta.Delta
+
+		return s.emit(ctx, acp.UpdateAgentMessageText(delta.Delta))
+	case assistantEventThinkingDelta:
+		state.streamedThought += delta.Delta
+
+		return s.emit(ctx, acp.UpdateAgentThoughtText(delta.Delta))
 	default:
 		return nil
 	}
+}
 
-	if err := emitUpdates(ctx, emit); err != nil {
-		return err
+// emitAssistantTextSuffix projects the terminal message frame's text as
+// append-only deltas: only what the streamed deltas did not carry, once per
+// native message identity.
+func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
+	if state.finalized == nil {
+		state.finalized = make(map[string]struct{})
 	}
 
-	s.mu.Lock()
-	s.advertisedCommands = cloneAvailableCommands(current)
-	s.mu.Unlock()
+	if message.ACPMessageID != "" {
+		if _, seen := state.finalized[message.ACPMessageID]; seen {
+			return nil
+		}
+
+		state.finalized[message.ACPMessageID] = struct{}{}
+	}
+
+	blocks, _ := message.ContentBlocks()
+
+	var text, thinking strings.Builder
+
+	for index := range blocks {
+		switch blocks[index].Type {
+		case contentBlockTypeText:
+			text.WriteString(blocks[index].Text)
+		case contentBlockTypeThinking:
+			thinking.WriteString(blocks[index].Thinking)
+		}
+	}
+
+	messageID := optionalString(message.ACPMessageID)
+	updates := make([]acp.SessionUpdate, 0, 2)
+
+	if suffix := unstreamedSuffix(state.streamedThought, thinking.String()); suffix != "" {
+		updates = append(updates, acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content: acp.TextBlock(suffix), MessageId: messageID,
+		}})
+	}
+
+	if suffix := unstreamedSuffix(state.streamedText, text.String()); suffix != "" {
+		updates = append(updates, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+			Content: acp.TextBlock(suffix), MessageId: messageID,
+		}})
+	}
+
+	state.streamedText = ""
+	state.streamedThought = ""
+
+	return s.emit(ctx, updates...)
+}
+
+// unstreamedSuffix reports the part of a terminal frame's text no delta of
+// this message already carried. Text that diverges from the streamed prefix
+// contributes nothing: the prefix is already with the client.
+func unstreamedSuffix(streamed string, full string) string {
+	if streamed == "" {
+		return full
+	}
+
+	if !strings.HasPrefix(full, streamed) {
+		return ""
+	}
+
+	return full[len(streamed):]
+}
+
+// emitAssistantImages projects image blocks of a finalized assistant message
+// as agent chunks, one image per chunk, deduplicated on message identity plus
+// fingerprint. A refused image is replaced by its guidance as agent text.
+func (s *session) emitAssistantImages(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
+	blocks, _ := message.ContentBlocks()
+	messageID := optionalString(message.ACPMessageID)
+
+	for index := range blocks {
+		if blocks[index].Type != contentBlockTypeImage {
+			continue
+		}
+
+		output, failure := decodeOutputImage(blocks[index], s.agent.options.ImageLimits.core().EffectiveOutputPerImage())
+		if failure != nil {
+			guidance, _ := failure.Guidance()
+
+			if err := s.emit(ctx, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+				Content: acp.TextBlock(guidance), MessageId: messageID,
+			}}); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		key := message.ACPMessageID + ":" + output.fingerprint
+
+		if state.agentImages == nil {
+			state.agentImages = make(map[string]struct{})
+		}
+
+		if _, seen := state.agentImages[key]; seen {
+			continue
+		}
+
+		if err := s.emit(ctx, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+			Content: acp.ImageBlock(output.data, output.mime), MessageId: messageID,
+		}}); err != nil {
+			return err
+		}
+
+		state.agentImages[key] = struct{}{}
+		state.imagesEmitted = true
+	}
 
 	return nil
 }
 
-func (s *agentSession) emitClearAvailableCommandsUpdate(ctx context.Context) error {
-	s.mu.Lock()
-	previous := len(s.advertisedCommands)
-	s.mu.Unlock()
-
-	if previous == 0 {
+func optionalString(value string) *string {
+	if value == "" {
 		return nil
 	}
 
-	if err := s.emitOptionalUpdates(ctx, emptyAvailableCommandsUpdate()); err != nil {
-		return err
+	return &value
+}
+
+func observeAssistantMessageEnd(message pi.AgentMessage, state *cycleState) {
+	if message.StopReason != "" {
+		state.stopReason = message.StopReason
+	}
+
+	if message.ErrorMessage != "" {
+		state.errorMessage = message.ErrorMessage
+	}
+
+	if message.Usage != nil {
+		state.usage = mergeUsage(state.usage, message.Usage)
+
+		if message.Usage.Cost != nil {
+			state.cost = message.Usage.Cost
+		}
+	}
+}
+
+func mergeUsage(total *acp.Usage, next *pi.Usage) *acp.Usage {
+	if total == nil {
+		total = &acp.Usage{CachedReadTokens: new(0), CachedWriteTokens: new(0)}
+	}
+
+	total.InputTokens += int(next.Input)
+	total.OutputTokens += int(next.Output)
+	*total.CachedReadTokens += int(next.CacheRead)
+	*total.CachedWriteTokens += int(next.CacheWrite)
+	total.TotalTokens = total.InputTokens + total.OutputTokens + *total.CachedReadTokens + *total.CachedWriteTokens
+
+	return total
+}
+
+// emitUsage reports harness-reported usage. size is the model's context
+// window from get_session_stats, else the selected model's catalog value,
+// else 0.
+func (s *session) emitUsage(ctx context.Context, state *cycleState, stats *pi.SessionStats) {
+	used := 0
+	if state.usage != nil {
+		used = state.usage.TotalTokens
+	}
+
+	var size int64
+
+	if stats != nil && stats.ContextUsage != nil {
+		if stats.ContextUsage.Tokens != nil {
+			used = int(*stats.ContextUsage.Tokens)
+		}
+
+		size = stats.ContextUsage.ContextWindow
+	}
+
+	if size == 0 {
+		s.mu.Lock()
+		size = s.contextWindow
+		s.mu.Unlock()
+	}
+
+	if state.usage == nil && used == 0 && size == 0 {
+		return
+	}
+
+	update := &acp.SessionUsageUpdate{Size: int(size), Used: used}
+	if state.cost != nil {
+		update.Cost = &acp.Cost{Amount: state.cost.Total, Currency: "USD"}
+	}
+
+	_ = s.emit(ctx, acp.SessionUpdate{UsageUpdate: update})
+}
+
+// emitRestoredUsage reports the restored session's context usage when pi
+// knows it.
+func (s *session) emitRestoredUsage(ctx context.Context, rt *runtime) {
+	stats, err := rt.client.GetSessionStats(ctx)
+	if err != nil || stats.ContextUsage == nil || stats.ContextUsage.ContextWindow <= 0 {
+		return
+	}
+
+	used := 0
+	if stats.ContextUsage.Tokens != nil {
+		used = int(*stats.ContextUsage.Tokens)
 	}
 
 	s.mu.Lock()
-	s.advertisedCommands = nil
+	s.contextWindow = stats.ContextUsage.ContextWindow
 	s.mu.Unlock()
 
-	return nil
+	_ = s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: int(stats.ContextUsage.ContextWindow), Used: used}})
 }
 
-func emptyAvailableCommandsUpdate() []acp.SessionUpdate {
-	return []acp.SessionUpdate{{
-		AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{AvailableCommands: []acp.AvailableCommand{}},
-	}}
-}
+// emitSessionInfo records the turn's time and, on the first prompt, a title.
+func (s *session) emitSessionInfo(ctx context.Context, prompt []acp.ContentBlock) {
+	updatedAt := time.Now().UTC().Format(time.RFC3339)
+	update := acp.SessionSessionInfoUpdate{UpdatedAt: &updatedAt}
 
-func (s *agentSession) commands() []pi.SlashCommand {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.updatedAt = updatedAt
 
-	return append([]pi.SlashCommand(nil), s.availableCommands...)
+	if s.title == "" {
+		if title := promptTitle(prompt); title != "" {
+			s.title = title
+			update.Title = &title
+		}
+	}
+	s.mu.Unlock()
+
+	_ = s.emit(ctx, acp.SessionUpdate{SessionInfoUpdate: &update})
 }
 
-// availableCommandsFromNative converts pi's command catalog into ACP
-// available commands, dropping names the shared sanitizer rejects.
-func availableCommandsFromNative(commands []pi.SlashCommand) []acp.AvailableCommand {
+func promptTitle(prompt []acp.ContentBlock) string {
+	for _, block := range prompt {
+		if block.Text == nil {
+			continue
+		}
+
+		if title := normalizeTitle(block.Text.Text); title != "" {
+			return title
+		}
+	}
+
+	return ""
+}
+
+func normalizeTitle(text string) string {
+	title := strings.Join(strings.Fields(text), " ")
+	if utf8.RuneCountInString(title) <= sessionTitleMaxRunes {
+		return title
+	}
+
+	runes := []rune(title)
+
+	return strings.TrimSpace(string(runes[:sessionTitleMaxRunes-3])) + "..."
+}
+
+func (s *session) sessionInfo() acp.SessionInfo {
+	s.mu.Lock()
+	title := s.title
+	updatedAt := s.updatedAt
+	s.mu.Unlock()
+
+	if title == "" {
+		title = string(s.id)
+	}
+
+	info := acp.SessionInfo{
+		SessionId:             s.id,
+		Title:                 &title,
+		Cwd:                   s.cwd,
+		AdditionalDirectories: append([]string(nil), s.additionalDirectories...),
+	}
+	if updatedAt != "" {
+		info.UpdatedAt = &updatedAt
+	}
+
+	return info
+}
+
+// publishCommands emits the session's command catalog as a full replacement,
+// including the explicit empty one.
+func (s *session) publishCommands(ctx context.Context) error {
+	s.mu.Lock()
+	commands := append([]acp.AvailableCommand{}, s.commands...)
+	s.mu.Unlock()
+
+	return s.emit(ctx, acp.SessionUpdate{AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{AvailableCommands: commands}})
+}
+
+func (s *session) clearCommands(ctx context.Context) {
+	s.mu.Lock()
+	s.commands = nil
+	s.mu.Unlock()
+
+	_ = s.publishCommands(ctx)
+}
+
+// availableCommands converts pi's command catalog, dropping names the shared
+// sanitizer rejects.
+func availableCommands(commands []pi.SlashCommand) []acp.AvailableCommand {
 	available := make([]acp.AvailableCommand, 0, len(commands))
 
 	for _, command := range commands {
-		if !validSlashCommandName(command.Name) {
+		if !validCommandName(command.Name) {
 			continue
 		}
 
-		if command.Name == pi.AuthCommandName {
-			continue
-		}
-
-		available = append(available, acp.AvailableCommand{
-			Name:        command.Name,
-			Description: command.Description,
-		})
+		available = append(available, acp.AvailableCommand{Name: command.Name, Description: command.Description})
 	}
 
 	return available
 }
 
-// validSlashCommandName is the shared advertisement/routing sanitizer:
-// reject empty names, names containing '/', invalid UTF-8, and any Unicode
-// whitespace, control, or format rune.
-func validSlashCommandName(name string) bool {
+// validCommandName rejects empty names, names containing '/', invalid UTF-8,
+// and any Unicode whitespace, control, or format rune.
+func validCommandName(name string) bool {
 	if name == "" || strings.Contains(name, "/") || !utf8.ValidString(name) {
 		return false
 	}
@@ -266,345 +479,50 @@ func validSlashCommandName(name string) bool {
 	return true
 }
 
-func cloneAvailableCommands(commands []acp.AvailableCommand) []acp.AvailableCommand {
-	if len(commands) == 0 {
-		return nil
-	}
-
-	cloned := make([]acp.AvailableCommand, len(commands))
-	for index, command := range commands {
-		cloned[index] = command
-		if command.Input != nil {
-			input := *command.Input
-			if input.Unstructured != nil {
-				unstructured := *input.Unstructured
-				input.Unstructured = &unstructured
-			}
-
-			cloned[index].Input = &input
-		}
-	}
-
-	return cloned
-}
-
-func availableCommandsEqual(left []acp.AvailableCommand, right []acp.AvailableCommand) bool {
-	if len(left) != len(right) {
-		return false
-	}
-
-	for index := range left {
-		if left[index].Name != right[index].Name || left[index].Description != right[index].Description {
-			return false
-		}
-	}
-
-	return true
-}
-
-// A poisoned session reports exactly one of these closed causes. Each names the
-// structural invariant that failed, in terms a host can branch on; none carries
-// a native path, native text, or a Go error string.
-const (
-	// poisonCauseCommandCatalog: the required session-open command catalog was
-	// not delivered.
-	poisonCauseCommandCatalog = "command_catalog_undelivered"
-	// poisonCauseLifecycleSnapshot: the required session-open lifecycle
-	// snapshot was not delivered.
-	poisonCauseLifecycleSnapshot = "lifecycle_snapshot_undelivered"
-	// poisonCauseOpenGate: the session-open generation gate could not be
-	// released.
-	poisonCauseOpenGate = "session_open_gate_unreleased"
-	// poisonCauseIdentityDrift: the native session id stopped matching the ACP
-	// session it was opened for.
-	poisonCauseIdentityDrift = "native_session_identity_drift"
-	// poisonCauseStreamFailed: the native JSONL event stream failed.
-	poisonCauseStreamFailed = "native_stream_failed"
-	// poisonCauseRetentionBound: an outbox or startup prefix reached its
-	// retention bound, so ordering could no longer be guaranteed.
-	poisonCauseRetentionBound = "outbox_retention_exceeded"
-	// poisonCauseNativeInvariant: the harness produced a record its generation
-	// cannot place.
-	poisonCauseNativeInvariant = "native_invariant_violated"
-	// poisonCausePanic: an adapter goroutine driving this generation panicked.
-	poisonCausePanic = "adapter_panic"
-	// poisonCauseRelaunchFailed: the native process relaunch could not be set
-	// up.
-	poisonCauseRelaunchFailed = "native_relaunch_failed"
-	// poisonCauseLifecycleStream: an agent-origin cycle could not be opened on,
-	// or delivered to, the lifecycle stream.
-	poisonCauseLifecycleStream = "lifecycle_stream_failed"
-	// poisonCauseAgentCycle: an agent-origin cycle's settlement step failed.
-	poisonCauseAgentCycle = "agent_cycle_settlement_failed"
-	// poisonCausePromptAcceptance: the native prompt acceptance boundary
-	// failed.
-	poisonCausePromptAcceptance = "prompt_acceptance_failed"
-	// poisonCauseActionRequest: a lifecycle action request could not be
-	// registered, announced, or resolved, so a pending host request was no
-	// longer answerable on the terms it was published under.
-	poisonCauseActionRequest = "lifecycle_action_failed"
-	// poisonCauseInteractionUnsettled: a native interaction response did not
-	// finish before cancellation, so the harness and the adapter no longer
-	// agree on what the session answered.
-	poisonCauseInteractionUnsettled = "native_interaction_unsettled"
-)
-
-// poisonReason is one permanent admission fence. The cause is the closed token
-// a client reads; the detail is the adapter-authored prose only the operator's
-// log sees, so a wire answer never becomes a transcript.
-type poisonReason struct {
-	cause  string
-	detail string
-}
-
-func poisoned(cause string, detail string) poisonReason {
-	return poisonReason{cause: cause, detail: detail}
-}
-
-func (s *agentSession) poisonedError() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.poisonCause == "" {
-		return nil
-	}
-
-	return poisonedSessionError(s.poisonCause)
-}
-
-func (s *agentSession) admissionFenceError(ctx context.Context) error {
-	s.mu.Lock()
-	cause := s.poisonCause
-	closing := s.closing
-	outboxes := append([]*sessionOutbox(nil), s.containmentOutboxes...)
-	closeAttempt := s.closeAttempt
-	s.mu.Unlock()
-
-	if cause == "" && !closing {
-		return nil
-	}
-
-	var fenceErr error
-	if cause != "" {
-		fenceErr = poisonedSessionError(cause)
-	} else {
-		fenceErr = unknownSessionError()
-	}
-
-	containmentErr := awaitGenerationContainments(outboxes)
-	if closing && len(outboxes) == 0 && closeAttempt != nil {
-		containmentErr = errors.Join(containmentErr, s.awaitClose(closeAttempt))
-	}
-
-	return errors.Join(fenceErr, containmentErr, ctx.Err())
-}
-
-func (s *agentSession) awaitPoisonContainment() error {
-	s.mu.Lock()
-	outboxes := append([]*sessionOutbox(nil), s.containmentOutboxes...)
-	s.mu.Unlock()
-
-	return awaitGenerationContainments(outboxes)
-}
-
-func awaitGenerationContainments(outboxes []*sessionOutbox) error {
-	var containmentErr error
-
-	for _, outbox := range outboxes {
-		joined, _ := outbox.awaitContainment()
-		containmentErr = errors.Join(containmentErr, joined)
-	}
-
-	return containmentErr
-}
-
-func (s *agentSession) poison(ctx context.Context, reason poisonReason) error {
-	if outbox := s.outboxRouter(); outbox != nil {
-		s.containGeneration(ctx, outbox, reason)
-
-		return s.admissionFenceError(ctx)
-	}
-
-	s.mu.Lock()
-	effective, first, cancel := s.installPoisonLocked(reason)
-	s.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-
-	if first {
-		s.reportPoison(ctx, effective)
-	}
-
-	return poisonedSessionError(effective.cause)
-}
-
-// installPoisonLocked publishes the permanent admission cause. Callers that
-// also fence a native router do both while holding the session and outbox locks,
-// so no prompt can observe one half of containment without the other.
-func (s *agentSession) installPoisonLocked(reason poisonReason) (poisonReason, bool, context.CancelFunc) {
-	if s.poisonCause != "" {
-		return poisonReason{cause: s.poisonCause, detail: s.poisonDetail}, false, s.cancel
-	}
-
-	s.poisonCause = reason.cause
-	s.poisonDetail = reason.detail
-
-	return reason, true, s.cancel
-}
-
-// reportPoison performs the observable, potentially blocking half after the
-// cause is already an admission fence.
-func (s *agentSession) reportPoison(ctx context.Context, reason poisonReason) {
-	if s.agent == nil {
+// emitRawEvent forwards one native record on the raw-event channel when the
+// session opted in. Image payloads are replaced by their size and digest so
+// diagnostics never carry a second copy of the bytes.
+func (s *session) emitRawEvent(ctx context.Context, event pi.Event) {
+	if !s.rawEvents.Enabled() {
 		return
 	}
 
-	// The closed cause is what a client reads; the prose detail is the
-	// operator's and never leaves this log line.
-	s.agent.log.ErrorContext(ctx, "poison pi session after native invariant violation",
-		slog.String(acpFieldSessionID, string(s.id)),
-		slog.String(failureFieldCause, reason.cause),
-		slog.String("detail", reason.detail),
-	)
-
-	if err := s.emitClearAvailableCommandsUpdate(ctx); err != nil {
-		s.agent.log.ErrorContext(ctx, "clear available pi commands after poison failed",
-			slog.String(acpFieldSessionID, string(s.id)),
-		)
-	}
-}
-
-// poisonedSessionError answers every method addressed to a session whose
-// admission is permanently fenced. The cause is one of the closed tokens above
-// — never prose, never a Go error string, and never native text. Why the
-// invariant broke is in the adapter log.
-func poisonedSessionError(cause string) error {
-	return acp.NewInternalError(map[string]any{
-		jsonFieldError:    sessionPoisonedError,
-		failureFieldCause: cause,
-	})
-}
-
-func (s *agentSession) emitLiveSessionInfoUpdate(ctx context.Context, prompt []acp.ContentBlock) error {
-	updatedAt := time.Now().UTC().Format(time.RFC3339)
-	update := acp.SessionSessionInfoUpdate{UpdatedAt: &updatedAt}
-	title := liveSessionTitleFromPrompt(prompt)
-
-	s.mu.Lock()
-
-	s.updatedAt = updatedAt
-	if s.title == "" && title != "" {
-		s.title = title
-		update.Title = &title
-	}
-	s.mu.Unlock()
-
-	return s.emitOptionalUpdates(ctx, []acp.SessionUpdate{{SessionInfoUpdate: &update}})
-}
-
-func (s *agentSession) sessionInfo(id acp.SessionId) acp.SessionInfo {
-	s.mu.Lock()
-	title := s.title
-	updatedAt := s.updatedAt
-	s.mu.Unlock()
-
-	if title == "" {
-		title = string(id)
-	}
-
-	info := acp.SessionInfo{
-		SessionId:             id,
-		Title:                 &title,
-		Cwd:                   s.cwd,
-		AdditionalDirectories: append([]string(nil), s.additionalDirectories...),
-	}
-	if updatedAt != "" {
-		info.UpdatedAt = &updatedAt
-	}
-
-	return info
-}
-
-func liveSessionTitleFromPrompt(prompt []acp.ContentBlock) string {
-	for _, block := range prompt {
-		if block.Text == nil {
-			continue
-		}
-
-		if title := normalizeLiveSessionTitle(block.Text.Text); title != "" {
-			return title
-		}
-	}
-
-	return ""
-}
-
-func normalizeLiveSessionTitle(text string) string {
-	title := strings.Join(strings.Fields(text), " ")
-	if title == "" {
-		return ""
-	}
-
-	if utf8.RuneCountInString(title) <= liveSessionTitleMaxRunes {
-		return title
-	}
-
-	runes := []rune(title)
-
-	return strings.TrimSpace(string(runes[:liveSessionTitleMaxRunes-3])) + "..."
-}
-
-// emitRawPiEvent emits one live raw-event notification when raw events are
-// enabled. It never returns an error and never aborts the caller's turn: raw
-// events are non-authoritative debug output, so oversized/unserializable
-// events become markers and emit failures are recorded on the internal
-// observer hook.
-func (s *agentSession) emitRawPiEvent(ctx context.Context, raw []byte) {
-	if !s.rawMessages.Enabled() || len(raw) == 0 {
+	conn := s.agent.connection()
+	if conn == nil {
 		return
 	}
 
-	s.agent.mu.Lock()
-	if s.agent.closed || s.agent.conn == nil {
-		s.agent.mu.Unlock()
-
+	var payload map[string]any
+	if err := json.Unmarshal(event.RawJSON(), &payload); err != nil {
 		return
 	}
 
-	conn := s.agent.conn
-	s.agent.mu.Unlock()
+	redactImages(payload)
 
-	// Serialize reservation through delivery so successful notifications cannot
-	// reorder and a failed attempt leaves the next contiguous sequence reusable.
-	s.rawEventMu.Lock()
-	defer s.rawEventMu.Unlock()
-
-	sequence := s.rawEventSequence + 1
-
-	payload := map[string]any{
-		acpFieldSessionID:     s.id,
-		rawEventFieldSequence: sequence,
-		rawEventFieldSource:   rawEventSourceValue,
-		rawEventFieldEvent:    json.RawMessage(redactRawEventImages(raw)),
-	}
-	if meta := turnRouteMetaFromContext(ctx); meta != nil {
-		payload["_meta"] = meta
+	notify := func(ctx context.Context, method string, params map[string]any) error {
+		return conn.NotifyExtension(ctx, method, params)
 	}
 
-	capped, err := capRawEventPayload(payload)
-	if err != nil {
+	if err := s.rawEvents.Emit(ctx, notify, payload); err != nil {
 		s.agent.observe.RecordRawMessageEmitFailure(ctx, err)
-
-		return
 	}
+}
 
-	if err := conn.NotifyExtension(ctx, RawEventMethod, capped); err != nil {
-		s.agent.observe.RecordRawMessageEmitFailure(ctx, err)
+func redactImages(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		blockType, _ := typed["type"].(string)
+		if data, ok := typed["data"].(string); ok && blockType == contentBlockTypeImage && data != "" {
+			typed["data"] = ""
+			typed["sizeBytes"] = len(data) / 4 * 3
+		}
 
-		return
+		for _, item := range typed {
+			redactImages(item)
+		}
+	case []any:
+		for _, item := range typed {
+			redactImages(item)
+		}
 	}
-
-	s.rawEventSequence = sequence
 }

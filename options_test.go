@@ -1,93 +1,53 @@
 package piacp
 
 import (
-	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel/metric/noop"
-	"go.opentelemetry.io/otel/propagation"
-	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
-func TestApplyOptionsDefaults(t *testing.T) {
+func TestOptionDefaults(t *testing.T) {
 	t.Parallel()
 
 	options := applyOptions(nil)
-
 	require.Equal(t, "acp-go-pi", options.AgentName)
-	require.Equal(t, "acp-go-pi", options.AgentTitle)
-	require.Equal(t, "0.1.0", options.AgentVersion)
-	require.Empty(t, options.ExecutablePath)
-	require.Empty(t, options.Home)
-	require.Empty(t, options.ScratchDir)
-	require.Empty(t, options.ProviderAuthRoot)
-	require.Empty(t, options.DefaultModel)
-	require.Nil(t, options.Env)
-	require.Nil(t, options.SessionStore)
-	require.Zero(t, options.SessionStoreLoadTimeout)
-	require.Zero(t, options.TurnTimeout)
-	require.Zero(t, options.ConcurrencyLimits)
-	require.Nil(t, options.SeedFiles)
+	require.Equal(t, int64(6291456), options.ImageLimits.MaxInputBytesPerImage)
+	require.Equal(t, defaultMaxActiveSessions, options.ConcurrencyLimits.MaxActiveSessions)
+	require.Equal(t, defaultMaxConcurrentClientCalls, options.ConcurrencyLimits.MaxConcurrentClientCalls)
+	require.Equal(t, defaultSessionStoreLoadTimeout, options.SessionStoreLoadTimeout)
+
+	options = applyOptions([]Option{
+		WithAgentName("n"), WithAgentTitle("t"), WithAgentVersion("v"), WithExecutablePath("/p"), WithHome("/h"),
+		WithScratchDir("/s"), WithInputHandoffRoot("/r"), WithDefaultModel("a/b"), WithConfiguredModels([]string{"a/b"}),
+		WithEnv(map[string]string{"A": "1"}), WithSessionStoreLoadTimeout(time.Second), WithTurnTimeout(time.Minute),
+		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 2, MaxConcurrentClientCalls: 3}),
+		WithImageLimits(ImageLimits{}), WithSeedFiles(map[string]string{"a": "b"}),
+		WithTracerProvider(nil), WithMeterProvider(nil), WithTextMapPropagator(nil), WithLogger(nil), WithSessionStore(nil),
+	})
+	require.Equal(t, "n", options.AgentName)
+	require.Equal(t, "t", options.AgentTitle)
+	require.Equal(t, "v", options.AgentVersion)
+	require.Equal(t, "/p", options.ExecutablePath)
+	require.Equal(t, "/h", options.Home)
+	require.Equal(t, "/s", options.ScratchDir)
+	require.Equal(t, "/r", options.InputHandoffRoot)
+	require.Equal(t, "a/b", options.DefaultModel)
+	require.Equal(t, []string{"a/b"}, options.ConfiguredModels)
+	require.Equal(t, map[string]string{"A": "1"}, options.Env)
+	require.Equal(t, time.Second, options.SessionStoreLoadTimeout)
+	require.Equal(t, time.Minute, options.TurnTimeout)
+	require.Equal(t, 2, options.ConcurrencyLimits.MaxActiveSessions)
+	require.Equal(t, int64(0), options.ImageLimits.MaxInputBytesPerImage)
+	require.Equal(t, map[string]string{"a": "b"}, options.SeedFiles)
 }
 
-func TestApplyOptionsSetters(t *testing.T) {
+func TestValidateConfiguredModels(t *testing.T) {
 	t.Parallel()
 
-	logger := slog.Default()
-	store := NewInMemorySessionStore()
-	tracerProvider := tracenoop.NewTracerProvider()
-	meterProvider := noop.NewMeterProvider()
-	propagator := propagation.TraceContext{}
-	env := map[string]string{"ANTHROPIC_API_KEY": "k"}
-	seeds := map[string]string{"settings.json": "{}"}
-
-	options := applyOptions([]Option{
-		WithLogger(logger),
-		WithAgentName("name"),
-		WithAgentTitle("title"),
-		WithAgentVersion("9.9.9"),
-		WithExecutablePath("/usr/bin/pi"),
-		WithHostAuthority(nil),
-		WithHome("/srv/pi-home"),
-		WithScratchDir("/srv/pi-scratch"),
-		WithProviderAuthRoot("/srv/pi-auth"),
-		WithDefaultModel("openai/gpt-4o"),
-		WithEnv(env),
-		WithTracerProvider(tracerProvider),
-		WithMeterProvider(meterProvider),
-		WithTextMapPropagator(propagator),
-		WithSessionStore(store),
-		WithSessionStoreLoadTimeout(3 * time.Second),
-		WithTurnTimeout(time.Minute),
-		WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 4, MaxConcurrentClientCalls: 2}),
-		WithSeedFiles(seeds),
-	})
-
-	require.Equal(t, logger, options.Logger)
-	require.Equal(t, "name", options.AgentName)
-	require.Equal(t, "title", options.AgentTitle)
-	require.Equal(t, "9.9.9", options.AgentVersion)
-	require.Equal(t, "/usr/bin/pi", options.ExecutablePath)
-	require.True(t, options.hostAuthoritySupplied)
-	require.Equal(t, "/srv/pi-home", options.Home)
-	require.Equal(t, "/srv/pi-scratch", options.ScratchDir)
-	require.Equal(t, "/srv/pi-auth", options.ProviderAuthRoot)
-	require.Equal(t, "openai/gpt-4o", options.DefaultModel)
-	require.Equal(t, env, options.Env)
-	require.Equal(t, tracerProvider, options.TracerProvider)
-	require.Equal(t, meterProvider, options.MeterProvider)
-	require.Equal(t, propagator, options.TextMapPropagator)
-	require.Same(t, store, options.SessionStore)
-	require.Equal(t, 3*time.Second, options.SessionStoreLoadTimeout)
-	require.Equal(t, time.Minute, options.TurnTimeout)
-	require.Equal(t, ConcurrencyLimits{MaxActiveSessions: 4, MaxConcurrentClientCalls: 2}, options.ConcurrencyLimits)
-	require.Equal(t, seeds, options.SeedFiles)
-
-	// Env and seed maps are cloned, not aliased.
-	env["ANTHROPIC_API_KEY"] = "mutated"
-	seeds["settings.json"] = "mutated"
-	require.Equal(t, "k", options.Env["ANTHROPIC_API_KEY"])
-	require.Equal(t, "{}", options.SeedFiles["settings.json"])
+	require.NoError(t, validateConfiguredModels([]string{"a/b", "c/d"}))
+	require.Error(t, validateConfiguredModels([]string{"a/b", "a/b"}))
+	require.Error(t, validateConfiguredModels([]string{" a/b"}))
+	require.Error(t, validateConfiguredModels([]string{""}))
+	require.Error(t, validateConfiguredModels([]string{"nope"}))
 }

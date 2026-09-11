@@ -153,7 +153,8 @@ func (AgentEndEvent) Kind() string { return EventTypeAgentEnd }
 
 // AgentSettledEvent signals the run fully settled: no automatic retry,
 // compaction retry, or queued continuation remains. It fires exactly once per
-// accepted prompt and fences the mirror commit point.
+// accepted prompt and is the point at which pi's session file holds the whole
+// run.
 type AgentSettledEvent struct {
 	baseEvent
 }
@@ -287,8 +288,7 @@ type CompactionEndEvent struct {
 func (CompactionEndEvent) Kind() string { return EventTypeCompactionEnd }
 
 // AutoRetryStartEvent signals an automatic retry began after a transient
-// error. The adapter disables auto-retry at session start, so this appears
-// only if an operator re-enables it natively.
+// error.
 type AutoRetryStartEvent struct {
 	baseEvent
 

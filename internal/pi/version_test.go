@@ -3,59 +3,40 @@ package pi
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-func TestProbeOrdinaryVersion(t *testing.T) {
-	_, err := ProbeOrdinaryVersion(t.Context(), "", nil)
-	require.ErrorContains(t, err, "resolve pi version executable")
+func TestCheckMinimumVersion(t *testing.T) {
+	t.Parallel()
 
-	executable := fakeOrdinaryExecutable(t)
+	require.NoError(t, CheckMinimumVersion("0.84.4", MinimumVersion))
+	require.NoError(t, CheckMinimumVersion("v0.80.6-beta", "0.80.6"))
+	require.NoError(t, CheckMinimumVersion("1.0", "0.99.99"))
+	require.Error(t, CheckMinimumVersion("0.80.5", "0.80.6"))
+	require.Error(t, CheckMinimumVersion("abc", "0.80.6"))
+	require.Error(t, CheckMinimumVersion("0.80.6", "x"))
+	require.Error(t, CheckMinimumVersion("", "0.80.6"))
+}
 
-	version, err := ProbeOrdinaryVersion(t.Context(), executable, childProbeEnvironment(ordinaryChildVersion))
+func TestProbeVersion(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	script := filepath.Join(dir, "pi")
+	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\necho 1.2.3\n"), 0o700))
+
+	version, err := ProbeVersion(context.Background(), script, []string{"PATH=/usr/bin:/bin"})
 	require.NoError(t, err)
-	require.Equal(t, "0.80.6", version)
+	require.Equal(t, "1.2.3", version)
 
-	_, err = ProbeOrdinaryVersion(t.Context(), executable, childProbeEnvironment(ordinaryChildSilent))
+	empty := filepath.Join(dir, "empty")
+	require.NoError(t, os.WriteFile(empty, []byte("#!/bin/sh\n"), 0o700))
+	_, err = ProbeVersion(context.Background(), empty, nil)
 	require.ErrorContains(t, err, "empty output")
 
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
-	defer cancel()
-	_, err = ProbeOrdinaryVersion(ctx, executable, childProbeEnvironment(ordinaryChildSleep))
+	_, err = ProbeVersion(context.Background(), filepath.Join(dir, "missing"), nil)
 	require.Error(t, err)
-}
-
-func CaptureOrdinaryEnvironmentEntries() []string {
-	return environmentEntries(CaptureOrdinaryEnvironment(os.Environ()))
-}
-
-// childProbeEnvironment is a captured ordinary environment with the fake
-// child's mode appended. The capture filter drops names pi has no use for,
-// which includes this one, so the probe is handed it directly.
-func childProbeEnvironment(mode string) []string {
-	return append(CaptureOrdinaryEnvironmentEntries(), ordinaryChildEnvKey+"="+mode)
-}
-
-func TestCheckMinimumVersion(t *testing.T) {
-	tests := []struct{ version, minimum, want string }{
-		{"0.80.6", "0.80.6", ""}, {"0.80.7", "0.80.6", ""}, {"1.0.0", "0.80.6", ""},
-		{"v0.80.6", "0.80.6", ""}, {"0.80.6-rc.1", "0.80.6", ""}, {"1", "0.80.6", ""},
-		{"0.80.5", "0.80.6", "below the minimum"}, {"abc", "0.80.6", "invalid version"},
-		{"0.80.6", "", "invalid version"}, {"0.-1.0", "0.80.6", "invalid version"},
-	}
-	for _, test := range tests {
-		err := CheckMinimumVersion(test.version, test.minimum)
-		if test.want == "" {
-			require.NoError(t, err)
-		} else {
-			require.ErrorContains(t, err, test.want)
-		}
-	}
-}
-
-func TestDefaultMinimumVersionIsValid(t *testing.T) {
-	require.NoError(t, CheckMinimumVersion(DefaultMinimumVersion, DefaultMinimumVersion))
 }

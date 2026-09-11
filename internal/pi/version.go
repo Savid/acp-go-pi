@@ -6,9 +6,9 @@ import (
 	"strings"
 )
 
-// DefaultMinimumVersion is the minimum `pi --version` the adapter accepts by
-// default: the version its behavior was verified against.
-const DefaultMinimumVersion = "0.80.6"
+// MinimumVersion is the lowest `pi --version` the adapter accepts: the
+// version its behavior was verified against.
+const MinimumVersion = "0.80.6"
 
 // CheckMinimumVersion fails when version sorts below minimum.
 func CheckMinimumVersion(version string, minimum string) error {

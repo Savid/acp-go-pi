@@ -3,200 +3,87 @@
 package integration
 
 import (
-	"bytes"
-	"context"
-	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/coder/acp-go-sdk"
-	piacp "github.com/savid/acp-go-pi"
 	"github.com/stretchr/testify/require"
+
+	piacp "github.com/savid/acp-go-pi"
 )
 
-func TestPiACPAgentBinaryClosedInput(t *testing.T) {
-	requireRunIntegration(t)
+func TestSmokeSessionLifecycle(t *testing.T) {
+	requireIntegration(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	h := newHarness(t, false)
+	ctx := h.ctx(t)
 
-	cmd := agentCommand(t, ctx,
-		"-path", fakePiExecutable(t, fakeScenario{}),
-		"-scratch-dir", integrationScratchDir(t),
-	)
-	cmd.Stdin = strings.NewReader("")
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("run acp-go-pi: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
-	}
-
-	require.Empty(t, stdout.String(), "closed input must produce an empty ACP stdout stream")
-}
-
-func TestPiACPAgentBinaryVersionFlag(t *testing.T) {
-	requireRunIntegration(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	cmd := agentCommand(t, ctx, "-version")
-
-	output, err := cmd.Output()
+	init, err := h.conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err)
-	require.NotEmpty(t, strings.TrimSpace(string(output)))
+	require.Empty(t, init.AuthMethods)
+	require.True(t, init.AgentCapabilities.LoadSession)
+
+	cwd := t.TempDir()
+
+	session, err := h.conn.NewSession(ctx, piacp.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	require.NotEmpty(t, session.SessionId)
+
+	list, err := h.conn.ListSessions(ctx, piacp.ListSessionsRequest())
+	require.NoError(t, err)
+	require.Len(t, list.Sessions, 1)
+
+	_, err = h.conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+
+	_, err = h.conn.UnstableDeleteSession(ctx, piacp.DeleteSessionRequest(session.SessionId))
+	require.NoError(t, err)
+
+	_, err = h.conn.LoadSession(ctx, piacp.LoadSessionRequest(session.SessionId, cwd))
+	require.Equal(t, "unknown session", requestErrorData(t, err)["error"])
 }
 
-func TestPiACPAgentBinaryFakeConversation(t *testing.T) {
-	requireRunIntegration(t)
+func TestLivePromptResumeAndPath(t *testing.T) {
+	requireLive(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
+	h := newHarness(t, true)
+	ctx := h.ctx(t)
 
-	agent := startAgentBinary(t, ctx,
-		"-path", fakePiExecutable(t, fakeTurnScenario()),
-		"-scratch-dir", integrationScratchDir(t),
-	)
+	_, err := h.conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
 
-	client := &recordingClient{}
-	conn := acp.NewClientSideConnection(client, agent.stdin, agent.stdout)
+	cwd := t.TempDir()
+	binDir := filepath.Join(t.TempDir(), "bin")
+	require.NoError(t, os.MkdirAll(binDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "acp-marker"), []byte("#!/bin/sh\necho MARKER_OK\n"), 0o700))
 
-	_, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
-	require.NoError(t, err, "stderr: %s", agent.stderrString())
+	session, err := h.conn.NewSession(ctx, piacp.NewSessionRequest(cwd, liveModel(),
+		piacp.WithSessionPiOptions(piacp.NewPiOptions(piacp.WithPiExtraPathDirs(binDir), piacp.WithPiPermission("allow")))))
+	require.NoError(t, err)
 
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t)))
-	require.NoError(t, err, "stderr: %s", agent.stderrString())
-
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "test-turn", "hello via binary"))
-	require.NoError(t, err, "stderr: %s", agent.stderrString())
+	resp, err := h.conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "Reply with exactly LIVE_OK and nothing else. Do not use tools."))
+	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
-	require.Contains(t, client.text(), fakeDefaultReply)
+	require.Contains(t, h.rec.text(), "LIVE_OK")
 
-	_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
+	resp, err = h.conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "Run the shell command `acp-marker` with the bash tool and reply with its exact output and nothing else."))
 	require.NoError(t, err)
-}
-
-// TestPiACPAgentBinaryOrphanReapOnCrash is the crash-during-pending-
-// permission E2E: SIGKILL the wrapper while the fake harness blocks on a
-// permission dialog and require the pi child to die with it
-// (parent-death enforcement), leaving no orphan.
-func TestPiACPAgentBinaryOrphanReapOnCrash(t *testing.T) {
-	requireRunIntegration(t)
-
-	if runtime.GOOS != "linux" && runtime.GOOS != "freebsd" {
-		t.Skip("parent-death enforcement is verified via pdeathsig, which needs linux or freebsd")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	scenario := fakeTurnScenario()
-	scenario.ToolName = "bash"
-	scenario.ToolArgs = map[string]any{"command": "echo orphan-probe"}
-
-	// The scratch path appears in the child's --session-dir argv, so it
-	// doubles as a unique process-search marker.
-	scratchDir := integrationScratchDir(t)
-
-	agent := startAgentBinary(t, ctx,
-		"-path", fakePiExecutable(t, scenario),
-		"-scratch-dir", scratchDir,
-	)
-
-	client := newBlockingPermissionClient()
-	conn := acp.NewClientSideConnection(client, agent.stdin, agent.stdout)
-
-	_, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
-	require.NoError(t, err, "stderr: %s", agent.stderrString())
-
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t)))
-	require.NoError(t, err, "stderr: %s", agent.stderrString())
-
-	go func() {
-		_, _ = conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "test-turn", "trigger the tool"))
-	}()
-
-	select {
-	case <-client.permissionRequested:
-	case <-time.After(60 * time.Second):
-		t.Fatalf("no permission request observed; stderr: %s", agent.stderrString())
-	}
-
-	require.NotEmpty(t, pgrepChildren(t, scratchDir), "expected a running pi child while the permission is pending")
-
-	require.NoError(t, agent.cmd.Process.Kill())
-
-	require.Eventually(t, func() bool {
-		return len(pgrepChildren(t, scratchDir)) == 0
-	}, 15*time.Second, 100*time.Millisecond, "pi child survived the wrapper crash")
-}
-
-func pgrepChildren(t *testing.T, marker string) []string {
-	t.Helper()
-
-	output, err := exec.Command("pgrep", "-f", marker).Output()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			return nil
-		}
-		t.Fatalf("pgrep: %v", err)
-	}
-
-	lines := strings.Fields(strings.TrimSpace(string(output)))
-	pids := make([]string, 0, len(lines))
-	pids = append(pids, lines...)
-
-	return pids
-}
-
-func TestPiACPAgentBinaryLiveConversation(t *testing.T) {
-	requireLiveTokens(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	// The auth bytes are copied into a private temp file for the -seed-file
-	// host path, so the operator's pi home is never handed to the binary.
-	authPath := filepath.Join(t.TempDir(), "auth.json")
-	require.NoError(t, os.WriteFile(authPath, livePiAuth(t), 0o600))
-
-	args := []string{
-		"-path", livePiPath(t),
-		"-scratch-dir", integrationScratchDir(t),
-		"-seed-file", "auth.json=" + authPath,
-	}
-	if model := os.Getenv(envPiModel); model != "" {
-		args = append(args, "-model", model)
-	}
-
-	agent := startAgentBinary(t, ctx, args...)
-
-	client := &recordingClient{}
-	conn := acp.NewClientSideConnection(client, agent.stdin, agent.stdout)
-
-	_, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
-	require.NoError(t, err, "stderr: %s", agent.stderrString())
-
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(integrationWorkspaceDir(t)))
-	require.NoError(t, err, "stderr: %s", agent.stderrString())
-
-	resp, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId,
-		"test-turn",
-		"Reply with exactly ACP_PI_BINARY_OK and no punctuation."))
-	require.NoError(t, err, "stderr: %s", agent.stderrString())
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
-	require.Contains(t, client.text(), "ACP_PI_BINARY_OK")
+	require.Contains(t, h.rec.text(), "MARKER_OK")
 
-	_, err = conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
+	_, err = h.conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
 	require.NoError(t, err)
+
+	matches, err := filepath.Glob(filepath.Join(h.home, "sessions", "*", "*_"+string(session.SessionId)+".jsonl"))
+	require.NoError(t, err)
+	require.Len(t, matches, 1, "pi keeps the session file in its own home after close")
+
+	_, err = h.conn.ResumeSession(ctx, piacp.ResumeSessionRequest(session.SessionId, cwd, liveModel()))
+	require.NoError(t, err)
+
+	resp, err = h.conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "Reply with exactly RESUME_OK and nothing else."))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
+	require.Contains(t, h.rec.text(), "RESUME_OK")
 }

@@ -10,728 +10,255 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
-	piacp "github.com/savid/acp-go-pi"
-	internalpi "github.com/savid/acp-go-pi/internal/pi"
 	"github.com/stretchr/testify/require"
+
+	piacp "github.com/savid/acp-go-pi"
 )
 
 const (
 	envRunIntegration = "ACP_GO_PI_RUN_INTEGRATION"
-	envRunLiveTokens  = "ACP_GO_PI_RUN_LIVE_TOKENS" //nolint:gosec // Environment variable name, not a credential value.
+	envRunLiveTokens  = "ACP_GO_PI_RUN_LIVE_TOKENS"
 	envAgentBinary    = "ACP_GO_PI_AGENT_BINARY"
-	envPiHome         = "ACP_GO_PI_HOME"
-	envPiModel        = "ACP_GO_PI_MODEL"
+	envHome           = "ACP_GO_PI_HOME"
+	envModel          = "ACP_GO_PI_MODEL"
 	envHarnessPath    = "ACP_GO_PI_HARNESS_PATH"
+
+	testTimeout = 120 * time.Second
 )
 
-var integrationLogger = slog.New(slog.DiscardHandler)
-
-func integrationScratchDir(t *testing.T) string {
-	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "acp-go-pi-integration-scratch-")
-	require.NoError(t, err)
-	require.NoError(t, os.Chmod(dir, 0o700))
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-	return dir
-}
-
-func integrationWorkspaceDir(t *testing.T) string {
-	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "acp-go-pi-integration-workspace-")
-	require.NoError(t, err)
-	require.NoError(t, os.Chmod(dir, 0o700))
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-	return dir
-}
-
-func integrationBaseEnvironment(t *testing.T) map[string]string {
-	t.Helper()
-	account, err := user.Current()
-	require.NoError(t, err)
-	return map[string]string{
-		"HOME": t.TempDir(), "LANG": "C.UTF-8", "LOGNAME": account.Username,
-		"PATH": os.Getenv("PATH"), "USER": account.Username,
-	}
-}
-
-type integrationRuntime struct {
-	root            string
-	baseEnvironment map[string]string
-}
-
-func newIntegrationRuntime(t *testing.T) integrationRuntime {
-	t.Helper()
-	root, err := os.MkdirTemp(t.TempDir(), "acp-go-pi-runtime-*")
-	require.NoError(t, err)
-	return integrationRuntime{root: root, baseEnvironment: integrationBaseEnvironment(t)}
-}
-func integrationVersionProbeSpec(t *testing.T) (string, []string) {
-	t.Helper()
-	runtime := newIntegrationRuntime(t)
-	agentDir := filepath.Join(runtime.root, "probe-agent")
-	require.NoError(t, (internalpi.AgentDir{Root: agentDir}).Write())
-	environment := (internalpi.LaunchSpec{AgentDir: agentDir, BaseEnvironment: runtime.baseEnvironment}).Environ()
-	return agentDir, environment
-}
-
-func expectedBuiltinCommandNames(t *testing.T, executable string) []string {
-	t.Helper()
-
-	_, environment := integrationVersionProbeSpec(t)
-	version, err := internalpi.ProbeOrdinaryVersion(t.Context(), executable, environment)
-	require.NoError(t, err)
-	if internalpi.CheckMinimumVersion(version, "0.81.0") == nil {
-		return []string{"llama"}
-	}
-
-	return []string{}
-}
-
-func TestMain(m *testing.M) {
-	// A copy of this binary published as a pi executable carries its
-	// instructions in a file beside the image. The role is claimed here,
-	// before the test framework looks at arguments that belong to pi.
-	if sidecar, found := loadFakePiSidecar(); found {
-		recordFakePiLaunch(sidecar)
-		os.Exit(runFakePi(os.Args))
-	}
-
-	previousLogger := slog.Default()
-	slog.SetDefault(integrationLogger)
-
-	code := m.Run()
-	cleanupIntegrationBinary()
-
-	slog.SetDefault(previousLogger)
-	if fakePiTargetBinaryRoot != "" {
-		_ = os.RemoveAll(fakePiTargetBinaryRoot)
-	}
-	os.Exit(code)
-}
-
-func requireRunIntegration(t *testing.T) {
+func requireIntegration(t *testing.T) {
 	t.Helper()
 
 	if os.Getenv(envRunIntegration) != "1" {
-		t.Skipf("set %s=1 to run pi integration tests", envRunIntegration)
+		t.Skipf("set %s=1 to run integration tests", envRunIntegration)
 	}
 }
 
-// requireLiveTokens gates tests that spend model tokens. Only
-// `make test-integration-live` sets this variable.
-func requireLiveTokens(t *testing.T) {
+func requireLive(t *testing.T) {
 	t.Helper()
-
-	requireRunIntegration(t)
+	requireIntegration(t)
 
 	if os.Getenv(envRunLiveTokens) != "1" {
-		t.Skipf("set %s=1 to run live pi tests that spend model tokens", envRunLiveTokens)
+		t.Skipf("set %s=1 to run token-spending tests", envRunLiveTokens)
 	}
 }
 
-// smokePiPath resolves the real pi binary for token-free smoke tests,
-// skipping cleanly when it is not installed.
-func smokePiPath(t *testing.T) string {
+// harnessPath resolves the pi binary; a missing pi skips the smoke tier and
+// fails the live tier.
+func harnessPath(t *testing.T, live bool) string {
 	t.Helper()
 
-	requireRunIntegration(t)
-
-	path, err := resolvePiPath()
-	if err != nil {
-		if os.Getenv(envRunLiveTokens) == "1" || os.Getenv("ACP_GO_PI_RUN_ATTENDED") == "1" || os.Getenv("ACP_GO_PI_RUN_KEYSTORE") == "1" {
-			t.Fatalf("requested pi integration tier requires the CLI: %v", err)
-		}
-		t.Skipf("pi CLI not found (%v); install pi or set %s", err, envHarnessPath)
-	}
-
-	return path
-}
-
-// livePiPath resolves the real pi binary for the live tier. Live runs were
-// requested explicitly, so a missing binary fails instead of skipping.
-func livePiPath(t *testing.T) string {
-	t.Helper()
-
-	path, err := resolvePiPath()
-	if err != nil {
-		t.Fatalf("live pi tests requested but the pi CLI is missing (%v); install pi or set %s",
-			err, envHarnessPath)
-	}
-
-	return path
-}
-
-func resolvePiPath() (string, error) {
 	path := os.Getenv(envHarnessPath)
 	if path == "" {
 		path = "pi"
 	}
 
-	return exec.LookPath(path)
-}
-
-func piSourceHome(t *testing.T) string {
-	t.Helper()
-
-	if source := os.Getenv(envPiHome); source != "" {
-		return source
-	}
-
-	home, err := os.UserHomeDir()
-	require.NoError(t, err)
-
-	return filepath.Join(home, ".pi")
-}
-
-// livePiAuth reads portable auth material from the source pi home. The
-// source is only ever read; live sessions run against isolated temp homes.
-func livePiAuth(t *testing.T) []byte {
-	t.Helper()
-
-	source := piSourceHome(t)
-
-	data, err := os.ReadFile(filepath.Join(source, "agent", "auth.json")) // #nosec G304 -- reads the operator-designated auth source.
-	if errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("live pi tests requested but %s/agent/auth.json is missing; set %s to a pi home with credentials",
-			source, envPiHome)
-	}
-	require.NoError(t, err)
-
-	return data
-}
-
-// livePiAuthSeed injects the portable auth material into each session's
-// isolated pi agent directory; seed files are the adapter's credential
-// injection surface, so the source pi home itself is never read by pi.
-func livePiAuthSeed(t *testing.T) piacp.Option {
-	t.Helper()
-
-	return piacp.WithSeedFiles(map[string]string{"auth.json": string(livePiAuth(t))})
-}
-
-type agentPipes struct {
-	clientInput io.Writer
-	agentOutput io.Reader
-}
-
-func serveAgentRawForTest(t *testing.T, ctx context.Context, opts ...piacp.Option) agentPipes {
-	t.Helper()
-	baseOptions := []piacp.Option{
-		piacp.WithLogger(integrationLogger),
-	}
-
-	return serveAgentWithBaseOptionsForTest(t, ctx, baseOptions, opts...)
-}
-
-// serveEmbeddedAgentRawForTest runs the same real adapter boundary without
-// the Linux-only distinct-identity policy. Darwin still uses the adapter's
-// explicit best-effort containment because native launches fail closed there.
-func serveEmbeddedAgentRawForTest(t *testing.T, ctx context.Context, opts ...piacp.Option) agentPipes {
-	t.Helper()
-	baseOptions := []piacp.Option{piacp.WithLogger(integrationLogger)}
-
-	return serveAgentWithBaseOptionsForTest(t, ctx, baseOptions, opts...)
-}
-
-func serveAgentWithBaseOptionsForTest(
-	t *testing.T,
-	ctx context.Context,
-	baseOptions []piacp.Option,
-	opts ...piacp.Option,
-) agentPipes {
-	t.Helper()
-
-	c2aR, c2aW := io.Pipe()
-	a2cR, a2cW := io.Pipe()
-	serveCtx, stopServe := context.WithCancel(ctx)
-
-	serveErr := make(chan error, 1)
-	go func() {
-		options := append(baseOptions, opts...)
-		serveErr <- piacp.Serve(serveCtx, c2aR, a2cW, options...)
-	}()
-
-	t.Cleanup(func() {
-		stopServe()
-		_ = c2aR.Close()
-		_ = c2aW.Close()
-		_ = a2cR.Close()
-		_ = a2cW.Close()
-
-		select {
-		case err := <-serveErr:
-			if err != nil && !errors.Is(err, context.Canceled) {
-				t.Logf("agent serve returned: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Log("agent serve did not stop within cleanup timeout")
+	resolved, err := exec.LookPath(path)
+	if err != nil {
+		if live {
+			t.Fatalf("pi not found: %v", err)
 		}
-	})
 
-	return agentPipes{clientInput: c2aW, agentOutput: a2cR}
-}
-
-func connectAgentForTest(
-	t *testing.T,
-	ctx context.Context,
-	client acp.Client,
-	opts ...piacp.Option,
-) *acp.ClientSideConnection {
-	t.Helper()
-
-	return connectAgentWithInitForTest(t, ctx, client,
-		acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}, opts...)
-}
-
-func connectEmbeddedAgentForTest(
-	t *testing.T,
-	ctx context.Context,
-	client acp.Client,
-	opts ...piacp.Option,
-) *acp.ClientSideConnection {
-	t.Helper()
-
-	return initializeAgentPipesForTest(t, ctx, client,
-		acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber},
-		serveEmbeddedAgentRawForTest(t, ctx, opts...),
-	)
-}
-
-func connectAgentWithInitForTest(
-	t *testing.T,
-	ctx context.Context,
-	client acp.Client,
-	init acp.InitializeRequest,
-	opts ...piacp.Option,
-) *acp.ClientSideConnection {
-	t.Helper()
-
-	return initializeAgentPipesForTest(t, ctx, client, init, serveAgentRawForTest(t, ctx, opts...))
-}
-
-func initializeAgentPipesForTest(
-	t *testing.T,
-	ctx context.Context,
-	client acp.Client,
-	init acp.InitializeRequest,
-	pipes agentPipes,
-) *acp.ClientSideConnection {
-	t.Helper()
-	conn := acp.NewClientSideConnection(client, pipes.clientInput, pipes.agentOutput)
-
-	_, err := conn.Initialize(ctx, init)
-	require.NoError(t, err)
-
-	return conn
-}
-
-// formElicitationInit advertises form elicitation support, which the agent
-// requires before relaying native dialogs as elicitations.
-func formElicitationInit() acp.InitializeRequest {
-	return acp.InitializeRequest{
-		ProtocolVersion: acp.ProtocolVersionNumber,
-		ClientCapabilities: acp.ClientCapabilities{
-			Elicitation: &acp.ElicitationCapabilities{Form: &acp.ElicitationFormCapabilities{}},
-		},
-	}
-}
-
-// connectFakeAgentForTest serves the wrapper in-process against a fake pi
-// harness scenario, on an isolated scratch parent.
-func connectFakeAgentForTest(
-	t *testing.T,
-	ctx context.Context,
-	client acp.Client,
-	scenario fakeScenario,
-	opts ...piacp.Option,
-) *acp.ClientSideConnection {
-	t.Helper()
-
-	options := append([]piacp.Option{
-		piacp.WithExecutablePath(fakePiExecutable(t, scenario)),
-		piacp.WithScratchDir(integrationScratchDir(t)),
-	}, opts...)
-
-	return connectAgentForTest(t, ctx, client, options...)
-}
-
-func repoRoot() string {
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		return ".."
+		t.Skipf("pi not installed: %v", err)
 	}
 
-	return filepath.Dir(filepath.Dir(file))
+	return resolved
 }
 
-func agentBinaryPath(t *testing.T) string { t.Helper(); return integrationBinaryPath(t) }
-
-func agentCommand(t *testing.T, ctx context.Context, args ...string) *exec.Cmd {
+// isolatedHome copies the operator's pi home named by ACP_GO_PI_HOME into a
+// temporary directory, so a live test never writes into the real home.
+func isolatedHome(t *testing.T) string {
 	t.Helper()
 
-	cmd := exec.CommandContext(ctx, agentBinaryPath(t), args...) // #nosec G204,G702 -- test-built wrapper binary.
-	cmd.WaitDelay = 5 * time.Second
-	return cmd
-}
+	home := filepath.Join(t.TempDir(), "home")
+	require.NoError(t, os.MkdirAll(home, 0o700))
 
-type liveAgent struct{ *integrationProcess }
-
-func startAgentBinary(t *testing.T, ctx context.Context, args ...string) *liveAgent {
-	t.Helper()
-	return startAgentProcess(t, agentCommand(t, ctx, args...))
-}
-func startOrdinaryAgentBinary(t *testing.T, ctx context.Context, args ...string) *liveAgent {
-	t.Helper()
-	return startAgentProcess(t, agentCommand(t, ctx, args...))
-}
-func startAgentProcess(t *testing.T, cmd *exec.Cmd) *liveAgent {
-	t.Helper()
-	return &liveAgent{startIntegrationProcess(t, cmd)}
-}
-func (a *liveAgent) stderrString() string { return a.stderr.String() }
-
-type lockedBuffer struct {
-	mu   sync.Mutex
-	data []byte
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.data = append(b.data, p...)
-
-	return len(p), nil
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	return string(b.data)
-}
-
-const (
-	permissionChoiceAllow  = "allow"
-	permissionChoiceDeny   = "deny"
-	permissionChoiceCancel = "cancel"
-)
-
-type recordedExtension struct {
-	Method string
-	Params map[string]any
-}
-
-type recordingClient struct {
-	mu sync.Mutex
-
-	permissionChoice string
-	elicitationValue string
-
-	textChunks    []string
-	updates       []acp.SessionUpdate
-	notifications []acp.SessionNotification
-	usageUpdates  []acp.SessionUsageUpdate
-	permissions   []acp.RequestPermissionRequest
-	elicitations  []acp.UnstableCreateElicitationRequest
-	extensions    []recordedExtension
-}
-
-var _ acp.Client = (*recordingClient)(nil)
-
-var _ interface {
-	acp.ExtensionMethodHandler
-	UnstableCreateElicitation(
-		context.Context,
-		acp.UnstableCreateElicitationRequest,
-	) (acp.UnstableCreateElicitationResponse, error)
-} = (*recordingClient)(nil)
-
-func (c *recordingClient) ReadTextFile(context.Context, acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
-	return acp.ReadTextFileResponse{}, nil
-}
-
-func (c *recordingClient) WriteTextFile(context.Context, acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {
-	return acp.WriteTextFileResponse{}, nil
-}
-
-func (c *recordingClient) RequestPermission(
-	_ context.Context,
-	params acp.RequestPermissionRequest,
-) (acp.RequestPermissionResponse, error) {
-	c.mu.Lock()
-	c.permissions = append(c.permissions, params)
-	choice := c.permissionChoice
-	c.mu.Unlock()
-
-	if choice == permissionChoiceCancel {
-		return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
+	source := os.Getenv(envHome)
+	if source == "" {
+		return home
 	}
 
-	for _, option := range params.Options {
-		allow := option.Kind == acp.PermissionOptionKindAllowOnce ||
-			option.Kind == acp.PermissionOptionKindAllowAlways
-		deny := option.Kind == acp.PermissionOptionKindRejectOnce ||
-			option.Kind == acp.PermissionOptionKindRejectAlways
-
-		if (choice == permissionChoiceDeny && deny) || (choice != permissionChoiceDeny && allow) {
-			return acp.RequestPermissionResponse{
-				Outcome: acp.NewRequestPermissionOutcomeSelected(option.OptionId),
-			}, nil
+	for _, name := range []string{"auth.json", "settings.json", "models-store.json"} {
+		data, err := os.ReadFile(filepath.Join(source, name))
+		if err != nil {
+			continue
 		}
+
+		require.NoError(t, os.WriteFile(filepath.Join(home, name), data, 0o600))
 	}
 
-	return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
+	return home
 }
 
-func (c *recordingClient) SessionUpdate(_ context.Context, params acp.SessionNotification) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// recorder records updates and allows every permission.
+type recorder struct {
+	mu      sync.Mutex
+	updates []acp.SessionNotification
+}
 
-	c.updates = append(c.updates, params.Update)
-	c.notifications = append(c.notifications, params)
+func (r *recorder) SessionUpdate(_ context.Context, params acp.SessionNotification) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	switch {
-	case params.Update.UsageUpdate != nil:
-		c.usageUpdates = append(c.usageUpdates, *params.Update.UsageUpdate)
-	case params.Update.AgentMessageChunk != nil && params.Update.AgentMessageChunk.Content.Text != nil:
-		c.textChunks = append(c.textChunks, params.Update.AgentMessageChunk.Content.Text.Text)
-	}
+	r.updates = append(r.updates, params)
 
 	return nil
 }
 
-func (c *recordingClient) CreateTerminal(context.Context, acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
-	return acp.CreateTerminalResponse{TerminalId: "terminal-1"}, nil
-}
+func (r *recorder) text() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-func (c *recordingClient) KillTerminal(context.Context, acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
-	return acp.KillTerminalResponse{}, nil
-}
+	text := ""
 
-func (c *recordingClient) TerminalOutput(context.Context, acp.TerminalOutputRequest) (acp.TerminalOutputResponse, error) {
-	return acp.TerminalOutputResponse{}, nil
-}
-
-func (c *recordingClient) ReleaseTerminal(
-	context.Context,
-	acp.ReleaseTerminalRequest,
-) (acp.ReleaseTerminalResponse, error) {
-	return acp.ReleaseTerminalResponse{}, nil
-}
-
-func (c *recordingClient) WaitForTerminalExit(
-	context.Context,
-	acp.WaitForTerminalExitRequest,
-) (acp.WaitForTerminalExitResponse, error) {
-	return acp.WaitForTerminalExitResponse{}, nil
-}
-
-func (c *recordingClient) UnstableCreateElicitation(
-	_ context.Context,
-	params acp.UnstableCreateElicitationRequest,
-) (acp.UnstableCreateElicitationResponse, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.elicitations = append(c.elicitations, params)
-
-	value := c.elicitationValue
-	if value == "" {
-		value = "Go"
-	}
-
-	content := map[string]any{"question_1": value}
-	if params.Form != nil {
-		for _, required := range params.Form.RequestedSchema.Required {
-			content[required] = value
+	for _, update := range r.updates {
+		if chunk := update.Update.AgentMessageChunk; chunk != nil && chunk.Content.Text != nil {
+			text += chunk.Content.Text.Text
 		}
 	}
 
-	return acp.UnstableCreateElicitationResponse{
-		Accept: &acp.UnstableCreateElicitationAccept{Action: "accept", Content: content},
-	}, nil
+	return text
 }
 
-func (c *recordingClient) HandleExtensionMethod(
-	_ context.Context,
-	method string,
-	params json.RawMessage,
-) (any, error) {
-	var decoded map[string]any
-	if len(params) > 0 {
-		if err := json.Unmarshal(params, &decoded); err != nil {
-			return nil, err
+func (*recorder) RequestPermission(_ context.Context, params acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
+	for _, option := range params.Options {
+		if option.Kind == acp.PermissionOptionKindAllowOnce {
+			return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeSelected(option.OptionId)}, nil
 		}
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.extensions = append(c.extensions, recordedExtension{Method: method, Params: decoded})
-
-	return map[string]any{}, nil
-}
-
-func (c *recordingClient) text() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return strings.Join(c.textChunks, "")
-}
-
-func (c *recordingClient) notificationSnapshot() []acp.SessionNotification {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return append([]acp.SessionNotification(nil), c.notifications...)
-}
-
-func (c *recordingClient) permissionCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return len(c.permissions)
-}
-
-func (c *recordingClient) permissionSnapshot() []acp.RequestPermissionRequest {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return append([]acp.RequestPermissionRequest(nil), c.permissions...)
-}
-
-func (c *recordingClient) elicitationSnapshot() []acp.UnstableCreateElicitationRequest {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return append([]acp.UnstableCreateElicitationRequest(nil), c.elicitations...)
-}
-
-func (c *recordingClient) usageUpdateCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return len(c.usageUpdates)
-}
-
-func (c *recordingClient) extensionSnapshot() []recordedExtension {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return append([]recordedExtension(nil), c.extensions...)
-}
-
-func (c *recordingClient) rawEventCount() int {
-	count := 0
-	for _, extension := range c.extensionSnapshot() {
-		if extension.Method == piacp.RawEventMethod {
-			count++
-		}
-	}
-
-	return count
-}
-
-// blockingPermissionClient parks the first permission request until its
-// context ends, so tests can crash or cancel the wrapper while a native
-// permission dialog is pending.
-type blockingPermissionClient struct {
-	recordingClient
-
-	permissionRequested chan struct{}
-	requestOnce         sync.Once
-}
-
-func newBlockingPermissionClient() *blockingPermissionClient {
-	return &blockingPermissionClient{permissionRequested: make(chan struct{})}
-}
-
-func (c *blockingPermissionClient) RequestPermission(
-	ctx context.Context,
-	params acp.RequestPermissionRequest,
-) (acp.RequestPermissionResponse, error) {
-	c.mu.Lock()
-	c.permissions = append(c.permissions, params)
-	c.mu.Unlock()
-
-	c.requestOnce.Do(func() { close(c.permissionRequested) })
-
-	<-ctx.Done()
 
 	return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
 }
 
-func TestIntegrationHarnessPrerequisites(t *testing.T) {
-	if os.Args[len(os.Args)-1] == "harness-prerequisite-child" {
-		path := smokePiPath(t)
-		t.Log("resolved harness " + path)
-		return
+func (*recorder) ReadTextFile(context.Context, acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
+	return acp.ReadTextFileResponse{}, errors.New("unsupported")
+}
+
+func (*recorder) WriteTextFile(context.Context, acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {
+	return acp.WriteTextFileResponse{}, errors.New("unsupported")
+}
+
+func (*recorder) CreateTerminal(context.Context, acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
+	return acp.CreateTerminalResponse{}, errors.New("unsupported")
+}
+
+func (*recorder) KillTerminal(context.Context, acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
+	return acp.KillTerminalResponse{}, nil
+}
+
+func (*recorder) TerminalOutput(context.Context, acp.TerminalOutputRequest) (acp.TerminalOutputResponse, error) {
+	return acp.TerminalOutputResponse{}, nil
+}
+
+func (*recorder) ReleaseTerminal(context.Context, acp.ReleaseTerminalRequest) (acp.ReleaseTerminalResponse, error) {
+	return acp.ReleaseTerminalResponse{}, nil
+}
+
+func (*recorder) WaitForTerminalExit(context.Context, acp.WaitForTerminalExitRequest) (acp.WaitForTerminalExitResponse, error) {
+	return acp.WaitForTerminalExitResponse{}, nil
+}
+
+// harness serves the agent to a recording client, either in-process or
+// through a prebuilt binary named by ACP_GO_PI_AGENT_BINARY.
+type harness struct {
+	conn *acp.ClientSideConnection
+	rec  *recorder
+	home string
+}
+
+func newHarness(t *testing.T, live bool, extra ...piacp.Option) *harness {
+	t.Helper()
+
+	pi := harnessPath(t, live)
+	home := isolatedHome(t)
+	rec := &recorder{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var (
+		clientWriter io.WriteCloser
+		clientReader io.Reader
+		wait         func()
+	)
+
+	if binary := os.Getenv(envAgentBinary); binary != "" {
+		cmd := exec.CommandContext(ctx, binary, "-path", pi, "-home", home, "-scratch-dir", t.TempDir())
+		cmd.Stderr = os.Stderr
+
+		stdin, err := cmd.StdinPipe()
+		require.NoError(t, err)
+
+		stdout, err := cmd.StdoutPipe()
+		require.NoError(t, err)
+		require.NoError(t, cmd.Start())
+
+		clientWriter, clientReader = stdin, stdout
+		wait = func() { _ = cmd.Wait() }
+	} else {
+		agentReader, writer := io.Pipe()
+		reader, agentWriter := io.Pipe()
+		served := make(chan error, 1)
+
+		options := append([]piacp.Option{
+			piacp.WithExecutablePath(pi),
+			piacp.WithHome(home),
+			piacp.WithScratchDir(t.TempDir()),
+			piacp.WithLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+		}, extra...)
+
+		go func() { served <- piacp.Serve(ctx, agentReader, agentWriter, options...) }()
+
+		clientWriter, clientReader = writer, reader
+		wait = func() { <-served }
 	}
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
+
+	conn := acp.NewClientSideConnection(rec, clientWriter, clientReader)
+	conn.SetLogger(slog.New(slog.DiscardHandler))
+
+	t.Cleanup(func() {
+		cancel()
+		_ = clientWriter.Close()
+		wait()
+	})
+
+	return &harness{conn: conn, rec: rec, home: home}
+}
+
+func (h *harness) ctx(t *testing.T) context.Context {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	t.Cleanup(cancel)
+
+	return ctx
+}
+
+func liveModel() piacp.SessionRequestOption {
+	options := piacp.NewPiOptions()
+	if model := os.Getenv(envModel); model != "" {
+		options.Model = model
 	}
-	for _, tc := range []struct {
-		name, integration, tier, value, outcome string
-		available                               bool
-	}{
-		{name: "ungated", outcome: "SKIP"},
-		{name: "disabled", integration: "0", outcome: "SKIP"},
-		{name: "invalid_gate", integration: "true", outcome: "SKIP"},
-		{name: "missing_smoke", integration: "1", outcome: "SKIP"},
-		{name: "disabled_live", integration: "1", tier: "RUN_LIVE_TOKENS", value: "0", outcome: "SKIP"},
-		{name: "missing_live", integration: "1", tier: "RUN_LIVE_TOKENS", value: "1", outcome: "FAIL"},
-		{name: "missing_attended", integration: "1", tier: "RUN_ATTENDED", value: "1", outcome: "FAIL"},
-		{name: "missing_keystore", integration: "1", tier: "RUN_KEYSTORE", value: "1", outcome: "FAIL"},
-		{name: "fake_path", integration: "1", outcome: "PASS", available: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, suffix := range []string{"RUN_INTEGRATION", "RUN_LIVE_TOKENS", "RUN_ATTENDED", "RUN_KEYSTORE"} {
-				t.Setenv("ACP_GO_PI_"+suffix, "0")
-			}
-			t.Setenv("ACP_GO_PI_RUN_INTEGRATION", tc.integration)
-			if tc.tier != "" {
-				t.Setenv("ACP_GO_PI_"+tc.tier, tc.value)
-			}
-			dir := t.TempDir()
-			harness := filepath.Join(dir, "pi")
-			if runtime.GOOS == "windows" {
-				harness += ".exe"
-			}
-			if tc.available {
-				// Resolution only: this file is never executed.
-				if err := os.WriteFile(harness, []byte("fake harness path"), 0o700); err != nil {
-					t.Fatal(err)
-				}
-			}
-			t.Setenv("ACP_GO_PI_HARNESS_PATH", harness)
-			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, executable, "-test.run=^TestIntegrationHarnessPrerequisites$", "-test.v", "--", "harness-prerequisite-child")
-			cmd.WaitDelay = time.Second
-			output, runErr := cmd.CombinedOutput()
-			if ctx.Err() != nil {
-				t.Fatal(ctx.Err())
-			}
-			if (runErr != nil) != (tc.outcome == "FAIL") {
-				t.Fatalf("unexpected child result: %v\n%s", runErr, output)
-			}
-			if !strings.Contains(string(output), "--- "+tc.outcome+": TestIntegrationHarnessPrerequisites") {
-				t.Fatalf("want child %s:\n%s", tc.outcome, output)
-			}
-			if tc.available && !strings.Contains(string(output), "resolved harness "+harness) {
-				t.Fatalf("fake harness selection was lost:\n%s", output)
-			}
-		})
-	}
+
+	return piacp.WithSessionPiOptions(options)
+}
+
+func requestErrorData(t *testing.T, err error) map[string]any {
+	t.Helper()
+
+	var reqErr *acp.RequestError
+	require.ErrorAs(t, err, &reqErr)
+
+	encoded, marshalErr := json.Marshal(reqErr.Data)
+	require.NoError(t, marshalErr)
+
+	var data map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &data))
+
+	return data
 }

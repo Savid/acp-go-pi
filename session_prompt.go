@@ -2,756 +2,424 @@ package piacp
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
 
+	"github.com/savid/acp-go-core/image"
+	"github.com/savid/acp-go-core/lifecycle"
+	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 const (
-	fieldPrompt         = "prompt"
-	fieldPromptImage    = "prompt.image"
-	fieldPromptResource = "prompt.resource"
-
-	assistantEventTextDelta     = "text_delta"
-	assistantEventThinkingDelta = "thinking_delta"
+	limitSessionPrompt = "session_prompt"
 
 	stopReasonStop      = "stop"
 	stopReasonLength    = "length"
 	stopReasonMaxTokens = "max_tokens"
 	stopReasonAborted   = "aborted"
 	stopReasonError     = "error"
+
+	// extensionFailureMessage is the whole of what a client is told about a
+	// wrapper extension that threw: its path and thrown text are internal.
+	extensionFailureMessage = "a pi extension failed"
+	// nativeCauseMaxBytes bounds the native cause text a failure carries.
+	nativeCauseMaxBytes = 2048
+	// processExitGrace is how long failure classification waits for a dead
+	// child to be reaped after its stdout closed.
+	processExitGrace = 2 * time.Second
 )
 
-// piPrompt is one mapped native prompt: the message text plus attached
-// images.
-type piPrompt struct {
-	Message string
-	Images  []pi.ImageContent
-	// ImageField is the request member the first attached image arrived on, so a
-	// refusal of the prompt's images reports the channel that carried them
-	// rather than assuming the image block form.
-	ImageField string
+// nativePrompt is one mapped prompt: the message text plus attached images.
+type nativePrompt struct {
+	message string
+	images  []pi.ImageContent
+	// firstImage is the gated-media index and field of the first image, for
+	// the selected-model refusal.
+	firstImage *image.Decoded
 }
 
-// promptToPi converts ACP prompt content to pi's prompt command shape.
-// Embedded context is flattened into the message text at map time; audio is
-// rejected. pi's prompt images take base64 payloads only, so a validated
-// handoff file's bytes are encoded into the native request and the handoff
-// path itself never leaves the validation read. Image validation is
-// deterministic and stops on the first failing block in request order.
-func promptToPi(ctx context.Context, prompt []acp.ContentBlock, limits ImageLimits, handoffRoot string) (piPrompt, error) {
-	return mapPiPrompt(ctx, prompt, newPromptImageBudget(limits, handoffRoot))
-}
-
-func mapPiPrompt(ctx context.Context, prompt []acp.ContentBlock, budget *promptImageBudget) (piPrompt, error) {
-	if len(prompt) == 0 {
-		return piPrompt{}, unsupportedField(fieldPrompt)
+// mapPrompt converts ACP prompt content to pi's prompt shape. Embedded
+// context is appended to the message text; images run the core input gates
+// and travel as inline base64.
+func (s *session) mapPrompt(ctx context.Context, blocks []acp.ContentBlock) (nativePrompt, error) {
+	if len(blocks) == 0 {
+		return nativePrompt{}, wire.Unsupported("prompt")
 	}
 
-	textParts := make([]string, 0, len(prompt))
+	decoded, refusal, err := image.ValidatePrompt(ctx, blocks, image.Options{
+		Limits:      s.agent.options.ImageLimits.core(),
+		HandoffRoot: s.agent.options.InputHandoffRoot,
+		Blobs:       func(string) image.BlobDisposition { return image.BlobRefuse },
+	})
+	if err != nil {
+		return nativePrompt{}, err
+	}
+
+	if refusal != nil {
+		return nativePrompt{}, refusal.InvalidParams()
+	}
+
+	textParts := make([]string, 0, len(blocks))
 	contextParts := make([]string, 0)
-	images := make([]pi.ImageContent, 0)
 
-	defer budget.closeHandoffRoot()
-
-	for _, block := range prompt {
-		if err := ctx.Err(); err != nil {
-			return piPrompt{}, err
-		}
-
+	for _, block := range blocks {
 		switch {
 		case block.Text != nil:
-			if textAudienceIsUserOnly(block.Text.Annotations) {
+			if audienceIsUserOnly(block.Text.Annotations) {
 				continue
 			}
 
 			textParts = append(textParts, block.Text.Text)
 		case block.Image != nil:
-			data, err := budget.validateBlock(ctx, block.Image)
-			if err != nil {
-				return piPrompt{}, err
-			}
-
-			images = append(images, pi.NewImageContent(data, block.Image.MimeType))
 		case block.ResourceLink != nil:
 			textParts = append(textParts, strings.TrimSpace(block.ResourceLink.Uri))
 		case block.Resource != nil:
-			text, contextText, image, err := resourceToPi(block.Resource.Resource, budget)
-			if err != nil {
-				return piPrompt{}, err
-			}
-
-			if text != "" {
-				textParts = append(textParts, text)
-			}
-
-			if contextText != "" {
-				contextParts = append(contextParts, contextText)
-			}
-
-			if image != nil {
-				images = append(images, *image)
+			if text := block.Resource.Resource.TextResourceContents; text != nil {
+				textParts = append(textParts, strings.TrimSpace(text.Uri))
+				contextParts = append(contextParts, contextResourceText(text.Uri, text.Text))
 			}
 		default:
-			return piPrompt{}, unsupportedField(fieldPrompt)
+			return nativePrompt{}, wire.Unsupported("prompt")
 		}
 	}
 
-	message := strings.Join(append(textParts, contextParts...), "\n")
-	if strings.TrimSpace(message) == "" && len(images) == 0 {
-		return piPrompt{}, unsupportedField(fieldPrompt)
+	prompt := nativePrompt{
+		message: strings.Join(append(textParts, contextParts...), "\n"),
+		images:  make([]pi.ImageContent, 0, len(decoded)),
 	}
 
-	return piPrompt{Message: message, Images: images, ImageField: budget.firstImageField}, nil
+	for index := range decoded {
+		if prompt.firstImage == nil {
+			prompt.firstImage = &decoded[index]
+		}
+
+		prompt.images = append(prompt.images, pi.NewImageContent(base64.StdEncoding.EncodeToString(decoded[index].Data), decoded[index].MIME))
+	}
+
+	if strings.TrimSpace(prompt.message) == "" && len(prompt.images) == 0 {
+		return nativePrompt{}, wire.Unsupported("prompt")
+	}
+
+	return prompt, nil
 }
 
-func resourceToPi(resource acp.EmbeddedResourceResource, budget *promptImageBudget) (string, string, *pi.ImageContent, error) {
-	if resource.TextResourceContents != nil {
-		if err := budget.chargeText(int64(len(resource.TextResourceContents.Text))); err != nil {
-			return "", "", nil, err
-		}
-
-		contextText := contextResourceText(resource.TextResourceContents.Uri, resource.TextResourceContents.Text)
-		text := strings.TrimSpace(resource.TextResourceContents.Uri)
-
-		return text, contextText, nil, nil
-	}
-
-	if resource.BlobResourceContents != nil {
-		mimeType := ""
-		if resource.BlobResourceContents.MimeType != nil {
-			mimeType = *resource.BlobResourceContents.MimeType
-		}
-
-		if strings.HasPrefix(inboundMediaTypeRoute(mimeType), "image/") {
-			if err := budget.validate(resource.BlobResourceContents.Blob, mimeType); err != nil {
-				return "", "", nil, err
-			}
-
-			image := pi.NewImageContent(resource.BlobResourceContents.Blob, mimeType)
-
-			return "", "", &image, nil
-		}
-
-		return "", "", nil, unsupportedField(fieldPromptResource)
-	}
-
-	return "", "", nil, unsupportedField(fieldPromptResource)
-}
-
-func textAudienceIsUserOnly(annotations *acp.Annotations) bool {
-	return annotations != nil &&
-		len(annotations.Audience) == 1 &&
-		annotations.Audience[0] == acp.RoleUser
+func audienceIsUserOnly(annotations *acp.Annotations) bool {
+	return annotations != nil && len(annotations.Audience) == 1 && annotations.Audience[0] == acp.RoleUser
 }
 
 func contextResourceText(uri string, text string) string {
-	var output strings.Builder
+	escape := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
 
-	output.WriteString("\n<context ref=\"")
-	output.WriteString(xmlEscape(uri))
-	output.WriteString("\">\n")
-	output.WriteString(xmlEscape(text))
-	output.WriteString("\n</context>")
-
-	return output.String()
+	return "\n<context ref=\"" + escape.Replace(uri) + "\">\n" + escape.Replace(text) + "\n</context>"
 }
 
-func xmlEscape(text string) string {
-	replacer := strings.NewReplacer(
-		"&", "&amp;",
-		"<", "&lt;",
-		">", "&gt;",
-		`"`, "&quot;",
-		"'", "&apos;",
-	)
-
-	return replacer.Replace(text)
-}
-
-// Prompt sends one turn to pi and streams updates until the run settles.
-// Route validation runs first, then the lifecycle submission identity: a
-// prompt never reports two rejections, and the order of two failures is never
-// implementation-defined.
-func (s *agentSession) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
-	route, err := parseInboundTurnRoute(params.Meta)
-	if err != nil {
-		return acp.PromptResponse{}, err
+// rejectImagesForModel refuses image input pre-turn when the selected model's
+// catalog entry says it accepts no images. An absent model, field, or empty
+// list forwards.
+func (s *session) rejectImagesForModel(prompt nativePrompt) error {
+	if prompt.firstImage == nil {
+		return nil
 	}
-
-	submission, err := s.agent.lifecyclePromptCorrelation(params.Meta)
-	if err != nil {
-		return acp.PromptResponse{}, err
-	}
-
-	if poisonErr := s.admissionFenceError(ctx); poisonErr != nil {
-		return acp.PromptResponse{}, poisonErr
-	}
-
-	releaseTurn, err := s.acquireTurn(ctx)
-	if err != nil {
-		return acp.PromptResponse{}, err
-	}
-
-	defer releaseTurn()
-
-	budget := newPromptImageBudget(s.agent.imageLimits(), s.agent.inputHandoffRoot())
-	budget.managedHandoff = s.agent.managedHandoff
-
-	mapped, err := mapPiPrompt(ctx, params.Prompt, budget)
-	if err != nil {
-		return acp.PromptResponse{}, err
-	}
-
-	if imageErr := s.rejectImagesForUnsupportedModel(mapped); imageErr != nil {
-		return acp.PromptResponse{}, imageErr
-	}
-
-	delivery := newTurnDelivery()
-
-	if admissionErr := s.claimPromptForeground(ctx, delivery); admissionErr != nil {
-		return acp.PromptResponse{}, admissionErr
-	}
-
-	var cancel context.CancelFunc
-
-	defer func() {
-		if cancel != nil {
-			cancel()
-		}
-
-		s.finishPromptForeground(delivery)
-	}()
-
-	outbox, client, reserveErr := s.refreshAndReservePrompt(ctx, delivery)
-	if reserveErr != nil {
-		var requestErr *acp.RequestError
-		if errors.As(reserveErr, &requestErr) {
-			return acp.PromptResponse{}, reserveErr
-		}
-
-		return acp.PromptResponse{}, s.nativeTurnFailure(ctx, reserveErr)
-	}
-
-	s.resetTurnTools()
-
-	turnCtx, turnCancel := context.WithCancel(ctx)
-	cancel = turnCancel
-	turnCtx = withTurnRoute(turnCtx, route.turnNonce)
-
-	s.cancelMu.Lock()
-	s.mu.Lock()
-	s.cancel = turnCancel
-	s.turnCancelled = false
-	s.turnNonce = route.turnNonce
-	s.turnFenceStarted = false
-	s.turnFenceDone = make(chan struct{})
-	s.turnFenceErr = nil
-	s.turnSettling = false
-	s.turnCommitOnCancel = false
-	s.turnImagesEmitted = false
-	s.mu.Unlock()
-	s.cancelMu.Unlock()
-
-	var (
-		timedOut       atomic.Bool
-		nativeAccepted atomic.Bool
-	)
-
-	if timeout := s.agent.turnTimeout(); timeout > 0 {
-		timer := time.AfterFunc(timeout, func() {
-			_ = s.fenceTimedOutTurn(context.Background(), &timedOut)
-		})
-		defer timer.Stop()
-	}
-
-	boundary := pi.CallBoundary{
-		BeforeDispatch: func() (func(), error) {
-			return s.beginPromptDispatch(turnCtx, outbox, delivery)
-		},
-		Accepted: func(acceptCtx context.Context) error {
-			nativeAccepted.Store(true)
-			s.openSettlement()
-
-			return s.acceptPromptResponse(acceptCtx, outbox, delivery, submission)
-		},
-	}
-	if promptErr := client.PromptWithBoundary(turnCtx, mapped.Message, mapped.Images, boundary); promptErr != nil {
-		if nativeAccepted.Load() {
-			return s.settlePrompt(turnCtx, params, &promptTurnState{}, promptOutcome{failure: promptErr}, &timedOut)
-		}
-
-		if poisonErr := s.admissionFenceError(ctx); poisonErr != nil {
-			return acp.PromptResponse{}, poisonErr
-		}
-
-		// The native dispatcher never took the frame, so this creates neither
-		// submission nor turn and settles nothing.
-		fenceErr := s.fenceTurnAfterFailure(context.WithoutCancel(ctx))
-
-		return acp.PromptResponse{}, errors.Join(s.nativeTurnFailure(ctx, promptErr), fenceErr)
-	}
-
-	state := &promptTurnState{}
-	outcomeOfTurn := s.runPromptTurn(turnCtx, outbox, delivery, state)
-
-	return s.settlePrompt(turnCtx, params, state, outcomeOfTurn, &timedOut)
-}
-
-// finishPromptForeground ends one prompt's hold on the session and hands the
-// router back. The order is the point: the turn's route, its delivery, and the
-// shared tool tracker are all finished before the release, because the release
-// wakes the pump into a drain that can open an agent-origin cycle immediately.
-// Releasing first would let this turn's own cleanup erase the first tool that
-// cycle started.
-func (s *agentSession) finishPromptForeground(delivery *turnDelivery) {
-	s.cancelMu.Lock()
 
 	s.mu.Lock()
-	s.cancel = nil
-	s.turnCancelled = false
-	s.turnNonce = ""
-	s.turnSettling = false
-	s.turnNativeSettled = false
-	s.turnCommitOnCancel = false
-
-	if s.turnEvents == delivery {
-		s.turnEvents = nil
-	}
-
-	if s.promptAdmission == delivery {
-		s.promptAdmission = nil
-	}
-
-	outbox := s.outbox
+	model := s.model
+	models := s.models
 	s.mu.Unlock()
 
-	delivery.abandonQueuedDialogs(context.Background(), s)
-	close(delivery.done)
-	s.resetTurnTools()
-	s.cancelMu.Unlock()
-
-	outbox.release(delivery)
-	outbox.releasePromptAdmission(delivery)
-}
-
-// promptOutcome is how the streaming loop ended. Every accepted exit returns
-// one rather than returning a response directly, so exactly one settlement
-// point covers them all.
-type promptOutcome struct {
-	// settled reports that native pi crossed agent_settled for this turn.
-	settled bool
-	// transportEnded reports that this generation's event stream ended before
-	// the run settled.
-	transportEnded bool
-	// contextEnded reports that the turn context ended before the run settled.
-	contextEnded bool
-	// failure is an update-emission or lifecycle-emission failure the loop
-	// stopped on.
-	failure error
-}
-
-// runPromptTurn streams the accepted turn until it ends, and reports how it
-// ended instead of writing a response of its own.
-func (s *agentSession) runPromptTurn(
-	ctx context.Context,
-	outbox *sessionOutbox,
-	delivery *turnDelivery,
-	state *promptTurnState,
-) promptOutcome {
-	deliveryCtx, cancelDelivery := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
-	defer cancelDelivery()
-
-	for {
-		select {
-		case event, ok := <-delivery.events:
-			if !ok {
-				return promptOutcome{transportEnded: true}
-			}
-
-			settled, err := s.handleTurnEvent(deliveryCtx, event, state)
-			if err != nil {
-				return promptOutcome{failure: err}
-			}
-
-			if settled {
-				return promptOutcome{settled: true}
-			}
-		case dialog := <-delivery.uiRequests:
-			if dialog != nil && dialog.claim() {
-				go func() {
-					defer dialog.complete()
-					defer recoverAgentGoroutine(context.WithoutCancel(ctx), agentLogger(s.agent), "UI dialog handler")
-
-					s.handleNativeUIDialog(ctx, dialog)
-				}()
-			}
-		case <-ctx.Done():
-			// Internal containment cancels the turn context after the client has
-			// terminalized a malformed or unterminated JSONL stream. That fixed
-			// structural terminal outranks the cancellation it caused; otherwise
-			// the same T4 record can nondeterministically become a successful
-			// cancelled response.
-			if outbox != nil && outbox.client != nil && outbox.client.Err() != nil {
-				return promptOutcome{transportEnded: true}
-			}
-
-			return promptOutcome{contextEnded: true}
-		}
-	}
-}
-
-// handleTurnEvent maps one native event to ACP session updates; it reports
-// whether the run settled.
-func (s *agentSession) handleTurnEvent(ctx context.Context, event pi.Event, state *promptTurnState) (bool, error) {
-	switch typed := event.(type) {
-	case pi.AgentSettledEvent:
-		return true, nil
-	case pi.MessageStartEvent:
-		if typed.Message.Role == messageRoleAssistant {
-			state.model = typed.Message.Model
-			state.provider = typed.Message.Provider
-			// A new native message starts its own delta run; what the previous
-			// one streamed can never be a prefix of this one's final text.
-			state.streamedText = ""
-			state.streamedThought = ""
-		}
-
-		return false, nil
-	case pi.MessageUpdateEvent:
-		return false, s.emitAssistantDelta(ctx, typed.AssistantMessageEvent, state)
-	case pi.MessageEndEvent:
-		if typed.Message.Role == messageRoleAssistant {
-			observeAssistantMessageEnd(typed.Message, state)
-
-			if err := s.emitAssistantTextSuffix(ctx, typed.Message, state); err != nil {
-				return false, err
-			}
-
-			if err := s.emitAssistantImages(ctx, typed.Message, state); err != nil {
-				return false, err
-			}
-
-			if err := s.emitNativeMessageIdentity(ctx, typed.Message.ACPMessageID); err != nil {
-				return false, err
-			}
-		}
-
-		return false, nil
-	case pi.ToolExecutionStartEvent:
-		return false, s.publishNativeToolStart(ctx, typed)
-	case pi.ToolExecutionUpdateEvent:
-		if typed.PartialResult == nil {
-			return false, nil
-		}
-
-		return false, s.publishNativeToolUpdate(ctx, typed.ToolCallID, typed.PartialResult.Content)
-	case pi.ToolExecutionEndEvent:
-		status := acp.ToolCallStatusCompleted
-		if typed.IsError {
-			status = acp.ToolCallStatusFailed
-		}
-
-		return false, s.publishNativeToolTerminal(ctx, typed.ToolCallID, status, typed.Result)
-	case pi.ExtensionErrorEvent:
-		// The wrapper-owned extensions are the permission bridge and the MCP
-		// client, so an extension that threw is a cycle whose permission
-		// admission or tool surface may no longer be the one the host believes
-		// it authorized. The cycle fails closed and states nothing about which
-		// extension or why: the native path and the thrown error are
-		// adapter-internal and reach the operator's log, never the client.
-		return false, extensionTurnFailure()
-	default:
-		// The remaining decoded types are foreground machinery inside
-		// agent_settled's own scope — the agent and turn brackets, the queue
-		// update, and the compaction and auto-retry pairs — plus a type this
-		// package does not model. None carries an entity ACP or the lifecycle
-		// extension can name, so none projects an update. They still reached
-		// the session outbox, which is what keeps them off the raw-event
-		// stream's gap detector.
-		return false, nil
-	}
-}
-
-// emitAssistantImages projects image blocks carried by a finalized assistant
-// message as agent message chunks, one image per chunk, validated and
-// de-duplicated by native message identity plus artifact fingerprint. pi's
-// streaming deltas carry only text and thinking, so the finalized message is
-// the sole live source of assistant image content.
-func (s *agentSession) emitAssistantImages(ctx context.Context, message pi.AgentMessage, state *promptTurnState) error {
-	// A content payload that does not decode carries no image blocks to
-	// project; unrelated decode problems keep their existing handling.
-	blocks, _ := message.ContentBlocks()
-	perImage := effectiveOutputImageLimit(s.agent.imageLimits().MaxOutputBytesPerImage)
-
-	var messageIDPtr *string
-
-	if message.ACPMessageID != "" {
-		messageID := message.ACPMessageID
-		messageIDPtr = &messageID
-	}
-
-	for index := range blocks {
-		block := &blocks[index]
-		if block.Type != contentBlockTypeImage {
+	for index := range models {
+		candidate := &models[index]
+		if candidate.Ref() != model || len(candidate.Input) == 0 {
 			continue
 		}
 
-		image, failure := normalizeOutputImage(block.Data, block.MimeType, perImage)
-		if failure != nil {
-			// Every verdict normalization raises here is one the model can act
-			// on — bad base64, non-raster bytes, a contradicted media type, an
-			// oversize image. An assistant image has no tool call to attribute
-			// to, so the guidance takes the image's place as agent text and the
-			// turn runs on with its context.
-			guidance, _ := imageOutputGuidance(failure)
-
-			if err := s.emitUpdates(ctx, []acp.SessionUpdate{{
-				AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
-					Content: acp.TextBlock(guidance), MessageId: messageIDPtr,
-				},
-			}}); err != nil {
-				return err
-			}
-
-			continue
+		if slices.Contains(candidate.Input, "image") {
+			return nil
 		}
 
-		key := message.ACPMessageID + ":" + image.fingerprint
-
-		if state.agentImages == nil {
-			state.agentImages = make(map[string]struct{}, 1)
-		}
-
-		if _, seen := state.agentImages[key]; seen {
-			continue
-		}
-
-		update := acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
-			Content: acp.ImageBlock(image.data, image.mime), MessageId: messageIDPtr,
-		}}
-		if err := s.emitUpdatesWithNativeMessageID(ctx, []acp.SessionUpdate{update}, message.ACPMessageID); err != nil {
-			return err
-		}
-
-		state.agentImages[key] = struct{}{}
-
-		s.markTurnImageEmission()
+		return image.UnsupportedByModel(prompt.firstImage.Field, prompt.firstImage.Index).InvalidParams()
 	}
 
 	return nil
 }
 
-// markTurnImageEmission records that the live turn delivered image bytes, so
-// a failed mirror commit afterwards is a durability loss for emitted
-// artifacts.
-func (s *agentSession) markTurnImageEmission() {
-	s.mu.Lock()
-	s.turnImagesEmitted = true
-	s.mu.Unlock()
-}
+// prompt sends one turn to pi and streams updates until the run settles.
+func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json.RawMessage) (acp.PromptResponse, error) {
+	meta := lifecycle.RetainRequestMetadata(params.Meta, raw)
 
-func (s *agentSession) turnEmittedImages() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.turnImagesEmitted
-}
-
-// imageAwareMirrorFailure maps a failed mirror commit after image emission
-// to the storage_failed image-output envelope: the turn delivered image
-// bytes whose durable replay representation was lost.
-func (s *agentSession) imageAwareMirrorFailure(err error) error {
-	if !s.turnEmittedImages() {
-		return err
+	submission, paramErr := lifecycle.DecodePromptCorrelation(meta, s.lifecycleNegotiated())
+	if paramErr != nil {
+		return acp.PromptResponse{}, invalidParam(paramErr)
 	}
 
-	return storageFailure("session mirror commit failed after image output: " + err.Error())
+	if err := s.admissionError(); err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	release, err := s.acquireGate(limitSessionPrompt)
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+	defer release()
+
+	s.mu.Lock()
+	busy := s.cycle != nil
+	s.mu.Unlock()
+
+	if busy {
+		return acp.PromptResponse{}, wire.Backpressure(limitSessionPrompt)
+	}
+
+	mapped, err := s.mapPrompt(ctx, params.Prompt)
+	if err != nil {
+		if ctx.Err() != nil {
+			return cancelledResponse(params), nil
+		}
+
+		return acp.PromptResponse{}, err
+	}
+
+	// session/cancel cancels this request's context through the SDK. A cancel
+	// that lands before native dispatch creates neither submission nor turn and
+	// answers cancelled.
+	if ctx.Err() != nil {
+		return cancelledResponse(params), nil
+	}
+
+	rt, err := s.ensureRuntime(ctx)
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	if err := s.rejectImagesForModel(mapped); err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	t := &turn{
+		cycle:      cycle{origin: lifecycle.CauseSubmission, state: cycleState{tools: make(map[string]*toolState)}},
+		submission: submission,
+		settled:    make(chan struct{}),
+		finished:   make(chan struct{}),
+	}
+	defer close(t.finished)
+
+	s.mu.Lock()
+	s.turn = t
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		if s.turn == t {
+			s.turn = nil
+		}
+		s.mu.Unlock()
+	}()
+
+	if timeout := s.agent.options.TurnTimeout; timeout > 0 {
+		timer := time.AfterFunc(timeout, func() { s.timeout(context.WithoutCancel(ctx), t) })
+		defer timer.Stop()
+	}
+
+	if err := rt.client.Prompt(ctx, mapped.message, mapped.images); err != nil {
+		if !t.accepted {
+			if ctx.Err() != nil {
+				return cancelledResponse(params), nil
+			}
+
+			return acp.PromptResponse{}, s.dispatchFailure(ctx, rt, err)
+		}
+	}
+
+	s.acceptTurn(ctx, t)
+
+	select {
+	case <-t.settled:
+	case <-ctx.Done():
+		s.cancel(ctx)
+
+		select {
+		case <-t.settled:
+		case <-time.After(sessionAbortTimeout):
+			t.settle(turnTransportEnded)
+		}
+	}
+
+	return s.settleTurn(ctx, rt, t, params)
 }
 
-func (s *agentSession) emitAssistantDelta(
-	ctx context.Context,
-	delta pi.AssistantMessageEvent,
-	state *promptTurnState,
-) error {
-	switch delta.Type {
-	case assistantEventTextDelta:
-		if delta.Delta == "" {
-			return nil
+func cancelledResponse(params acp.PromptRequest) acp.PromptResponse {
+	return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}
+}
+
+// dispatchFailure classifies a prompt command pi never accepted: a native
+// rejection carries its text as a provider failure, a dead child is a
+// process exit, and everything else is transport.
+func (s *session) dispatchFailure(ctx context.Context, rt *runtime, err error) error {
+	var commandErr *pi.CommandError
+	if errors.As(err, &commandErr) {
+		return turnFailure(wire.CauseProvider, commandErr.Message)
+	}
+
+	return s.transportFailure(ctx, rt, err)
+}
+
+// transportFailure recovers the real cause behind a lost native stream: the
+// child's exit status and last stderr line where it died, otherwise the
+// transport error.
+func (s *session) transportFailure(ctx context.Context, rt *runtime, err error) error {
+	waitCtx, cancel := context.WithTimeout(ctx, processExitGrace)
+	defer cancel()
+
+	if result, waitErr := rt.proc.Wait(waitCtx); waitErr == nil {
+		message := fmt.Sprintf("pi process exited with status %d", result.ExitCode)
+		if result.Signal != 0 {
+			message = fmt.Sprintf("pi process was killed by signal %d", result.Signal)
 		}
 
-		state.streamedText += delta.Delta
-
-		return s.emitUpdates(ctx, []acp.SessionUpdate{acp.UpdateAgentMessageText(delta.Delta)})
-	case assistantEventThinkingDelta:
-		if delta.Delta == "" {
-			return nil
+		if line := rt.stderr.lastLine(); line != "" {
+			message += ": " + line
 		}
 
-		state.streamedThought += delta.Delta
+		return turnFailure(wire.CauseProcessExit, message)
+	}
 
-		return s.emitUpdates(ctx, []acp.SessionUpdate{acp.UpdateAgentThoughtText(delta.Delta)})
+	if err == nil {
+		err = rt.client.Err()
+	}
+
+	if err == nil {
+		err = errors.New("pi event stream closed mid-turn")
+	}
+
+	return turnFailure(wire.CauseTransport, err.Error())
+}
+
+func turnFailure(cause string, message string) *acp.RequestError {
+	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: cause, Message: boundNativeCause(message)})
+}
+
+// boundNativeCause is the single gate every native cause text passes through
+// before it reaches a client.
+func boundNativeCause(message string) string {
+	if len(message) > nativeCauseMaxBytes {
+		message = message[:nativeCauseMaxBytes]
+	}
+
+	return strings.TrimSpace(strings.ToValidUTF8(message, ""))
+}
+
+// cycleVerdict is how one cycle ended, in the terms the lifecycle stream and
+// the prompt response need.
+type cycleVerdict struct {
+	outcome    lifecycle.Outcome
+	stopReason string
+	failure    error
+}
+
+// judgeCycle records how a natively settled cycle finished. The cancel guard
+// runs before every failure mapping.
+func judgeCycle(c *cycle, cancelled bool) cycleVerdict {
+	switch {
+	case cancelled:
+		return cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
+	case c.failure != nil:
+		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: c.failure}
+	case c.state.stopReason == stopReasonError:
+		message := strings.TrimSpace(c.state.errorMessage)
+		if message == "" {
+			message = "pi reported a turn error"
+		}
+
+		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: turnFailure(wire.CauseProvider, message)}
+	}
+
+	stop := acp.StopReasonEndTurn
+	outcome := lifecycle.OutcomeSuccess
+
+	switch c.state.stopReason {
+	case stopReasonLength, stopReasonMaxTokens:
+		stop = acp.StopReasonMaxTokens
+		outcome = lifecycle.OutcomeLimit
+	case stopReasonAborted:
+		stop = acp.StopReasonCancelled
+		outcome = lifecycle.OutcomeCancelled
+	}
+
+	return cycleVerdict{outcome: outcome, stopReason: string(stop)}
+}
+
+// settleTurn is the one settlement point every accepted prompt reaches:
+// usage and session info, the durable mirror commit, the terminal idle, and
+// only then the response or error.
+func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params acp.PromptRequest) (acp.PromptResponse, error) {
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
+	defer cancel()
+
+	var verdict cycleVerdict
+
+	switch {
+	case t.cancelled:
+		verdict = cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
+	case t.timedOut:
+		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: turnFailure(wire.CauseTimeout, fmt.Sprintf("pi turn exceeded %s", s.agent.options.TurnTimeout))}
+	case t.ended == turnTransportEnded:
+		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: s.transportFailure(settleCtx, rt, nil)}
 	default:
+		verdict = judgeCycle(&t.cycle, false)
+	}
+
+	if t.ended == turnSettled {
+		if !t.cancelled {
+			stats := s.settledStats(settleCtx, rt)
+			s.emitUsage(settleCtx, &t.state, stats)
+			s.emitSessionInfo(settleCtx, params.Prompt)
+		}
+
+		if err := s.commitMirror(settleCtx); err != nil && verdict.failure == nil {
+			verdict.failure = s.mirrorFailure(&t.state, err)
+			verdict.outcome = lifecycle.OutcomeFailed
+		}
+	}
+
+	if err := s.lcIdle(settleCtx, &t.cycle, verdict); err != nil && verdict.failure == nil {
+		verdict.failure = err
+	}
+
+	if t.ended == turnTransportEnded {
+		s.lcFence()
+	}
+
+	if verdict.failure != nil {
+		return acp.PromptResponse{}, verdict.failure
+	}
+
+	return acp.PromptResponse{
+		StopReason:    acp.StopReason(verdict.stopReason),
+		Usage:         t.state.usage,
+		UserMessageId: params.MessageId,
+	}, nil
+}
+
+// settledStats reads pi's post-turn statistics. A native session id that no
+// longer matches the ACP session poisons it.
+func (s *session) settledStats(ctx context.Context, rt *runtime) *pi.SessionStats {
+	stats, err := rt.client.GetSessionStats(ctx)
+	if err != nil {
+		s.agent.log.DebugContext(ctx, "get pi session stats failed", slog.String("session_id", string(s.id)))
+
 		return nil
 	}
-}
 
-// emitAssistantTextSuffix projects the terminal full-message frame's text as
-// append-only deltas. agent_message_chunk and agent_thought_chunk are never
-// snapshots: a client renders the turn as the in-order concatenation of every
-// chunk, so text already streamed is never sent twice.
-//
-//   - A harness that streamed deltas and then repeats the assembled text in its
-//     terminal frame contributes only the suffix the deltas did not carry, and
-//     nothing when they carried all of it.
-//   - A harness that delivers only a terminal frame — no deltas at all —
-//     produces exactly one chunk carrying that text.
-//   - A turn carrying several native assistant messages emits each message's
-//     text once, in native order, de-duplicated on native identity rather than
-//     on text, so two messages that happen to say the same thing both emit.
-//
-// A terminal frame whose text diverges from what was already streamed emits
-// nothing: the streamed prefix is already with the client, and re-sending a
-// corrected whole would break the append-only rule the client renders under.
-func (s *agentSession) emitAssistantTextSuffix(
-	ctx context.Context,
-	message pi.AgentMessage,
-	state *promptTurnState,
-) error {
-	if state.finalizedMessages == nil {
-		state.finalizedMessages = make(map[string]struct{}, 1)
-	}
-
-	if message.ACPMessageID != "" {
-		if _, seen := state.finalizedMessages[message.ACPMessageID]; seen {
-			return nil
-		}
-
-		state.finalizedMessages[message.ACPMessageID] = struct{}{}
-	}
-
-	blocks, _ := message.ContentBlocks()
-
-	var text, thinking strings.Builder
-
-	for index := range blocks {
-		switch blocks[index].Type {
-		case contentBlockTypeText:
-			text.WriteString(blocks[index].Text)
-		case contentBlockTypeThinking:
-			thinking.WriteString(blocks[index].Thinking)
-		}
-	}
-
-	updates := make([]acp.SessionUpdate, 0, 2)
-	if suffix := unstreamedSuffix(state.streamedThought, thinking.String()); suffix != "" {
-		updates = append(updates, acp.UpdateAgentThoughtText(suffix))
-	}
-
-	if suffix := unstreamedSuffix(state.streamedText, text.String()); suffix != "" {
-		updates = append(updates, acp.UpdateAgentMessageText(suffix))
-	}
-
-	state.streamedText = ""
-	state.streamedThought = ""
-
-	return s.emitUpdatesWithNativeMessageID(ctx, updates, message.ACPMessageID)
-}
-
-// unstreamedSuffix reports the part of a terminal frame's text no delta of this
-// message already carried.
-func unstreamedSuffix(streamed string, full string) string {
-	if streamed == "" {
-		return full
-	}
-
-	if !strings.HasPrefix(full, streamed) {
-		return ""
-	}
-
-	return full[len(streamed):]
-}
-
-func observeAssistantMessageEnd(message pi.AgentMessage, state *promptTurnState) {
-	if message.ACPMessageID != "" {
-		state.nativeMessageID = message.ACPMessageID
-	}
-
-	if message.Model != "" {
-		state.model = message.Model
-	}
-
-	if message.Provider != "" {
-		state.provider = message.Provider
-	}
-
-	if message.StopReason != "" {
-		state.stopReason = message.StopReason
-	}
-
-	if message.ErrorMessage != "" {
-		state.errorMessage = message.ErrorMessage
-	}
-
-	if message.Usage != nil {
-		state.usage = mergeTurnUsage(state.usage, message.Usage)
-
-		if message.Usage.Cost != nil {
-			state.cost = message.Usage.Cost
-		}
-	}
-}
-
-func mergeTurnUsage(total *acp.Usage, next *pi.Usage) *acp.Usage {
-	if next == nil {
-		return total
-	}
-
-	if total == nil {
-		total = &acp.Usage{
-			CachedReadTokens:  new(0),
-			CachedWriteTokens: new(0),
-		}
-	}
-
-	total.InputTokens += int(next.Input)
-	total.OutputTokens += int(next.Output)
-	*total.CachedReadTokens += int(next.CacheRead)
-	*total.CachedWriteTokens += int(next.CacheWrite)
-	total.TotalTokens = total.InputTokens + total.OutputTokens + *total.CachedReadTokens + *total.CachedWriteTokens
-
-	return total
-}
-
-func acpStopReason(s *agentSession, state *promptTurnState) acp.StopReason {
-	switch state.stopReason {
-	case stopReasonLength, stopReasonMaxTokens:
-		return acp.StopReasonMaxTokens
-	case stopReasonAborted:
-		// An abort the wrapper did not request still settles the run; the
-		// nearest truthful terminal state is cancelled.
-		return acp.StopReasonCancelled
-	case stopReasonStop, "":
-		return acp.StopReasonEndTurn
-	default:
-		s.agent.log.Debug("unknown pi stop reason")
-
-		return acp.StopReasonEndTurn
-	}
-}
-
-func (s *agentSession) settledSessionStats(ctx context.Context) *pi.SessionStats {
-	stats, err := s.currentClient().GetSessionStats(ctx)
-	if err != nil {
-		s.agent.log.DebugContext(ctx, "get pi session stats failed",
-			slog.String(acpFieldSessionID, string(s.id)),
-		)
+	if stats.SessionID != "" && stats.SessionID != string(s.id) {
+		s.poisonSession(ctx, "native_session_identity_drift")
 
 		return nil
 	}
@@ -759,47 +427,17 @@ func (s *agentSession) settledSessionStats(ctx context.Context) *pi.SessionStats
 	return &stats
 }
 
-// emitTurnUsageUpdate reports harness-reported usage. size is the model's
-// context window from get_session_stats (or the model catalog); it is 0 when
-// unknown, never fabricated.
-func (s *agentSession) emitTurnUsageUpdate(ctx context.Context, state *promptTurnState, stats *pi.SessionStats) {
-	used := 0
-	if state.usage != nil {
-		used = state.usage.TotalTokens
+// mirrorFailure maps a failed mirror commit onto the turn-failure shape. A
+// turn that delivered image bytes lost their durable replay representation.
+func (s *session) mirrorFailure(state *cycleState, err error) error {
+	s.agent.log.Error("session mirror commit failed", slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
+
+	failure := wire.TurnFailure{Cause: wire.CauseTransport, Message: "session mirror commit failed"}
+	if state.imagesEmitted {
+		failure.Message = "image output is no longer available from the artifact store"
+		failure.Stage = image.OutputStage
+		failure.Reason = image.ReasonStorageFailed
 	}
 
-	size := int64(0)
-
-	if stats != nil && stats.ContextUsage != nil {
-		if stats.ContextUsage.Tokens != nil {
-			used = int(*stats.ContextUsage.Tokens)
-		}
-
-		size = stats.ContextUsage.ContextWindow
-	}
-
-	if size == 0 {
-		size = s.currentModelContextWindow()
-	}
-
-	if state.usage == nil && used == 0 && size == 0 {
-		return
-	}
-
-	update := &acp.SessionUsageUpdate{
-		Size: int(size),
-		Used: used,
-	}
-	if state.cost != nil {
-		update.Cost = &acp.Cost{Amount: state.cost.Total, Currency: "USD"}
-	}
-
-	_ = s.emitOptionalUpdates(ctx, []acp.SessionUpdate{{UsageUpdate: update}})
-}
-
-func (s *agentSession) currentModelContextWindow() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.contextWindowSize
+	return wire.TurnFailed(vendor, failure)
 }

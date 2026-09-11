@@ -1,6 +1,6 @@
 // Package observer centralizes the adapter's OpenTelemetry instrumentation:
-// ACP request spans/metrics, prompt-turn GenAI metrics, permission and
-// elicitation dialogs, session store operations, and pi process lifecycle.
+// ACP request spans and metrics, prompt-turn GenAI metrics, permission and
+// elicitation dialogs, session store operations, and pi process exits.
 package observer
 
 import (
@@ -50,10 +50,6 @@ const (
 	metaBaggage     = "baggage"
 	metaTraceParent = "traceparent"
 	metaTraceState  = "tracestate"
-
-	envBaggage     = "BAGGAGE"
-	envTraceParent = "TRACEPARENT"
-	envTraceState  = "TRACESTATE"
 
 	outcomeCanceled = "canceled"
 	outcomeError    = "error"
@@ -226,40 +222,14 @@ func (o *Observer) Extract(ctx context.Context, meta map[string]any) context.Con
 	return o.propagator.Extract(ctx, carrier)
 }
 
-// InjectTraceEnv injects the active trace context into a pi launch env map.
-func (o *Observer) InjectTraceEnv(ctx context.Context, env map[string]string) map[string]string {
-	if o == nil {
-		return env
-	}
+// StartACP begins one ACP request observation.
+func (o *Observer) StartACP(ctx context.Context, meta map[string]any, method string, attrs ...attribute.KeyValue) (context.Context, func(error)) {
+	ctx, finish := o.startACP(ctx, meta, method, attrs...)
 
-	carrier := propagation.MapCarrier{}
-	o.propagator.Inject(ctx, carrier)
-
-	if len(carrier) == 0 {
-		return env
-	}
-
-	if env == nil {
-		env = make(map[string]string, len(carrier))
-	}
-
-	if value := carrier.Get(metaTraceParent); value != "" {
-		env[envTraceParent] = value
-	}
-
-	if value := carrier.Get(metaTraceState); value != "" {
-		env[envTraceState] = value
-	}
-
-	if value := carrier.Get(metaBaggage); value != "" {
-		env[envBaggage] = value
-	}
-
-	return env
+	return ctx, func(err error) { finish(ACPResult{Err: err}) }
 }
 
-// StartACP begins one ACP request observation.
-func (o *Observer) StartACP(ctx context.Context, meta map[string]any, method string, attrs ...attribute.KeyValue) (context.Context, func(ACPResult)) {
+func (o *Observer) startACP(ctx context.Context, meta map[string]any, method string, attrs ...attribute.KeyValue) (context.Context, func(ACPResult)) {
 	if o == nil {
 		return ctx, func(ACPResult) {}
 	}
@@ -297,7 +267,7 @@ func (o *Observer) StartACP(ctx context.Context, meta map[string]any, method str
 
 // StartPrompt begins one prompt-turn observation.
 func (o *Observer) StartPrompt(ctx context.Context, meta map[string]any, model string) (context.Context, func(PromptResult)) {
-	ctx, finishACP := o.StartACP(ctx, meta, "session/prompt", modelAttrs(model)...)
+	ctx, finishACP := o.startACP(ctx, meta, "session/prompt", modelAttrs(model)...)
 	if o == nil {
 		return ctx, func(PromptResult) {}
 	}
@@ -402,16 +372,6 @@ func (o *Observer) StartSpan(ctx context.Context, name string, attrs ...attribut
 
 		span.End()
 	}
-}
-
-// StartPiProcess begins one pi process-lifecycle span.
-func (o *Observer) StartPiProcess(ctx context.Context, operation string) (context.Context, func(error)) {
-	ctx, finish := o.StartSpan(ctx, "pi.process."+operation,
-		attribute.String(attrOperation, operation),
-		attribute.String(attrPiClient, piClientValue),
-	)
-
-	return ctx, func(err error) { finish(err) }
 }
 
 // RecordPiProcessExit counts one pi process exit.

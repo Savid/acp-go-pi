@@ -1,24 +1,12 @@
 # Resume From File
 
-This example reads mirrored pi session JSONL rows into a `SessionStore`, adds
-the adapter-owned durable boundary required by the current store format, loads
-the session through ACP so previous interactions are replayed, then sends one
-no-tools smoke-test prompt in-process.
-It denies tool permissions by default so a copied session cannot silently run
-commands while you are checking resume behavior.
-
-Use it with rows previously captured from the adapter's session store:
+Embeds the agent in-process with a session store persisted to a JSON file.
+The first run creates a session and prints its id; a later run resumes it.
 
 ```sh
-go run ./examples/resume-from-file \
-  -file ./transcript.jsonl \
-  -auth-file "$HOME/.pi/agent/auth.json"
+go run ./examples/resume-from-file "Remember the word pelican."
+go run ./examples/resume-from-file -session <id> "What word did I ask you to remember?"
 ```
 
-The first pi session header row carries `id` and `cwd`; when present,
-`-session` and `-cwd` are inferred from it. Loading uses normal ACP
-`session/load`, and the prompt uses normal ACP `session/prompt`.
-
-Pass `-prompt "..."` to change the smoke-test turn, `-path` to point at a
-specific `pi` CLI, and `-scratch-dir` to set the parent root for isolated pi
-session state. `-auth-file` explicitly seeds credentials into that isolated session.
+The store file is an example of the `acpcore.SessionStore` contract, not a
+durable store. pi's own session file is left in pi's home either way.

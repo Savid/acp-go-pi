@@ -3,30 +3,22 @@ package piacp
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
-// scratchParent resolves the parent directory for all ephemeral on-disk
-// materialization: dir when set, else the system temp directory. This is
-// the only place in the module that consults the system temp directory.
-func scratchParent(dir string) string {
-	if dir != "" {
-		return dir
+// scratchDir is the sole scratch accessor. It returns the adapter directory
+// for one purpose under the configured scratch parent, creating the parent
+// 0700 when missing. Names carry the acp-go-pi-<purpose>- prefix so a host
+// can sweep orphans.
+func (a *Agent) scratchDir(purpose string, name string) (string, error) {
+	parent := a.options.ScratchDir
+	if parent == "" {
+		parent = os.TempDir()
 	}
 
-	return os.TempDir()
-}
-
-func scratchParentForOptions(options Options) string {
-	return scratchParent(options.ScratchDir)
-}
-
-// ensureScratchParent resolves the scratch parent and creates it 0700 when
-// missing.
-func ensureScratchParent(dir string) (string, error) {
-	parent := scratchParent(dir)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return "", fmt.Errorf("create scratch parent: %w", err)
 	}
 
-	return parent, nil
+	return filepath.Join(parent, "acp-go-pi-"+purpose+"-"+name), nil
 }

@@ -10,22 +10,14 @@ import (
 const (
 	commandPrompt             = "prompt"
 	commandAbort              = "abort"
-	commandNewSession         = "new_session"
-	commandSwitchSession      = "switch_session"
-	commandClone              = "clone"
 	commandGetState           = "get_state"
 	commandGetAvailableModels = "get_available_models"
 	commandSetModel           = "set_model"
 	commandSetThinkingLevel   = "set_thinking_level"
 	commandSetAutoRetry       = "set_auto_retry"
-	commandSetSessionName     = "set_session_name"
 	commandGetSessionStats    = "get_session_stats"
-	commandGetEntries         = "get_entries"
 	commandGetCommands        = "get_commands"
 )
-
-// fieldEnabled is the JSON key for boolean toggle commands.
-const fieldEnabled = "enabled"
 
 // ImageContent is one base64 image attached to a prompt.
 type ImageContent struct {
@@ -45,8 +37,6 @@ type SessionState struct {
 	ThinkingLevel         string `json:"thinkingLevel"`
 	IsStreaming           bool   `json:"isStreaming"`
 	IsCompacting          bool   `json:"isCompacting"`
-	SteeringMode          string `json:"steeringMode"`
-	FollowUpMode          string `json:"followUpMode"`
 	SessionFile           string `json:"sessionFile,omitempty"`
 	SessionID             string `json:"sessionId"`
 	SessionName           string `json:"sessionName,omitempty"`
@@ -69,16 +59,18 @@ type Model struct {
 	Cost          json.RawMessage `json:"cost,omitempty"`
 }
 
-// SlashCommand is one entry of the get_commands response payload. Location
-// and Path cover the flattened wire shape; SourceInfo keeps the structured
-// source metadata when pi emits it in place of the flattened fields.
+// Ref is the model's "provider/id" address.
+func (m Model) Ref() string {
+	return m.Provider + "/" + m.ID
+}
+
+// SlashCommand is one entry of the get_commands response payload.
 type SlashCommand struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	Source      string          `json:"source"`
-	Location    string          `json:"location,omitempty"`
-	Path        string          `json:"path,omitempty"`
-	SourceInfo  json.RawMessage `json:"sourceInfo,omitempty"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Source      string `json:"source"`
+	Location    string `json:"location,omitempty"`
+	Path        string `json:"path,omitempty"`
 }
 
 // TokenTotals is the session-level token usage inside get_session_stats.
@@ -113,80 +105,26 @@ type SessionStats struct {
 	ContextUsage      *ContextUsage `json:"contextUsage,omitempty"`
 }
 
-// Entries is the get_entries response payload: raw session rows in append
-// order plus the current leaf id (nil for an empty session).
-type Entries struct {
-	Entries []json.RawMessage `json:"entries"`
-	LeafID  *string           `json:"leafId"`
-}
-
 // Prompt sends a user prompt. The response acknowledges acceptance; results
 // stream as events afterwards.
 func (c *Client) Prompt(ctx context.Context, message string, images []ImageContent) error {
-	return c.PromptWithBoundary(ctx, message, images, CallBoundary{})
-}
-
-// PromptWithBoundary sends a prompt with hooks at the native command write and
-// successful acceptance response. The event consumer resolves the accepted
-// hook on a detached bounded context at the exact response boundary, so later
-// prompt events cannot overtake it and caller cancellation cannot bypass it.
-func (c *Client) PromptWithBoundary(
-	ctx context.Context,
-	message string,
-	images []ImageContent,
-	boundary CallBoundary,
-) error {
 	fields := map[string]any{commandTypeKey: commandPrompt, "message": message}
 	if len(images) > 0 {
 		fields["images"] = images
 	}
 
-	response, err := c.CallWithBoundary(ctx, fields, boundary)
-	if err != nil {
-		return err
-	}
-
-	return response.Err()
+	return c.simpleCall(ctx, fields)
 }
 
 // Abort aborts the current agent operation. The terminal events for the
-// aborted turn precede the response (pi's response-after-events barrier).
+// aborted turn precede the response.
 func (c *Client) Abort(ctx context.Context) error {
 	return c.simpleCall(ctx, map[string]any{commandTypeKey: commandAbort})
-}
-
-// NewSession starts a fresh session, optionally recording a parent session
-// path. It reports whether an extension cancelled the switch.
-func (c *Client) NewSession(ctx context.Context, parentSession string) (bool, error) {
-	fields := map[string]any{commandTypeKey: commandNewSession}
-	if parentSession != "" {
-		fields["parentSession"] = parentSession
-	}
-
-	return c.cancellableCall(ctx, fields)
-}
-
-// SwitchSession loads a different session file. It reports whether an
-// extension cancelled the switch.
-func (c *Client) SwitchSession(ctx context.Context, sessionPath string) (bool, error) {
-	return c.cancellableCall(ctx, map[string]any{commandTypeKey: commandSwitchSession, "sessionPath": sessionPath})
-}
-
-// Clone duplicates the current active branch into a new session with a new
-// session id. It reports whether an extension cancelled the clone. Cloning an
-// empty session fails natively.
-func (c *Client) Clone(ctx context.Context) (bool, error) {
-	return c.cancellableCall(ctx, map[string]any{commandTypeKey: commandClone})
 }
 
 // GetState fetches the current session state.
 func (c *Client) GetState(ctx context.Context) (SessionState, error) {
 	return callWithData[SessionState](ctx, c, map[string]any{commandTypeKey: commandGetState})
-}
-
-// GetStateWithBoundary is GetState with a transport-linearized write boundary.
-func (c *Client) GetStateWithBoundary(ctx context.Context, boundary CallBoundary) (SessionState, error) {
-	return callWithDataBoundary[SessionState](ctx, c, map[string]any{commandTypeKey: commandGetState}, boundary)
 }
 
 // GetAvailableModels lists all configured models.
@@ -204,64 +142,28 @@ func (c *Client) GetAvailableModels(ctx context.Context) ([]Model, error) {
 // SetModel switches to a specific model and returns the selected catalog
 // entry.
 func (c *Client) SetModel(ctx context.Context, provider string, modelID string) (Model, error) {
-	return c.SetModelWithBoundary(ctx, provider, modelID, CallBoundary{})
-}
-
-// SetModelWithBoundary is SetModel with a transport-linearized write boundary.
-func (c *Client) SetModelWithBoundary(
-	ctx context.Context,
-	provider string,
-	modelID string,
-	boundary CallBoundary,
-) (Model, error) {
-	return callWithDataBoundary[Model](ctx, c, map[string]any{
+	return callWithData[Model](ctx, c, map[string]any{
 		commandTypeKey: commandSetModel,
 		"provider":     provider,
 		"modelId":      modelID,
-	}, boundary)
+	})
 }
 
 // SetThinkingLevel sends the requested reasoning level to pi. pi acknowledges
 // unknown values even when its effective thinking level does not change, so a
-// caller that needs the level pi actually runs reads GetState back rather than
-// trusting this acknowledgement.
+// caller that needs the level pi actually runs reads GetState back.
 func (c *Client) SetThinkingLevel(ctx context.Context, level string) error {
-	return c.SetThinkingLevelWithBoundary(ctx, level, CallBoundary{})
+	return c.simpleCall(ctx, map[string]any{commandTypeKey: commandSetThinkingLevel, "level": level})
 }
 
-// SetThinkingLevelWithBoundary is SetThinkingLevel with a
-// transport-linearized write boundary.
-func (c *Client) SetThinkingLevelWithBoundary(ctx context.Context, level string, boundary CallBoundary) error {
-	return c.simpleCallBoundary(ctx, map[string]any{commandTypeKey: commandSetThinkingLevel, "level": level}, boundary)
-}
-
-// SetAutoRetry enables or disables automatic retry on transient errors. The
-// adapter disables it at session start so native failures surface once with
-// the real cause.
+// SetAutoRetry enables or disables automatic retry on transient errors.
 func (c *Client) SetAutoRetry(ctx context.Context, enabled bool) error {
-	return c.simpleCall(ctx, map[string]any{commandTypeKey: commandSetAutoRetry, fieldEnabled: enabled})
-}
-
-// SetSessionName sets the session display name.
-func (c *Client) SetSessionName(ctx context.Context, name string) error {
-	return c.simpleCall(ctx, map[string]any{commandTypeKey: commandSetSessionName, "name": name})
+	return c.simpleCall(ctx, map[string]any{commandTypeKey: commandSetAutoRetry, "enabled": enabled})
 }
 
 // GetSessionStats fetches token usage, cost, and context-window usage.
 func (c *Client) GetSessionStats(ctx context.Context) (SessionStats, error) {
 	return callWithData[SessionStats](ctx, c, map[string]any{commandTypeKey: commandGetSessionStats})
-}
-
-// GetEntries fetches session entries in append order. A non-empty since is a
-// durable cursor: only entries strictly after it are returned, and an invalid
-// cursor fails with a native error.
-func (c *Client) GetEntries(ctx context.Context, since string) (Entries, error) {
-	fields := map[string]any{commandTypeKey: commandGetEntries}
-	if since != "" {
-		fields["since"] = since
-	}
-
-	return callWithData[Entries](ctx, c, fields)
 }
 
 // GetCommands lists available slash commands (extension commands, prompt
@@ -278,11 +180,7 @@ func (c *Client) GetCommands(ctx context.Context) ([]SlashCommand, error) {
 }
 
 func (c *Client) simpleCall(ctx context.Context, fields map[string]any) error {
-	return c.simpleCallBoundary(ctx, fields, CallBoundary{})
-}
-
-func (c *Client) simpleCallBoundary(ctx context.Context, fields map[string]any, boundary CallBoundary) error {
-	response, err := c.CallWithBoundary(ctx, fields, boundary)
+	response, err := c.Call(ctx, fields)
 	if err != nil {
 		return err
 	}
@@ -290,30 +188,10 @@ func (c *Client) simpleCallBoundary(ctx context.Context, fields map[string]any, 
 	return response.Err()
 }
 
-func (c *Client) cancellableCall(ctx context.Context, fields map[string]any) (bool, error) {
-	data, err := callWithData[struct {
-		Cancelled bool `json:"cancelled"`
-	}](ctx, c, fields)
-	if err != nil {
-		return false, err
-	}
-
-	return data.Cancelled, nil
-}
-
 func callWithData[T any](ctx context.Context, c *Client, fields map[string]any) (T, error) {
-	return callWithDataBoundary[T](ctx, c, fields, CallBoundary{})
-}
-
-func callWithDataBoundary[T any](
-	ctx context.Context,
-	c *Client,
-	fields map[string]any,
-	boundary CallBoundary,
-) (T, error) {
 	var data T
 
-	response, err := c.CallWithBoundary(ctx, fields, boundary)
+	response, err := c.Call(ctx, fields)
 	if err != nil {
 		return data, err
 	}

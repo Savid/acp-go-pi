@@ -2,63 +2,107 @@ package piacp
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
-	"strings"
 
 	"github.com/coder/acp-go-sdk"
 
+	"github.com/savid/acp-go-core/lifecycle"
+	"github.com/savid/acp-go-core/process"
+	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 const (
-	piMetaKey              = "pi"
-	jsonFieldMessageID     = "messageId"
-	metaOptionsKey         = "options"
-	metaModelKey           = "model"
-	metaEnvKey             = "env"
-	metaExtraPathDirsKey   = "extraPathDirs"
-	metaOutputSchemaKey    = "outputSchema"
-	metaThinkingLevelKey   = "thinkingLevel"
-	metaPermissionKey      = "permission"
-	metaAutoRetryKey       = "autoRetry"
-	metaRawEventKey        = "rawEvent"
-	metaRawEventEnabledKey = "enabled"
-
-	privateEnvPrefix = "ACP_" + "GO_PI_INTERNAL_"
+	metaOptionsKey       = "options"
+	metaRawEventKey      = "rawEvent"
+	metaModelKey         = "model"
+	metaEnvKey           = "env"
+	metaExtraPathDirsKey = "extraPathDirs"
+	metaOutputSchemaKey  = "outputSchema"
+	metaThinkingLevelKey = "thinkingLevel"
+	metaPermissionKey    = "permission"
+	metaAutoRetryKey     = "autoRetry"
+	metaEnabledKey       = "enabled"
 )
 
-// PiOptions is the stable, supported pi-specific subset accepted at
-// _meta.pi.options. The JSON field names below are part of this package's
-// wire contract; unsupported option keys are rejected.
+// PiOptions is the per-session options struct carried at _meta.pi.options.
 type PiOptions struct {
 	// Model selects the pi model for this session as "provider/id".
 	Model string `json:"model,omitempty"`
-	// Env adds environment variables for this pi session's process. PATH is
-	// rejected; use ExtraPathDirs for executable search prefixes.
+	// Env overlays the session's pi process environment.
 	Env map[string]string `json:"env,omitempty"`
 	// ExtraPathDirs are absolute directories prepended, in order, to the PATH
-	// of this session's pi process, so the first entry resolves ahead of every
-	// other while the captured native base path remains last.
+	// of this session's pi process.
 	ExtraPathDirs []string `json:"extraPathDirs,omitempty"`
-	// OutputSchema requests JSON Schema structured output. pi has no native
-	// structured-output surface, so setting it fails closed at session start.
+	// OutputSchema requests structured output. pi has no native surface for
+	// it, so a session carrying it fails at session start.
 	OutputSchema map[string]any `json:"outputSchema,omitempty"`
-	// ThinkingLevel is a non-empty reasoning-level value passed unchanged to
-	// pi. The advertised levels are a host menu, not a whitelist.
+	// ThinkingLevel is a reasoning-level value passed unchanged to pi.
 	ThinkingLevel string `json:"thinkingLevel,omitempty"`
-	// Permission selects the adapter permission mode for this session:
-	// "ask" (deny-by-default dialog, the default) or "allow" (auto-allow).
+	// Permission selects the permission mode: "ask" (the default) raises a
+	// permission request per tool call, "allow" auto-allows every tool call.
 	Permission string `json:"permission,omitempty"`
-	// AutoRetry opts this session in to pi's native automatic retry of
-	// transient provider errors (5xx, timeouts). Off by default so a native
-	// failure surfaces once, immediately, with the real cause; when enabled,
-	// the final error after exhausted retries still carries the last cause.
+	// AutoRetry opts the session in to pi's native retry of transient
+	// provider errors.
 	AutoRetry bool `json:"autoRetry,omitempty"`
 }
 
-// Meta returns an ACP _meta object for the supported pi-specific options.
+// PiOption configures PiOptions values.
+type PiOption func(*PiOptions)
+
+// NewPiOptions constructs PiOptions from functional options.
+func NewPiOptions(opts ...PiOption) PiOptions {
+	options := PiOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	return options.clone()
+}
+
+// WithPiModel configures the session model as "provider/id".
+func WithPiModel(model string) PiOption {
+	return func(options *PiOptions) { options.Model = model }
+}
+
+// WithPiEnv configures the session environment overlay.
+func WithPiEnv(env map[string]string) PiOption {
+	cloned := cloneStringMap(env)
+
+	return func(options *PiOptions) { options.Env = cloneStringMap(cloned) }
+}
+
+// WithPiExtraPathDirs configures the directories prepended to the session PATH.
+func WithPiExtraPathDirs(dirs ...string) PiOption {
+	cloned := slices.Clone(dirs)
+
+	return func(options *PiOptions) { options.ExtraPathDirs = slices.Clone(cloned) }
+}
+
+// WithPiOutputSchema configures structured output, which pi refuses at
+// session start.
+func WithPiOutputSchema(schema map[string]any) PiOption {
+	cloned := cloneAnyMap(schema)
+
+	return func(options *PiOptions) { options.OutputSchema = cloneAnyMap(cloned) }
+}
+
+// WithPiThinkingLevel configures the reasoning level passed to pi.
+func WithPiThinkingLevel(level string) PiOption {
+	return func(options *PiOptions) { options.ThinkingLevel = level }
+}
+
+// WithPiPermission configures the permission mode: "ask" or "allow".
+func WithPiPermission(mode string) PiOption {
+	return func(options *PiOptions) { options.Permission = mode }
+}
+
+// WithPiAutoRetry opts the session in to pi's native automatic retry.
+func WithPiAutoRetry(enabled bool) PiOption {
+	return func(options *PiOptions) { options.AutoRetry = enabled }
+}
+
+// Meta returns exactly {"pi": {"options": {...}}} with the non-zero fields.
 func (options PiOptions) Meta() map[string]any {
 	values := map[string]any{}
 
@@ -90,124 +134,114 @@ func (options PiOptions) Meta() map[string]any {
 		values[metaAutoRetryKey] = true
 	}
 
-	return map[string]any{
-		piMetaKey: map[string]any{
-			metaOptionsKey: values,
-		},
-	}
+	return map[string]any{vendor: map[string]any{metaOptionsKey: values}}
 }
 
-// piOptionsFromMeta parses and validates the owned _meta.pi namespace of one
-// session lifecycle request. Unknown own-namespace keys fail closed; foreign
-// namespaces are ignored.
-func piOptionsFromMeta(meta map[string]any) (PiOptions, error) {
-	options, _, err := piOptionsFromMetaWithConfigurationPresence(meta)
+func (options PiOptions) clone() PiOptions {
+	cloned := options
+	cloned.Env = cloneStringMap(options.Env)
+	cloned.ExtraPathDirs = slices.Clone(options.ExtraPathDirs)
+	cloned.OutputSchema = cloneAnyMap(options.OutputSchema)
 
-	return options, err
+	return cloned
 }
 
-type sessionConfigurationPresence struct {
-	Env           bool
-	ExtraPathDirs bool
-}
-
-func piOptionsFromMetaWithConfigurationPresence(
-	meta map[string]any,
-) (PiOptions, sessionConfigurationPresence, error) {
-	options := PiOptions{}
-	presence := sessionConfigurationPresence{}
-
-	// The session lifecycle extension rides no session lifecycle request: the
-	// family literal is never a foreign namespace here and never a no-op.
-	if refusal := refuseLifecycleMeta(meta); refusal != nil {
-		return PiOptions{}, sessionConfigurationPresence{}, refusal
+// ValidatePiSessionMeta runs the owned-namespace parsing of a session
+// lifecycle request's _meta without an Agent and returns the same refusal.
+func ValidatePiSessionMeta(meta map[string]any) error {
+	_, err := parseSessionMeta(meta)
+	if err != nil {
+		return err
 	}
 
-	piMeta, ok := meta[piMetaKey].(map[string]any)
+	return nil
+}
+
+// sessionMeta is what one session lifecycle request's _meta.pi carried.
+type sessionMeta struct {
+	options   PiOptions
+	rawEvents bool
+	// present records which carrier fields the request named, so a load or
+	// resume inherits the stored value only for fields it left out.
+	presentEnv           bool
+	presentExtraPathDirs bool
+}
+
+// parseSessionMeta validates the owned _meta.pi namespace of one session
+// lifecycle request. Unknown own-namespace keys fail closed; foreign
+// namespaces are ignored; the lifecycle literal is refused by name.
+func parseSessionMeta(meta map[string]any) (sessionMeta, *acp.RequestError) {
+	if refusal := lifecycle.RejectKey(meta); refusal != nil {
+		return sessionMeta{}, invalidParam(refusal)
+	}
+
+	raw, exists := meta[vendor]
+	if !exists {
+		return sessionMeta{}, nil
+	}
+
+	piMeta, ok := raw.(map[string]any)
 	if !ok {
-		if _, exists := meta[piMetaKey]; exists {
-			return PiOptions{}, sessionConfigurationPresence{}, unsupportedField("_meta." + piMetaKey)
-		}
+		return sessionMeta{}, wire.Unsupported("_meta." + vendor)
 	}
 
-	if err := validatePiLifecycleMeta(piMeta); err != nil {
-		return PiOptions{}, sessionConfigurationPresence{}, err
-	}
-
-	if rawOptions, ok := piMeta[metaOptionsKey]; ok {
-		parsed, err := parsePiOptions(rawOptions)
-		if err != nil {
-			return PiOptions{}, sessionConfigurationPresence{}, err
-		}
-
-		options = parsed
-
-		// parsePiOptions accepts only this exact representation.
-		values, _ := rawOptions.(map[string]any)
-
-		_, presence.Env = values[metaEnvKey]
-		_, presence.ExtraPathDirs = values[metaExtraPathDirsKey]
-	}
-
-	return options, presence, nil
-}
-
-func validatePiLifecycleMeta(piMeta map[string]any) error {
-	if piMeta == nil {
-		return nil
-	}
+	parsed := sessionMeta{}
 
 	for key := range piMeta {
 		switch key {
 		case metaOptionsKey, metaRawEventKey:
 		default:
-			return unsupportedField("_meta." + piMetaKey + "." + key)
+			return sessionMeta{}, wire.Unsupported("_meta." + vendor + "." + key)
 		}
 	}
 
 	if rawEvent, ok := piMeta[metaRawEventKey]; ok {
-		if err := validateRawEventMeta(rawEvent); err != nil {
-			return err
+		values, ok := rawEvent.(map[string]any)
+		if !ok {
+			return sessionMeta{}, wire.Unsupported("_meta." + vendor + "." + metaRawEventKey)
 		}
-	}
 
-	return nil
-}
-
-func validateRawEventMeta(value any) error {
-	raw, ok := value.(map[string]any)
-	if !ok {
-		return unsupportedField("_meta." + piMetaKey + "." + metaRawEventKey)
-	}
-
-	for key, item := range raw {
-		switch key {
-		case metaRawEventEnabledKey:
-			if _, ok := item.(bool); !ok {
-				return unsupportedField("_meta." + piMetaKey + "." + metaRawEventKey + "." + key)
+		for key, item := range values {
+			enabled, ok := item.(bool)
+			if key != metaEnabledKey || !ok {
+				return sessionMeta{}, wire.Unsupported("_meta." + vendor + "." + metaRawEventKey + "." + key)
 			}
-		default:
-			return unsupportedField("_meta." + piMetaKey + "." + metaRawEventKey + "." + key)
+
+			parsed.rawEvents = enabled
 		}
 	}
 
-	return nil
-}
-
-func parsePiOptions(value any) (PiOptions, error) {
-	raw, ok := value.(map[string]any)
-	if !ok {
-		return PiOptions{}, unsupportedField("_meta." + piMetaKey + "." + metaOptionsKey)
+	rawOptions, hasOptions := piMeta[metaOptionsKey]
+	if !hasOptions {
+		return parsed, nil
 	}
 
+	values, isObject := rawOptions.(map[string]any)
+	if !isObject {
+		return sessionMeta{}, wire.Unsupported(metaOptionPath(""))
+	}
+
+	options, err := parsePiOptions(values)
+	if err != nil {
+		return sessionMeta{}, err
+	}
+
+	parsed.options = options
+	_, parsed.presentEnv = values[metaEnvKey]
+	_, parsed.presentExtraPathDirs = values[metaExtraPathDirsKey]
+
+	return parsed, nil
+}
+
+func parsePiOptions(values map[string]any) (PiOptions, *acp.RequestError) {
 	options := PiOptions{}
 
-	for key, item := range raw {
+	for key, item := range values {
 		switch key {
 		case metaModelKey:
 			model, ok := item.(string)
 			if !ok {
-				return PiOptions{}, unsupportedField(metaOptionPath(key))
+				return PiOptions{}, wire.Unsupported(metaOptionPath(key))
 			}
 
 			options.Model = model
@@ -228,112 +262,85 @@ func parsePiOptions(value any) (PiOptions, error) {
 		case metaOutputSchemaKey:
 			schema, ok := item.(map[string]any)
 			if !ok {
-				return PiOptions{}, unsupportedField(metaOptionPath(key))
+				return PiOptions{}, wire.Unsupported(metaOptionPath(key))
 			}
 
 			options.OutputSchema = cloneAnyMap(schema)
 		case metaThinkingLevelKey:
-			// Absence and presence-with-nothing are different requests, and
-			// only this arm can tell them apart: an absent key states no
-			// selection and the session takes whatever pi starts on, while a
-			// key that arrived states one and names none. Empty is the empty
-			// string exactly — whitespace names a level this adapter does not
-			// judge, so it travels and the level pi reports back is what the
-			// session advertises.
 			level, ok := item.(string)
 			if !ok || level == "" {
-				return PiOptions{}, unsupportedField(metaOptionPath(key))
+				return PiOptions{}, wire.Unsupported(metaOptionPath(key))
 			}
 
 			options.ThinkingLevel = level
 		case metaPermissionKey:
 			permission, ok := item.(string)
 			if !ok {
-				return PiOptions{}, unsupportedField(metaOptionPath(key))
+				return PiOptions{}, wire.Unsupported(metaOptionPath(key))
 			}
 
 			options.Permission = permission
 		case metaAutoRetryKey:
 			enabled, ok := item.(bool)
 			if !ok {
-				return PiOptions{}, unsupportedField(metaOptionPath(key))
+				return PiOptions{}, wire.Unsupported(metaOptionPath(key))
 			}
 
 			options.AutoRetry = enabled
 		default:
-			return PiOptions{}, unsupportedField(metaOptionPath(key))
+			return PiOptions{}, wire.Unsupported(metaOptionPath(key))
 		}
 	}
 
-	return validatePiOptions(options)
+	return options, validatePiOptions(options)
 }
 
-func validatePiOptions(options PiOptions) (PiOptions, error) {
+func validatePiOptions(options PiOptions) *acp.RequestError {
 	if options.OutputSchema != nil {
-		return PiOptions{}, unsupportedField(metaOptionPath(metaOutputSchemaKey))
+		return wire.Unsupported(metaOptionPath(metaOutputSchemaKey))
 	}
 
 	if options.Model != "" {
 		if _, err := pi.ParseModelRef(options.Model); err != nil {
-			return PiOptions{}, unsupportedField(metaOptionPath(metaModelKey))
+			return wire.Unsupported(metaOptionPath(metaModelKey))
 		}
 	}
 
 	if options.Permission != "" && options.Permission != pi.PermissionModeAsk && options.Permission != pi.PermissionModeAllow {
-		return PiOptions{}, unsupportedField(metaOptionPath(metaPermissionKey))
+		return wire.Unsupported(metaOptionPath(metaPermissionKey))
 	}
 
-	if err := validateEnvironment(options.Env, metaOptionPath(metaEnvKey), blockedSessionEnvKey); err != nil {
-		return PiOptions{}, err
-	}
-
-	if err := validateExtraPathDirs(options.ExtraPathDirs, metaOptionPath(metaExtraPathDirsKey)); err != nil {
-		return PiOptions{}, err
-	}
-
-	return options, nil
-}
-
-func validateExtraPathDirs(dirs []string, path string) error {
-	for index, dir := range dirs {
-		if !filepath.IsAbs(dir) || strings.ContainsRune(dir, os.PathListSeparator) {
-			return unsupportedField(fmt.Sprintf("%s[%d]", path, index))
+	if err := process.ValidateNames(options.Env); err != nil {
+		var nameErr *process.NameError
+		if errorsAs(err, &nameErr) {
+			return wire.Unsupported(metaOptionPath(metaEnvKey) + "." + nameErr.Key)
 		}
+
+		return wire.Unsupported(metaOptionPath(metaEnvKey))
+	}
+
+	if err := process.ValidateExtraPathDirs(options.ExtraPathDirs); err != nil {
+		var dirErr *process.PathDirError
+		if errorsAs(err, &dirErr) {
+			return wire.Unsupported(fmt.Sprintf("%s[%d]", metaOptionPath(metaExtraPathDirsKey), dirErr.Index))
+		}
+
+		return wire.Unsupported(metaOptionPath(metaExtraPathDirsKey))
 	}
 
 	return nil
 }
 
-func unsupportedField(path string) error {
-	return unsupportedRequest(path)
-}
-
-// unsupportedRequest is the uniform refusal of one request member, typed for
-// the in-process handlers that answer with the JSON-RPC error directly.
-func unsupportedRequest(path string) *acp.RequestError {
-	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: valUnsupported,
-		jsonFieldField: path,
-	})
-}
-
-// missingField refuses a reserved key the contract requires and the caller left
-// out. It is a distinct verdict from unsupportedField and the two are never
-// collapsed: unsupported names a value that is present and refused, missing
-// names one the request had to carry. A host that reads missing adds the key;
-// a host that reads unsupported on the same bare path stops sending it.
-func missingField(path string) error {
-	return acp.NewInvalidParams(map[string]any{
-		jsonFieldError: valMissing,
-		jsonFieldField: path,
-	})
-}
-
 func metaOptionPath(key string) string {
-	return "_meta." + piMetaKey + "." + metaOptionsKey + "." + key
+	path := "_meta." + vendor + "." + metaOptionsKey
+	if key == "" {
+		return path
+	}
+
+	return path + "." + key
 }
 
-func stringMapOption(value any, path string) (map[string]string, error) {
+func stringMapOption(value any, path string) (map[string]string, *acp.RequestError) {
 	switch typed := value.(type) {
 	case map[string]string:
 		return cloneStringMap(typed), nil
@@ -342,7 +349,7 @@ func stringMapOption(value any, path string) (map[string]string, error) {
 		for key, item := range typed {
 			text, ok := item.(string)
 			if !ok {
-				return nil, unsupportedField(path + "." + key)
+				return nil, wire.Unsupported(path + "." + key)
 			}
 
 			result[key] = text
@@ -350,11 +357,11 @@ func stringMapOption(value any, path string) (map[string]string, error) {
 
 		return result, nil
 	default:
-		return nil, unsupportedField(path)
+		return nil, wire.Unsupported(path)
 	}
 }
 
-func stringSliceOption(value any, path string) ([]string, error) {
+func stringSliceOption(value any, path string) ([]string, *acp.RequestError) {
 	switch typed := value.(type) {
 	case []string:
 		return slices.Clone(typed), nil
@@ -363,7 +370,7 @@ func stringSliceOption(value any, path string) ([]string, error) {
 		for index, item := range typed {
 			text, ok := item.(string)
 			if !ok {
-				return nil, unsupportedField(fmt.Sprintf("%s[%d]", path, index))
+				return nil, wire.Unsupported(fmt.Sprintf("%s[%d]", path, index))
 			}
 
 			result = append(result, text)
@@ -371,10 +378,58 @@ func stringSliceOption(value any, path string) ([]string, error) {
 
 		return result, nil
 	default:
-		return nil, unsupportedField(path)
+		return nil, wire.Unsupported(path)
 	}
 }
 
-func sessionAdditionalDirectories(primary []string) []string {
-	return append([]string(nil), primary...)
+func cloneAnyMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+
+	cloned := make(map[string]any, len(values))
+	for key, value := range values {
+		cloned[key] = cloneAny(value)
+	}
+
+	return cloned
+}
+
+func cloneAny(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneAnyMap(typed)
+	case []any:
+		cloned := make([]any, len(typed))
+		for index, item := range typed {
+			cloned[index] = cloneAny(item)
+		}
+
+		return cloned
+	case []string:
+		return slices.Clone(typed)
+	default:
+		return typed
+	}
+}
+
+func mergeAnyMap(base map[string]any, overlay map[string]any) map[string]any {
+	result := cloneAnyMap(base)
+	if result == nil {
+		result = map[string]any{}
+	}
+
+	for key, value := range overlay {
+		if valueMap, ok := value.(map[string]any); ok {
+			if existing, ok := result[key].(map[string]any); ok {
+				result[key] = mergeAnyMap(existing, valueMap)
+
+				continue
+			}
+		}
+
+		result[key] = cloneAny(value)
+	}
+
+	return result
 }

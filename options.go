@@ -9,6 +9,9 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+
+	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/image"
 )
 
 // Option configures the pi ACP agent.
@@ -24,44 +27,28 @@ type Options struct {
 	// AgentVersion is the agent version advertised during ACP initialize.
 	AgentVersion string
 
-	// ExecutablePath is the pi CLI executable path. If empty, PATH is searched.
-	ExecutablePath        string
-	HostAuthority         HostAuthority
-	hostAuthoritySupplied bool
-	// Home is the durable per-instance PI_CODING_AGENT_DIR shared by ordinary-mode
-	// sessions. Managed mode rejects it and always builds isolated generation
-	// residences. Provider auth is advertised only with both Home and
-	// ProviderAuthRoot configured in ordinary mode.
+	// ExecutablePath selects the pi executable. A bare name is searched on the
+	// base PATH; a path containing a separator is used as given. Empty means
+	// "pi".
+	ExecutablePath string
+	// Home is pi's native config, auth, and runtime root, passed to every
+	// session as PI_CODING_AGENT_DIR. Empty leaves pi to resolve its home from
+	// the inherited environment exactly as it would from a shell.
 	Home string
-	// ScratchDir is the parent directory for all ephemeral on-disk
-	// materialization (per-session roots, hydration temp files, and the version
-	// probe's isolated PI_CODING_AGENT_DIR/settings residence). Empty means the
-	// system temp directory. The directory is created 0700 when missing.
+	// ScratchDir is the parent directory for ephemeral adapter state. Empty
+	// means the system temp directory.
 	ScratchDir string
-	// DefaultModel selects the model for newly created pi sessions when
-	// non-empty, as "provider/id" (for example "openai/gpt-4o").
+	// InputHandoffRoot is the absolute directory under which handoff-form
+	// prompt images are read. Empty rejects the handoff form.
+	InputHandoffRoot string
+	// DefaultModel selects the model for new sessions as "provider/id".
 	DefaultModel string
 	// ConfiguredModels are the model ids the host lists explicitly, each as
-	// "provider/id". Each is a configured catalog entry: published after the
-	// native rows on every route, standing aside for a native row of the same
-	// value, and carrying no invented facts.
+	// "provider/id".
 	ConfiguredModels []string
-	// DirectAPI permits read-only quota requests from the native bridge to
-	// supported providers. It defaults to true; set WithPiDirectAPI(false)
-	// to disable every direct account endpoint.
-	DirectAPI bool
-	// Env is the static agent-scoped addition to every launched pi process
-	// environment. pi children run with a scrubbed environment, so provider API
-	// keys must travel here (or per session) rather than relying on ambient
-	// variables. PATH here is the static native base search path every session
-	// resolves against. Process-loader, shell-loader, and Node loader keys are
-	// rejected at construction.
+	// Env is the static agent-scoped overlay on the inherited process
+	// environment every pi process runs with.
 	Env map[string]string
-	// AmbientEnvironment replaces the adapter's own process environment as the
-	// block ordinary execution inherits from. Its names are judged exactly as
-	// inherited names are; WithEnv and session environments overlay it. Nil
-	// inherits from the adapter's process. Managed execution never reads it.
-	AmbientEnvironment map[string]string
 
 	// Logger receives structured diagnostic logs. If nil, the default logger is used.
 	Logger *slog.Logger
@@ -69,58 +56,64 @@ type Options struct {
 	TracerProvider trace.TracerProvider
 	// MeterProvider records adapter metrics. If nil, metrics are no-ops.
 	MeterProvider metric.MeterProvider
-	// TextMapPropagator extracts ACP _meta trace context and injects pi launch
-	// env. If nil, W3C trace context plus baggage propagation is used.
+	// TextMapPropagator extracts trace context from ACP _meta. If nil, W3C
+	// trace context plus baggage propagation is used.
 	TextMapPropagator propagation.TextMapPropagator
 
-	// SessionStore mirrors pi session JSONL rows and backs store restores.
-	SessionStore SessionStore
-	// SessionStoreLoadTimeout bounds store load/list operations used for resume.
+	// SessionStore is the durability boundary for session rows. Nil installs a
+	// fresh in-memory store.
+	SessionStore acpcore.SessionStore
+	// SessionStoreLoadTimeout bounds store reads used for list, load, and resume.
 	SessionStoreLoadTimeout time.Duration
-	// TurnTimeout bounds one pi prompt turn. Zero (the default) means no
-	// deadline. On expiry the turn is aborted and fails with cause "timeout".
+	// TurnTimeout bounds one prompt turn. Zero means no deadline.
 	TurnTimeout time.Duration
 	// ConcurrencyLimits controls process-local backpressure.
 	ConcurrencyLimits ConcurrencyLimits
-	// SeedFiles maps paths relative to the pi agent directory a session
-	// launches against to file contents written there before the pi process
-	// starts, so the launched CLI reads them as its own config. Every file is
-	// written verbatim, settings.json included; that directory is the durable
-	// Home when one is configured, and a per-session ephemeral directory
-	// otherwise. Set via WithSeedFiles.
+	// SeedFiles maps paths relative to pi's config root to file contents
+	// written there before each launch.
 	SeedFiles map[string]string
 	// ImageLimits bounds decoded image bytes on prompt input and emitted
-	// output. Set via WithImageLimits; every field defaults to 6 MiB when the
-	// option is omitted, and an explicit zero in a supplied struct disables
-	// that policy limit.
+	// output. Every field defaults to 6 MiB when the option is omitted.
 	ImageLimits ImageLimits
-	// InputHandoffRoot is the absolute directory under which handoff-form
-	// prompt images are read. Empty (the default) rejects the handoff form.
-	// The adapter only reads under it and never writes, moves, or removes
-	// anything there. Managed execution pins a root disjoint from the complete
-	// scratch parent before native work; the host must preserve that separation.
-	InputHandoffRoot string
-	// ProviderAuthRoot is the absolute host-owned directory containing Pi's
-	// values-free provider-auth ledger. Empty leaves every _pi/auth/* leg
-	// unadvertised.
-	ProviderAuthRoot string
-	// imageLimitsSet records whether WithImageLimits supplied the struct; an
-	// omitted option leaves every field at its default.
+
 	imageLimitsSet bool
 }
 
-// ConcurrencyLimits controls per-agent/session backpressure. Zero fields use defaults.
+// ConcurrencyLimits controls per-agent backpressure. Zero fields use defaults.
 type ConcurrencyLimits struct {
 	MaxActiveSessions        int
 	MaxConcurrentClientCalls int
 }
+
+// ImageLimits bounds decoded image bytes. A zero field disables that policy
+// limit; the frame clamp still applies.
+type ImageLimits struct {
+	MaxInputBytesPerImage     int64
+	MaxInputBytesPerPrompt    int64
+	MaxOutputBytesPerImage    int64
+	MaxOutputBytesPerToolCall int64
+}
+
+func (l ImageLimits) core() image.Limits {
+	return image.Limits{
+		MaxInputBytesPerImage:     l.MaxInputBytesPerImage,
+		MaxInputBytesPerPrompt:    l.MaxInputBytesPerPrompt,
+		MaxOutputBytesPerImage:    l.MaxOutputBytesPerImage,
+		MaxOutputBytesPerToolCall: l.MaxOutputBytesPerToolCall,
+	}
+}
+
+const (
+	defaultMaxActiveSessions        = 32
+	defaultMaxConcurrentClientCalls = 16
+	defaultSessionStoreLoadTimeout  = 10 * time.Second
+)
 
 func applyOptions(opts []Option) Options {
 	options := Options{
 		AgentName:    "acp-go-pi",
 		AgentTitle:   "acp-go-pi",
 		AgentVersion: "0.1.0",
-		DirectAPI:    true,
 	}
 
 	for _, opt := range opts {
@@ -128,215 +121,137 @@ func applyOptions(opts []Option) Options {
 	}
 
 	if !options.imageLimitsSet {
-		options.ImageLimits = defaultImageLimits()
+		limits := image.DefaultLimits()
+		options.ImageLimits = ImageLimits{
+			MaxInputBytesPerImage:     limits.MaxInputBytesPerImage,
+			MaxInputBytesPerPrompt:    limits.MaxInputBytesPerPrompt,
+			MaxOutputBytesPerImage:    limits.MaxOutputBytesPerImage,
+			MaxOutputBytesPerToolCall: limits.MaxOutputBytesPerToolCall,
+		}
+	}
+
+	if options.ConcurrencyLimits.MaxActiveSessions == 0 {
+		options.ConcurrencyLimits.MaxActiveSessions = defaultMaxActiveSessions
+	}
+
+	if options.ConcurrencyLimits.MaxConcurrentClientCalls == 0 {
+		options.ConcurrencyLimits.MaxConcurrentClientCalls = defaultMaxConcurrentClientCalls
+	}
+
+	if options.SessionStoreLoadTimeout == 0 {
+		options.SessionStoreLoadTimeout = defaultSessionStoreLoadTimeout
 	}
 
 	return options
 }
 
-// WithPiDirectAPI enables or disables the native bridge's direct quota reads.
-func WithPiDirectAPI(enabled bool) Option {
-	return func(options *Options) { options.DirectAPI = enabled }
-}
-
 // WithLogger configures structured diagnostic logging.
 func WithLogger(logger *slog.Logger) Option {
-	return func(options *Options) {
-		options.Logger = logger
-	}
+	return func(options *Options) { options.Logger = logger }
 }
 
 // WithAgentName sets the protocol identifier advertised during ACP initialize.
 func WithAgentName(name string) Option {
-	return func(options *Options) {
-		options.AgentName = name
-	}
+	return func(options *Options) { options.AgentName = name }
 }
 
 // WithAgentTitle sets the human-readable agent name advertised during ACP initialize.
 func WithAgentTitle(title string) Option {
-	return func(options *Options) {
-		options.AgentTitle = title
-	}
+	return func(options *Options) { options.AgentTitle = title }
 }
 
-// WithAgentVersion sets the agent version advertised during ACP initialize and
-// used by adapter OpenTelemetry instrumentation.
+// WithAgentVersion sets the agent version advertised during ACP initialize.
 func WithAgentVersion(version string) Option {
-	return func(options *Options) {
-		options.AgentVersion = version
-	}
+	return func(options *Options) { options.AgentVersion = version }
 }
 
-// WithExecutablePath sets the pi CLI executable path. If unset, PATH is searched.
+// WithExecutablePath selects the pi executable.
 func WithExecutablePath(path string) Option {
-	return func(options *Options) {
-		options.ExecutablePath = path
-	}
+	return func(options *Options) { options.ExecutablePath = path }
 }
 
-// WithHostAuthority routes native processes and tree ownership through authority.
-func WithHostAuthority(authority HostAuthority) Option {
-	return func(options *Options) {
-		options.hostAuthoritySupplied = true
-		options.HostAuthority = authority
-	}
-}
-
-// WithHome sets the durable per-instance PI_CODING_AGENT_DIR shared by all
-// ordinary-mode sessions. Managed mode rejects it. It is required for provider
-// auth so Pi's native cross-process credential lock and credential residence
-// survive session teardown.
+// WithHome sets pi's native config root, passed to every session as
+// PI_CODING_AGENT_DIR.
 func WithHome(path string) Option {
-	return func(options *Options) {
-		options.Home = path
-	}
+	return func(options *Options) { options.Home = path }
 }
 
-// WithProviderAuthRoot sets the durable root for the values-free provider-auth
-// ledger. Omitting it leaves every _pi/auth/* leg unadvertised.
-func WithProviderAuthRoot(path string) Option {
-	return func(options *Options) {
-		options.ProviderAuthRoot = path
-	}
-}
-
-// WithScratchDir sets the parent directory for all ephemeral on-disk
-// materialization (per-session roots, hydration temp files, and the version
-// probe's isolated PI_CODING_AGENT_DIR/settings residence). Empty means the
-// system temp directory. The directory is created 0700 when missing.
+// WithScratchDir sets the parent directory for ephemeral adapter state.
 func WithScratchDir(dir string) Option {
-	return func(options *Options) {
-		options.ScratchDir = dir
-	}
+	return func(options *Options) { options.ScratchDir = dir }
 }
 
 // WithInputHandoffRoot sets the absolute directory under which handoff-form
-// prompt images are read. Omitting the option rejects the handoff form, so a
-// host that expects it can tell from the absence of the handoff capability
-// advertisement that its option never reached this adapter. The directory is
-// read-only to the adapter: handoff files stay owned by the host, which may
-// remove them as soon as session/prompt returns.
+// prompt images are read. The adapter never writes there.
 func WithInputHandoffRoot(dir string) Option {
-	return func(options *Options) {
-		options.InputHandoffRoot = dir
-	}
+	return func(options *Options) { options.InputHandoffRoot = dir }
 }
 
-// WithDefaultModel selects a pi model for newly created sessions as
-// "provider/id".
+// WithDefaultModel selects the model for new sessions as "provider/id".
 func WithDefaultModel(model string) Option {
-	return func(options *Options) {
-		options.DefaultModel = model
-	}
+	return func(options *Options) { options.DefaultModel = model }
 }
 
 // WithConfiguredModels names the models the host lists explicitly.
 func WithConfiguredModels(ids []string) Option {
-	return func(options *Options) {
-		options.ConfiguredModels = slices.Clone(ids)
-	}
+	return func(options *Options) { options.ConfiguredModels = slices.Clone(ids) }
 }
 
-// WithEnv sets the static agent-scoped environment every launched pi process
-// runs with. pi children run with a scrubbed environment, so provider API keys
-// must travel here. A PATH entry here is the static native base search path
-// used for executable lookup, version probing, and native launch; per-session
-// directories from WithPiExtraPathDirs are prepended ahead of it.
-// NODE_OPTIONS, BASH_ENV, ENV, LD_*, DYLD_*, and invalid names are rejected at
-// construction.
+// WithEnv sets the static agent-scoped environment overlay applied to every
+// pi process after the inherited environment and before the session env.
 func WithEnv(env map[string]string) Option {
-	return func(options *Options) {
-		options.Env = cloneStringMap(env)
-	}
+	return func(options *Options) { options.Env = cloneStringMap(env) }
 }
 
-// WithAmbientEnvironment supplies the block ordinary execution inherits from in
-// place of the adapter's own process environment. Entries are filtered like
-// inherited entries; an entry that could not be an environment entry fails
-// Agent construction. Managed execution reads nothing from it.
-func WithAmbientEnvironment(env map[string]string) Option {
-	return func(options *Options) {
-		options.AmbientEnvironment = cloneStringMap(env)
-	}
-}
-
-// WithTracerProvider configures the OpenTelemetry tracer provider used for
-// adapter spans. If unset, tracing is a no-op.
+// WithTracerProvider configures the OpenTelemetry tracer provider.
 func WithTracerProvider(provider trace.TracerProvider) Option {
-	return func(options *Options) {
-		options.TracerProvider = provider
-	}
+	return func(options *Options) { options.TracerProvider = provider }
 }
 
-// WithMeterProvider configures the OpenTelemetry meter provider used for
-// adapter metrics. If unset, metrics are no-ops.
+// WithMeterProvider configures the OpenTelemetry meter provider.
 func WithMeterProvider(provider metric.MeterProvider) Option {
-	return func(options *Options) {
-		options.MeterProvider = provider
-	}
+	return func(options *Options) { options.MeterProvider = provider }
 }
 
-// WithTextMapPropagator configures trace-context propagation for ACP _meta and
-// pi process launch environment. If unset, W3C trace context plus baggage
-// propagation is used.
+// WithTextMapPropagator configures trace-context extraction from ACP _meta.
 func WithTextMapPropagator(propagator propagation.TextMapPropagator) Option {
-	return func(options *Options) {
-		options.TextMapPropagator = propagator
-	}
+	return func(options *Options) { options.TextMapPropagator = propagator }
 }
 
-// WithSessionStore configures external pi session storage.
-func WithSessionStore(store SessionStore) Option {
-	return func(options *Options) {
-		options.SessionStore = store
-	}
+// WithSessionStore configures the session store.
+func WithSessionStore(store acpcore.SessionStore) Option {
+	return func(options *Options) { options.SessionStore = store }
 }
 
-// WithSessionStoreLoadTimeout bounds session store reads used during resume.
+// WithSessionStoreLoadTimeout bounds session store reads.
 func WithSessionStoreLoadTimeout(timeout time.Duration) Option {
-	return func(options *Options) {
-		options.SessionStoreLoadTimeout = timeout
-	}
+	return func(options *Options) { options.SessionStoreLoadTimeout = timeout }
 }
 
-// WithTurnTimeout bounds one pi prompt turn. Zero (the default) disables the
-// deadline. On expiry the native turn is aborted and session/prompt fails with
-// a pi_turn_failed error whose cause is "timeout" (never cancelled).
+// WithTurnTimeout bounds one prompt turn. On expiry the native turn is aborted
+// and session/prompt fails with cause "timeout".
 func WithTurnTimeout(timeout time.Duration) Option {
-	return func(options *Options) {
-		options.TurnTimeout = timeout
-	}
+	return func(options *Options) { options.TurnTimeout = timeout }
 }
 
-// WithConcurrencyLimits sets process-local backpressure limits. Zero fields use defaults.
+// WithConcurrencyLimits sets process-local backpressure limits.
 func WithConcurrencyLimits(limits ConcurrencyLimits) Option {
+	return func(options *Options) { options.ConcurrencyLimits = limits }
+}
+
+// WithImageLimits bounds decoded image bytes. A zero field disables that
+// policy limit; a negative field fails construction.
+func WithImageLimits(limits ImageLimits) Option {
 	return func(options *Options) {
-		options.ConcurrencyLimits = limits
+		options.ImageLimits = limits
+		options.imageLimitsSet = true
 	}
 }
 
-// WithSeedFiles registers files written into the pi agent directory a session
-// launches against, before the pi process starts. Keys are paths relative to
-// that directory and values are the file contents.
-//
-// Every file, settings.json included, is written verbatim: the adapter authors
-// no settings.json of its own and merges nothing into a seeded one. The only
-// special handling for settings.json is a parse check that fails the seed
-// closed, because pi records a load error for unparsable settings and then
-// silently runs its own defaults.
-//
-// The directory written to is per session unless ordinary mode has a durable
-// Home. With WithHome in ordinary mode, every session launches against that one
-// shared directory and the seed is written there, so a seeded file is
-// agent-scoped operator configuration rather than per-session state.
-//
-// Paths are confined to the agent directory: absolute paths, ".." escapes, and
-// empty keys fail closed at session start.
+// WithSeedFiles registers files written into pi's config root before each
+// launch. Keys are paths relative to that root; values are the contents.
 func WithSeedFiles(files map[string]string) Option {
-	return func(options *Options) {
-		options.SeedFiles = cloneStringMap(files)
-	}
+	return func(options *Options) { options.SeedFiles = cloneStringMap(files) }
 }
 
 func cloneStringMap(values map[string]string) map[string]string {
@@ -344,8 +259,5 @@ func cloneStringMap(values map[string]string) map[string]string {
 		return nil
 	}
 
-	cloned := make(map[string]string, len(values))
-	maps.Copy(cloned, values)
-
-	return cloned
+	return maps.Clone(values)
 }
