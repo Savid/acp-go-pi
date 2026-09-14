@@ -341,3 +341,11 @@ func TestClosedAgentRefusesRequests(t *testing.T) {
 	_, err := agent.NewSession(context.Background(), NewSessionRequest(t.TempDir()))
 	require.Equal(t, -32600, requestErrorCode(t, err))
 }
+
+func TestNegativeClientCallLimitReturnsOptionsError(t *testing.T) {
+	t.Parallel()
+	agent := NewAgent(WithConcurrencyLimits(ConcurrencyLimits{MaxConcurrentClientCalls: -1}))
+	defer agent.Close()
+	_, err := agent.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.Equal(t, "pi_invalid_options", requestErrorData(t, err)["error"])
+}

@@ -115,7 +115,7 @@ func NewAgent(opts ...Option) *Agent {
 		store:            store,
 		sessions:         make(map[acp.SessionId]*session),
 		deleted:          make(map[acp.SessionId]struct{}),
-		clientCalls:      make(chan struct{}, options.ConcurrencyLimits.MaxConcurrentClientCalls),
+		clientCalls:      make(chan struct{}, max(0, options.ConcurrencyLimits.MaxConcurrentClientCalls)),
 		positionEncoding: acp.PositionEncodingKindUtf16,
 	}
 	agent.optionErr = agent.validateOptions()
