@@ -80,6 +80,10 @@ func (a *Agent) newSession(start sessionStart) *session {
 	env, _ := a.environment(s.options.Env, nil).Build()
 	s.agentDir = pi.AgentDir(a.options.Home, func(key string) (string, bool) { return process.Lookup(env, key) })
 
+	if !filepath.IsAbs(s.agentDir) {
+		s.agentDir = filepath.Join(s.cwd, s.agentDir)
+	}
+
 	return s
 }
 

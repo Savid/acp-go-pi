@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -339,7 +340,12 @@ func (s *session) configureRuntime(ctx context.Context, rt *runtime, model strin
 
 	s.mu.Lock()
 	s.id = acp.SessionId(state.SessionID)
+
 	s.sessionFile = state.SessionFile
+	if !filepath.IsAbs(s.sessionFile) {
+		s.sessionFile = filepath.Join(s.cwd, s.sessionFile)
+	}
+
 	s.thinkingLevel = state.ThinkingLevel
 	s.model = selected
 	s.contextWindow = contextWindow

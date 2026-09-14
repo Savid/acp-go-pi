@@ -314,3 +314,21 @@ func TestMirrorFailureFencesTurnAndAllowsRetry(t *testing.T) {
 	types = eventTypes(lifecycleEvents(h.rec.snapshot()))
 	require.Equal(t, []string{"lifecycle_snapshot", "prompt_accepted", "state_update:running", "lifecycle_snapshot", "prompt_accepted", "state_update:running", "state_update:idle"}, types)
 }
+
+func TestRelativeNativeHomeUsesSessionCwd(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	h := newHarness(t, WithHome(""), WithSessionStore(store), WithEnv(map[string]string{fakePiEnv: "1", pi.EnvAgentDir: "native-home"}))
+	h.initialize()
+	session := h.newSession()
+	_, err := h.prompt(session.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+	rows, err := store.Load(t.Context(), acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: "config"})
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	var record sessionRecord
+	require.NoError(t, json.Unmarshal(rows[0], &record))
+	require.True(t, filepath.IsAbs(record.SessionFile))
+	require.Contains(t, record.SessionFile, filepath.Join(record.Cwd, "native-home"))
+	require.FileExists(t, record.SessionFile)
+}

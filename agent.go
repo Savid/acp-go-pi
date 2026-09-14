@@ -225,6 +225,7 @@ func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Optio
 	conn := acp.NewAgentSideConnection(agent, transport.Writer(), transport.Reader())
 	conn.SetLogger(agent.log)
 	agent.attach(conn, transport)
+	transport.Start()
 
 	select {
 	case <-ctx.Done():
