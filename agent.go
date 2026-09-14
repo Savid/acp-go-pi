@@ -65,6 +65,7 @@ type Agent struct {
 	// lifecycle is the answer this connection gave at initialize. An absent
 	// answer leaves the extension dormant for every session on it.
 	lifecycle    lifecycle.Negotiated
+	restores     wire.SessionRequests
 	sessions     map[acp.SessionId]*session
 	deleted      map[acp.SessionId]struct{}
 	clientCalls  chan struct{}

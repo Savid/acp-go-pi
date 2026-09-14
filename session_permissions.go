@@ -38,7 +38,7 @@ func (s *session) handleUIRequest(rt *runtime, request pi.UIRequest) {
 		return
 	}
 
-	go s.handleDialog(rt, request)
+	s.handleDialog(rt, request)
 }
 
 // handleDialog answers one blocking dialog. A select whose title carries the
@@ -48,6 +48,7 @@ func (s *session) handleDialog(rt *runtime, request pi.UIRequest) {
 	var c *cycle
 
 	s.mu.Lock()
+	t := s.turn
 
 	switch {
 	case s.turn != nil:
@@ -60,31 +61,44 @@ func (s *session) handleDialog(rt *runtime, request pi.UIRequest) {
 	s.mu.Unlock()
 
 	ctx, cancel := context.WithCancelCause(context.Background())
-	defer cancel(nil)
-
 	unregister := s.registerDialog(request.ID, cancel)
-	defer unregister()
 
-	if c == nil || closing {
+	if c == nil || closing || ctx.Err() != nil {
+		cancel(nil)
+		unregister()
 		s.respond(rt, pi.UICancelResponse(request.ID))
 
 		return
 	}
 
+	if t != nil {
+		s.acceptTurn(ctx, t)
+	}
+
 	if strings.HasPrefix(request.Title, pi.PermissionTitleMarker) {
 		prompt, ok := pi.ParsePermissionTitle(request.Title)
-		if request.Method != uiMethodSelect || !ok {
+		if request.Method != uiMethodSelect || !ok || s.publishPendingTool(ctx, &c.state, prompt) != nil {
+			cancel(nil)
+			unregister()
 			s.respond(rt, pi.UICancelResponse(request.ID))
 
 			return
 		}
-
-		s.respond(rt, s.permissionDialog(ctx, c, request, prompt))
-
-		return
 	}
 
-	s.respond(rt, s.elicitationDialog(ctx, c, request))
+	go func() {
+		defer cancel(nil)
+		defer unregister()
+
+		if strings.HasPrefix(request.Title, pi.PermissionTitleMarker) {
+			prompt, _ := pi.ParsePermissionTitle(request.Title)
+			s.respond(rt, s.permissionDialog(ctx, c, request, prompt))
+
+			return
+		}
+
+		s.respond(rt, s.elicitationDialog(ctx, c, request))
+	}()
 }
 
 func (s *session) respond(rt *runtime, response pi.UIResponse) {
@@ -113,10 +127,6 @@ func (s *session) permissionDialog(ctx context.Context, c *cycle, request pi.UIR
 func (s *session) requestPermission(ctx context.Context, c *cycle, prompt pi.PermissionPrompt) acp.PermissionOptionId {
 	conn := s.agent.connection()
 	if conn == nil {
-		return permissionOptionDeny
-	}
-
-	if err := s.publishPendingTool(ctx, &c.state, prompt); err != nil {
 		return permissionOptionDeny
 	}
 

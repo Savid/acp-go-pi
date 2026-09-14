@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -191,6 +192,10 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 	if err := s.commitMirror(ctx); err != nil {
 		a.log.ErrorContext(ctx, "initial mirror commit failed",
 			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
+		_ = s.close(context.WithoutCancel(ctx))
+		a.detach(ctx, s)
+
+		return acp.NewSessionResponse{}, wire.InternalFailure(vendor, "")
 	}
 
 	if err := a.scheduleOpen(ctx, s); err != nil {
@@ -246,6 +251,12 @@ func (a *Agent) restore(
 		return nil, nil, err
 	}
 
+	releaseRestore, err := a.restores.Acquire(sessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer releaseRestore()
+
 	a.mu.Lock()
 	deleted := isDeleted(a.deleted, sessionID)
 	active := a.sessions[sessionID]
@@ -256,11 +267,20 @@ func (a *Agent) restore(
 	}
 
 	if active != nil {
-		if sameCarrier(active, start) {
-			return a.restoreActive(ctx, active, replay)
+		release, gateErr := active.acquireGate(limitSessionRestore)
+		if gateErr != nil {
+			return nil, nil, gateErr
 		}
 
-		if closeErr := active.close(ctx); closeErr != nil {
+		if sameCarrier(active, start) {
+			return a.restoreActive(ctx, active, replay, release)
+		}
+
+		closeErr := active.close(ctx)
+
+		release()
+
+		if closeErr != nil {
 			return nil, nil, wire.RestoreFailed(vendor)
 		}
 
@@ -277,6 +297,9 @@ func (a *Agent) restore(
 	}
 
 	start.meta.options = inheritCarrier(start.meta, stored.record)
+	if start.additionalDirectories == nil {
+		start.additionalDirectories = slices.Clone(stored.record.AdditionalDirectories)
+	}
 
 	s := a.newSession(start)
 	s.id = sessionID
@@ -306,6 +329,13 @@ func (a *Agent) restore(
 		return nil, nil, err
 	}
 
+	if err := s.commitMirror(ctx); err != nil {
+		_ = s.close(context.WithoutCancel(ctx))
+		a.detach(ctx, s)
+
+		return nil, nil, a.restoreRefused(ctx, sessionID, err)
+	}
+
 	if replay {
 		if err := s.replay(ctx, rows); err != nil {
 			_ = s.close(context.WithoutCancel(ctx))
@@ -326,13 +356,10 @@ func (a *Agent) restore(
 
 // restoreActive answers a load or resume from a session that is already
 // live, holding its foreground for the replay.
-func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool) (*session, func(), error) {
+func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool, release func()) (*session, func(), error) {
 	if err := s.admissionError(); err != nil {
-		return nil, nil, err
-	}
+		release()
 
-	release, err := s.acquireGate(limitSessionRestore)
-	if err != nil {
 		return nil, nil, err
 	}
 
@@ -359,29 +386,19 @@ func (a *Agent) restoreActive(ctx context.Context, s *session, replay bool) (*se
 // sameCarrier reports whether a restore names the configuration the live
 // session already runs under. A field the request omits inherits.
 func sameCarrier(s *session, start sessionStart) bool {
-	if s.cwd != start.cwd {
+	record := s.record()
+	if record.Cwd != start.cwd {
 		return false
 	}
 
-	if start.meta.presentEnv && !mapsEqual(s.options.Env, start.meta.options.Env) {
+	if start.additionalDirectories != nil && !slices.Equal(record.AdditionalDirectories, start.additionalDirectories) {
 		return false
 	}
 
-	return !start.meta.presentExtraPathDirs || slices.Equal(s.options.ExtraPathDirs, start.meta.options.ExtraPathDirs)
-}
+	current := inheritCarrier(sessionMeta{}, record)
+	requested := inheritCarrier(start.meta, record)
 
-func mapsEqual(left, right map[string]string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-
-	for key, value := range left {
-		if other, ok := right[key]; !ok || other != value {
-			return false
-		}
-	}
-
-	return true
+	return reflect.DeepEqual(current.Meta(), requested.Meta())
 }
 
 // inheritCarrier fills the fields a restore omitted from the stored record.
@@ -408,7 +425,9 @@ func inheritCarrier(meta sessionMeta, record sessionRecord) PiOptions {
 		options.ThinkingLevel = record.ThinkingLevel
 	}
 
-	options.AutoRetry = options.AutoRetry || record.AutoRetry
+	if !options.autoRetrySet {
+		options.AutoRetry = record.AutoRetry
+	}
 
 	return options
 }

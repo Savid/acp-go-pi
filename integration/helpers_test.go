@@ -170,13 +170,17 @@ type harness struct {
 	conn *acp.ClientSideConnection
 	rec  *recorder
 	home string
+	stop func()
 }
 
 func newHarness(t *testing.T, live bool, extra ...piacp.Option) *harness {
 	t.Helper()
+	return newHarnessAt(t, live, isolatedHome(t), extra...)
+}
 
+func newHarnessAt(t *testing.T, live bool, home string, extra ...piacp.Option) *harness {
+	t.Helper()
 	pi := harnessPath(t, live)
-	home := isolatedHome(t)
 	rec := &recorder{}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -221,13 +225,14 @@ func newHarness(t *testing.T, live bool, extra ...piacp.Option) *harness {
 	conn := acp.NewClientSideConnection(rec, clientWriter, clientReader)
 	conn.SetLogger(slog.New(slog.DiscardHandler))
 
-	t.Cleanup(func() {
+	stop := sync.OnceFunc(func() {
 		cancel()
 		_ = clientWriter.Close()
 		wait()
 	})
+	t.Cleanup(stop)
 
-	return &harness{conn: conn, rec: rec, home: home}
+	return &harness{conn: conn, rec: rec, home: home, stop: stop}
 }
 
 func (h *harness) ctx(t *testing.T) context.Context {

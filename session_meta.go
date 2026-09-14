@@ -45,7 +45,8 @@ type PiOptions struct {
 	Permission string `json:"permission,omitempty"`
 	// AutoRetry opts the session in to pi's native retry of transient
 	// provider errors.
-	AutoRetry bool `json:"autoRetry,omitempty"`
+	AutoRetry    bool `json:"autoRetry,omitempty"`
+	autoRetrySet bool
 }
 
 // PiOption configures PiOptions values.
@@ -100,10 +101,10 @@ func WithPiPermission(mode string) PiOption {
 
 // WithPiAutoRetry opts the session in to pi's native automatic retry.
 func WithPiAutoRetry(enabled bool) PiOption {
-	return func(options *PiOptions) { options.AutoRetry = enabled }
+	return func(options *PiOptions) { options.AutoRetry = enabled; options.autoRetrySet = true }
 }
 
-// Meta returns exactly {"pi": {"options": {...}}} with the non-zero fields.
+// Meta returns exactly {"pi": {"options": {...}}}, including an explicit false autoRetry.
 func (options PiOptions) Meta() map[string]any {
 	values := map[string]any{}
 
@@ -131,8 +132,8 @@ func (options PiOptions) Meta() map[string]any {
 		values[metaPermissionKey] = options.Permission
 	}
 
-	if options.AutoRetry {
-		values[metaAutoRetryKey] = true
+	if options.AutoRetry || options.autoRetrySet {
+		values[metaAutoRetryKey] = options.AutoRetry
 	}
 
 	return map[string]any{vendor: map[string]any{metaOptionsKey: values}}
@@ -288,6 +289,7 @@ func parsePiOptions(values map[string]any) (PiOptions, *acp.RequestError) {
 			}
 
 			options.AutoRetry = enabled
+			options.autoRetrySet = true
 		default:
 			return PiOptions{}, wire.Unsupported(metaOptionPath(key))
 		}

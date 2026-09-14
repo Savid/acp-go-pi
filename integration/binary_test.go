@@ -4,10 +4,12 @@ package integration
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
+	acpcore "github.com/savid/acp-go-core"
 	"github.com/stretchr/testify/require"
 
 	piacp "github.com/savid/acp-go-pi"
@@ -86,4 +88,48 @@ func TestLivePromptResumeAndPath(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 	require.Contains(t, h.rec.text(), "RESUME_OK")
+}
+
+func TestNativeContinuation(t *testing.T) {
+	requireLive(t)
+	store := acpcore.NewInMemorySessionStore()
+	h := newHarness(t, true, piacp.WithSessionStore(store))
+	ctx := h.ctx(t)
+	_, err := h.conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	cwd := t.TempDir()
+	session, err := h.conn.NewSession(ctx, piacp.NewSessionRequest(cwd, liveModel()))
+	require.NoError(t, err)
+	response, err := h.conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "Remember that the project slug is apricot-orbit. Reply with exactly apricot-orbit. Do not use tools."))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+	require.Contains(t, h.rec.text(), "apricot-orbit")
+	_, err = h.conn.CloseSession(ctx, acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+	h.stop()
+	args := []string{"--print", "--session", string(session.SessionId)}
+	if model := os.Getenv(envModel); model != "" {
+		args = append(args, "--model", model)
+	}
+	args = append(args, "Remember that the release label is cobalt-lantern. Reply with the project slug and release label, and nothing else. Do not use tools.")
+	command := exec.CommandContext(ctx, harnessPath(t, true), args...)
+	command.Dir = cwd
+	command.Env = append(os.Environ(), "PI_CODING_AGENT_DIR="+h.home)
+	output, err := command.Output()
+	require.NoError(t, err, "native continuation")
+	require.Contains(t, string(output), "apricot-orbit")
+	require.Contains(t, string(output), "cobalt-lantern")
+	resumed := newHarnessAt(t, true, h.home, piacp.WithSessionStore(store))
+	_, err = resumed.conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	_, err = resumed.conn.LoadSession(ctx, piacp.LoadSessionRequest(session.SessionId, cwd, liveModel()))
+	require.NoError(t, err)
+	require.Contains(t, resumed.rec.text(), "apricot-orbit")
+	require.Contains(t, resumed.rec.text(), "cobalt-lantern")
+	before := len(resumed.rec.text())
+	response, err = resumed.conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, "What project slug and release label did we choose? Reply with both and nothing else. Do not use tools."))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+	require.Contains(t, resumed.rec.text()[before:], "apricot-orbit")
+	require.Contains(t, resumed.rec.text()[before:], "cobalt-lantern")
 }
