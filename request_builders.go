@@ -1,7 +1,6 @@
 package piacp
 
 import (
-	"errors"
 	"slices"
 
 	"github.com/coder/acp-go-sdk"
@@ -195,8 +194,4 @@ func rejectReservedMeta(builder string, meta map[string]any) {
 	if err := wire.CheckReservedMeta(meta); err != nil {
 		panic(builder + ": " + err.Error())
 	}
-}
-
-func errorsAs[T any](err error, target *T) bool {
-	return errors.As(err, target)
 }

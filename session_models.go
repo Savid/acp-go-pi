@@ -185,6 +185,10 @@ func (s *session) setConfigOption(ctx context.Context, configID acp.SessionConfi
 		s.mu.Unlock()
 	}
 
+	if err := s.commitMirror(ctx); err != nil {
+		return nil, wire.InternalFailure(vendor, "")
+	}
+
 	options := s.configOptions()
 
 	_ = s.emit(ctx, acp.SessionUpdate{ConfigOptionUpdate: &acp.SessionConfigOptionUpdate{ConfigOptions: options}})

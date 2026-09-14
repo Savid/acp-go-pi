@@ -18,9 +18,9 @@ import (
 	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/image"
 	"github.com/savid/acp-go-core/lifecycle"
+	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/process"
 	"github.com/savid/acp-go-core/wire"
-	"github.com/savid/acp-go-pi/internal/observer"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -58,7 +58,7 @@ type Agent struct {
 
 	mu                 sync.Mutex
 	conn               client
-	transport          *transport
+	transport          *wire.Transport
 	closed             bool
 	clientCapabilities acp.ClientCapabilities
 	positionEncoding   acp.PositionEncodingKind
@@ -105,6 +105,7 @@ func NewAgent(opts ...Option) *Agent {
 		options: options,
 		log:     log,
 		observe: observer.New(observer.Config{
+			Vendor: vendor, NativeClient: "pi-coding-agent",
 			MeterProvider:  options.MeterProvider,
 			Propagator:     options.TextMapPropagator,
 			TracerProvider: options.TracerProvider,
@@ -220,8 +221,8 @@ func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Optio
 		}
 	}()
 
-	transport := newTransport(input, output)
-	conn := acp.NewAgentSideConnection(agent, transport.writer(), transport.reader())
+	transport := wire.NewTransport(input, output)
+	conn := acp.NewAgentSideConnection(agent, transport.Writer(), transport.Reader())
 	conn.SetLogger(agent.log)
 	agent.attach(conn, transport)
 
@@ -234,7 +235,7 @@ func Serve(ctx context.Context, input io.Reader, output io.Writer, opts ...Optio
 }
 
 // attach binds the host connection the sessions emit through.
-func (a *Agent) attach(conn client, transport *transport) {
+func (a *Agent) attach(conn client, transport *wire.Transport) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -312,7 +313,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 
 	meta := params.Meta
 	if t := a.transportRef(); t != nil {
-		meta = lifecycle.RetainRequestMetadata(meta, t.takeRaw(rawKeyInitialize))
+		meta = lifecycle.RetainRequestMetadata(meta, t.TakeRaw(acp.AgentMethodInitialize))
 	}
 
 	offer, present, paramErr := lifecycle.DecodeOffer(meta)
@@ -436,7 +437,7 @@ func (a *Agent) HandleExtensionMethod(_ context.Context, method string, params j
 	return nil, acp.NewMethodNotFound(method)
 }
 
-func (a *Agent) transportRef() *transport {
+func (a *Agent) transportRef() *wire.Transport {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 

@@ -10,7 +10,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-core/lifecycle"
-	"github.com/savid/acp-go-pi/internal/observer"
+	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -245,7 +245,7 @@ func announcedRequest[T any](
 
 	var written <-chan struct{}
 	if t := s.agent.transportRef(); t != nil {
-		written = t.awaitRequestWrite(actionID)
+		written = t.AwaitRequestWrite(actionID)
 	}
 
 	go func() {

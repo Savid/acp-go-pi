@@ -84,6 +84,8 @@ plus any `WithConfiguredModels` entries) and `thought_level` (`off`,
 the adapter's session record under `config`, format `pi-session-jsonl-v1`.
 `session/load` and `session/resume` prefer pi's own file when it exists and
 materialize it from the store otherwise.
+Native rows and session configuration commit as one store generation. A
+configuration change is durable even when no native rows were added.
 
 ## Development
 

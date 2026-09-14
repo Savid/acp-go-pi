@@ -55,7 +55,6 @@ type session struct {
 
 	mu            sync.Mutex
 	runtime       *runtime
-	epoch         uint64
 	mirrored      int
 	model         string
 	contextWindow int64
@@ -72,13 +71,13 @@ type session struct {
 	cycle         *cycle
 	dialogs       map[string]*dialog
 
-	lcMu sync.Mutex
-	lc   lifecycleState
+	mirrorMu sync.Mutex
+	lcMu     sync.Mutex
+	lc       lifecycleState
 }
 
 // runtime is one pi process generation.
 type runtime struct {
-	epoch  uint64
 	proc   *process.Process
 	client *pi.Client
 	stderr *stderrTail
@@ -183,9 +182,9 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 	}
 
 	if seedErr := pi.WriteSeedFiles(s.agentDir, s.agent.options.SeedFiles); seedErr != nil {
-		var refused *pi.SeedFileError
+		var refused *process.SeedFileError
 		if errors.As(seedErr, &refused) {
-			return nil, wire.Unsupported("seedFiles." + refused.Name)
+			return nil, wire.Unsupported("seedFiles")
 		}
 
 		return nil, s.startFailure(ctx, seedErr)
@@ -220,9 +219,8 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 	}
 
 	s.mu.Lock()
-	s.epoch++
 
-	rt := &runtime{epoch: s.epoch, proc: proc, client: client, stderr: tail, cancel: cancelRead, done: make(chan struct{})}
+	rt := &runtime{proc: proc, client: client, stderr: tail, cancel: cancelRead, done: make(chan struct{})}
 	s.runtime = rt
 	s.mu.Unlock()
 
@@ -456,6 +454,8 @@ func (s *session) handleEvent(ctx context.Context, rt *runtime, event pi.Event) 
 
 		if settled {
 			t.settle(turnSettled)
+
+			s.finishDelivery(ctx, rt, t)
 		}
 	case c != nil:
 		settled, err := s.projectEvent(ctx, rt, c, event)
@@ -518,6 +518,7 @@ func (s *session) settleAgentCycle(ctx context.Context, c *cycle) {
 	s.emitUsage(settleCtx, &c.state, nil)
 
 	if err := s.commitMirror(settleCtx); err != nil {
+		s.lcFence()
 		s.agent.log.ErrorContext(settleCtx, "mirror commit after agent-origin cycle failed",
 			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 	}
@@ -796,4 +797,51 @@ func (s *session) close(ctx context.Context) error {
 	s.mu.Unlock()
 
 	return s.closeErr
+}
+
+// nativeRecord preserves event and dialog order while a completed foreground
+// turn commits its mirror and reads its final statistics.
+type nativeRecord struct {
+	event   pi.Event
+	request *pi.UIRequest
+}
+
+func (s *session) finishDelivery(ctx context.Context, rt *runtime, t *turn) {
+	events := rt.client.Events()
+	requests := rt.client.UIRequests()
+
+	var pending []nativeRecord
+
+	for {
+		select {
+		case <-t.finished:
+			for _, record := range pending {
+				if record.request != nil {
+					s.handleUIRequest(rt, *record.request)
+				} else {
+					s.handleEvent(ctx, rt, record.event)
+				}
+			}
+
+			return
+		case <-rt.proc.Done():
+			return
+		case event, ok := <-events:
+			if !ok {
+				events = nil
+
+				continue
+			}
+
+			pending = append(pending, nativeRecord{event: event})
+		case request, ok := <-requests:
+			if !ok {
+				requests = nil
+
+				continue
+			}
+
+			pending = append(pending, nativeRecord{request: &request})
+		}
+	}
 }

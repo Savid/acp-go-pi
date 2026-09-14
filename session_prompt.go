@@ -383,7 +383,9 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 			s.emitSessionInfo(settleCtx, params.Prompt)
 		}
 
-		if err := s.commitMirror(settleCtx); err != nil && verdict.failure == nil {
+		if err := s.commitMirror(settleCtx); err != nil {
+			s.stopRuntime(settleCtx, rt)
+			s.lcFence()
 			verdict.failure = s.mirrorFailure(&t.state, err)
 			verdict.outcome = lifecycle.OutcomeFailed
 		}

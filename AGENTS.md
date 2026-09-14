@@ -11,14 +11,12 @@ started over ACP can be continued natively with `pi --resume` afterwards.
 
 - `cmd/acp-go-pi`: stdio entrypoint, OpenTelemetry setup, signals, flags.
 - Root `agent*.go`, `options.go`, `request_builders.go`: the public ACP
-  surface, option validation, and the transport wrapper that orders session
-  publication behind the establishing response.
+  surface and option validation; the shared ACP transport orders publication.
 - Root `session*.go`, `image_output.go`: one session's process, event pump,
   prompt turns, permissions and elicitation, lifecycle stream, store mirror,
   replay, config options, and image output.
 - `internal/pi`: pi's JSONL RPC codec and client, launch arguments, the
   embedded extensions in `ext/`, seed files, and pi's session-file layout.
-- `internal/observer`: OpenTelemetry spans and metrics.
 - `integration`: gated tests against the installed pi.
 - `examples`: runnable ACP clients.
 

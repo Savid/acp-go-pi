@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 
@@ -312,7 +313,7 @@ func validatePiOptions(options PiOptions) *acp.RequestError {
 
 	if err := process.ValidateNames(options.Env); err != nil {
 		var nameErr *process.NameError
-		if errorsAs(err, &nameErr) {
+		if errors.As(err, &nameErr) {
 			return wire.Unsupported(metaOptionPath(metaEnvKey) + "." + nameErr.Key)
 		}
 
@@ -321,7 +322,7 @@ func validatePiOptions(options PiOptions) *acp.RequestError {
 
 	if err := process.ValidateExtraPathDirs(options.ExtraPathDirs); err != nil {
 		var dirErr *process.PathDirError
-		if errorsAs(err, &dirErr) {
+		if errors.As(err, &dirErr) {
 			return wire.Unsupported(fmt.Sprintf("%s[%d]", metaOptionPath(metaExtraPathDirsKey), dirErr.Index))
 		}
 

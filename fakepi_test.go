@@ -355,7 +355,6 @@ func (f *fakePi) runTurn(message string, imageCount int, abort <-chan struct{}, 
 	f.run(message, imageCount, abort)
 
 	if strings.HasPrefix(message, "AGENTWORK") {
-		time.Sleep(50 * time.Millisecond)
 		f.run("HELLO background", 0, make(chan struct{}))
 	}
 }

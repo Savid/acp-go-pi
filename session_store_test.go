@@ -3,24 +3,19 @@ package piacp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
 	acpcore "github.com/savid/acp-go-core"
-	"github.com/savid/acp-go-core/storetest"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
-
-func TestInMemoryStoreContract(t *testing.T) {
-	t.Parallel()
-
-	storetest.Run(t, func(*testing.T) acpcore.SessionStore { return acpcore.NewInMemorySessionStore() })
-}
 
 func TestMirrorCommitsRowsAndRecord(t *testing.T) {
 	t.Parallel()
@@ -222,7 +217,7 @@ func TestHydrateDisagreementFailsRestore(t *testing.T) {
 	require.Equal(t, "pi_restore_failed", requestErrorData(t, err)["error"])
 }
 
-func TestStoredTitleAndCwd(t *testing.T) {
+func TestStoredTitle(t *testing.T) {
 	t.Parallel()
 
 	rows := [][]byte{
@@ -233,8 +228,6 @@ func TestStoredTitleAndCwd(t *testing.T) {
 
 	require.Equal(t, "ask me", storedTitle("abc", rows))
 	require.Equal(t, "abc", storedTitle("abc", rows[:2]))
-	require.Equal(t, "/work", storedCwd(rows))
-	require.Equal(t, "", storedCwd(nil))
 }
 
 func TestLoadUnknownSession(t *testing.T) {
@@ -245,4 +238,79 @@ func TestLoadUnknownSession(t *testing.T) {
 
 	_, err := h.conn.LoadSession(h.ctx(), LoadSessionRequest("00000000-0000-4000-8000-000000000000", t.TempDir()))
 	require.Equal(t, "unknown session", requestErrorData(t, err)["error"])
+}
+
+func TestConfigurationCommitsWithoutNewNativeRows(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	session := h.newSession()
+	_, err := h.prompt(session.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+	before, err := store.Load(t.Context(), acpcore.SessionKey{SessionID: string(session.SessionId)})
+	require.NoError(t, err)
+	_, err = h.conn.SetSessionConfigOption(h.ctx(), SetModelRequest(session.SessionId, "fake/text-only"))
+	require.NoError(t, err)
+	records, err := store.Load(t.Context(), acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: configSubpath})
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	var record sessionRecord
+	require.NoError(t, json.Unmarshal(records[0], &record))
+	require.Equal(t, "fake/text-only", record.Model)
+	after, err := store.Load(t.Context(), acpcore.SessionKey{SessionID: string(session.SessionId)})
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(after), len(before))
+}
+
+func TestMalformedStoreRecordFailsRestore(t *testing.T) {
+	t.Parallel()
+	store := acpcore.NewInMemorySessionStore()
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	session := h.newSession()
+	_, err := h.prompt(session.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+	rows, err := store.Load(t.Context(), acpcore.SessionKey{SessionID: string(session.SessionId)})
+	require.NoError(t, err)
+	main := acpcore.SessionKey{SessionID: string(session.SessionId)}
+	require.NoError(t, store.Replace(t.Context(), main, []acpcore.SessionStoreReplacement{
+		{Key: main, Entries: rows},
+		{Key: acpcore.SessionKey{SessionID: main.SessionID, Subpath: configSubpath}, Entries: []acpcore.SessionStoreEntry{[]byte(`{"sessionId":"wrong"}`)}},
+	}))
+	_, err = h.conn.LoadSession(h.ctx(), LoadSessionRequest(session.SessionId, t.TempDir()))
+	require.Equal(t, "pi_restore_failed", requestErrorData(t, err)["error"])
+}
+
+type mirrorFaultStore struct {
+	acpcore.SessionStore
+	fail atomic.Bool
+}
+
+func (s *mirrorFaultStore) Replace(ctx context.Context, key acpcore.SessionKey, replacements []acpcore.SessionStoreReplacement) error {
+	if s.fail.Load() {
+		return errors.New("mirror unavailable")
+	}
+
+	return s.SessionStore.Replace(ctx, key, replacements)
+}
+
+func TestMirrorFailureFencesTurnAndAllowsRetry(t *testing.T) {
+	t.Parallel()
+	store := &mirrorFaultStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize(withLifecycle())
+	session := h.newSession()
+	store.fail.Store(true)
+	_, err := h.prompt(session.SessionId, "HELLO", promptMeta(1))
+	require.Equal(t, "pi_turn_failed", requestErrorData(t, err)["error"])
+	types := eventTypes(lifecycleEvents(h.rec.snapshot()))
+	require.Equal(t, []string{"lifecycle_snapshot", "prompt_accepted", "state_update:running"}, types)
+	store.fail.Store(false)
+	_, err = h.prompt(session.SessionId, "HELLO", promptMeta(2))
+	require.NoError(t, err)
+	types = eventTypes(lifecycleEvents(h.rec.snapshot()))
+	require.Equal(t, []string{"lifecycle_snapshot", "prompt_accepted", "state_update:running", "lifecycle_snapshot", "prompt_accepted", "state_update:running", "state_update:idle"}, types)
 }

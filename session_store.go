@@ -1,26 +1,26 @@
 package piacp
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
 
-	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/process"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
-// configSubpath holds the adapter's session records. Each mirror commit
-// appends one; the last row is current.
-const configSubpath = "config"
+// configSubpath holds the current session configuration.
+const configSubpath = sessionlog.ConfigSubpath
 
 // sessionRecord is the adapter-owned state a session needs to resume: where
 // pi keeps the native file and the configuration the session was established
@@ -58,10 +58,12 @@ func (s *session) record() sessionRecord {
 	}
 }
 
-// commitMirror appends the native session file's new rows to the store, then
-// the current session record. pi creates the file lazily, so a session that
-// produced nothing yet leaves nothing to mirror.
+// commitMirror publishes the native rows and current session configuration
+// as one durable generation.
 func (s *session) commitMirror(ctx context.Context) error {
+	s.mirrorMu.Lock()
+	defer s.mirrorMu.Unlock()
+
 	s.mu.Lock()
 	path := s.sessionFile
 	mirrored := s.mirrored
@@ -73,41 +75,28 @@ func (s *session) commitMirror(ctx context.Context) error {
 
 	rows, err := pi.ReadRows(path)
 	if err != nil {
-		return fmt.Errorf("read native session file: %w", err)
+		return fmt.Errorf("read native session: %w", err)
 	}
 
-	if len(rows) <= mirrored {
+	if len(rows) < mirrored {
+		return fmt.Errorf("native log shrank from %d to %d rows", mirrored, len(rows))
+	}
+
+	if len(rows) == 0 {
 		return nil
 	}
 
-	entries := make([]acpcore.SessionStoreEntry, 0, len(rows)-mirrored)
-	for _, row := range rows[mirrored:] {
-		entries = append(entries, acpcore.SessionStoreEntry(row))
-	}
-
-	store := s.agent.store
-	key := acpcore.SessionKey{SessionID: string(s.id)}
-
-	appendCtx, finish := s.agent.observe.StartSessionStore(ctx, "append")
-	err = store.Append(appendCtx, key, entries)
+	commitCtx, finish := s.agent.observe.StartSessionStore(ctx, "replace")
+	err = sessionlog.Commit(commitCtx, s.agent.store, string(s.id), rows, s.record())
 	finish(err)
 
 	if err != nil {
-		return fmt.Errorf("append session rows: %w", err)
+		return fmt.Errorf("commit session mirror: %w", err)
 	}
 
 	s.mu.Lock()
-	if len(rows) > s.mirrored {
-		s.mirrored = len(rows)
-	}
+	s.mirrored = len(rows)
 	s.mu.Unlock()
-
-	// The record cannot fail to marshal: it holds strings, bools, and an integer.
-	encoded, _ := json.Marshal(s.record())
-
-	if err := store.Append(ctx, acpcore.SessionKey{SessionID: string(s.id), Subpath: configSubpath}, []acpcore.SessionStoreEntry{encoded}); err != nil {
-		return fmt.Errorf("append session record: %w", err)
-	}
 
 	return nil
 }
@@ -119,51 +108,43 @@ type storedSession struct {
 	found  bool
 }
 
-// loadStored reads a session's rows and latest record. A session with no
-// committed rows is unknown.
+// loadStored reads the native rows and required current configuration.
 func (a *Agent) loadStored(ctx context.Context, sessionID acp.SessionId) (storedSession, error) {
 	loadCtx, cancel := context.WithTimeout(ctx, a.options.SessionStoreLoadTimeout)
 	defer cancel()
 
 	loadCtx, finish := a.observe.StartSessionStore(loadCtx, "load")
 
-	entries, err := a.store.Load(loadCtx, acpcore.SessionKey{SessionID: string(sessionID)})
-	if err == nil {
-		var records []acpcore.SessionStoreEntry
+	var record sessionRecord
 
-		records, err = a.store.Load(loadCtx, acpcore.SessionKey{SessionID: string(sessionID), Subpath: configSubpath})
-		if err == nil && len(records) > 0 {
-			var record sessionRecord
-			if decodeErr := json.Unmarshal(records[len(records)-1], &record); decodeErr == nil {
-				return storedSession{rows: storeRows(entries), record: record, found: len(entries) > 0}, finishLoad(finish, nil)
-			}
-		}
+	rows, err := sessionlog.Load(loadCtx, a.store, string(sessionID), &record)
+	if err == nil && len(rows) > 0 {
+		err = record.validate(string(sessionID))
 	}
 
 	finish(err)
 
 	if err != nil {
-		return storedSession{}, fmt.Errorf("load session store: %w", err)
+		return storedSession{}, a.restoreRefused(ctx, sessionID, err)
 	}
 
-	return storedSession{rows: storeRows(entries), found: len(entries) > 0}, nil
+	return storedSession{rows: rows, record: record, found: len(rows) > 0}, nil
 }
 
-func finishLoad(finish func(error), err error) error {
-	finish(err)
-
-	return err
-}
-
-func storeRows(entries []acpcore.SessionStoreEntry) [][]byte {
-	rows := make([][]byte, 0, len(entries))
-	for _, entry := range entries {
-		if trimmed := bytes.TrimSpace(entry); len(trimmed) > 0 {
-			rows = append(rows, trimmed)
-		}
+func (r sessionRecord) validate(sessionID string) error {
+	if r.SessionID != sessionID || !filepath.IsAbs(r.Cwd) || !filepath.IsAbs(r.SessionFile) || r.UpdatedAtUnixMilli <= 0 {
+		return fmt.Errorf("invalid session record identity or location")
 	}
 
-	return rows
+	if err := process.ValidateNames(r.Env); err != nil {
+		return err
+	}
+
+	if err := process.ValidateExtraPathDirs(r.ExtraPathDirs); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // hydrate reconciles the store with pi's own file before a load or resume. An
@@ -172,15 +153,18 @@ func storeRows(entries []acpcore.SessionStoreEntry) [][]byte {
 // disagreement at a shared position fails the restore. It returns the native
 // path and the rows the session now holds.
 func (a *Agent) hydrate(ctx context.Context, sessionID acp.SessionId, stored storedSession, cwd string, agentDir string) (string, [][]byte, error) {
+	header, ok := pi.ParseHeader(stored.rows[0])
+	if !ok || header.ID != string(sessionID) || filepath.Base(header.ID) != header.ID {
+		return "", nil, a.restoreRefused(ctx, sessionID, fmt.Errorf("invalid native session identity"))
+	}
+
+	stamp, err := time.Parse(time.RFC3339Nano, header.Timestamp)
+	if err != nil {
+		return "", nil, a.restoreRefused(ctx, sessionID, err)
+	}
+
 	path := stored.record.SessionFile
-	if path == "" || !fileExists(path) {
-		header, _ := pi.ParseHeader(stored.rows[0])
-
-		stamp, err := time.Parse(time.RFC3339Nano, header.Timestamp)
-		if err != nil {
-			stamp = time.Now()
-		}
-
+	if !fileExists(path) {
 		path = pi.SessionFile(agentDir, cwd, string(sessionID), stamp)
 	}
 
@@ -189,21 +173,13 @@ func (a *Agent) hydrate(ctx context.Context, sessionID acp.SessionId, stored sto
 		return "", nil, a.restoreRefused(ctx, sessionID, err)
 	}
 
-	shared := min(len(native), len(stored.rows))
-	for index := range shared {
-		if !bytes.Equal(native[index], stored.rows[index]) {
-			return "", nil, a.restoreRefused(ctx, sessionID, fmt.Errorf("native row %d disagrees with the store", index))
-		}
+	if _, err := sessionlog.Reconcile(native, stored.rows); err != nil {
+		return "", nil, a.restoreRefused(ctx, sessionID, err)
 	}
 
 	if len(native) >= len(stored.rows) {
 		if len(native) > len(stored.rows) {
-			entries := make([]acpcore.SessionStoreEntry, 0, len(native)-len(stored.rows))
-			for _, row := range native[len(stored.rows):] {
-				entries = append(entries, acpcore.SessionStoreEntry(row))
-			}
-
-			if err := a.store.Append(ctx, acpcore.SessionKey{SessionID: string(sessionID)}, entries); err != nil {
+			if err := sessionlog.Commit(ctx, a.store, string(sessionID), native, stored.record); err != nil {
 				return "", nil, a.restoreRefused(ctx, sessionID, err)
 			}
 		}
@@ -266,19 +242,6 @@ func storedTitle(sessionID string, rows [][]byte) string {
 	}
 
 	return sessionID
-}
-
-func storedCwd(rows [][]byte) string {
-	if len(rows) == 0 {
-		return ""
-	}
-
-	header, ok := pi.ParseHeader(rows[0])
-	if !ok {
-		return ""
-	}
-
-	return header.Cwd
 }
 
 func trimSpace(value string) string {
