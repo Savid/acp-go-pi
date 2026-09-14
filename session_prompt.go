@@ -363,12 +363,16 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
 	defer cancel()
 
+	s.mu.Lock()
+	cancelled, timedOut := t.cancelled, t.timedOut
+	s.mu.Unlock()
+
 	var verdict cycleVerdict
 
 	switch {
-	case t.cancelled:
+	case cancelled:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
-	case t.timedOut:
+	case timedOut:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: turnFailure(wire.CauseTimeout, fmt.Sprintf("pi turn exceeded %s", s.agent.options.TurnTimeout))}
 	case t.ended == turnTransportEnded:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: s.transportFailure(settleCtx, rt, nil)}
@@ -377,7 +381,7 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 	}
 
 	if t.ended == turnSettled {
-		if !t.cancelled {
+		if !cancelled {
 			stats := s.settledStats(settleCtx, rt)
 			s.emitUsage(settleCtx, &t.state, stats)
 			s.emitSessionInfo(settleCtx, params.Prompt)
