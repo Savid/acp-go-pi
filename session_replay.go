@@ -3,12 +3,55 @@ package piacp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-core/image"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
+
+// messageRow decodes one native row's message and its content blocks. ok is
+// false for a row that carries no message.
+func messageRow(row []byte) (pi.AgentMessage, []pi.ContentBlock, bool, error) {
+	var entry struct {
+		Type    string          `json:"type"`
+		Message json.RawMessage `json:"message"`
+	}
+
+	if err := json.Unmarshal(row, &entry); err != nil {
+		return pi.AgentMessage{}, nil, false, err
+	}
+
+	if entry.Type != rowTypeMessage {
+		return pi.AgentMessage{}, nil, false, nil
+	}
+
+	var message pi.AgentMessage
+	if err := json.Unmarshal(entry.Message, &message); err != nil {
+		return pi.AgentMessage{}, nil, false, err
+	}
+
+	blocks, err := message.ContentBlocks()
+	if err != nil {
+		return pi.AgentMessage{}, nil, false, fmt.Errorf("decode stored message content: %w", err)
+	}
+
+	return message, blocks, true, nil
+}
+
+// validateRows refuses a native log the adapter cannot decode. Restore runs it
+// before any row reaches pi's own session file, so the file an operator
+// continues outside ACP never gains a row this adapter could not read back.
+func validateRows(rows [][]byte) error {
+	for index, row := range rows {
+		if _, _, _, err := messageRow(row); err != nil {
+			return fmt.Errorf("invalid native row %d: %w", index, err)
+		}
+	}
+
+	return nil
+}
 
 // replay delivers mirrored native rows as session updates in append order.
 // Replay runs the same image validation as live emission; a stored artifact
@@ -17,21 +60,16 @@ func (s *session) replay(ctx context.Context, rows [][]byte) error {
 	limits := s.agent.options.ImageLimits.core()
 
 	for _, row := range rows {
-		var entry struct {
-			Type    string          `json:"type"`
-			Message json.RawMessage `json:"message"`
+		message, blocks, ok, err := messageRow(row)
+		if err != nil {
+			return s.agent.restoreRefused(ctx, s.id, err)
 		}
 
-		if json.Unmarshal(row, &entry) != nil || entry.Type != rowTypeMessage {
+		if !ok {
 			continue
 		}
 
-		var message pi.AgentMessage
-		if json.Unmarshal(entry.Message, &message) != nil {
-			continue
-		}
-
-		updates, failure := replayUpdates(message, limits)
+		updates, failure := replayUpdates(message, blocks, limits)
 		if failure != nil {
 			return s.agent.restoreRefused(ctx, s.id, failure)
 		}
@@ -44,12 +82,7 @@ func (s *session) replay(ctx context.Context, rows [][]byte) error {
 	return nil
 }
 
-func replayUpdates(message pi.AgentMessage, limits image.Limits) ([]acp.SessionUpdate, *image.OutputError) {
-	blocks, err := message.ContentBlocks()
-	if err != nil {
-		return nil, nil //nolint:nilerr // a row whose content does not decode replays nothing
-	}
-
+func replayUpdates(message pi.AgentMessage, blocks []pi.ContentBlock, limits image.Limits) ([]acp.SessionUpdate, *image.OutputError) {
 	switch message.Role {
 	case messageRoleUser:
 		updates := make([]acp.SessionUpdate, 0, len(blocks))
@@ -61,7 +94,12 @@ func replayUpdates(message pi.AgentMessage, limits image.Limits) ([]acp.SessionU
 			case block.Type == contentBlockTypeText && block.Text != "":
 				updates = append(updates, acp.UpdateUserMessageText(block.Text))
 			case block.Type == contentBlockTypeImage && block.Data != "":
-				updates = append(updates, acp.UpdateUserMessage(acp.ImageBlock(block.Data, block.MimeType)))
+				output, failure := image.DecodeOutput(block.Data, block.MimeType, limits.EffectiveOutputPerImage())
+				if failure != nil {
+					return nil, failure
+				}
+
+				updates = append(updates, acp.UpdateUserMessage(acp.ImageBlock(output.Data, output.MIME)))
 			}
 		}
 
@@ -115,13 +153,13 @@ func assistantReplayUpdates(message pi.AgentMessage, blocks []pi.ContentBlock, l
 				}})
 			}
 		case contentBlockTypeImage:
-			output, failure := decodeOutputImage(*block, limits.EffectiveOutputPerImage())
+			output, failure := image.DecodeOutput(block.Data, block.MimeType, limits.EffectiveOutputPerImage())
 			if failure != nil {
 				return nil, failure
 			}
 
 			updates = append(updates, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
-				Content: acp.ImageBlock(output.data, output.mime), MessageId: messageID,
+				Content: acp.ImageBlock(output.Data, output.MIME), MessageId: messageID,
 			}})
 		case contentBlockTypeToolCall:
 			opts := []acp.ToolCallStartOpt{

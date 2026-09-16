@@ -18,18 +18,11 @@ const (
 	EventTypeToolExecutionStart  = "tool_execution_start"
 	EventTypeToolExecutionUpdate = "tool_execution_update"
 	EventTypeToolExecutionEnd    = "tool_execution_end"
-	EventTypeQueueUpdate         = "queue_update"
-	EventTypeCompactionStart     = "compaction_start"
-	EventTypeCompactionEnd       = "compaction_end"
-	EventTypeAutoRetryStart      = "auto_retry_start"
-	EventTypeAutoRetryEnd        = "auto_retry_end"
 	EventTypeExtensionError      = "extension_error"
 )
 
 // Event is one decoded pi RPC agent event.
 type Event interface {
-	// Kind returns the native event type string.
-	Kind() string
 	// RawJSON returns the raw event line bytes.
 	RawJSON() json.RawMessage
 }
@@ -61,9 +54,6 @@ type UsageCost struct {
 	Total      float64 `json:"total"`
 }
 
-// ContentBlockTypeText is the content block type carrying plain text.
-const ContentBlockTypeText = "text"
-
 // ContentBlock is one message content block (text, thinking, toolCall, or
 // image).
 type ContentBlock struct {
@@ -79,20 +69,16 @@ type ContentBlock struct {
 
 // AgentMessage is one pi conversation message. Role selects which fields are
 // populated: assistant messages carry usage/stopReason/errorMessage, tool
-// result messages carry toolCallId/toolName/isError.
+// result messages carry toolCallId/isError.
 type AgentMessage struct {
 	ACPMessageID string          `json:"acpMessageId,omitempty"`
 	Role         string          `json:"role"`
 	Content      json.RawMessage `json:"content,omitempty"`
-	Provider     string          `json:"provider,omitempty"`
-	Model        string          `json:"model,omitempty"`
 	Usage        *Usage          `json:"usage,omitempty"`
 	StopReason   string          `json:"stopReason,omitempty"`
 	ErrorMessage string          `json:"errorMessage,omitempty"`
 	ToolCallID   string          `json:"toolCallId,omitempty"`
-	ToolName     string          `json:"toolName,omitempty"`
 	IsError      bool            `json:"isError,omitempty"`
-	Timestamp    int64           `json:"timestamp,omitempty"`
 }
 
 // ContentBlocks decodes the message content, which is either a plain string
@@ -104,7 +90,7 @@ func (m AgentMessage) ContentBlocks() ([]ContentBlock, error) {
 
 	var text string
 	if err := json.Unmarshal(m.Content, &text); err == nil {
-		return []ContentBlock{{Type: ContentBlockTypeText, Text: text}}, nil
+		return []ContentBlock{{Type: "text", Text: text}}, nil
 	}
 
 	var blocks []ContentBlock
@@ -117,19 +103,13 @@ func (m AgentMessage) ContentBlocks() ([]ContentBlock, error) {
 
 // AssistantMessageEvent is one streaming delta inside a message_update event.
 type AssistantMessageEvent struct {
-	Type         string          `json:"type"`
-	ContentIndex int             `json:"contentIndex,omitempty"`
-	Delta        string          `json:"delta,omitempty"`
-	Content      string          `json:"content,omitempty"`
-	Reason       string          `json:"reason,omitempty"`
-	ToolCall     json.RawMessage `json:"toolCall,omitempty"`
-	Partial      json.RawMessage `json:"partial,omitempty"`
+	Type  string `json:"type"`
+	Delta string `json:"delta,omitempty"`
 }
 
 // ToolResult is a tool execution result or accumulated partial result.
 type ToolResult struct {
-	Content []ContentBlock  `json:"content"`
-	Details json.RawMessage `json:"details,omitempty"`
+	Content []ContentBlock `json:"content"`
 }
 
 // AgentStartEvent signals the agent began processing a prompt.
@@ -137,19 +117,10 @@ type AgentStartEvent struct {
 	baseEvent
 }
 
-// Kind returns the native event type string.
-func (AgentStartEvent) Kind() string { return EventTypeAgentStart }
-
 // AgentEndEvent signals one low-level agent run completed.
 type AgentEndEvent struct {
 	baseEvent
-
-	Messages  []json.RawMessage `json:"messages"`
-	WillRetry bool              `json:"willRetry"`
 }
-
-// Kind returns the native event type string.
-func (AgentEndEvent) Kind() string { return EventTypeAgentEnd }
 
 // AgentSettledEvent signals the run fully settled: no automatic retry,
 // compaction retry, or queued continuation remains. It fires exactly once per
@@ -159,28 +130,15 @@ type AgentSettledEvent struct {
 	baseEvent
 }
 
-// Kind returns the native event type string.
-func (AgentSettledEvent) Kind() string { return EventTypeAgentSettled }
-
 // TurnStartEvent signals a new turn began.
 type TurnStartEvent struct {
 	baseEvent
 }
 
-// Kind returns the native event type string.
-func (TurnStartEvent) Kind() string { return EventTypeTurnStart }
-
-// TurnEndEvent signals a turn completed with its assistant message and tool
-// results.
+// TurnEndEvent signals a turn completed.
 type TurnEndEvent struct {
 	baseEvent
-
-	Message     json.RawMessage   `json:"message"`
-	ToolResults []json.RawMessage `json:"toolResults"`
 }
-
-// Kind returns the native event type string.
-func (TurnEndEvent) Kind() string { return EventTypeTurnEnd }
 
 // MessageStartEvent signals a message began.
 type MessageStartEvent struct {
@@ -189,19 +147,12 @@ type MessageStartEvent struct {
 	Message AgentMessage `json:"message"`
 }
 
-// Kind returns the native event type string.
-func (MessageStartEvent) Kind() string { return EventTypeMessageStart }
-
 // MessageUpdateEvent streams one assistant message delta.
 type MessageUpdateEvent struct {
 	baseEvent
 
-	Message               json.RawMessage       `json:"message"`
 	AssistantMessageEvent AssistantMessageEvent `json:"assistantMessageEvent"`
 }
-
-// Kind returns the native event type string.
-func (MessageUpdateEvent) Kind() string { return EventTypeMessageUpdate }
 
 // MessageEndEvent signals a message completed. For assistant messages the
 // message carries usage, stopReason, and errorMessage.
@@ -211,9 +162,6 @@ type MessageEndEvent struct {
 	Message AgentMessage `json:"message"`
 }
 
-// Kind returns the native event type string.
-func (MessageEndEvent) Kind() string { return EventTypeMessageEnd }
-
 // ToolExecutionStartEvent signals a tool began executing.
 type ToolExecutionStartEvent struct {
 	baseEvent
@@ -222,9 +170,6 @@ type ToolExecutionStartEvent struct {
 	ToolName   string          `json:"toolName"`
 	Args       json.RawMessage `json:"args,omitempty"`
 }
-
-// Kind returns the native event type string.
-func (ToolExecutionStartEvent) Kind() string { return EventTypeToolExecutionStart }
 
 // ToolExecutionUpdateEvent streams accumulated partial tool output.
 type ToolExecutionUpdateEvent struct {
@@ -236,9 +181,6 @@ type ToolExecutionUpdateEvent struct {
 	PartialResult *ToolResult     `json:"partialResult,omitempty"`
 }
 
-// Kind returns the native event type string.
-func (ToolExecutionUpdateEvent) Kind() string { return EventTypeToolExecutionUpdate }
-
 // ToolExecutionEndEvent signals a tool completed.
 type ToolExecutionEndEvent struct {
 	baseEvent
@@ -249,70 +191,6 @@ type ToolExecutionEndEvent struct {
 	IsError    bool        `json:"isError"`
 }
 
-// Kind returns the native event type string.
-func (ToolExecutionEndEvent) Kind() string { return EventTypeToolExecutionEnd }
-
-// QueueUpdateEvent signals the pending steering/follow-up queue changed.
-type QueueUpdateEvent struct {
-	baseEvent
-
-	Steering []string `json:"steering"`
-	FollowUp []string `json:"followUp"`
-}
-
-// Kind returns the native event type string.
-func (QueueUpdateEvent) Kind() string { return EventTypeQueueUpdate }
-
-// CompactionStartEvent signals compaction began.
-type CompactionStartEvent struct {
-	baseEvent
-
-	Reason string `json:"reason"`
-}
-
-// Kind returns the native event type string.
-func (CompactionStartEvent) Kind() string { return EventTypeCompactionStart }
-
-// CompactionEndEvent signals compaction completed, aborted, or failed.
-type CompactionEndEvent struct {
-	baseEvent
-
-	Reason       string          `json:"reason"`
-	Result       json.RawMessage `json:"result,omitempty"`
-	Aborted      bool            `json:"aborted"`
-	WillRetry    bool            `json:"willRetry"`
-	ErrorMessage string          `json:"errorMessage,omitempty"`
-}
-
-// Kind returns the native event type string.
-func (CompactionEndEvent) Kind() string { return EventTypeCompactionEnd }
-
-// AutoRetryStartEvent signals an automatic retry began after a transient
-// error.
-type AutoRetryStartEvent struct {
-	baseEvent
-
-	Attempt      int     `json:"attempt"`
-	MaxAttempts  int     `json:"maxAttempts"`
-	DelayMs      float64 `json:"delayMs"`
-	ErrorMessage string  `json:"errorMessage,omitempty"`
-}
-
-// Kind returns the native event type string.
-func (AutoRetryStartEvent) Kind() string { return EventTypeAutoRetryStart }
-
-// AutoRetryEndEvent signals an automatic retry finished.
-type AutoRetryEndEvent struct {
-	baseEvent
-
-	Success    bool   `json:"success"`
-	Attempt    int    `json:"attempt"`
-	FinalError string `json:"finalError,omitempty"`
-}
-
-// Kind returns the native event type string.
-func (AutoRetryEndEvent) Kind() string { return EventTypeAutoRetryEnd }
-
 // ExtensionErrorEvent signals an extension threw an error.
 type ExtensionErrorEvent struct {
 	baseEvent
@@ -322,19 +200,14 @@ type ExtensionErrorEvent struct {
 	Error         string `json:"error"`
 }
 
-// Kind returns the native event type string.
-func (ExtensionErrorEvent) Kind() string { return EventTypeExtensionError }
-
-// UnknownEvent carries an event type this package does not model. It keeps
-// the raw payload available for raw-event forwarding.
+// UnknownEvent carries an event type this package does not model: a queue
+// report, compaction, an automatic retry pair, or a type pi added. The adapter
+// acts on none of them and keeps the raw payload for raw-event forwarding.
 type UnknownEvent struct {
 	baseEvent
 
 	EventType string
 }
-
-// Kind returns the native event type string.
-func (e UnknownEvent) Kind() string { return e.EventType }
 
 func decodeEvent(eventType string, line []byte, raw json.RawMessage) (Event, error) {
 	base := baseEvent{raw: raw}
@@ -348,17 +221,13 @@ func decodeEvent(eventType string, line []byte, raw json.RawMessage) (Event, err
 	case EventTypeAgentStart:
 		event = AgentStartEvent{baseEvent: base}
 	case EventTypeAgentEnd:
-		typed := AgentEndEvent{baseEvent: base}
-		err = json.Unmarshal(line, &typed)
-		event = typed
+		event = AgentEndEvent{baseEvent: base}
 	case EventTypeAgentSettled:
 		event = AgentSettledEvent{baseEvent: base}
 	case EventTypeTurnStart:
 		event = TurnStartEvent{baseEvent: base}
 	case EventTypeTurnEnd:
-		typed := TurnEndEvent{baseEvent: base}
-		err = json.Unmarshal(line, &typed)
-		event = typed
+		event = TurnEndEvent{baseEvent: base}
 	case EventTypeMessageStart:
 		typed := MessageStartEvent{baseEvent: base}
 		err = json.Unmarshal(line, &typed)
@@ -381,26 +250,6 @@ func decodeEvent(eventType string, line []byte, raw json.RawMessage) (Event, err
 		event = typed
 	case EventTypeToolExecutionEnd:
 		typed := ToolExecutionEndEvent{baseEvent: base}
-		err = json.Unmarshal(line, &typed)
-		event = typed
-	case EventTypeQueueUpdate:
-		typed := QueueUpdateEvent{baseEvent: base}
-		err = json.Unmarshal(line, &typed)
-		event = typed
-	case EventTypeCompactionStart:
-		typed := CompactionStartEvent{baseEvent: base}
-		err = json.Unmarshal(line, &typed)
-		event = typed
-	case EventTypeCompactionEnd:
-		typed := CompactionEndEvent{baseEvent: base}
-		err = json.Unmarshal(line, &typed)
-		event = typed
-	case EventTypeAutoRetryStart:
-		typed := AutoRetryStartEvent{baseEvent: base}
-		err = json.Unmarshal(line, &typed)
-		event = typed
-	case EventTypeAutoRetryEnd:
-		typed := AutoRetryEndEvent{baseEvent: base}
 		err = json.Unmarshal(line, &typed)
 		event = typed
 	case EventTypeExtensionError:

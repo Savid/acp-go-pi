@@ -107,12 +107,8 @@ func TestProtocolAdmission(t *testing.T) {
 	h := newHarness(t)
 	h.initialize()
 
-	for _, method := range []string{"_pi/anything"} {
-		_, err := h.conn.CallExtension(h.ctx(), method, map[string]any{})
-		require.Equal(t, -32601, requestErrorCode(t, err), method)
-	}
-
-	var err error
+	_, err := h.conn.CallExtension(h.ctx(), "_pi/anything", map[string]any{})
+	require.Equal(t, -32601, requestErrorCode(t, err))
 
 	_, err = h.conn.SetSessionMode(h.ctx(), acp.SetSessionModeRequest{SessionId: "x", ModeId: "plan"})
 	require.Equal(t, -32601, requestErrorCode(t, err))
@@ -150,7 +146,7 @@ func TestSessionMetaStrictness(t *testing.T) {
 			h := newHarness(t)
 			h.initialize()
 
-			request := NewSessionRequest(t.TempDir())
+			request := wire.NewSessionRequest(t.TempDir())
 			request.Meta = tc.meta
 
 			_, err := h.conn.NewSession(h.ctx(), request)
@@ -169,7 +165,7 @@ func TestForeignMetaIgnored(t *testing.T) {
 	h := newHarness(t)
 	h.initialize()
 
-	session := h.newSession(WithSessionMeta(map[string]any{"other": map[string]any{"x": 1}, "traceparent": "00-1-2-01"}))
+	session := h.newSession(wire.WithSessionMeta(map[string]any{"other": map[string]any{"x": 1}, "traceparent": "00-1-2-01"}))
 	require.NotEmpty(t, session.SessionId)
 }
 
@@ -190,17 +186,17 @@ func TestUniformRejections(t *testing.T) {
 
 	session := h.newSession()
 
-	_, err = h.conn.Prompt(h.ctx(), PromptRequest(session.SessionId))
+	_, err = h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId))
 	require.Equal(t, "prompt", requestErrorData(t, err)["field"])
 
-	_, err = h.conn.Prompt(h.ctx(), PromptRequest(session.SessionId, acp.ContentBlock{Audio: &acp.ContentBlockAudio{Data: "x", MimeType: "audio/wav"}}))
+	_, err = h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId, acp.ContentBlock{Audio: &acp.ContentBlockAudio{Data: "x", MimeType: "audio/wav"}}))
 	require.Equal(t, "prompt", requestErrorData(t, err)["field"])
 
-	_, err = h.conn.Prompt(h.ctx(), TextPromptRequest("00000000-0000-4000-8000-000000000000", "hi"))
+	_, err = h.conn.Prompt(h.ctx(), wire.TextPromptRequest("00000000-0000-4000-8000-000000000000", "hi"))
 	require.Equal(t, -32602, requestErrorCode(t, err))
 	require.Equal(t, "unknown session", requestErrorData(t, err)["error"])
 
-	require.NoError(t, h.conn.Cancel(h.ctx(), CancelRequest("00000000-0000-4000-8000-000000000000")))
+	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest("00000000-0000-4000-8000-000000000000")))
 }
 
 func TestPromptCorrelationGate(t *testing.T) {
@@ -276,7 +272,7 @@ func TestInvalidOptionsVerdict(t *testing.T) {
 			require.Equal(t, "pi_invalid_options", data["error"])
 			require.Equal(t, field, data["field"])
 
-			_, err = agent.NewSession(context.Background(), NewSessionRequest(t.TempDir()))
+			_, err = agent.NewSession(context.Background(), wire.NewSessionRequest(t.TempDir()))
 			require.Equal(t, "pi_invalid_options", requestErrorData(t, err)["error"])
 		})
 	}
@@ -303,7 +299,7 @@ func TestPromptBackpressure(t *testing.T) {
 	require.Equal(t, "backpressure", requestErrorData(t, err)["error"])
 	require.Equal(t, "session_prompt", requestErrorData(t, err)["limit"])
 
-	require.NoError(t, h.conn.Cancel(h.ctx(), CancelRequest(session.SessionId)))
+	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
 	require.NoError(t, <-done)
 }
 
@@ -314,7 +310,7 @@ func TestActiveSessionLimit(t *testing.T) {
 	h.initialize()
 	h.newSession()
 
-	_, err := h.conn.NewSession(h.ctx(), NewSessionRequest(t.TempDir()))
+	_, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir()))
 	require.Equal(t, "backpressure", requestErrorData(t, err)["error"])
 	require.Equal(t, "active_sessions", requestErrorData(t, err)["limit"])
 }
@@ -325,7 +321,7 @@ func TestVersionFloor(t *testing.T) {
 	h := newHarness(t, WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvVersion: "0.1.0"}))
 	h.initialize()
 
-	_, err := h.conn.NewSession(h.ctx(), NewSessionRequest(t.TempDir()))
+	_, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir()))
 	require.Equal(t, -32603, requestErrorCode(t, err))
 	require.Equal(t, "pi_internal_failure", requestErrorData(t, err)["error"])
 	require.Equal(t, "native_start", requestErrorData(t, err)["class"])
@@ -338,7 +334,7 @@ func TestClosedAgentRefusesRequests(t *testing.T) {
 	require.NoError(t, agent.Close())
 	require.NoError(t, agent.Close())
 
-	_, err := agent.NewSession(context.Background(), NewSessionRequest(t.TempDir()))
+	_, err := agent.NewSession(context.Background(), wire.NewSessionRequest(t.TempDir()))
 	require.Equal(t, -32600, requestErrorCode(t, err))
 }
 
@@ -348,4 +344,39 @@ func TestNegativeClientCallLimitReturnsOptionsError(t *testing.T) {
 	defer agent.Close()
 	_, err := agent.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.Equal(t, "pi_invalid_options", requestErrorData(t, err)["error"])
+}
+
+func TestForkIsMethodNotFound(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	_, err := h.conn.UnstableForkSession(h.ctx(), acp.UnstableForkSessionRequest{SessionId: session.SessionId, Cwd: t.TempDir()})
+	require.Equal(t, -32601, requestErrorCode(t, err))
+}
+
+// pi's stdout and stderr are the adapter's own pipes, so a non-JSON record or
+// stderr chatter from pi never reaches the client.
+func TestNativeNoiseCannotCorruptACPStdout(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	_, err := h.prompt(session.SessionId, "NOISE", nil)
+	require.NoError(t, err)
+
+	for _, update := range h.rec.snapshot() {
+		encoded, marshalErr := json.Marshal(update)
+		require.NoError(t, marshalErr)
+		require.NotContains(t, string(encoded), "not a json record at all")
+		require.NotContains(t, string(encoded), "chatter on stderr")
+	}
+
+	list, err := h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
+	require.NoError(t, err)
+	require.Len(t, list.Sessions, 1)
 }

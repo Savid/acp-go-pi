@@ -52,8 +52,13 @@ func (s *scriptedPi) serve() {
 	_ = s.stdout.Close()
 }
 
-func drain(client *Client) {
+// drain consumes both streams and reports when the read loop has ended.
+func drain(client *Client) <-chan struct{} {
+	stopped := make(chan struct{})
+
 	go func() {
+		defer close(stopped)
+
 		for range client.Events() {
 		}
 	}()
@@ -62,6 +67,8 @@ func drain(client *Client) {
 		for range client.UIRequests() {
 		}
 	}()
+
+	return stopped
 }
 
 func TestClientCallCorrelatesResponses(t *testing.T) {
@@ -83,8 +90,11 @@ func TestClientCallCorrelatesResponses(t *testing.T) {
 	})
 
 	events := make(chan Event, 8)
+	stopped := make(chan struct{})
 
 	go func() {
+		defer close(stopped)
+
 		for event := range client.Events() {
 			events <- event
 		}
@@ -98,7 +108,7 @@ func TestClientCallCorrelatesResponses(t *testing.T) {
 	state, err := client.GetState(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, "s", state.SessionID)
-	require.Equal(t, EventTypeAgentStart, (<-events).Kind())
+	require.IsType(t, AgentStartEvent{}, <-events)
 
 	_, err = client.SetModel(context.Background(), "a", "b")
 
@@ -114,7 +124,6 @@ func TestClientCallCorrelatesResponses(t *testing.T) {
 	require.NoError(t, client.Abort(context.Background()))
 	require.NoError(t, client.SetThinkingLevel(context.Background(), "high"))
 	require.NoError(t, client.SetAutoRetry(context.Background(), true))
-	require.EqualValues(t, 4, client.StrayResponses())
 
 	_, err = client.Call(context.Background(), map[string]any{})
 	require.Error(t, err)
@@ -123,14 +132,15 @@ func TestClientCallCorrelatesResponses(t *testing.T) {
 
 	_ = scripted.stdin.Close()
 	_ = scripted.stdout.Close()
-	require.NoError(t, client.Stop())
+	<-stopped
+	require.NoError(t, client.Err())
 }
 
 func TestClientContextCancelAndClose(t *testing.T) {
 	t.Parallel()
 
 	client, scripted := newScriptedPi(t, func(map[string]any) []string { return nil })
-	drain(client)
+	stopped := drain(client)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -139,7 +149,8 @@ func TestClientContextCancelAndClose(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 
 	_ = scripted.stdout.Close()
-	require.NoError(t, client.Stop())
+	<-stopped
+	require.NoError(t, client.Err())
 
 	_, err = client.GetState(context.Background())
 	require.ErrorIs(t, err, ErrTransportClosed)
@@ -149,12 +160,12 @@ func TestClientStructuralFailure(t *testing.T) {
 	t.Parallel()
 
 	client, scripted := newScriptedPi(t, func(map[string]any) []string { return []string{"{not json"} })
-	drain(client)
+	stopped := drain(client)
 
 	_, err := client.GetState(context.Background())
 	require.ErrorIs(t, err, ErrTransportClosed)
 	require.ErrorIs(t, client.Err(), ErrJSONLStructural)
 
-	<-client.Done()
+	<-stopped
 	_ = scripted.stdin.Close()
 }

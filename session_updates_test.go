@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -53,15 +54,6 @@ func TestThoughtChunks(t *testing.T) {
 	require.Equal(t, "ok", agentText(h.rec.snapshot()))
 }
 
-func TestUnstreamedSuffix(t *testing.T) {
-	t.Parallel()
-
-	require.Equal(t, "full", unstreamedSuffix("", "full"))
-	require.Equal(t, "lo", unstreamedSuffix("Hel", "Hello"))
-	require.Equal(t, "", unstreamedSuffix("Hello", "Hello"))
-	require.Equal(t, "", unstreamedSuffix("Hex", "Hello"))
-}
-
 func TestCommandCatalogPublishedAfterResponse(t *testing.T) {
 	t.Parallel()
 
@@ -77,16 +69,16 @@ func TestCommandCatalogPublishedAfterResponse(t *testing.T) {
 	require.Equal(t, []acp.AvailableCommand{{Name: "help", Description: "Show help"}}, first.Update.AvailableCommandsUpdate.AvailableCommands)
 }
 
-func TestValidCommandName(t *testing.T) {
+func TestAvailableCommandsDropsRejectedNames(t *testing.T) {
 	t.Parallel()
 
-	require.True(t, validCommandName("help"))
-	require.False(t, validCommandName(""))
-	require.False(t, validCommandName("a/b"))
-	require.False(t, validCommandName("bad name"))
-	require.False(t, validCommandName("tab\there"))
-	require.False(t, validCommandName("\xff"))
-	require.False(t, validCommandName("zero\u200bwidth"))
+	commands := availableCommands([]pi.SlashCommand{
+		{Name: "help", Description: "Show help"},
+		{Name: ""}, {Name: "a/b"}, {Name: "bad name"}, {Name: "tab\there"},
+		{Name: "\xff"}, {Name: "zero\u200bwidth"},
+	})
+
+	require.Equal(t, []acp.AvailableCommand{{Name: "help", Description: "Show help"}}, commands)
 }
 
 func TestUsageAndSessionInfoUpdates(t *testing.T) {
@@ -173,12 +165,15 @@ func TestRawEventsOptIn(t *testing.T) {
 func TestRedactImages(t *testing.T) {
 	t.Parallel()
 
+	decoded, err := base64.StdEncoding.DecodeString(tinyPNG)
+	require.NoError(t, err)
+
 	block := map[string]any{"type": "image", "data": tinyPNG}
 	payload := map[string]any{"message": map[string]any{"content": []any{block}}}
 	redactImages(payload)
 
 	require.Equal(t, "", block["data"])
-	require.Positive(t, block["sizeBytes"])
+	require.Equal(t, len(decoded), block["sizeBytes"], "the padded payload is not over-reported")
 }
 
 func TestMergeUsage(t *testing.T) {
@@ -190,26 +185,11 @@ func TestMergeUsage(t *testing.T) {
 	require.Equal(t, 11, total.TotalTokens)
 }
 
-func TestNormalizeTitle(t *testing.T) {
-	t.Parallel()
-
-	require.Equal(t, "a b", normalizeTitle("  a \n b "))
-	require.Equal(t, "", normalizeTitle("   "))
-
-	long := make([]rune, sessionTitleMaxRunes+5)
-	for index := range long {
-		long[index] = 'x'
-	}
-
-	require.Len(t, []rune(normalizeTitle(string(long))), sessionTitleMaxRunes)
-}
-
 func TestBearsWork(t *testing.T) {
 	t.Parallel()
 
 	require.True(t, bearsWork(pi.AgentStartEvent{}))
 	require.True(t, bearsWork(pi.MessageStartEvent{Message: pi.AgentMessage{Role: messageRoleAssistant}}))
 	require.False(t, bearsWork(pi.MessageStartEvent{Message: pi.AgentMessage{Role: messageRoleCustom}}))
-	require.False(t, bearsWork(pi.QueueUpdateEvent{}))
-	require.False(t, bearsWork(pi.CompactionStartEvent{}))
+	require.False(t, bearsWork(pi.UnknownEvent{}))
 }

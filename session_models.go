@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -93,7 +94,7 @@ func modelSelectOptions(model string, models []pi.Model, hostListed []string) ac
 		seen[info.Ref()] = struct{}{}
 	}
 
-	for _, id := range append(hostListed, model) {
+	for _, id := range append(slices.Clone(hostListed), model) {
 		if _, ok := seen[id]; ok {
 			continue
 		}

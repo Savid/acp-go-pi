@@ -8,9 +8,10 @@
 // home, so a session started over ACP can be continued natively with
 // `pi --resume` after the adapter closes.
 //
-// Hosts that need durable remote resume provide [WithSessionStore]. The
-// store mirrors pi's session JSONL rows and backs session/list, session/load,
-// and session/resume when the native file is absent.
+// Hosts that need durable remote resume provide [WithSessionStore]. The store
+// is the durability boundary for session/list, session/load and session/resume;
+// pi's own session file is the native copy an operator can continue outside
+// ACP.
 //
 // Hosts that need adapter telemetry provide OpenTelemetry providers with
 // [WithTracerProvider] and [WithMeterProvider]; the package never configures

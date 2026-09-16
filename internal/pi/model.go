@@ -12,11 +12,6 @@ type ModelRef struct {
 	ID       string
 }
 
-// String returns the "provider/id" form.
-func (r ModelRef) String() string {
-	return r.Provider + "/" + r.ID
-}
-
 // ParseModelRef parses "provider/id"; both parts are required.
 func ParseModelRef(model string) (ModelRef, error) {
 	provider, id, found := strings.Cut(model, "/")

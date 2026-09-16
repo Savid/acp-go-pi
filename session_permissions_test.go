@@ -6,6 +6,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
+	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -115,10 +116,12 @@ func TestElicitationWithFormCapability(t *testing.T) {
 	require.Equal(t, "hi Bob", agentText(h.rec.snapshot()))
 }
 
-func TestElicitationWithoutFormCapabilityCancels(t *testing.T) {
+// Form elicitation is relayed only when the client advertises form support,
+// in every shape the capability can take.
+func TestElicitationCapabilityGating(t *testing.T) {
 	t.Parallel()
 
-	cases := map[string]func(*acp.InitializeRequest){
+	refusing := map[string]func(*acp.InitializeRequest){
 		"omitted": func(*acp.InitializeRequest) {},
 		"empty":   func(r *acp.InitializeRequest) { r.ClientCapabilities.Elicitation = &acp.ElicitationCapabilities{} },
 		"url only": func(r *acp.InitializeRequest) {
@@ -129,7 +132,7 @@ func TestElicitationWithoutFormCapabilityCancels(t *testing.T) {
 		},
 	}
 
-	for name, option := range cases {
+	for name, option := range refusing {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
@@ -140,6 +143,35 @@ func TestElicitationWithoutFormCapabilityCancels(t *testing.T) {
 			_, err := h.prompt(session.SessionId, "ASK", nil)
 			require.NoError(t, err)
 			require.Equal(t, "declined", agentText(h.rec.snapshot()))
+		})
+	}
+
+	accepting := map[string]func(*acp.InitializeRequest){
+		"form only": withFormElicitation(),
+		"form and url": func(r *acp.InitializeRequest) {
+			r.ClientCapabilities.Elicitation = &acp.ElicitationCapabilities{
+				Form: &acp.ElicitationFormCapabilities{},
+				Url:  &acp.ElicitationUrlCapabilities{},
+			}
+		},
+	}
+
+	for name, option := range accepting {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			h.rec.elicit = func(acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error) {
+				return acp.UnstableCreateElicitationResponse{Accept: &acp.UnstableCreateElicitationAccept{
+					Content: map[string]any{elicitationFieldValue: "Bob"},
+				}}, nil
+			}
+			h.initialize(option)
+			session := h.newSession()
+
+			_, err := h.prompt(session.SessionId, "ASK", nil)
+			require.NoError(t, err)
+			require.Equal(t, "hi Bob", agentText(h.rec.snapshot()))
 		})
 	}
 }
@@ -189,7 +221,7 @@ func TestCancelResolvesPendingPermission(t *testing.T) {
 		return len(h.rec.permissions) == 1
 	})
 
-	require.NoError(t, h.conn.Cancel(h.ctx(), CancelRequest(session.SessionId)))
+	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
 	resp := <-done
 	err := <-errs
 	t.Logf("events: %v", eventTypes(lifecycleEvents(h.rec.snapshot())))

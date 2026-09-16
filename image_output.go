@@ -2,9 +2,6 @@ package piacp
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -12,38 +9,6 @@ import (
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
-
-// outputImage is one validated emitted image: the base64 payload, the
-// sniffed MIME, its decoded size, and its fingerprint.
-type outputImage struct {
-	data        string
-	mime        string
-	fingerprint string
-	sizeBytes   int64
-}
-
-// decodeOutputImage validates one native image block for emission through
-// the core output gate. Output is not format-allowlisted: any sniffable
-// raster is emitted with its sniffed MIME.
-func decodeOutputImage(block pi.ContentBlock, limit int64) (outputImage, *image.OutputError) {
-	data, mime, size, failure := image.DecodeInline(block.Data, limit)
-	if failure != nil {
-		return outputImage{}, failure
-	}
-
-	if block.MimeType != "" && block.MimeType != mime && image.IsImageMIME(block.MimeType) {
-		return outputImage{}, &image.OutputError{Reason: image.ReasonMediaTypeMismatch, Message: "declared media type does not match the image"}
-	}
-
-	digest := sha256.Sum256(data)
-
-	return outputImage{
-		data:        base64.StdEncoding.EncodeToString(data),
-		mime:        mime,
-		fingerprint: hex.EncodeToString(digest[:]),
-		sizeBytes:   size,
-	}, nil
-}
 
 // toolState is the exact-id lifecycle published for one native tool call.
 type toolState struct {
@@ -251,15 +216,15 @@ func mapToolContent(previous []toolContentItem, blocks []pi.ContentBlock, limits
 
 			next = append(next, toolContentItem{content: acp.ToolContent(acp.TextBlock(block.Text)), key: "text:" + block.Text})
 		case contentBlockTypeImage:
-			output, failure := decodeOutputImage(*block, limits.EffectiveOutputPerImage())
+			output, failure := image.DecodeOutput(block.Data, block.MimeType, limits.EffectiveOutputPerImage())
 			if failure != nil {
 				return nil, failure
 			}
 
 			next = append(next, toolContentItem{
-				content:    acp.ToolContent(acp.ImageBlock(output.data, output.mime)),
-				key:        "image:" + output.mime + ":" + output.fingerprint,
-				imageBytes: output.sizeBytes,
+				content:    acp.ToolContent(acp.ImageBlock(output.Data, output.MIME)),
+				key:        "image:" + output.MIME + ":" + output.Fingerprint,
+				imageBytes: output.SizeBytes,
 			})
 		}
 	}

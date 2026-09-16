@@ -1,7 +1,6 @@
 package piacp
 
 import (
-	"encoding/base64"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -82,23 +81,6 @@ func TestAssistantImageRefusedInPlace(t *testing.T) {
 	_, err := h.prompt(session.SessionId, "IMAGE", nil)
 	require.NoError(t, err)
 	require.Equal(t, "here"+image.GuidanceTooLarge, agentText(h.rec.snapshot()))
-}
-
-func TestDecodeOutputImage(t *testing.T) {
-	t.Parallel()
-
-	output, failure := decodeOutputImage(pi.ContentBlock{Type: contentBlockTypeImage, Data: tinyPNG, MimeType: "image/png"}, 1<<20)
-	require.Nil(t, failure)
-	require.Equal(t, "image/png", output.mime)
-	require.Len(t, output.fingerprint, 64)
-
-	_, failure = decodeOutputImage(pi.ContentBlock{Type: contentBlockTypeImage, Data: tinyPNG, MimeType: "image/jpeg"}, 1<<20)
-	require.NotNil(t, failure)
-	require.Equal(t, image.ReasonMediaTypeMismatch, failure.Reason)
-
-	_, failure = decodeOutputImage(pi.ContentBlock{Type: contentBlockTypeImage, Data: base64.StdEncoding.EncodeToString([]byte("text"))}, 1<<20)
-	require.NotNil(t, failure)
-	require.Equal(t, image.ReasonNotRaster, failure.Reason)
 }
 
 func TestMapToolContentMergesAndBounds(t *testing.T) {

@@ -35,13 +35,11 @@ type Client struct {
 	failure   error
 	failed    bool
 
-	nextID         atomic.Uint64
-	strayResponses atomic.Uint64
-	started        atomic.Bool
+	nextID  atomic.Uint64
+	started atomic.Bool
 
 	events     chan Event
 	uiRequests chan UIRequest
-	done       chan struct{}
 	wg         sync.WaitGroup
 }
 
@@ -53,7 +51,6 @@ func NewClient(stdin io.Writer, stdout io.Reader) *Client {
 		pending:    make(map[string]chan Response, 4),
 		events:     make(chan Event),
 		uiRequests: make(chan UIRequest),
-		done:       make(chan struct{}),
 	}
 }
 
@@ -70,16 +67,6 @@ func (c *Client) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop waits for the read loop to exit and returns the transport failure, if
-// any. The caller must first end the stream by terminating the process.
-func (c *Client) Stop() error {
-	if c.started.Load() {
-		c.wg.Wait()
-	}
-
-	return c.Err()
-}
-
 // Events returns the agent event stream. It is closed when the read loop
 // exits.
 func (c *Client) Events() <-chan Event {
@@ -92,22 +79,12 @@ func (c *Client) UIRequests() <-chan UIRequest {
 	return c.uiRequests
 }
 
-// Done is closed when the read loop has exited.
-func (c *Client) Done() <-chan struct{} {
-	return c.done
-}
-
 // Err returns the transport failure, or nil after a clean end-of-stream.
 func (c *Client) Err() error {
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
 
 	return c.failure
-}
-
-// StrayResponses counts responses that matched no pending command id.
-func (c *Client) StrayResponses() uint64 {
-	return c.strayResponses.Load()
 }
 
 // Call sends one command with a fresh correlation id and waits for its
@@ -265,8 +242,6 @@ func (c *Client) dispatch(ctx context.Context, line []byte) error {
 		c.pendingMu.Unlock()
 
 		if !ok {
-			c.strayResponses.Add(1)
-
 			return nil
 		}
 
@@ -303,7 +278,6 @@ func (c *Client) finish(failure error) {
 
 	close(c.events)
 	close(c.uiRequests)
-	close(c.done)
 }
 
 func isBlank(line []byte) bool {

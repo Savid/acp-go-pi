@@ -10,8 +10,13 @@ session started over ACP can be continued natively:
 
 ```sh
 acp-go-pi              # host runs a session in /work
-cd /work && pi --resume
+cd /work && pi --session NATIVE_SESSION_ID
 ```
+
+New, load, and resume responses and session-list entries expose the current
+native ID as `_meta.pi.nativeSessionId`. Use it for native CLI continuation.
+ACP requests continue to use the stable ACP `sessionId`. The store's configuration
+record saves both IDs with the matching native history.
 
 ## Install
 
@@ -78,6 +83,15 @@ Options: `WithExecutablePath`, `WithHome`, `WithScratchDir`,
 plus any `WithConfiguredModels` entries) and `thought_level` (`off`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
 
+### Image input
+
+Images are accepted as inline data or through `WithInputHandoffRoot`. Pi's
+native prompt has separate text and image fields. Put all text, resource
+links, and text resources before the images; images alone and multiple images
+are accepted. Forwarded text after the first image fails with
+`{"error":"unsupported","field":"prompt"}` before native dispatch.
+User-only text excluded from native input does not affect ordering.
+
 ### Session store
 
 `WithSessionStore` mirrors pi's session JSONL rows under the main subpath and
@@ -85,7 +99,11 @@ the adapter's session record under `config`, format `pi-session-jsonl-v1`.
 `session/load` and `session/resume` prefer pi's own file when it exists and
 materialize it from the store otherwise.
 Native rows and session configuration commit as one store generation. A
-configuration change is durable even when no native rows were added.
+configuration change is durable even when no native rows were added, and an
+established conversation with no native history yet commits its configuration
+with an empty main record. Replay decodes every stored image, user or
+assistant, through the same output gate as live image output, so a stored
+image that gate refuses fails the whole restore rather than leaving a hole.
 
 ## Development
 

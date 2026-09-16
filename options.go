@@ -200,7 +200,7 @@ func WithConfiguredModels(ids []string) Option {
 // WithEnv sets the static agent-scoped environment overlay applied to every
 // pi process after the inherited environment and before the session env.
 func WithEnv(env map[string]string) Option {
-	return func(options *Options) { options.Env = cloneStringMap(env) }
+	return func(options *Options) { options.Env = maps.Clone(env) }
 }
 
 // WithTracerProvider configures the OpenTelemetry tracer provider.
@@ -251,13 +251,5 @@ func WithImageLimits(limits ImageLimits) Option {
 // WithSeedFiles registers files written into pi's config root before each
 // launch. Keys are paths relative to that root; values are the contents.
 func WithSeedFiles(files map[string]string) Option {
-	return func(options *Options) { options.SeedFiles = cloneStringMap(files) }
-}
-
-func cloneStringMap(values map[string]string) map[string]string {
-	if values == nil {
-		return nil
-	}
-
-	return maps.Clone(values)
+	return func(options *Options) { options.SeedFiles = maps.Clone(files) }
 }

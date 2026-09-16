@@ -2,13 +2,13 @@ package piacp
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
@@ -26,6 +26,7 @@ const configSubpath = sessionlog.ConfigSubpath
 // with.
 type sessionRecord struct {
 	SessionID             string            `json:"sessionId"`
+	NativeSessionID       string            `json:"nativeSessionId"`
 	Cwd                   string            `json:"cwd"`
 	AdditionalDirectories []string          `json:"additionalDirectories,omitempty"`
 	SessionFile           string            `json:"sessionFile"`
@@ -44,10 +45,11 @@ func (s *session) record() sessionRecord {
 
 	return sessionRecord{
 		SessionID:             string(s.id),
+		NativeSessionID:       s.nativeID,
 		Cwd:                   s.cwd,
 		AdditionalDirectories: slices.Clone(s.additionalDirectories),
 		SessionFile:           s.sessionFile,
-		Env:                   cloneStringMap(s.options.Env),
+		Env:                   maps.Clone(s.options.Env),
 		ExtraPathDirs:         slices.Clone(s.options.ExtraPathDirs),
 		Model:                 s.model,
 		ThinkingLevel:         s.thinkingLevel,
@@ -81,10 +83,6 @@ func (s *session) commitMirror(ctx context.Context) error {
 		return fmt.Errorf("native log shrank from %d to %d rows", mirrored, len(rows))
 	}
 
-	if len(rows) == 0 {
-		return nil
-	}
-
 	commitCtx, finish := s.agent.observe.StartSessionStore(ctx, "replace")
 	err = sessionlog.Commit(commitCtx, s.agent.store, string(s.id), rows, s.record())
 	finish(err)
@@ -116,8 +114,8 @@ func (a *Agent) loadStored(ctx context.Context, sessionID acp.SessionId) (stored
 
 	var record sessionRecord
 
-	rows, err := sessionlog.Load(loadCtx, a.store, string(sessionID), &record)
-	if err == nil && len(rows) > 0 {
+	rows, found, err := sessionlog.Load(loadCtx, a.store, string(sessionID), &record)
+	if err == nil && found {
 		err = record.validate(string(sessionID))
 	}
 
@@ -127,11 +125,11 @@ func (a *Agent) loadStored(ctx context.Context, sessionID acp.SessionId) (stored
 		return storedSession{}, a.restoreRefused(ctx, sessionID, err)
 	}
 
-	return storedSession{rows: rows, record: record, found: len(rows) > 0}, nil
+	return storedSession{rows: rows, record: record, found: found}, nil
 }
 
 func (r sessionRecord) validate(sessionID string) error {
-	if r.SessionID != sessionID || !filepath.IsAbs(r.Cwd) || !filepath.IsAbs(r.SessionFile) || r.UpdatedAtUnixMilli <= 0 {
+	if r.NativeSessionID == "" || r.SessionID != sessionID || !filepath.IsAbs(r.Cwd) || !filepath.IsAbs(r.SessionFile) || r.UpdatedAtUnixMilli <= 0 {
 		return fmt.Errorf("invalid session record identity or location")
 	}
 
@@ -151,24 +149,12 @@ func (r sessionRecord) validate(sessionID string) error {
 // hydrate reconciles the store with pi's own file before a load or resume. An
 // existing native file at least as long as the store wins and its newer rows
 // are adopted; a missing or shorter one is materialized from the store. A
-// disagreement at a shared position fails the restore. It returns the native
-// path and the rows the session now holds.
+// disagreement at a shared position, or a row the adapter cannot decode, fails
+// the restore. It returns the native path and the rows the session now holds.
 func (a *Agent) hydrate(ctx context.Context, sessionID acp.SessionId, stored storedSession, cwd string, agentDir string) (string, [][]byte, error) {
-	header, ok := pi.ParseHeader(stored.rows[0])
-	if !ok || header.ID != string(sessionID) || filepath.Base(header.ID) != header.ID {
-		return "", nil, a.restoreRefused(ctx, sessionID, fmt.Errorf("invalid native session identity"))
-	}
-
-	stamp, err := time.Parse(time.RFC3339Nano, header.Timestamp)
+	path, err := a.nativePath(ctx, sessionID, stored, cwd, agentDir)
 	if err != nil {
-		return "", nil, a.restoreRefused(ctx, sessionID, err)
-	}
-
-	path := stored.record.SessionFile
-
-	relative, pathErr := filepath.Rel(agentDir, path)
-	if pathErr != nil || !filepath.IsLocal(relative) || !fileExists(path) {
-		path = pi.SessionFile(agentDir, cwd, string(sessionID), stamp)
+		return "", nil, err
 	}
 
 	native, err := pi.ReadRows(path)
@@ -176,25 +162,60 @@ func (a *Agent) hydrate(ctx context.Context, sessionID acp.SessionId, stored sto
 		return "", nil, a.restoreRefused(ctx, sessionID, err)
 	}
 
-	if _, err := sessionlog.Reconcile(native, stored.rows); err != nil {
+	rows, nativeWins, err := sessionlog.Reconcile(native, stored.rows)
+	if err != nil {
 		return "", nil, a.restoreRefused(ctx, sessionID, err)
 	}
 
-	if len(native) >= len(stored.rows) {
+	if err := validateRows(rows); err != nil {
+		return "", nil, a.restoreRefused(ctx, sessionID, err)
+	}
+
+	if nativeWins {
 		if len(native) > len(stored.rows) {
-			if err := sessionlog.Commit(ctx, a.store, string(sessionID), native, stored.record); err != nil {
+			if err := sessionlog.Commit(ctx, a.store, string(sessionID), rows, stored.record); err != nil {
 				return "", nil, a.restoreRefused(ctx, sessionID, err)
 			}
 		}
 
-		return path, native, nil
+		return path, rows, nil
 	}
 
-	if err := pi.WriteRows(path, stored.rows); err != nil {
+	if err := pi.WriteRows(path, rows); err != nil {
 		return "", nil, a.restoreRefused(ctx, sessionID, err)
 	}
 
-	return path, stored.rows, nil
+	return path, rows, nil
+}
+
+// nativePath locates the session file a restore continues. The recorded path
+// is used while it still names a file under the agent directory; otherwise the
+// header row's timestamp reproduces the name pi gives it. A committed
+// conversation with no native history carries no header row, so the recorded
+// path is the only identity it has.
+func (a *Agent) nativePath(ctx context.Context, sessionID acp.SessionId, stored storedSession, cwd string, agentDir string) (string, error) {
+	path := stored.record.SessionFile
+
+	if len(stored.rows) == 0 {
+		return path, nil
+	}
+
+	header, ok := pi.ParseHeader(stored.rows[0])
+	if !ok || header.ID != stored.record.NativeSessionID || filepath.Base(header.ID) != header.ID {
+		return "", a.restoreRefused(ctx, sessionID, errors.New("invalid native session identity"))
+	}
+
+	stamp, err := time.Parse(time.RFC3339Nano, header.Timestamp)
+	if err != nil {
+		return "", a.restoreRefused(ctx, sessionID, err)
+	}
+
+	relative, pathErr := filepath.Rel(agentDir, path)
+	if pathErr != nil || !filepath.IsLocal(relative) || !fileExists(path) {
+		path = pi.SessionFile(agentDir, cwd, stored.record.NativeSessionID, stamp)
+	}
+
+	return path, nil
 }
 
 func fileExists(path string) bool {
@@ -214,22 +235,8 @@ func (a *Agent) restoreRefused(ctx context.Context, sessionID acp.SessionId, err
 // session id.
 func storedTitle(sessionID string, rows [][]byte) string {
 	for _, row := range rows {
-		var entry struct {
-			Type    string          `json:"type"`
-			Message json.RawMessage `json:"message"`
-		}
-
-		if json.Unmarshal(row, &entry) != nil || entry.Type != rowTypeMessage {
-			continue
-		}
-
-		var message pi.AgentMessage
-		if json.Unmarshal(entry.Message, &message) != nil || message.Role != messageRoleUser {
-			continue
-		}
-
-		blocks, err := message.ContentBlocks()
-		if err != nil {
+		message, blocks, ok, err := messageRow(row)
+		if err != nil || !ok || message.Role != messageRoleUser {
 			continue
 		}
 
@@ -238,15 +245,11 @@ func storedTitle(sessionID string, rows [][]byte) string {
 				continue
 			}
 
-			if title := normalizeTitle(blocks[index].Text); title != "" {
+			if title := wire.NormalizeTitle(blocks[index].Text); title != "" {
 				return title
 			}
 		}
 	}
 
 	return sessionID
-}
-
-func trimSpace(value string) string {
-	return strings.TrimSpace(value)
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 
+	"github.com/savid/acp-go-core/wire"
 	piacp "github.com/savid/acp-go-pi"
 )
 
@@ -162,12 +163,12 @@ func chat(ctx context.Context, conn agentConnection, input *bufio.Reader, cwd st
 		return err
 	}
 
-	var opts []piacp.SessionRequestOption
+	var opts []wire.SessionRequestOption
 	if model != "" {
 		opts = append(opts, piacp.WithSessionPiOptions(piacp.NewPiOptions(piacp.WithPiModel(model))))
 	}
 
-	session, err := conn.NewSession(ctx, piacp.NewSessionRequest(cwd, opts...))
+	session, err := conn.NewSession(ctx, wire.NewSessionRequest(cwd, opts...))
 	if err != nil {
 		return err
 	}
@@ -186,7 +187,7 @@ func chat(ctx context.Context, conn agentConnection, input *bufio.Reader, cwd st
 			return nil
 		}
 
-		if _, err := conn.Prompt(ctx, piacp.TextPromptRequest(session.SessionId, text)); err != nil {
+		if _, err := conn.Prompt(ctx, wire.TextPromptRequest(session.SessionId, text)); err != nil {
 			return err
 		}
 

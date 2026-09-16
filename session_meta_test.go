@@ -1,7 +1,10 @@
 package piacp
 
 import (
+	"maps"
 	"testing"
+
+	"github.com/savid/acp-go-core/wire"
 
 	"github.com/stretchr/testify/require"
 )
@@ -91,8 +94,8 @@ func TestCloneAnyAndMerge(t *testing.T) {
 	t.Parallel()
 
 	base := map[string]any{"a": map[string]any{"x": 1}, "list": []any{1}, "strs": []string{"a"}}
-	merged := mergeAnyMap(base, map[string]any{"a": map[string]any{"y": 2}, "b": 3})
+	merged := wire.MergeMap(base, map[string]any{"a": map[string]any{"y": 2}, "b": 3})
 	require.Equal(t, map[string]any{"a": map[string]any{"x": 1, "y": 2}, "b": 3, "list": []any{1}, "strs": []string{"a"}}, merged)
-	require.Nil(t, cloneAnyMap(nil))
-	require.Nil(t, cloneStringMap(nil))
+	require.Nil(t, wire.CloneMap(nil))
+	require.Nil(t, maps.Clone(map[string]string(nil)))
 }

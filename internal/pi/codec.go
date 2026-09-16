@@ -86,13 +86,6 @@ type Response struct {
 	Success bool            `json:"success"`
 	Error   string          `json:"error,omitempty"`
 	Data    json.RawMessage `json:"data,omitempty"`
-
-	raw json.RawMessage
-}
-
-// RawJSON returns the raw response line bytes.
-func (r Response) RawJSON() json.RawMessage {
-	return r.raw
 }
 
 // CommandError is a pi RPC command failure carrying the real native cause.
@@ -127,15 +120,6 @@ type UIRequest struct {
 	Message     string   `json:"message,omitempty"`
 	Placeholder string   `json:"placeholder,omitempty"`
 	Prefill     string   `json:"prefill,omitempty"`
-	NotifyType  string   `json:"notifyType,omitempty"`
-	TimeoutMs   *float64 `json:"timeout,omitempty"`
-
-	raw json.RawMessage
-}
-
-// RawJSON returns the raw request line bytes.
-func (r UIRequest) RawJSON() json.RawMessage {
-	return r.raw
 }
 
 // IsDialog reports whether the request blocks the extension until answered.
@@ -202,16 +186,12 @@ func DecodeMessage(line []byte) (Message, error) {
 			return Message{}, fmt.Errorf("decode response record: %w", err)
 		}
 
-		response.raw = raw
-
 		return Message{Kind: MessageKindResponse, Response: response}, nil
 	case "extension_ui_request":
 		var request UIRequest
 		if err := json.Unmarshal(line, &request); err != nil {
 			return Message{}, fmt.Errorf("decode extension ui request: %w", err)
 		}
-
-		request.raw = raw
 
 		return Message{Kind: MessageKindUIRequest, UIRequest: request}, nil
 	default:

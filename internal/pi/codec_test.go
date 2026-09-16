@@ -40,13 +40,11 @@ func TestDecodeMessage(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, MessageKindResponse, message.Kind)
 	require.EqualError(t, message.Response.Err(), "pi command prompt failed: no")
-	require.NotEmpty(t, message.Response.RawJSON())
 
 	message, err = DecodeMessage([]byte(`{"type":"extension_ui_request","id":"u","method":"select","title":"t","options":["a"]}`))
 	require.NoError(t, err)
 	require.Equal(t, MessageKindUIRequest, message.Kind)
 	require.True(t, message.UIRequest.IsDialog())
-	require.NotEmpty(t, message.UIRequest.RawJSON())
 
 	message, err = DecodeMessage([]byte(`{"type":"extension_ui_request","id":"u","method":"notify"}`))
 	require.NoError(t, err)
@@ -55,11 +53,13 @@ func TestDecodeMessage(t *testing.T) {
 	message, err = DecodeMessage([]byte(`{"type":"agent_start"}`))
 	require.NoError(t, err)
 	require.Equal(t, MessageKindEvent, message.Kind)
-	require.Equal(t, EventTypeAgentStart, message.Event.Kind())
+	require.IsType(t, AgentStartEvent{}, message.Event)
 
 	message, err = DecodeMessage([]byte(`{"type":"something_new","x":1}`))
 	require.NoError(t, err)
-	require.Equal(t, "something_new", message.Event.Kind())
+	unknown, ok := message.Event.(UnknownEvent)
+	require.True(t, ok)
+	require.Equal(t, "something_new", unknown.EventType)
 
 	_, err = DecodeMessage([]byte(`not json`))
 	require.Error(t, err)

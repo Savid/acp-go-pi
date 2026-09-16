@@ -5,15 +5,14 @@ import (
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
-	"github.com/stretchr/testify/require"
-
+	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/wire"
+	"github.com/stretchr/testify/require"
 )
 
-// reduceAll runs every recorded notification through the core reducer, so
-// the stream the adapter emitted is proven against the same validator the
-// fixture battery drives.
+// reduceAll replays one session's recorded notifications through the core
+// lifecycle reducer and returns the state they produce.
 func reduceAll(t *testing.T, sessionID acp.SessionId, updates []acp.SessionNotification) lifecycle.State {
 	t.Helper()
 
@@ -137,7 +136,7 @@ func TestLifecycleCancelledTurn(t *testing.T) {
 		return len(lifecycleEvents(updates)) >= 3
 	})
 
-	require.NoError(t, h.conn.Cancel(h.ctx(), CancelRequest(session.SessionId)))
+	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
 	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
 
 	events := lifecycleEvents(h.rec.snapshot())
@@ -209,4 +208,150 @@ func TestLifecycleDormantWithoutNegotiation(t *testing.T) {
 	require.Empty(t, lifecycleEvents(h.rec.snapshot()))
 	require.Len(t, h.rec.permissions, 1)
 	require.NotContains(t, h.rec.permissions[0].Meta, wire.LifecycleKey)
+}
+
+// An incarnation ends with its native generation, including a clean exit that
+// follows a turn the session already settled.
+func TestLifecycleCleanExitAfterSettledTurnFences(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize(withLifecycle())
+	session := h.newSession()
+
+	resp, err := h.prompt(session.SessionId, "QUIT", promptMeta(1))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
+
+	// The native process is gone; the next prompt relaunches it.
+	settled := h.rec.snapshot()
+	firstStream, _ := settled[len(settled)-1].Meta[wire.LifecycleKey].(map[string]any)
+
+	// A prompt that arrives before the adapter has observed the exit fails on
+	// the lost transport; the one after it runs on the replacement process.
+	for attempt := range 3 {
+		resp, err = h.prompt(session.SessionId, "HELLO", promptMeta(2+attempt))
+		if err == nil {
+			break
+		}
+	}
+
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
+
+	updates := h.rec.snapshot()
+	types := eventTypes(lifecycleEvents(updates))
+	require.Equal(t, "lifecycle_snapshot", types[len(types)-4], "the replacement process opens its own incarnation: %v", types)
+
+	for _, update := range updates[len(settled):] {
+		envelope, ok := update.Meta[wire.LifecycleKey].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		require.NotEqual(t, firstStream["streamId"], envelope["streamId"],
+			"an incarnation carried work after the native process behind it exited")
+	}
+}
+
+// Close terminalizes an open agent-origin cycle before it fences the stream.
+func TestLifecycleCloseTerminalizesAgentCycle(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize(withLifecycle())
+	session := h.newSession()
+
+	_, err := h.prompt(session.SessionId, "AGENTHANG", promptMeta(1))
+	require.NoError(t, err)
+
+	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool {
+		types := eventTypes(lifecycleEvents(updates))
+
+		return len(types) >= 5 && types[4] == "state_update:running"
+	})
+
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+
+	events := lifecycleEvents(h.rec.snapshot())
+	last := events[len(events)-1]
+	require.Equal(t, "idle", last["state"])
+	require.Equal(t, "cancelled", last["outcome"])
+	require.Equal(t, "activity", last["cause"])
+}
+
+// A relaunch republishes the command catalog for the new incarnation.
+func TestCommandsReEmittedAfterRelaunch(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	_, err := h.prompt(session.SessionId, "QUIT", nil)
+	require.NoError(t, err)
+
+	before := commandCatalogs(h.rec.snapshot())
+
+	for range 3 {
+		if _, err = h.prompt(session.SessionId, "HELLO", nil); err == nil {
+			break
+		}
+	}
+
+	require.NoError(t, err)
+
+	require.Greater(t, commandCatalogs(h.rec.snapshot()), before, "the relaunched incarnation republishes its catalog")
+}
+
+func commandCatalogs(updates []acp.SessionNotification) int {
+	count := 0
+
+	for _, update := range updates {
+		if update.Update.AvailableCommandsUpdate != nil {
+			count++
+		}
+	}
+
+	return count
+}
+
+func TestCloseBackgroundCycleRequiresCommit(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "committed", true: "failed"}[fail], func(t *testing.T) {
+			store := &recoveryFaultStore{SessionStore: acpcore.NewInMemorySessionStore()}
+			h := newHarness(t, WithSessionStore(store))
+			h.initialize(withLifecycle())
+			created := h.newSession()
+			_, err := h.prompt(created.SessionId, "AGENTHANG", promptMeta(1))
+			require.NoError(t, err)
+			h.rec.waitFor(t, func(updates []acp.SessionNotification) bool {
+				events := lifecycleEvents(updates)
+
+				return len(events) >= 5 && events[4]["state"] == "running"
+			})
+			before := len(lifecycleEvents(h.rec.snapshot()))
+			store.fail.Store(fail)
+			_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: created.SessionId})
+			store.fail.Store(false)
+			if fail {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			terminal := 0
+			for _, event := range lifecycleEvents(h.rec.snapshot())[before:] {
+				if event["state"] == "idle" {
+					terminal++
+					require.Equal(t, "cancelled", event["outcome"])
+				}
+			}
+			if fail {
+				require.Zero(t, terminal)
+			} else {
+				require.Equal(t, 1, terminal)
+			}
+		})
+	}
 }

@@ -12,7 +12,6 @@ func TestParseModelRef(t *testing.T) {
 	ref, err := ParseModelRef("openai/gpt/nested")
 	require.NoError(t, err)
 	require.Equal(t, ModelRef{Provider: "openai", ID: "gpt/nested"}, ref)
-	require.Equal(t, "openai/gpt/nested", ref.String())
 
 	for _, bad := range []string{"", "openai", "/x", "x/"} {
 		_, err := ParseModelRef(bad)

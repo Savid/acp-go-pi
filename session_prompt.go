@@ -22,7 +22,6 @@ import (
 const (
 	limitSessionPrompt = "session_prompt"
 
-	stopReasonStop      = "stop"
 	stopReasonLength    = "length"
 	stopReasonMaxTokens = "max_tokens"
 	stopReasonAborted   = "aborted"
@@ -31,8 +30,6 @@ const (
 	// extensionFailureMessage is the whole of what a client is told about a
 	// wrapper extension that threw: its path and thrown text are internal.
 	extensionFailureMessage = "a pi extension failed"
-	// nativeCauseMaxBytes bounds the native cause text a failure carries.
-	nativeCauseMaxBytes = 2048
 	// processExitGrace is how long failure classification waits for a dead
 	// child to be reaped after its stdout closed.
 	processExitGrace = 2 * time.Second
@@ -56,9 +53,10 @@ func (s *session) mapPrompt(ctx context.Context, blocks []acp.ContentBlock) (nat
 	}
 
 	decoded, refusal, err := image.ValidatePrompt(ctx, blocks, image.Options{
-		Limits:      s.agent.options.ImageLimits.core(),
-		HandoffRoot: s.agent.options.InputHandoffRoot,
-		Blobs:       func(string) image.BlobDisposition { return image.BlobRefuse },
+		Limits:           s.agent.options.ImageLimits.core(),
+		HandoffRoot:      s.agent.options.InputHandoffRoot,
+		Blobs:            func(string) image.BlobDisposition { return image.BlobRefuse },
+		TextBeforeImages: true,
 	})
 	if err != nil {
 		return nativePrompt{}, err
@@ -74,7 +72,7 @@ func (s *session) mapPrompt(ctx context.Context, blocks []acp.ContentBlock) (nat
 	for _, block := range blocks {
 		switch {
 		case block.Text != nil:
-			if audienceIsUserOnly(block.Text.Annotations) {
+			if wire.AudienceIsUserOnly(block.Text.Annotations) {
 				continue
 			}
 
@@ -85,7 +83,7 @@ func (s *session) mapPrompt(ctx context.Context, blocks []acp.ContentBlock) (nat
 		case block.Resource != nil:
 			if text := block.Resource.Resource.TextResourceContents; text != nil {
 				textParts = append(textParts, strings.TrimSpace(text.Uri))
-				contextParts = append(contextParts, contextResourceText(text.Uri, text.Text))
+				contextParts = append(contextParts, wire.ContextResourceText(text.Uri, text.Text))
 			}
 		default:
 			return nativePrompt{}, wire.Unsupported("prompt")
@@ -110,16 +108,6 @@ func (s *session) mapPrompt(ctx context.Context, blocks []acp.ContentBlock) (nat
 	}
 
 	return prompt, nil
-}
-
-func audienceIsUserOnly(annotations *acp.Annotations) bool {
-	return annotations != nil && len(annotations.Audience) == 1 && annotations.Audience[0] == acp.RoleUser
-}
-
-func contextResourceText(uri string, text string) string {
-	escape := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
-
-	return "\n<context ref=\"" + escape.Replace(uri) + "\">\n" + escape.Replace(text) + "\n</context>"
 }
 
 // rejectImagesForModel refuses image input pre-turn when the selected model's
@@ -157,7 +145,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 
 	submission, paramErr := lifecycle.DecodePromptCorrelation(meta, s.lifecycleNegotiated())
 	if paramErr != nil {
-		return acp.PromptResponse{}, invalidParam(paramErr)
+		return acp.PromptResponse{}, wire.ParamRefusal(paramErr)
 	}
 
 	if err := s.admissionError(); err != nil {
@@ -178,39 +166,26 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 		return acp.PromptResponse{}, wire.Backpressure(limitSessionPrompt)
 	}
 
-	mapped, err := s.mapPrompt(ctx, params.Prompt)
-	if err != nil {
-		if ctx.Err() != nil {
-			return cancelledResponse(params), nil
-		}
-
-		return acp.PromptResponse{}, err
-	}
-
-	// session/cancel cancels this request's context through the SDK. A cancel
-	// that lands before native dispatch creates neither submission nor turn and
-	// answers cancelled.
-	if ctx.Err() != nil {
-		return cancelledResponse(params), nil
-	}
-
-	rt, err := s.ensureRuntime(ctx)
-	if err != nil {
-		return acp.PromptResponse{}, err
-	}
-
-	if err := s.rejectImagesForModel(mapped); err != nil {
-		return acp.PromptResponse{}, err
-	}
+	// The turn outlives this request: the pinned SDK cancels a session's
+	// previous prompt context before it dispatches the next one, so a peer
+	// prompt this session refuses must not end the live turn. Only the session
+	// cancels a turn.
+	turnCtx, cancelTurn := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelTurn()
 
 	t := &turn{
-		cycle:      cycle{origin: lifecycle.CauseSubmission, state: cycleState{tools: make(map[string]*toolState)}},
+		cycle:      cycle{Cycle: lifecycle.Cycle{Origin: lifecycle.CauseSubmission}, state: cycleState{tools: make(map[string]*toolState)}},
 		submission: submission,
+		cancel:     cancelTurn,
 		settled:    make(chan struct{}),
 		finished:   make(chan struct{}),
 	}
 	defer close(t.finished)
 
+	// The turn is the session's before any of the work a session/cancel must be
+	// able to interrupt: image decode and a relaunch of pi. It carries no
+	// generation yet, so no pump attributes anything to it and nothing is
+	// published for it until it dispatches.
 	s.mu.Lock()
 	s.turn = t
 	s.mu.Unlock()
@@ -228,35 +203,60 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 		defer timer.Stop()
 	}
 
-	if err := rt.client.Prompt(ctx, mapped.message, mapped.images); err != nil {
-		if !t.accepted {
-			if ctx.Err() != nil {
-				return cancelledResponse(params), nil
+	mapped, err := s.mapPrompt(turnCtx, params.Prompt)
+	if turnCtx.Err() != nil {
+		return s.endedBeforeDispatch(t, params)
+	}
+
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	rt, err := s.ensureRuntime(turnCtx)
+	if turnCtx.Err() != nil {
+		return s.endedBeforeDispatch(t, params)
+	}
+
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	if err := s.rejectImagesForModel(mapped); err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	// pi is about to receive the turn, so its pump owns the turn from here.
+	s.mu.Lock()
+	t.rt = rt
+	s.mu.Unlock()
+
+	if err := rt.client.Prompt(turnCtx, mapped.message, mapped.images); err != nil {
+		if !s.turnAccepted(t) {
+			if s.turnCancelled(t) {
+				return wire.CancelledResponse(params), nil
 			}
 
-			return acp.PromptResponse{}, s.dispatchFailure(ctx, rt, err)
+			return acp.PromptResponse{}, s.dispatchFailure(context.WithoutCancel(ctx), rt, err)
 		}
 	}
 
-	s.acceptTurn(ctx, t)
+	s.acceptTurn(turnCtx, t)
 
 	select {
 	case <-t.settled:
-	case <-ctx.Done():
-		s.cancel(ctx)
-
+	case <-turnCtx.Done():
 		select {
 		case <-t.settled:
 		case <-time.After(sessionAbortTimeout):
+			// The child is still alive: end its generation before the turn
+			// reports a lost transport, so nothing publishes on the incarnation
+			// this fences.
+			s.stopRuntime(context.WithoutCancel(ctx), rt)
 			t.settle(turnTransportEnded)
 		}
 	}
 
 	return s.settleTurn(ctx, rt, t, params)
-}
-
-func cancelledResponse(params acp.PromptRequest) acp.PromptResponse {
-	return acp.PromptResponse{StopReason: acp.StopReasonCancelled, UserMessageId: params.MessageId}
 }
 
 // dispatchFailure classifies a prompt command pi never accepted: a native
@@ -265,7 +265,7 @@ func cancelledResponse(params acp.PromptRequest) acp.PromptResponse {
 func (s *session) dispatchFailure(ctx context.Context, rt *runtime, err error) error {
 	var commandErr *pi.CommandError
 	if errors.As(err, &commandErr) {
-		return turnFailure(wire.CauseProvider, commandErr.Message)
+		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseProvider, Message: commandErr.Message})
 	}
 
 	return s.transportFailure(ctx, rt, err)
@@ -284,11 +284,11 @@ func (s *session) transportFailure(ctx context.Context, rt *runtime, err error) 
 			message = fmt.Sprintf("pi process was killed by signal %d", result.Signal)
 		}
 
-		if line := rt.stderr.lastLine(); line != "" {
+		if line := rt.proc.StderrLastLine(); line != "" {
 			message += ": " + line
 		}
 
-		return turnFailure(wire.CauseProcessExit, message)
+		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseProcessExit, Message: message})
 	}
 
 	if err == nil {
@@ -299,21 +299,7 @@ func (s *session) transportFailure(ctx context.Context, rt *runtime, err error) 
 		err = errors.New("pi event stream closed mid-turn")
 	}
 
-	return turnFailure(wire.CauseTransport, err.Error())
-}
-
-func turnFailure(cause string, message string) *acp.RequestError {
-	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: cause, Message: boundNativeCause(message)})
-}
-
-// boundNativeCause is the single gate every native cause text passes through
-// before it reaches a client.
-func boundNativeCause(message string) string {
-	if len(message) > nativeCauseMaxBytes {
-		message = message[:nativeCauseMaxBytes]
-	}
-
-	return strings.TrimSpace(strings.ToValidUTF8(message, ""))
+	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: err.Error()})
 }
 
 // cycleVerdict is how one cycle ended, in the terms the lifecycle stream and
@@ -326,19 +312,21 @@ type cycleVerdict struct {
 
 // judgeCycle records how a natively settled cycle finished. The cancel guard
 // runs before every failure mapping.
-func judgeCycle(c *cycle, cancelled bool) cycleVerdict {
+func (s *session) judgeCycle(c *cycle, cancelled bool) cycleVerdict {
+	failure := s.cycleFailure(c)
+
 	switch {
 	case cancelled:
 		return cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
-	case c.failure != nil:
-		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: c.failure}
+	case failure != nil:
+		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: failure}
 	case c.state.stopReason == stopReasonError:
 		message := strings.TrimSpace(c.state.errorMessage)
 		if message == "" {
 			message = "pi reported a turn error"
 		}
 
-		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: turnFailure(wire.CauseProvider, message)}
+		return cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseProvider, Message: message})}
 	}
 
 	stop := acp.StopReasonEndTurn
@@ -373,11 +361,11 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 	case cancelled:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
 	case timedOut:
-		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: turnFailure(wire.CauseTimeout, fmt.Sprintf("pi turn exceeded %s", s.agent.options.TurnTimeout))}
+		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: s.turnTimeout()}
 	case t.ended == turnTransportEnded:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: s.transportFailure(settleCtx, rt, nil)}
 	default:
-		verdict = judgeCycle(&t.cycle, false)
+		verdict = s.judgeCycle(&t.cycle, false)
 	}
 
 	if t.ended == turnSettled {
@@ -389,18 +377,18 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 
 		if err := s.commitMirror(settleCtx); err != nil {
 			s.stopRuntime(settleCtx, rt)
-			s.lcFence()
+			s.lc.Fence()
 			verdict.failure = s.mirrorFailure(&t.state, err)
 			verdict.outcome = lifecycle.OutcomeFailed
 		}
 	}
 
-	if err := s.lcIdle(settleCtx, &t.cycle, verdict); err != nil && verdict.failure == nil {
+	if err := s.lc.Idle(settleCtx, t.Cycle, verdict.stopReason, verdict.outcome); err != nil && verdict.failure == nil {
 		verdict.failure = err
 	}
 
-	if t.ended == turnTransportEnded {
-		s.lcFence()
+	if s.claimFence(t, rt) {
+		s.lc.Fence()
 	}
 
 	if verdict.failure != nil {
@@ -414,6 +402,47 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 	}, nil
 }
 
+// endedBeforeDispatch answers a prompt the session ended before pi received
+// it: no native turn exists, no submission was published, and nothing has to be
+// terminalized. The deadline fails the prompt; every other end is a cancel.
+func (s *session) endedBeforeDispatch(t *turn, params acp.PromptRequest) (acp.PromptResponse, error) {
+	s.mu.Lock()
+	timedOut := t.timedOut
+	s.mu.Unlock()
+
+	if timedOut {
+		return acp.PromptResponse{}, s.turnTimeout()
+	}
+
+	return wire.CancelledResponse(params), nil
+}
+
+// turnTimeout is the failure a turn that outran its deadline carries.
+func (s *session) turnTimeout() error {
+	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTimeout, Message: fmt.Sprintf("pi turn exceeded %s", s.agent.options.TurnTimeout)})
+}
+
+// turnCancelled reports whether the session has cancelled this turn.
+func (s *session) turnCancelled(t *turn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return t.cancelled
+}
+
+// claimFence records that the turn published its terminal lifecycle event and
+// reports whether this caller owes the incarnation fence. An incarnation ends
+// with its native generation, so whichever of the turn and the pump acts last
+// fences it exactly once.
+func (s *session) claimFence(t *turn, rt *runtime) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	t.lcSettled = true
+
+	return s.runtime != rt
+}
+
 // settledStats reads pi's post-turn statistics. A native session id that no
 // longer matches the ACP session poisons it.
 func (s *session) settledStats(ctx context.Context, rt *runtime) *pi.SessionStats {
@@ -424,7 +453,7 @@ func (s *session) settledStats(ctx context.Context, rt *runtime) *pi.SessionStat
 		return nil
 	}
 
-	if stats.SessionID != "" && stats.SessionID != string(s.id) {
+	if stats.SessionID != "" && stats.SessionID != s.nativeID {
 		s.poisonSession(ctx, "native_session_identity_drift")
 
 		return nil

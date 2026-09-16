@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"context"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -24,4 +25,15 @@ func TestServePromptRoundTrip(t *testing.T) {
 
 	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
 	require.NoError(t, err)
+}
+
+func TestCancelledVersionProbeDoesNotPoisonAgent(t *testing.T) {
+	agent := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = agent.Close() })
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := agent.ensureExecutable(ctx)
+	require.Error(t, err)
+	_, err = agent.ensureExecutable(t.Context())
+	require.NoError(t, err, "a request-local cancelled probe permanently poisoned the agent")
 }

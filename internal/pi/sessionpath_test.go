@@ -45,7 +45,6 @@ func TestRowsRoundTrip(t *testing.T) {
 	header, ok := ParseHeader(read[0])
 	require.True(t, ok)
 	require.Equal(t, "abc", header.ID)
-	require.Equal(t, "/w", header.Cwd)
 
 	_, ok = ParseHeader(read[1])
 	require.False(t, ok)

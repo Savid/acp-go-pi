@@ -33,30 +33,20 @@ func NewImageContent(data string, mimeType string) ImageContent {
 
 // SessionState is the get_state response payload.
 type SessionState struct {
-	Model                 *Model `json:"model,omitempty"`
-	ThinkingLevel         string `json:"thinkingLevel"`
-	IsStreaming           bool   `json:"isStreaming"`
-	IsCompacting          bool   `json:"isCompacting"`
-	SessionFile           string `json:"sessionFile,omitempty"`
-	SessionID             string `json:"sessionId"`
-	SessionName           string `json:"sessionName,omitempty"`
-	AutoCompactionEnabled bool   `json:"autoCompactionEnabled"`
-	MessageCount          int    `json:"messageCount"`
-	PendingMessageCount   int    `json:"pendingMessageCount"`
+	Model         *Model `json:"model,omitempty"`
+	ThinkingLevel string `json:"thinkingLevel"`
+	SessionFile   string `json:"sessionFile,omitempty"`
+	SessionID     string `json:"sessionId"`
 }
 
 // Model is one pi model catalog entry.
 type Model struct {
-	ID            string          `json:"id"`
-	Name          string          `json:"name"`
-	API           string          `json:"api"`
-	Provider      string          `json:"provider"`
-	BaseURL       string          `json:"baseUrl,omitempty"`
-	Reasoning     bool            `json:"reasoning"`
-	Input         []string        `json:"input"`
-	ContextWindow int64           `json:"contextWindow"`
-	MaxTokens     int64           `json:"maxTokens"`
-	Cost          json.RawMessage `json:"cost,omitempty"`
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Provider      string   `json:"provider"`
+	Input         []string `json:"input"`
+	ContextWindow int64    `json:"contextWindow"`
+	MaxTokens     int64    `json:"maxTokens"`
 }
 
 // Ref is the model's "provider/id" address.
@@ -68,18 +58,6 @@ func (m Model) Ref() string {
 type SlashCommand struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
-	Source      string `json:"source"`
-	Location    string `json:"location,omitempty"`
-	Path        string `json:"path,omitempty"`
-}
-
-// TokenTotals is the session-level token usage inside get_session_stats.
-type TokenTotals struct {
-	Input      int64 `json:"input"`
-	Output     int64 `json:"output"`
-	CacheRead  int64 `json:"cacheRead"`
-	CacheWrite int64 `json:"cacheWrite"`
-	Total      int64 `json:"total"`
 }
 
 // ContextUsage is the current context-window estimate inside
@@ -93,16 +71,8 @@ type ContextUsage struct {
 
 // SessionStats is the get_session_stats response payload.
 type SessionStats struct {
-	SessionFile       string        `json:"sessionFile,omitempty"`
-	SessionID         string        `json:"sessionId"`
-	UserMessages      int           `json:"userMessages"`
-	AssistantMessages int           `json:"assistantMessages"`
-	ToolCalls         int           `json:"toolCalls"`
-	ToolResults       int           `json:"toolResults"`
-	TotalMessages     int           `json:"totalMessages"`
-	Tokens            TokenTotals   `json:"tokens"`
-	Cost              float64       `json:"cost"`
-	ContextUsage      *ContextUsage `json:"contextUsage,omitempty"`
+	SessionID    string        `json:"sessionId"`
+	ContextUsage *ContextUsage `json:"contextUsage,omitempty"`
 }
 
 // Prompt sends a user prompt. The response acknowledges acceptance; results

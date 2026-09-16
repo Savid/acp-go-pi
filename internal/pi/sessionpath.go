@@ -17,10 +17,8 @@ const (
 // SessionHeader is the first row of a native session file.
 type SessionHeader struct {
 	Type      string `json:"type"`
-	Version   int    `json:"version"`
 	ID        string `json:"id"`
 	Timestamp string `json:"timestamp"`
-	Cwd       string `json:"cwd"`
 }
 
 // HeaderRowType is the type member of the session header row.

@@ -23,15 +23,22 @@ const (
 	fakePiEnvDump    = "ACP_GO_PI_TEST_ENV_DUMP"
 	fakePiEnvVersion = "ACP_GO_PI_TEST_VERSION"
 	fakePiEnvNoModel = "ACP_GO_PI_TEST_NO_MODEL"
-	fakePiVersion    = "0.84.4"
+	// fakePiEnvResumeHold names a file a resumed fake pi creates before it
+	// stops answering, so a test can act while the adapter is still relaunching.
+	fakePiEnvResumeHold = "ACP_GO_PI_TEST_RESUME_HOLD"
+	fakePiVersion       = "0.84.4"
+
+	// fakePiResumeHold is how long a held resume refuses to serve. It outlasts
+	// the shutdown the adapter sends when it gives up on the relaunch.
+	fakePiResumeHold = 30 * time.Second
 
 	// tinyPNG is a valid 1x1 PNG.
 	tinyPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
 )
 
 var fakeModels = []pi.Model{
-	{ID: "vision", Name: "Fake Vision", API: "fake", Provider: "fake", Input: []string{"text", "image"}, ContextWindow: 1000, MaxTokens: 100},
-	{ID: "text-only", Name: "Fake Text", API: "fake", Provider: "fake", Input: []string{"text"}, ContextWindow: 500, MaxTokens: 50},
+	{ID: "vision", Name: "Fake Vision", Provider: "fake", Input: []string{"text", "image"}, ContextWindow: 1000, MaxTokens: 100},
+	{ID: "text-only", Name: "Fake Text", Provider: "fake", Input: []string{"text"}, ContextWindow: 500, MaxTokens: 50},
 }
 
 type fakePi struct {
@@ -105,11 +112,18 @@ func runFakePi(args []string) int {
 		}
 	}
 
-	if f.sessionFile == "" {
+	resumed := f.sessionFile != ""
+
+	if !resumed {
 		f.sessionID = fakeUUID()
 		f.sessionFile = pi.SessionFile(f.agentDir, cwd, f.sessionID, time.Now())
 		_ = os.MkdirAll(filepath.Dir(f.sessionFile), 0o700)
-		header, _ := json.Marshal(pi.SessionHeader{Type: pi.HeaderRowType, Version: 3, ID: f.sessionID, Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Cwd: cwd})
+		// pi's header row carries members the adapter does not model; the fake
+		// writes the whole row so restore sees what pi writes.
+		header, _ := json.Marshal(map[string]any{
+			"type": pi.HeaderRowType, "version": 3, "id": f.sessionID,
+			"timestamp": time.Now().UTC().Format(time.RFC3339Nano), "cwd": cwd,
+		})
 		_ = os.WriteFile(f.sessionFile, append(header, '\n'), 0o600)
 		f.entries = 1
 	} else {
@@ -132,6 +146,11 @@ func runFakePi(args []string) int {
 	}
 
 	f.statsID = f.sessionID
+
+	if hold := os.Getenv(fakePiEnvResumeHold); hold != "" && resumed {
+		_ = os.WriteFile(hold, []byte("held\n"), 0o600)
+		time.Sleep(fakePiResumeHold)
+	}
 
 	return f.serve(os.Stdin)
 }
@@ -248,13 +267,14 @@ func (f *fakePi) dispatch(line []byte) {
 	case "get_session_stats":
 		tokens := int64(42)
 		f.respond(command.ID, command.Type, pi.SessionStats{
-			SessionFile: f.sessionFile, SessionID: f.statsID,
+			SessionID:    f.statsID,
 			ContextUsage: &pi.ContextUsage{Tokens: &tokens, ContextWindow: 1000},
 		})
+
 	case "get_commands":
 		f.respond(command.ID, command.Type, map[string]any{"commands": []pi.SlashCommand{
-			{Name: "help", Description: "Show help", Source: "extension"},
-			{Name: "bad name", Source: "prompt"},
+			{Name: "help", Description: "Show help"},
+			{Name: "bad name"},
 		}})
 	case "prompt":
 		if strings.HasPrefix(command.Message, "REJECT") {
@@ -357,6 +377,10 @@ func (f *fakePi) runTurn(message string, imageCount int, abort <-chan struct{}, 
 	if strings.HasPrefix(message, "AGENTWORK") {
 		f.run("HELLO background", 0, make(chan struct{}))
 	}
+
+	if strings.HasPrefix(message, "AGENTHANG") {
+		f.run("SLOW background", 0, abort)
+	}
 }
 
 func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
@@ -410,6 +434,13 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 			stopReason = "aborted"
 		case <-time.After(30 * time.Second):
 		}
+	case strings.HasPrefix(message, "WAIT"):
+		select {
+		case <-abort:
+			stopReason = "aborted"
+		case <-time.After(2 * time.Second):
+			content = append(content, textBlock("waited"))
+		}
 	case strings.HasPrefix(message, "EXTERR"):
 		f.event(map[string]any{"type": "extension_error", "extensionPath": f.bridgePath, "event": "tool_call", "error": "boom"})
 
@@ -439,6 +470,23 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 	f.event(map[string]any{"type": "turn_end", "message": assistant, "toolResults": []any{}})
 	f.event(map[string]any{"type": "agent_end", "messages": []any{assistant}, "willRetry": false})
 	f.event(map[string]any{"type": "agent_settled"})
+
+	if strings.HasPrefix(message, "QUIT") {
+		// pi exits cleanly once its run has settled. Its stdout closes first so
+		// nothing can be answered by a process on its way out.
+		f.writeMu.Lock()
+		_ = f.out.Flush()
+		_ = os.Stdout.Close()
+		os.Exit(0)
+	}
+
+	if strings.HasPrefix(message, "NOISE") {
+		fmt.Fprintln(os.Stderr, "fatal: chatter on stderr")
+		f.writeMu.Lock()
+		_, _ = f.out.WriteString("not a json record at all\n")
+		_ = f.out.Flush()
+		f.writeMu.Unlock()
+	}
 }
 
 func (f *fakePi) toolCall(id string, name string, args map[string]any, result []map[string]any) {

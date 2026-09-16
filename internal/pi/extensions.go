@@ -49,10 +49,6 @@ const (
 	PermissionOptionAllow = "allow"
 	// PermissionOptionDeny is the select option that blocks the tool call.
 	PermissionOptionDeny = "deny"
-
-	// QuestionToolName is the wrapper-owned tool the bridge registers so the
-	// model can ask the user a question through elicitation.
-	QuestionToolName = "question"
 )
 
 // PermissionPrompt is the payload the bridge extension encodes into a

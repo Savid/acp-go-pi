@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
+	"github.com/savid/acp-go-core/wire"
 	piacp "github.com/savid/acp-go-pi"
 )
 
@@ -175,6 +177,7 @@ type harness struct {
 
 func newHarness(t *testing.T, live bool, extra ...piacp.Option) *harness {
 	t.Helper()
+
 	return newHarnessAt(t, live, isolatedHome(t), extra...)
 }
 
@@ -244,7 +247,7 @@ func (h *harness) ctx(t *testing.T) context.Context {
 	return ctx
 }
 
-func liveModel() piacp.SessionRequestOption {
+func liveModel() wire.SessionRequestOption {
 	options := piacp.NewPiOptions()
 	if model := os.Getenv(envModel); model != "" {
 		options.Model = model
@@ -266,4 +269,21 @@ func requestErrorData(t *testing.T, err error) map[string]any {
 	require.NoError(t, json.Unmarshal(encoded, &data))
 
 	return data
+}
+
+func (r *recorder) toolText() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var text strings.Builder
+	for _, update := range r.updates {
+		if tool := update.Update.ToolCallUpdate; tool != nil {
+			for _, item := range tool.Content {
+				if item.Content != nil && item.Content.Content.Text != nil {
+					text.WriteString(item.Content.Content.Text.Text)
+				}
+			}
+		}
+	}
+
+	return text.String()
 }

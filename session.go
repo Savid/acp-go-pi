@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -32,9 +31,6 @@ const (
 	// ended: the stats read, the mirror commit, and the terminal lifecycle
 	// event.
 	sessionSettleTimeout = 60 * time.Second
-	// stderrTailBytes is how much of pi's stderr the session retains for the
-	// process-exit cause.
-	stderrTailBytes = 8 << 10
 )
 
 // session is one ACP session: one pi conversation, driven by one live pi
@@ -43,6 +39,7 @@ type session struct {
 	callbacks             sync.WaitGroup
 	agent                 *Agent
 	id                    acp.SessionId
+	nativeID              string
 	cwd                   string
 	additionalDirectories []string
 	options               PiOptions
@@ -75,14 +72,13 @@ type session struct {
 
 	mirrorMu sync.Mutex
 	lcMu     sync.Mutex
-	lc       lifecycleState
+	lc       lifecycle.Publisher
 }
 
 // runtime is one pi process generation.
 type runtime struct {
 	proc   *process.Process
 	client *pi.Client
-	stderr *stderrTail
 	cancel context.CancelFunc
 	// done is closed when the pump has stopped routing this generation.
 	done chan struct{}
@@ -91,10 +87,8 @@ type runtime struct {
 // cycle is one foreground run: the work of one accepted prompt, or one
 // agent-origin run pi started between prompts.
 type cycle struct {
-	turnID  string
-	cycleID string
-	origin  lifecycle.Cause
-	state   cycleState
+	lifecycle.Cycle
+	state cycleState
 	// failure records a wrapper extension failure observed during the run.
 	failure error
 }
@@ -111,9 +105,19 @@ const (
 type turn struct {
 	cycle
 	submission lifecycle.Submission
-	accepted   bool
-	cancelled  bool
-	timedOut   bool
+	// cancel ends the turn's own context. The turn outlives the request that
+	// created it, so only the session cancels it.
+	cancel context.CancelFunc
+	// rt is the process generation running this turn. It is nil until the
+	// prompt dispatches, so a turn the session can already cancel is still
+	// invisible to every pump.
+	rt        *runtime
+	accepted  bool
+	cancelled bool
+	timedOut  bool
+	// lcSettled records that the turn published its terminal lifecycle event,
+	// so whichever of the turn and the pump acts last fences the incarnation.
+	lcSettled  bool
 	ended      turnEnd
 	settled    chan struct{}
 	settleOnce sync.Once
@@ -135,35 +139,6 @@ type dialog struct {
 
 var errDialogCancelled = errors.New("dialog cancelled by the session")
 
-// stderrTail retains the last bytes pi wrote to stderr.
-type stderrTail struct {
-	mu   sync.Mutex
-	data []byte
-}
-
-func (t *stderrTail) Write(p []byte) (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.data = append(t.data, p...)
-	if len(t.data) > stderrTailBytes {
-		t.data = t.data[len(t.data)-stderrTailBytes:]
-	}
-
-	return len(p), nil
-}
-
-// lastLine is the final non-empty stderr line, which is where a dying harness
-// names its reason.
-func (t *stderrTail) lastLine() string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	lines := strings.Split(strings.TrimSpace(string(t.data)), "\n")
-
-	return strings.TrimSpace(lines[len(lines)-1])
-}
-
 // launch starts one pi process for this session and binds it as the live
 // runtime. sessionPath names the native session file to continue, or is
 // empty for a new conversation.
@@ -184,9 +159,8 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 	}
 
 	if seedErr := pi.WriteSeedFiles(s.agentDir, s.agent.options.SeedFiles); seedErr != nil {
-		var refused *process.SeedFileError
-		if errors.As(seedErr, &refused) {
-			return nil, wire.Unsupported("seedFiles")
+		if refusal := wire.SeedFileRefusal(seedErr); refusal != nil {
+			return nil, refusal
 		}
 
 		return nil, s.startFailure(ctx, seedErr)
@@ -201,10 +175,6 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 	if err != nil {
 		return nil, s.startFailure(ctx, err)
 	}
-
-	tail := &stderrTail{}
-
-	go func() { _, _ = io.Copy(tail, proc.Stderr()) }()
 
 	// The read loop outlives the request that launched pi: the shutdown ladder
 	// ends it.
@@ -222,7 +192,7 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 
 	s.mu.Lock()
 
-	rt := &runtime{proc: proc, client: client, stderr: tail, cancel: cancelRead, done: make(chan struct{})}
+	rt := &runtime{proc: proc, client: client, cancel: cancelRead, done: make(chan struct{})}
 	s.runtime = rt
 	s.mu.Unlock()
 
@@ -245,7 +215,7 @@ func (s *session) launchEnvironment() ([]string, error) {
 
 	env, err := environment.Build()
 	if err != nil {
-		return nil, wire.Unsupported(metaOptionPath(metaEnvKey))
+		return nil, wire.Unsupported(wire.MetaOptionPath(vendor, metaEnvKey))
 	}
 
 	return env, nil
@@ -319,7 +289,7 @@ func (s *session) configureRuntime(ctx context.Context, rt *runtime, model strin
 		if setErr != nil {
 			var commandErr *pi.CommandError
 			if errors.As(setErr, &commandErr) {
-				return wire.Unsupported(metaOptionPath(metaModelKey))
+				return wire.Unsupported(wire.MetaOptionPath(vendor, metaModelKey))
 			}
 
 			return s.startFailure(ctx, setErr)
@@ -340,7 +310,11 @@ func (s *session) configureRuntime(ctx context.Context, rt *runtime, model strin
 	}
 
 	s.mu.Lock()
-	s.id = acp.SessionId(state.SessionID)
+
+	s.nativeID = state.SessionID
+	if expectID == "" {
+		s.id = acp.SessionId(state.SessionID)
+	}
 
 	s.sessionFile = state.SessionFile
 	if !filepath.IsAbs(s.sessionFile) {
@@ -391,7 +365,7 @@ func (s *session) ensureRuntime(ctx context.Context) (*runtime, error) {
 		return nil, err
 	}
 
-	if configureErr := s.configureRuntime(ctx, rt, "", string(s.id)); configureErr != nil {
+	if configureErr := s.configureRuntime(ctx, rt, "", s.nativeID); configureErr != nil {
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
 		return nil, configureErr
@@ -436,6 +410,18 @@ func (s *session) pump(ctx context.Context, rt *runtime) {
 	s.runtimeEnded(ctx, rt)
 }
 
+// dispatchedTurn returns the turn rt is running, or nil when the session has
+// no turn on that generation. A turn the session has installed but not yet
+// dispatched, and a turn dispatched on a generation that has been replaced,
+// both belong to no live pump. The caller holds s.mu.
+func (s *session) dispatchedTurn(rt *runtime) *turn {
+	if s.turn == nil || s.turn.rt != rt {
+		return nil
+	}
+
+	return s.turn
+}
+
 // handleEvent attributes one native event to the foreground that owns it: the
 // in-flight prompt, the open agent-origin cycle, or, for an agent_start with
 // neither, a new agent-origin cycle.
@@ -443,7 +429,7 @@ func (s *session) handleEvent(ctx context.Context, rt *runtime, event pi.Event) 
 	s.emitRawEvent(ctx, event)
 
 	s.mu.Lock()
-	t := s.turn
+	t := s.dispatchedTurn(rt)
 	c := s.cycle
 	closing := s.closing
 	s.mu.Unlock()
@@ -455,9 +441,7 @@ func (s *session) handleEvent(ctx context.Context, rt *runtime, event pi.Event) 
 		}
 
 		settled, err := s.projectEvent(ctx, rt, &t.cycle, event)
-		if err != nil && t.failure == nil {
-			t.failure = err
-		}
+		s.recordFailure(&t.cycle, err)
 
 		if settled {
 			t.settle(turnSettled)
@@ -466,12 +450,10 @@ func (s *session) handleEvent(ctx context.Context, rt *runtime, event pi.Event) 
 		}
 	case c != nil:
 		settled, err := s.projectEvent(ctx, rt, c, event)
-		if err != nil && c.failure == nil {
-			c.failure = err
-		}
+		s.recordFailure(c, err)
 
 		if settled {
-			s.settleAgentCycle(ctx, c)
+			s.settleAgentCycle(ctx, rt, c)
 		}
 	default:
 		if _, opens := event.(pi.AgentStartEvent); opens && !closing {
@@ -501,10 +483,10 @@ func bearsWork(event pi.Event) bool {
 // openAgentCycle opens the foreground for work pi began with no prompt in
 // flight, such as a follow-up an operator extension queued.
 func (s *session) openAgentCycle(ctx context.Context) {
-	c := &cycle{origin: lifecycle.CauseActivity}
+	c := &cycle{Cycle: lifecycle.Cycle{Origin: lifecycle.CauseActivity}}
 	c.state.tools = make(map[string]*toolState)
 
-	if err := s.lcOpenAgentCycle(ctx, c); err != nil {
+	if err := s.lc.OpenAgentCycle(ctx, &c.Cycle); err != nil {
 		s.agent.log.ErrorContext(ctx, "open agent-origin cycle failed",
 			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 
@@ -518,21 +500,25 @@ func (s *session) openAgentCycle(ctx context.Context) {
 
 // settleAgentCycle runs the agent-origin settlement on the pump: usage, the
 // mirror commit, then the terminal idle.
-func (s *session) settleAgentCycle(ctx context.Context, c *cycle) {
+func (s *session) settleAgentCycle(ctx context.Context, rt *runtime, c *cycle) {
 	settleCtx, cancel := context.WithTimeout(ctx, sessionSettleTimeout)
 	defer cancel()
 
 	s.emitUsage(settleCtx, &c.state, nil)
 
 	if err := s.commitMirror(settleCtx); err != nil {
-		s.lcFence()
+		// The incarnation cannot publish what the store does not hold, so it
+		// ends with its generation: the next operation relaunches pi and opens
+		// a new stream.
+		s.lc.Fence()
+		s.dropRuntime(rt)
 		s.agent.log.ErrorContext(settleCtx, "mirror commit after agent-origin cycle failed",
 			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 	}
 
-	verdict := judgeCycle(c, false)
+	verdict := s.judgeCycle(c, false)
 
-	if err := s.lcIdle(settleCtx, c, verdict); err != nil {
+	if err := s.lc.Idle(settleCtx, c.Cycle, verdict.stopReason, verdict.outcome); err != nil {
 		s.agent.log.ErrorContext(settleCtx, "terminal idle for agent-origin cycle failed",
 			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
 	}
@@ -544,38 +530,80 @@ func (s *session) settleAgentCycle(ctx context.Context, c *cycle) {
 	s.mu.Unlock()
 }
 
-// runtimeEnded records that a process generation stopped producing events. An
-// in-flight prompt learns its transport ended; an open agent-origin cycle ends
-// failed; the incarnation's lifecycle stream is fenced once its last terminal
-// event is out.
+// runtimeEnded records that a process generation stopped producing events. The
+// turn this generation was running learns its transport ended; the generation
+// the session is still bound to also hands back its open agent-origin cycle,
+// its dialogs, and the incarnation fence. A generation the session already
+// replaced or dropped owns none of those. The child is always reaped.
 func (s *session) runtimeEnded(ctx context.Context, rt *runtime) {
+	s.mu.Lock()
+	bound := s.runtime == rt
+	closing := s.closing
+	t := s.dispatchedTurn(rt)
+
+	var c *cycle
+
+	if bound {
+		s.runtime = nil
+
+		if !closing {
+			// While closing, the shutdown ladder owns the open cycle so exactly
+			// one site terminalizes it.
+			c = s.cycle
+			s.cycle = nil
+		}
+	}
+
+	// A turn that already published its terminal event leaves the fence to the
+	// generation that carried it; one still settling fences itself.
+	fence := bound && !closing && (t == nil || t.lcSettled)
+	s.mu.Unlock()
+
+	if bound {
+		s.cancelDialogs()
+		s.callbacks.Wait()
+	}
+
+	if c != nil {
+		_ = s.lc.Idle(ctx, c.Cycle, "", lifecycle.OutcomeFailed)
+	}
+
+	if t != nil {
+		t.settle(turnTransportEnded)
+		t.cancel()
+	}
+
+	if fence {
+		s.lc.Fence()
+	}
+
+	s.releaseRuntime(ctx, rt)
+}
+
+// releaseRuntime reaps and releases a generation the pump has finished with.
+// The child is signalled first so a harness that closed its stdout while still
+// running never outlives the session that launched it.
+func (s *session) releaseRuntime(ctx context.Context, rt *runtime) {
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionShutdownTimeout)
+	defer cancel()
+
+	if err := rt.proc.Shutdown(shutdownCtx, sessionShutdownGrace); err != nil {
+		_ = rt.proc.Kill()
+	}
+
+	_ = rt.proc.Close()
+}
+
+// dropRuntime ends the binding to a generation this session can no longer
+// publish for and signals its child. The pump reaps it when its stream ends.
+func (s *session) dropRuntime(rt *runtime) {
 	s.mu.Lock()
 	if s.runtime == rt {
 		s.runtime = nil
 	}
-
-	t := s.turn
-	c := s.cycle
-	s.cycle = nil
-	closing := s.closing
 	s.mu.Unlock()
-	s.cancelDialogs()
-	s.callbacks.Wait()
 
-	if c != nil && !closing {
-		_ = s.lcIdle(ctx, c, cycleVerdict{outcome: lifecycle.OutcomeFailed})
-	}
-
-	if t != nil {
-		// The prompt settles the turn and fences the stream after its idle.
-		t.settle(turnTransportEnded)
-
-		return
-	}
-
-	if !closing {
-		s.lcFence()
-	}
+	_ = rt.proc.Kill()
 }
 
 // stopRuntime runs the native rungs of the shutdown ladder for one
@@ -595,7 +623,11 @@ func (s *session) stopRuntime(ctx context.Context, rt *runtime) {
 		rt.cancel()
 	}
 
+	// Closing the pipes ends the read loop of a pump that outlived the
+	// shutdown, and the join guarantees nothing still writes the cycle state
+	// the caller settles from.
 	_ = rt.proc.Close()
+	<-rt.done
 
 	s.mu.Lock()
 	if s.runtime == rt {
@@ -615,6 +647,28 @@ func (s *session) abort(ctx context.Context, rt *runtime) {
 	}
 }
 
+// abortAsync interrupts the native run from the pump. The abort waits on a
+// response only the pump can read, so it runs as session-owned work the
+// shutdown ladder joins. A session that is closing or no longer bound to rt is
+// already joining its callbacks and has nothing left to interrupt.
+func (s *session) abortAsync(ctx context.Context, rt *runtime) {
+	s.mu.Lock()
+	if s.closing || s.runtime != rt {
+		s.mu.Unlock()
+
+		return
+	}
+
+	s.callbacks.Add(1)
+	s.mu.Unlock()
+
+	go func() {
+		defer s.callbacks.Done()
+
+		s.abort(ctx, rt)
+	}()
+}
+
 // cancel implements session/cancel: it cancels the in-flight turn, resolves
 // its pending dialogs, and interrupts pi. It is a silent no-op with no turn.
 func (s *session) cancel(ctx context.Context) {
@@ -629,6 +683,7 @@ func (s *session) cancel(ctx context.Context) {
 	}
 
 	t.cancelled = true
+	t.cancel()
 	s.mu.Unlock()
 
 	s.cancelDialogs()
@@ -650,6 +705,7 @@ func (s *session) timeout(ctx context.Context, t *turn) {
 	}
 
 	t.timedOut = true
+	t.cancel()
 	s.mu.Unlock()
 
 	s.cancelDialogs()
@@ -748,12 +804,7 @@ func (s *session) acquireGate(limit string) (func(), error) {
 		return nil, wire.UnknownSession()
 	}
 
-	select {
-	case s.gate <- struct{}{}:
-		return func() { <-s.gate }, nil
-	default:
-		return nil, wire.Backpressure(limit)
-	}
+	return wire.AcquireSessionGate(s.gate, limit)
 }
 
 // close runs the shutdown ladder: mark closed, resolve pending dialogs and the
@@ -776,6 +827,7 @@ func (s *session) close(ctx context.Context) error {
 
 	if t != nil {
 		t.cancelled = true
+		t.cancel()
 	}
 	s.mu.Unlock()
 
@@ -811,13 +863,13 @@ func (s *session) close(ctx context.Context) error {
 	s.cycle = nil
 	s.mu.Unlock()
 
-	if c != nil {
-		if err := s.lcIdle(commitCtx, c, cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}); err != nil {
+	if len(errs) == 0 && c != nil {
+		if err := s.lc.Idle(commitCtx, c.Cycle, lifecycle.StopReasonCancelled, lifecycle.OutcomeCancelled); err != nil {
 			errs = append(errs, err)
 		}
 	}
 
-	s.lcFence()
+	s.lc.Fence()
 
 	s.mu.Lock()
 	s.closeErr = errors.Join(errs...)

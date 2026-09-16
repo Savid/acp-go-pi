@@ -5,13 +5,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
-	"github.com/stretchr/testify/require"
-
+	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
+	"github.com/stretchr/testify/require"
 )
 
 func TestListSessionsActiveAndStored(t *testing.T) {
@@ -21,7 +23,7 @@ func TestListSessionsActiveAndStored(t *testing.T) {
 	h.initialize()
 
 	cwd := t.TempDir()
-	first, err := h.conn.NewSession(h.ctx(), NewSessionRequest(cwd))
+	first, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd))
 	require.NoError(t, err)
 
 	second := h.newSession()
@@ -32,7 +34,7 @@ func TestListSessionsActiveAndStored(t *testing.T) {
 	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: second.SessionId})
 	require.NoError(t, err)
 
-	list, err := h.conn.ListSessions(h.ctx(), ListSessionsRequest())
+	list, err := h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
 	require.NoError(t, err)
 	require.Len(t, list.Sessions, 2)
 	require.Nil(t, list.NextCursor)
@@ -45,12 +47,12 @@ func TestListSessionsActiveAndStored(t *testing.T) {
 	require.Equal(t, cwd, byID[first.SessionId].Cwd)
 	require.Equal(t, "HELLO stored", *byID[second.SessionId].Title)
 
-	filtered, err := h.conn.ListSessions(h.ctx(), ListSessionsRequest(WithListSessionsCwd(cwd)))
+	filtered, err := h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest(wire.WithListSessionsCwd(cwd)))
 	require.NoError(t, err)
 	require.Len(t, filtered.Sessions, 1)
 	require.Equal(t, first.SessionId, filtered.Sessions[0].SessionId)
 
-	_, err = h.conn.ListSessions(h.ctx(), ListSessionsRequest(WithListSessionsCursor("!!")))
+	_, err = h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest(wire.WithListSessionsCursor("!!")))
 	require.Equal(t, "cursor", requestErrorData(t, err)["field"])
 }
 
@@ -64,22 +66,25 @@ func TestDeleteTombstonesAndHides(t *testing.T) {
 	_, err := h.prompt(session.SessionId, "HELLO", nil)
 	require.NoError(t, err)
 
-	_, err = h.conn.UnstableDeleteSession(h.ctx(), DeleteSessionRequest(session.SessionId))
+	_, err = h.conn.UnstableDeleteSession(h.ctx(), wire.DeleteSessionRequest(session.SessionId))
 	require.NoError(t, err)
 
-	_, err = h.conn.UnstableDeleteSession(h.ctx(), DeleteSessionRequest(session.SessionId))
+	_, err = h.conn.UnstableDeleteSession(h.ctx(), wire.DeleteSessionRequest(session.SessionId))
 	require.NoError(t, err)
 
-	list, err := h.conn.ListSessions(h.ctx(), ListSessionsRequest())
+	list, err := h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
 	require.NoError(t, err)
 	require.Empty(t, list.Sessions)
 
-	_, err = h.conn.LoadSession(h.ctx(), LoadSessionRequest(session.SessionId, t.TempDir()))
+	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, t.TempDir()))
+	require.Equal(t, "unknown session", requestErrorData(t, err)["error"])
+
+	_, err = h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(session.SessionId, t.TempDir()))
 	require.Equal(t, "unknown session", requestErrorData(t, err)["error"])
 
 	_, err = h.prompt(session.SessionId, "HELLO", nil)
 	require.Equal(t, "unknown session", requestErrorData(t, err)["error"])
-	require.NoError(t, h.conn.Cancel(h.ctx(), CancelRequest(session.SessionId)))
+	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
 }
 
 func TestCloseSessionThenUnknown(t *testing.T) {
@@ -115,7 +120,7 @@ func TestTwoSessionsStayIndependent(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 
-	require.NoError(t, h.conn.Cancel(h.ctx(), CancelRequest(first.SessionId)))
+	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(first.SessionId)))
 	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
 }
 
@@ -164,7 +169,7 @@ func TestRestoreActiveSessionReuses(t *testing.T) {
 
 	before := len(h.rec.snapshot())
 
-	resp, err := h.conn.LoadSession(h.ctx(), LoadSessionRequest(session.SessionId, sessionCwd(t, h, session.SessionId)))
+	resp, err := h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, sessionCwd(t, h, session.SessionId)))
 	require.NoError(t, err)
 	require.NotEmpty(t, resp.ConfigOptions)
 
@@ -181,7 +186,7 @@ func TestRestoreActiveSessionReuses(t *testing.T) {
 func sessionCwd(t *testing.T, h *harness, id acp.SessionId) string {
 	t.Helper()
 
-	list, err := h.conn.ListSessions(h.ctx(), ListSessionsRequest())
+	list, err := h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
 	require.NoError(t, err)
 
 	for _, info := range list.Sessions {
@@ -207,7 +212,7 @@ func TestRestoreChangedCarrierRestarts(t *testing.T) {
 
 	cwd := sessionCwd(t, h, session.SessionId)
 
-	_, err = h.conn.ResumeSession(h.ctx(), ResumeSessionRequest(session.SessionId, cwd,
+	_, err = h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(session.SessionId, cwd,
 		WithSessionPiOptions(NewPiOptions(WithPiEnv(map[string]string{"ACP_GO_PI_TEST_ROTATED": "1"})))))
 	require.NoError(t, err)
 
@@ -239,15 +244,15 @@ func TestSetConfigOptions(t *testing.T) {
 	_, err = h.conn.SetSessionConfigOption(h.ctx(), SetModelRequest(session.SessionId, "nomodel"))
 	require.Equal(t, "value", requestErrorData(t, err)["field"])
 
-	resp, err = h.conn.SetSessionConfigOption(h.ctx(), SetConfigOptionRequest(session.SessionId, configThoughtLevel, "high"))
+	resp, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, configThoughtLevel, "high"))
 	require.NoError(t, err)
 	require.Equal(t, acp.SessionConfigValueId("high"), resp.ConfigOptions[1].Select.CurrentValue)
 
-	resp, err = h.conn.SetSessionConfigOption(h.ctx(), SetConfigOptionRequest(session.SessionId, configThoughtLevel, "bogus"))
+	resp, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, configThoughtLevel, "bogus"))
 	require.NoError(t, err)
 	require.Equal(t, acp.SessionConfigValueId("high"), resp.ConfigOptions[1].Select.CurrentValue)
 
-	_, err = h.conn.SetSessionConfigOption(h.ctx(), SetConfigOptionRequest(session.SessionId, "mode", "x"))
+	_, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, "mode", "x"))
 	require.Equal(t, "configId", requestErrorData(t, err)["field"])
 
 	_, err = h.conn.SetSessionConfigOption(h.ctx(), acp.SetSessionConfigOptionRequest{Boolean: &acp.SetSessionConfigOptionBoolean{SessionId: session.SessionId, ConfigId: "x", Value: true}})
@@ -317,7 +322,7 @@ func TestEmbeddedAgentPublishesInline(t *testing.T) {
 	_, err := agent.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber, Meta: map[string]any{wire.LifecycleKey: map[string]any{"version": 1}}})
 	require.NoError(t, err)
 
-	session, err := agent.NewSession(ctx, NewSessionRequest(t.TempDir()))
+	session, err := agent.NewSession(ctx, wire.NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
 
 	updates := rec.snapshot()
@@ -325,12 +330,110 @@ func TestEmbeddedAgentPublishesInline(t *testing.T) {
 	require.NotNil(t, updates[0].Update.AvailableCommandsUpdate)
 	require.Equal(t, []string{"lifecycle_snapshot"}, eventTypes(lifecycleEvents(updates)))
 
-	_, err = agent.Prompt(ctx, PromptRequest(session.SessionId, acp.TextBlock("HELLO")))
+	_, err = agent.Prompt(ctx, wire.PromptRequest(session.SessionId, acp.TextBlock("HELLO")))
 	require.Equal(t, "missing", requestErrorData(t, err)["error"])
 
-	request := TextPromptRequest(session.SessionId, "HELLO")
+	request := wire.TextPromptRequest(session.SessionId, "HELLO")
 	request.Meta = promptMeta(1)
 	resp, err := agent.Prompt(ctx, request)
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
+}
+
+type commitBarrier struct {
+	acpcore.SessionStore
+	block   atomic.Bool
+	entered chan acpcore.SessionKey
+	release chan struct{}
+}
+
+func (s *commitBarrier) Replace(ctx context.Context, key acpcore.SessionKey, replacements []acpcore.SessionStoreReplacement) error {
+	if s.block.CompareAndSwap(true, false) {
+		s.entered <- key
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return s.SessionStore.Replace(ctx, key, replacements)
+}
+func TestEstablishmentExcludesPrompt(t *testing.T) {
+	t.Parallel()
+
+	for _, phase := range []string{"new", "cold_load"} {
+		t.Run(phase, func(t *testing.T) {
+			t.Parallel()
+
+			store := &commitBarrier{SessionStore: acpcore.NewInMemorySessionStore(), entered: make(chan acpcore.SessionKey, 1), release: make(chan struct{})}
+			release := sync.OnceFunc(func() { close(store.release) })
+			h := newHarness(t, WithSessionStore(store))
+			h.initialize()
+			t.Cleanup(release)
+			cwd := t.TempDir()
+			var id acp.SessionId
+			if phase == "cold_load" {
+				created, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd))
+				require.NoError(t, err)
+				id = created.SessionId
+				_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: id})
+				require.NoError(t, err)
+			}
+			store.block.Store(true)
+			done := make(chan error, 1)
+			ctx := h.ctx()
+			go func() {
+				if phase == "new" {
+					_, err := h.conn.NewSession(ctx, wire.NewSessionRequest(cwd))
+					done <- err
+				} else {
+					_, err := h.conn.LoadSession(ctx, wire.LoadSessionRequest(id, cwd))
+					done <- err
+				}
+			}()
+			select {
+			case key := <-store.entered:
+				id = acp.SessionId(key.SessionID)
+			case <-ctx.Done():
+				t.Fatal("establishment never reached commit")
+			}
+			// An empty prompt cannot dispatch native work, but admission must still reject
+			// it as busy before parsing content while establishment holds the session.
+			_, err := h.conn.Prompt(ctx, wire.PromptRequest(id))
+			data := requestErrorData(t, err)
+			release()
+			require.NoError(t, <-done)
+			require.Equal(t, "session_prompt", data["limit"], "establishing session admitted a prompt into content validation: %v", data)
+		})
+	}
+}
+
+func TestFailedRestoreCloseReleasesSlot(t *testing.T) {
+	for _, method := range []string{acp.AgentMethodSessionLoad, acp.AgentMethodSessionResume} {
+		t.Run(method, func(t *testing.T) {
+			store := &recoveryFaultStore{SessionStore: acpcore.NewInMemorySessionStore()}
+			h := newHarness(t, WithSessionStore(store), WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))
+			h.initialize()
+			cwd := t.TempDir()
+			created, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd))
+			require.NoError(t, err)
+			before, err := store.Load(h.ctx(), string(created.SessionId))
+			require.NoError(t, err)
+			option := wire.WithSessionMetaValue(map[string]any{"pi": map[string]any{"options": map[string]any{"env": map[string]string{"RESTORE_TEST": "changed"}}}})
+			store.fail.Store(true)
+			if method == acp.AgentMethodSessionLoad {
+				_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(created.SessionId, cwd, option))
+			} else {
+				_, err = h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(created.SessionId, cwd, option))
+			}
+			store.fail.Store(false)
+			require.Error(t, err, "store failure must fail restore")
+			after, err := store.Load(h.ctx(), string(created.SessionId))
+			require.NoError(t, err)
+			require.Equal(t, before, after, "failed teardown must retain the durable generation")
+			_, err = h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir()))
+			require.NoError(t, err, "a failed restore-close leaked its active-session slot")
+		})
+	}
 }

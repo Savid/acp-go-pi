@@ -2,15 +2,16 @@ package piacp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
 	"strings"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/coder/acp-go-sdk"
 
+	"github.com/savid/acp-go-core/image"
+	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -29,8 +30,6 @@ const (
 
 	assistantEventTextDelta     = "text_delta"
 	assistantEventThinkingDelta = "thinking_delta"
-
-	sessionTitleMaxRunes = 256
 )
 
 // cycleState accumulates what one cycle streamed.
@@ -122,9 +121,9 @@ func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event
 		if s.agent.extensions.IsWrapperExtension(typed.ExtensionPath) {
 			s.agent.log.ErrorContext(ctx, "wrapper extension failed",
 				slog.String("session_id", string(s.id)), slog.String("event", typed.Event))
-			go s.abort(ctx, rt)
+			s.abortAsync(ctx, rt)
 
-			return false, turnFailure("extension", extensionFailureMessage)
+			return false, wire.TurnFailed(vendor, wire.TurnFailure{Cause: "extension", Message: extensionFailureMessage})
 		}
 
 		return false, nil
@@ -184,13 +183,13 @@ func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentM
 	messageID := optionalString(message.ACPMessageID)
 	updates := make([]acp.SessionUpdate, 0, 2)
 
-	if suffix := unstreamedSuffix(state.streamedThought, thinking.String()); suffix != "" {
+	if suffix := wire.UnstreamedSuffix(state.streamedThought, thinking.String()); suffix != "" {
 		updates = append(updates, acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
 			Content: acp.TextBlock(suffix), MessageId: messageID,
 		}})
 	}
 
-	if suffix := unstreamedSuffix(state.streamedText, text.String()); suffix != "" {
+	if suffix := wire.UnstreamedSuffix(state.streamedText, text.String()); suffix != "" {
 		updates = append(updates, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
 			Content: acp.TextBlock(suffix), MessageId: messageID,
 		}})
@@ -200,21 +199,6 @@ func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentM
 	state.streamedThought = ""
 
 	return s.emit(ctx, updates...)
-}
-
-// unstreamedSuffix reports the part of a terminal frame's text no delta of
-// this message already carried. Text that diverges from the streamed prefix
-// contributes nothing: the prefix is already with the client.
-func unstreamedSuffix(streamed string, full string) string {
-	if streamed == "" {
-		return full
-	}
-
-	if !strings.HasPrefix(full, streamed) {
-		return ""
-	}
-
-	return full[len(streamed):]
 }
 
 // emitAssistantImages projects image blocks of a finalized assistant message
@@ -229,7 +213,9 @@ func (s *session) emitAssistantImages(ctx context.Context, message pi.AgentMessa
 			continue
 		}
 
-		output, failure := decodeOutputImage(blocks[index], s.agent.options.ImageLimits.core().EffectiveOutputPerImage())
+		block := &blocks[index]
+
+		output, failure := image.DecodeOutput(block.Data, block.MimeType, s.agent.options.ImageLimits.core().EffectiveOutputPerImage())
 		if failure != nil {
 			guidance, _ := failure.Guidance()
 
@@ -242,7 +228,7 @@ func (s *session) emitAssistantImages(ctx context.Context, message pi.AgentMessa
 			continue
 		}
 
-		key := message.ACPMessageID + ":" + output.fingerprint
+		key := message.ACPMessageID + ":" + output.Fingerprint
 
 		if state.agentImages == nil {
 			state.agentImages = make(map[string]struct{})
@@ -253,7 +239,7 @@ func (s *session) emitAssistantImages(ctx context.Context, message pi.AgentMessa
 		}
 
 		if err := s.emit(ctx, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
-			Content: acp.ImageBlock(output.data, output.mime), MessageId: messageID,
+			Content: acp.ImageBlock(output.Data, output.MIME), MessageId: messageID,
 		}}); err != nil {
 			return err
 		}
@@ -371,7 +357,7 @@ func (s *session) emitSessionInfo(ctx context.Context, prompt []acp.ContentBlock
 	s.updatedAt = updatedAt
 
 	if s.title == "" {
-		if title := promptTitle(prompt); title != "" {
+		if title := wire.PromptTitle(prompt); title != "" {
 			s.title = title
 			update.Title = &title
 		}
@@ -379,31 +365,6 @@ func (s *session) emitSessionInfo(ctx context.Context, prompt []acp.ContentBlock
 	s.mu.Unlock()
 
 	_ = s.emit(ctx, acp.SessionUpdate{SessionInfoUpdate: &update})
-}
-
-func promptTitle(prompt []acp.ContentBlock) string {
-	for _, block := range prompt {
-		if block.Text == nil {
-			continue
-		}
-
-		if title := normalizeTitle(block.Text.Text); title != "" {
-			return title
-		}
-	}
-
-	return ""
-}
-
-func normalizeTitle(text string) string {
-	title := strings.Join(strings.Fields(text), " ")
-	if utf8.RuneCountInString(title) <= sessionTitleMaxRunes {
-		return title
-	}
-
-	runes := []rune(title)
-
-	return strings.TrimSpace(string(runes[:sessionTitleMaxRunes-3])) + "..."
 }
 
 func (s *session) sessionInfo() acp.SessionInfo {
@@ -417,6 +378,7 @@ func (s *session) sessionInfo() acp.SessionInfo {
 	}
 
 	info := acp.SessionInfo{
+		Meta:                  wire.NativeSessionMeta(vendor, s.nativeID),
 		SessionId:             s.id,
 		Title:                 &title,
 		Cwd:                   s.cwd,
@@ -453,7 +415,7 @@ func availableCommands(commands []pi.SlashCommand) []acp.AvailableCommand {
 	available := make([]acp.AvailableCommand, 0, len(commands))
 
 	for _, command := range commands {
-		if !validCommandName(command.Name) {
+		if !wire.ValidCommandName(command.Name) {
 			continue
 		}
 
@@ -463,24 +425,8 @@ func availableCommands(commands []pi.SlashCommand) []acp.AvailableCommand {
 	return available
 }
 
-// validCommandName rejects empty names, names containing '/', invalid UTF-8,
-// and any Unicode whitespace, control, or format rune.
-func validCommandName(name string) bool {
-	if name == "" || strings.Contains(name, "/") || !utf8.ValidString(name) {
-		return false
-	}
-
-	for _, r := range name {
-		if unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			return false
-		}
-	}
-
-	return true
-}
-
 // emitRawEvent forwards one native record on the raw-event channel when the
-// session opted in. Image payloads are replaced by their size and digest so
+// session opted in. An image payload is replaced by its decoded size so
 // diagnostics never carry a second copy of the bytes.
 func (s *session) emitRawEvent(ctx context.Context, event pi.Event) {
 	if !s.rawEvents.Enabled() {
@@ -514,7 +460,7 @@ func redactImages(value any) {
 		blockType, _ := typed["type"].(string)
 		if data, ok := typed["data"].(string); ok && blockType == contentBlockTypeImage && data != "" {
 			typed["data"] = ""
-			typed["sizeBytes"] = len(data) / 4 * 3
+			typed["sizeBytes"] = base64.RawStdEncoding.DecodedLen(len(strings.TrimRight(data, "=")))
 		}
 
 		for _, item := range typed {
