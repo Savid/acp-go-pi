@@ -3,11 +3,14 @@ package piacp
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
 	"github.com/savid/acp-go-core/process"
+	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -31,15 +34,13 @@ func TestPermissionModeDefault(t *testing.T) {
 
 func TestLateDialogAfterCancellationIsRefused(t *testing.T) {
 	t.Parallel()
-	for _, state := range []string{"cancelled", "timed out", "closed", "disconnected"} {
+	for _, state := range []string{"cancelled", "closed", "disconnected"} {
 		t.Run(state, func(t *testing.T) {
 			t.Parallel()
 			s := &session{runtime: &runtime{}, turn: &turn{}}
 			switch state {
 			case "cancelled":
 				s.turn.cancelled = true
-			case "timed out":
-				s.turn.timedOut = true
 			case "closed":
 				s.closing = true
 			case "disconnected":
@@ -112,11 +113,61 @@ func startedProcess(t *testing.T) *process.Process {
 	t.Helper()
 
 	proc, err := process.Start(t.Context(), process.Request{
-		Executable: os.Args[0],
-		Args:       []string{"--version"},
-		Env:        []string{fakePiEnv + "=1"},
+		Executable: "/usr/bin/true",
 	})
 	require.NoError(t, err)
 
 	return proc
+}
+
+// A close that begins while a launch is in flight has already sampled the
+// runtime it will stop, so the launch binds nothing and answers unknown
+// session.
+func TestLaunchWhileClosingBindsNothing(t *testing.T) {
+	t.Parallel()
+
+	a := NewAgent(testOptions(t)...)
+	s := a.newSession(sessionStart{cwd: t.TempDir()})
+	s.id = "closing"
+	s.closing = true
+
+	rt, err := s.launch(t.Context(), "")
+	require.Nil(t, rt)
+	require.Equal(t, wire.UnknownSession(), err)
+	require.Nil(t, s.runtime)
+}
+
+// A released generation leaves no child behind: the process is signalled and
+// reaped before the release returns.
+func TestReleaseRuntimeReapsTheChild(t *testing.T) {
+	t.Parallel()
+
+	s := &session{agent: NewAgent(testOptions(t)...)}
+
+	proc, err := process.Start(t.Context(), process.Request{Executable: "/bin/sleep", Args: []string{"30"}})
+	require.NoError(t, err)
+
+	s.releaseRuntime(t.Context(), &runtime{proc: proc, cancel: func() {}, done: make(chan struct{})})
+
+	select {
+	case <-proc.Done():
+	default:
+		t.Fatal("the child was released without being reaped")
+	}
+}
+
+// Without an executable path, the pi name is resolved on the base PATH.
+func TestDefaultExecutableResolvesOnBasePath(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	require.NoError(t, os.Symlink(os.Args[0], filepath.Join(base, "pi")))
+
+	h := newHarness(t, WithExecutablePath(""), WithEnv(map[string]string{fakePiEnv: "1", "PATH": base}))
+	h.initialize()
+	session := h.newSession()
+
+	resp, err := h.prompt(session.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 }

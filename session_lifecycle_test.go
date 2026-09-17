@@ -228,12 +228,12 @@ func TestLifecycleCleanExitAfterSettledTurnFences(t *testing.T) {
 	firstStream, _ := settled[len(settled)-1].Meta[wire.LifecycleKey].(map[string]any)
 
 	// A prompt that arrives before the adapter has observed the exit fails on
-	// the lost transport; the one after it runs on the replacement process.
-	for attempt := range 3 {
-		resp, err = h.prompt(session.SessionId, "HELLO", promptMeta(2+attempt))
-		if err == nil {
-			break
-		}
+	// the lost transport and ends the incarnation; the one after it runs on
+	// the replacement process.
+	resp, err = h.prompt(session.SessionId, "HELLO", promptMeta(2))
+	if err != nil {
+		require.Equal(t, "pi_turn_failed", requestErrorData(t, err)["error"])
+		resp, err = h.prompt(session.SessionId, "HELLO", promptMeta(3))
 	}
 
 	require.NoError(t, err)

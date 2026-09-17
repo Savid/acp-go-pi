@@ -21,12 +21,10 @@ import (
 const (
 	fakePiEnv        = "ACP_GO_PI_TEST_FAKE"
 	fakePiEnvDump    = "ACP_GO_PI_TEST_ENV_DUMP"
-	fakePiEnvVersion = "ACP_GO_PI_TEST_VERSION"
 	fakePiEnvNoModel = "ACP_GO_PI_TEST_NO_MODEL"
 	// fakePiEnvResumeHold names a file a resumed fake pi creates before it
 	// stops answering, so a test can act while the adapter is still relaunching.
 	fakePiEnvResumeHold = "ACP_GO_PI_TEST_RESUME_HOLD"
-	fakePiVersion       = "0.84.4"
 
 	// fakePiResumeHold is how long a held resume refuses to serve. It outlasts
 	// the shutdown the adapter sends when it gives up on the relaunch.
@@ -65,17 +63,6 @@ type fakePi struct {
 }
 
 func runFakePi(args []string) int {
-	if slices.Contains(args, "--version") {
-		version := os.Getenv(fakePiEnvVersion)
-		if version == "" {
-			version = fakePiVersion
-		}
-
-		fmt.Println(version)
-
-		return 0
-	}
-
 	if dump := os.Getenv(fakePiEnvDump); dump != "" {
 		_ = os.WriteFile(dump, []byte(strings.Join(os.Environ(), "\n")+"\n"), 0o600)
 	}

@@ -156,7 +156,6 @@ func TestPromptCancelReturnsCancelled(t *testing.T) {
 
 	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool { return len(lifecycleEvents(updates)) >= 3 })
 	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
-	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
 
 	got := <-done
 	require.NoError(t, got.err)
@@ -253,43 +252,6 @@ func TestRefusedPeerPromptLeavesTurnRunning(t *testing.T) {
 	got := <-done
 	require.NoError(t, got.err)
 	require.Equal(t, acp.StopReasonEndTurn, got.resp.StopReason)
-}
-
-// The turn deadline bounds the whole prompt, including a relaunched pi that
-// never answers. It fails with cause "timeout", never as a cancel.
-func TestPromptTimesOutWhileRelaunching(t *testing.T) {
-	t.Parallel()
-
-	held := filepath.Join(t.TempDir(), "relaunch-held")
-	store := &mirrorFaultStore{SessionStore: acpcore.NewInMemorySessionStore()}
-	h := newHarness(t, WithTurnTimeout(300*time.Millisecond), WithSessionStore(store),
-		WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvResumeHold: held}))
-	h.initialize()
-	session := h.newSession()
-
-	store.fail.Store(true)
-
-	_, err := h.prompt(session.SessionId, "HELLO", nil)
-	require.Equal(t, "pi_turn_failed", requestErrorData(t, err)["error"])
-	store.fail.Store(false)
-
-	_, err = h.prompt(session.SessionId, "HELLO", nil)
-	data := requestErrorData(t, err)
-	require.Equal(t, "pi_turn_failed", data["error"])
-	require.Equal(t, "timeout", data["cause"])
-}
-
-func TestPromptTurnTimeout(t *testing.T) {
-	t.Parallel()
-
-	h := newHarness(t, WithTurnTimeout(300*time.Millisecond))
-	h.initialize()
-	session := h.newSession()
-
-	_, err := h.prompt(session.SessionId, "SLOW", nil)
-	data := requestErrorData(t, err)
-	require.Equal(t, "pi_turn_failed", data["error"])
-	require.Equal(t, "timeout", data["cause"])
 }
 
 func TestPromptWrapperExtensionFailure(t *testing.T) {

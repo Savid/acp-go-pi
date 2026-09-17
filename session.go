@@ -114,7 +114,6 @@ type turn struct {
 	rt        *runtime
 	accepted  bool
 	cancelled bool
-	timedOut  bool
 	// lcSettled records that the turn published its terminal lifecycle event,
 	// so whichever of the turn and the pump acts last fences the incarnation.
 	lcSettled  bool
@@ -190,11 +189,25 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 		return nil, s.startFailure(ctx, startErr)
 	}
 
-	s.mu.Lock()
-
 	rt := &runtime{proc: proc, client: client, cancel: cancelRead, done: make(chan struct{})}
-	s.runtime = rt
+
+	s.mu.Lock()
+	closing := s.closing
+
+	if !closing {
+		s.runtime = rt
+	}
 	s.mu.Unlock()
+
+	// A close that began while this launch was in flight has already sampled
+	// the runtime it will stop, so a process bound now would outlive the
+	// session: it is reaped here instead.
+	if closing {
+		rt.cancel()
+		s.releaseRuntime(ctx, rt)
+
+		return nil, wire.UnknownSession()
+	}
 
 	go s.pump(context.WithoutCancel(ctx), rt)
 
@@ -693,31 +706,9 @@ func (s *session) cancel(ctx context.Context) {
 	}
 }
 
-// timeout ends a turn that exceeded the configured deadline.
-func (s *session) timeout(ctx context.Context, t *turn) {
-	s.mu.Lock()
-	rt := s.runtime
-
-	if s.turn != t || t.cancelled || t.timedOut {
-		s.mu.Unlock()
-
-		return
-	}
-
-	t.timedOut = true
-	t.cancel()
-	s.mu.Unlock()
-
-	s.cancelDialogs()
-
-	if rt != nil {
-		s.abort(ctx, rt)
-	}
-}
-
 func (s *session) registerDialog(id string, cancel context.CancelCauseFunc) func() {
 	s.mu.Lock()
-	if s.closing || s.runtime == nil || (s.turn != nil && (s.turn.cancelled || s.turn.timedOut)) {
+	if s.closing || s.runtime == nil || (s.turn != nil && s.turn.cancelled) {
 		s.mu.Unlock()
 		cancel(errDialogCancelled)
 

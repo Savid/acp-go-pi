@@ -1,14 +1,5 @@
 package pi
 
-import (
-	"context"
-	"errors"
-	"fmt"
-	"os/exec"
-	"slices"
-	"strings"
-)
-
 // Launch describes one pi RPC process.
 type Launch struct {
 	// ExtensionPaths are the wrapper-owned extensions pi loads with -e, in
@@ -39,23 +30,4 @@ func (l Launch) Args() []string {
 	}
 
 	return args
-}
-
-// ProbeVersion runs `pi --version` against the resolved executable with the
-// given environment and returns the reported version.
-func ProbeVersion(ctx context.Context, executable string, environment []string) (string, error) {
-	command := exec.CommandContext(ctx, executable, "--version")
-	command.Env = slices.Clone(environment)
-
-	output, err := command.Output()
-	if err != nil {
-		return "", fmt.Errorf("probe pi version: %w", err)
-	}
-
-	version := strings.TrimSpace(string(output))
-	if version == "" {
-		return "", errors.New("probe pi version: empty output")
-	}
-
-	return version, nil
 }

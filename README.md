@@ -24,7 +24,7 @@ record saves both IDs with the matching native history.
 go install github.com/savid/acp-go-pi/cmd/acp-go-pi@latest
 ```
 
-Requires `pi` 0.80.6 or newer on `PATH` or named with `-path`.
+Verified against `pi` 0.85.1, found on `PATH` or named with `-path`.
 
 ## Run
 
@@ -55,10 +55,10 @@ err := piacp.Serve(ctx, os.Stdin, os.Stdout,
 
 Options: `WithExecutablePath`, `WithHome`, `WithScratchDir`,
 `WithInputHandoffRoot`, `WithDefaultModel`, `WithConfiguredModels`, `WithEnv`,
-`WithSeedFiles`, `WithSessionStore`, `WithSessionStoreLoadTimeout`,
-`WithTurnTimeout`, `WithConcurrencyLimits`, `WithImageLimits`, `WithLogger`,
-`WithTracerProvider`, `WithMeterProvider`, `WithTextMapPropagator`,
-`WithAgentName`, `WithAgentTitle`, `WithAgentVersion`.
+`WithSeedFiles`, `WithSessionStore`, `WithConcurrencyLimits`,
+`WithImageLimits`, `WithLogger`, `WithTracerProvider`, `WithMeterProvider`,
+`WithTextMapPropagator`, `WithAgentName`, `WithAgentTitle`,
+`WithAgentVersion`.
 
 ### Session options
 

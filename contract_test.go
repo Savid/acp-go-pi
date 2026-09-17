@@ -315,18 +315,6 @@ func TestActiveSessionLimit(t *testing.T) {
 	require.Equal(t, "active_sessions", requestErrorData(t, err)["limit"])
 }
 
-func TestVersionFloor(t *testing.T) {
-	t.Parallel()
-
-	h := newHarness(t, WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvVersion: "0.1.0"}))
-	h.initialize()
-
-	_, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir()))
-	require.Equal(t, -32603, requestErrorCode(t, err))
-	require.Equal(t, "pi_internal_failure", requestErrorData(t, err)["error"])
-	require.Equal(t, "native_start", requestErrorData(t, err)["class"])
-}
-
 func TestClosedAgentRefusesRequests(t *testing.T) {
 	t.Parallel()
 

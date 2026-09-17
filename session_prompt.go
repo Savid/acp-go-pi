@@ -198,14 +198,9 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 		s.mu.Unlock()
 	}()
 
-	if timeout := s.agent.options.TurnTimeout; timeout > 0 {
-		timer := time.AfterFunc(timeout, func() { s.timeout(context.WithoutCancel(ctx), t) })
-		defer timer.Stop()
-	}
-
 	mapped, err := s.mapPrompt(turnCtx, params.Prompt)
 	if turnCtx.Err() != nil {
-		return s.endedBeforeDispatch(t, params)
+		return endedBeforeDispatch(params)
 	}
 
 	if err != nil {
@@ -214,7 +209,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 
 	rt, err := s.ensureRuntime(turnCtx)
 	if turnCtx.Err() != nil {
-		return s.endedBeforeDispatch(t, params)
+		return endedBeforeDispatch(params)
 	}
 
 	if err != nil {
@@ -236,7 +231,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 				return wire.CancelledResponse(params), nil
 			}
 
-			return acp.PromptResponse{}, s.dispatchFailure(context.WithoutCancel(ctx), rt, err)
+			return acp.PromptResponse{}, s.dispatchFailure(context.WithoutCancel(ctx), rt, t, err)
 		}
 	}
 
@@ -261,14 +256,28 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 
 // dispatchFailure classifies a prompt command pi never accepted: a native
 // rejection carries its text as a provider failure, a dead child is a
-// process exit, and everything else is transport.
-func (s *session) dispatchFailure(ctx context.Context, rt *runtime, err error) error {
+// process exit, and everything else is transport. A lost transport ends the
+// generation, so its pump is joined and the incarnation fenced before the
+// failure is reported: the next prompt relaunches pi instead of failing on
+// the same dead generation.
+func (s *session) dispatchFailure(ctx context.Context, rt *runtime, t *turn, err error) error {
 	var commandErr *pi.CommandError
 	if errors.As(err, &commandErr) {
 		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseProvider, Message: commandErr.Message})
 	}
 
-	return s.transportFailure(ctx, rt, err)
+	failure := s.transportFailure(ctx, rt, err)
+
+	select {
+	case <-rt.done:
+	case <-time.After(processExitGrace):
+	}
+
+	if s.claimFence(t, rt) {
+		s.lc.Fence()
+	}
+
+	return failure
 }
 
 // transportFailure recovers the real cause behind a lost native stream: the
@@ -352,7 +361,7 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 	defer cancel()
 
 	s.mu.Lock()
-	cancelled, timedOut := t.cancelled, t.timedOut
+	cancelled := t.cancelled
 	s.mu.Unlock()
 
 	var verdict cycleVerdict
@@ -360,8 +369,6 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 	switch {
 	case cancelled:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeCancelled, stopReason: lifecycle.StopReasonCancelled}
-	case timedOut:
-		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: s.turnTimeout()}
 	case t.ended == turnTransportEnded:
 		verdict = cycleVerdict{outcome: lifecycle.OutcomeFailed, failure: s.transportFailure(settleCtx, rt, nil)}
 	default:
@@ -404,22 +411,9 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 
 // endedBeforeDispatch answers a prompt the session ended before pi received
 // it: no native turn exists, no submission was published, and nothing has to be
-// terminalized. The deadline fails the prompt; every other end is a cancel.
-func (s *session) endedBeforeDispatch(t *turn, params acp.PromptRequest) (acp.PromptResponse, error) {
-	s.mu.Lock()
-	timedOut := t.timedOut
-	s.mu.Unlock()
-
-	if timedOut {
-		return acp.PromptResponse{}, s.turnTimeout()
-	}
-
+// terminalized, so the prompt is a cancel.
+func endedBeforeDispatch(params acp.PromptRequest) (acp.PromptResponse, error) {
 	return wire.CancelledResponse(params), nil
-}
-
-// turnTimeout is the failure a turn that outran its deadline carries.
-func (s *session) turnTimeout() error {
-	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTimeout, Message: fmt.Sprintf("pi turn exceeded %s", s.agent.options.TurnTimeout)})
 }
 
 // turnCancelled reports whether the session has cancelled this turn.

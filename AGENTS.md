@@ -5,7 +5,7 @@
 This Go module exposes the local `pi` CLI as an Agent Client Protocol agent.
 Each ACP session drives one `pi --mode rpc` process that inherits the
 adapter's environment and keeps its session in pi's own home, so a session
-started over ACP can be continued natively with `pi --resume` afterwards.
+started over ACP can be continued natively with `pi --session` afterwards.
 
 ## Project Map
 
@@ -18,7 +18,6 @@ started over ACP can be continued natively with `pi --resume` afterwards.
 - `internal/pi`: pi's JSONL RPC codec and client, launch arguments, the
   embedded extensions in `ext/`, seed files, and pi's session-file layout.
 - `integration`: gated tests against the installed pi.
-- `examples`: runnable ACP clients.
 
 ## Commands
 
