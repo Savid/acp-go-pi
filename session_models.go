@@ -3,7 +3,6 @@ package piacp
 import (
 	"context"
 	"errors"
-	"slices"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -59,25 +58,14 @@ func (s *session) configOptions() []acp.SessionConfigOption {
 // modelSelectOptions lists the native catalog, then host-listed ids the
 // catalog lacks, then the current model when nothing else names it.
 func modelSelectOptions(model string, models []pi.Model, hostListed []string) acp.SessionConfigSelectOptionsUngrouped {
-	values := make(acp.SessionConfigSelectOptionsUngrouped, 0, len(models)+len(hostListed)+1)
-	seen := make(map[string]struct{}, len(models)+len(hostListed)+1)
-
+	rows := make([]wire.ModelRow, 0, len(models))
 	for index := range models {
 		info := &models[index]
 		if info.Provider == "" || info.ID == "" {
 			continue
 		}
 
-		if _, ok := seen[info.Ref()]; ok {
-			continue
-		}
-
-		name := info.Name
-		if name == "" {
-			name = info.Ref()
-		}
-
-		meta := map[string]any{"modelId": info.Ref()}
+		meta := map[string]any{}
 		if info.ContextWindow > 0 {
 			meta["contextWindow"] = info.ContextWindow
 		}
@@ -86,24 +74,10 @@ func modelSelectOptions(model string, models []pi.Model, hostListed []string) ac
 			meta["maxOutputTokens"] = info.MaxTokens
 		}
 
-		values = append(values, acp.SessionConfigSelectOption{
-			Name:  name,
-			Value: acp.SessionConfigValueId(info.Ref()),
-			Meta:  map[string]any{vendor: meta},
-		})
-		seen[info.Ref()] = struct{}{}
+		rows = append(rows, wire.ModelRow{ID: info.Ref(), Name: info.Name, Meta: meta})
 	}
 
-	for _, id := range append(slices.Clone(hostListed), model) {
-		if _, ok := seen[id]; ok {
-			continue
-		}
-
-		values = append(values, acp.SessionConfigSelectOption{Name: id, Value: acp.SessionConfigValueId(id)})
-		seen[id] = struct{}{}
-	}
-
-	return values
+	return wire.ModelSelectOptions(vendor, model, rows, hostListed)
 }
 
 func thinkingLevelSelectOptions() acp.SessionConfigSelectOptionsUngrouped {

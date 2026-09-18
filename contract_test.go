@@ -131,7 +131,6 @@ func TestSessionMetaStrictness(t *testing.T) {
 	}{
 		{"unknown own key", map[string]any{"pi": map[string]any{"bogus": 1}}, "_meta.pi.bogus"},
 		{"unknown option", map[string]any{"pi": map[string]any{"options": map[string]any{"bogus": 1}}}, "_meta.pi.options.bogus"},
-		{"output schema", map[string]any{"pi": map[string]any{"options": map[string]any{"outputSchema": map[string]any{}}}}, "_meta.pi.options.outputSchema"},
 		{"bad model", map[string]any{"pi": map[string]any{"options": map[string]any{"model": "nomodel"}}}, "_meta.pi.options.model"},
 		{"bad permission", map[string]any{"pi": map[string]any{"options": map[string]any{"permission": "deny"}}}, "_meta.pi.options.permission"},
 		{"relative path dir", map[string]any{"pi": map[string]any{"options": map[string]any{"extraPathDirs": []any{"rel"}}}}, "_meta.pi.options.extraPathDirs[0]"},

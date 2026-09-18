@@ -14,8 +14,6 @@ import (
 	"github.com/savid/acp-go-core/wire"
 )
 
-const internalClassAccountUsage = "account_usage"
-
 func (a *Agent) accountUsage(ctx context.Context, params json.RawMessage) (response wire.AccountUsageResponse, err error) {
 	request, refusal := wire.DecodeAccountUsageRequest(params, wire.AccountUsageScopeSession)
 
@@ -82,7 +80,7 @@ func (a *Agent) accountUsage(ctx context.Context, params json.RawMessage) (respo
 	}
 
 	if err != nil {
-		return wire.AccountUsageResponse{}, wire.InternalFailure(vendor, internalClassAccountUsage)
+		return wire.AccountUsageResponse{}, usage.RequestError(vendor, err)
 	}
 
 	return response, nil

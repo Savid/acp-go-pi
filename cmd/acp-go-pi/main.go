@@ -23,7 +23,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	flags := flag.NewFlagSet("acp-go-pi", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 
-	piPath := flags.String("path", "", "pi executable; a bare name is searched on PATH")
+	executablePath := flags.String("path", "", "pi executable; a bare name is searched on PATH")
 	home := flags.String("home", "", "pi config root passed as PI_CODING_AGENT_DIR; empty inherits pi's own resolution")
 	scratchDir := flags.String("scratch-dir", "", "parent directory for ephemeral adapter state; empty means the system temp directory")
 	model := flags.String("model", "", "default model for new sessions as provider/id")
@@ -63,7 +63,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 
 	options := []piacp.Option{
 		piacp.WithAgentVersion(version()),
-		piacp.WithExecutablePath(*piPath),
+		piacp.WithExecutablePath(*executablePath),
 		piacp.WithHome(*home),
 		piacp.WithScratchDir(*scratchDir),
 		piacp.WithDefaultModel(*model),

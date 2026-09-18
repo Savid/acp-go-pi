@@ -8,13 +8,7 @@ import (
 
 // WithSessionPiOptions merges pi-specific options into _meta.pi.options.
 func WithSessionPiOptions(options PiOptions) wire.SessionRequestOption {
-	return wire.WithSessionMetaValue(options.clone().Meta())
-}
-
-// WithSessionOutputSchema sets structured output, which pi refuses at
-// session start.
-func WithSessionOutputSchema(schema map[string]any) wire.SessionRequestOption {
-	return wire.WithSessionMetaValue(PiOptions{OutputSchema: wire.CloneMap(schema)}.Meta())
+	return wire.WithSessionMetaValue(options.Meta())
 }
 
 // WithSessionRawEvents toggles raw pi event emission for the session.

@@ -507,6 +507,16 @@ func (s *session) openAgentCycle(ctx context.Context) {
 	c := &cycle{Cycle: lifecycle.Cycle{Origin: lifecycle.CauseActivity}}
 	c.state.tools = make(map[string]*toolState)
 
+	// The check, the open event, and the install share one critical section,
+	// so a prompt cannot install a turn between them and leave a turn and a
+	// cycle live at once.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.turn != nil || s.cycle != nil || s.closing {
+		return
+	}
+
 	if err := s.lc.OpenAgentCycle(ctx, &c.Cycle); err != nil {
 		s.agent.log.ErrorContext(ctx, "open agent-origin cycle failed",
 			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
@@ -514,9 +524,7 @@ func (s *session) openAgentCycle(ctx context.Context) {
 		return
 	}
 
-	s.mu.Lock()
 	s.cycle = c
-	s.mu.Unlock()
 }
 
 // settleAgentCycle runs the agent-origin settlement on the pump: usage, the

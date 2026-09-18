@@ -158,14 +158,6 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	}
 	defer release()
 
-	s.mu.Lock()
-	busy := s.cycle != nil
-	s.mu.Unlock()
-
-	if busy {
-		return acp.PromptResponse{}, wire.Backpressure(limitSessionPrompt)
-	}
-
 	// The turn outlives this request: the pinned SDK cancels a session's
 	// previous prompt context before it dispatches the next one, so a peer
 	// prompt this session refuses must not end the live turn. Only the session
@@ -185,8 +177,15 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	// The turn is the session's before any of the work a session/cancel must be
 	// able to interrupt: image decode and a relaunch of pi. It carries no
 	// generation yet, so no pump attributes anything to it and nothing is
-	// published for it until it dispatches.
+	// published for it until it dispatches. The busy check shares this
+	// critical section so a cycle the pump opens is never missed.
 	s.mu.Lock()
+	if s.cycle != nil {
+		s.mu.Unlock()
+
+		return acp.PromptResponse{}, wire.Backpressure(limitSessionPrompt)
+	}
+
 	s.turn = t
 	s.mu.Unlock()
 

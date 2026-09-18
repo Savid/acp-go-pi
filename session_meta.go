@@ -17,7 +17,6 @@ const (
 	metaModelKey         = "model"
 	metaEnvKey           = "env"
 	metaExtraPathDirsKey = "extraPathDirs"
-	metaOutputSchemaKey  = "outputSchema"
 	metaThinkingLevelKey = "thinkingLevel"
 	metaPermissionKey    = "permission"
 	metaAutoRetryKey     = "autoRetry"
@@ -33,9 +32,6 @@ type PiOptions struct {
 	// ExtraPathDirs are absolute directories prepended, in order, to the PATH
 	// of this session's pi process.
 	ExtraPathDirs []string `json:"extraPathDirs,omitempty"`
-	// OutputSchema requests structured output. pi has no native surface for
-	// it, so a session carrying it fails at session start.
-	OutputSchema map[string]any `json:"outputSchema,omitempty"`
 	// ThinkingLevel is a reasoning-level value passed unchanged to pi.
 	ThinkingLevel string `json:"thinkingLevel,omitempty"`
 	// Permission selects the permission mode: "ask" (the default) raises a
@@ -79,14 +75,6 @@ func WithPiExtraPathDirs(dirs ...string) PiOption {
 	return func(options *PiOptions) { options.ExtraPathDirs = slices.Clone(cloned) }
 }
 
-// WithPiOutputSchema configures structured output, which pi refuses at
-// session start.
-func WithPiOutputSchema(schema map[string]any) PiOption {
-	cloned := wire.CloneMap(schema)
-
-	return func(options *PiOptions) { options.OutputSchema = wire.CloneMap(cloned) }
-}
-
 // WithPiThinkingLevel configures the reasoning level passed to pi.
 func WithPiThinkingLevel(level string) PiOption {
 	return func(options *PiOptions) { options.ThinkingLevel = level }
@@ -118,10 +106,6 @@ func (options PiOptions) Meta() map[string]any {
 		values[metaExtraPathDirsKey] = slices.Clone(options.ExtraPathDirs)
 	}
 
-	if options.OutputSchema != nil {
-		values[metaOutputSchemaKey] = wire.CloneMap(options.OutputSchema)
-	}
-
 	if options.ThinkingLevel != "" {
 		values[metaThinkingLevelKey] = options.ThinkingLevel
 	}
@@ -141,7 +125,6 @@ func (options PiOptions) clone() PiOptions {
 	cloned := options
 	cloned.Env = maps.Clone(options.Env)
 	cloned.ExtraPathDirs = slices.Clone(options.ExtraPathDirs)
-	cloned.OutputSchema = wire.CloneMap(options.OutputSchema)
 
 	return cloned
 }
@@ -259,13 +242,7 @@ func parsePiOptions(values map[string]any) (PiOptions, *acp.RequestError) {
 			}
 
 			options.ExtraPathDirs = dirs
-		case metaOutputSchemaKey:
-			schema, ok := item.(map[string]any)
-			if !ok {
-				return PiOptions{}, wire.Unsupported(wire.MetaOptionPath(vendor, key))
-			}
 
-			options.OutputSchema = wire.CloneMap(schema)
 		case metaThinkingLevelKey:
 			level, ok := item.(string)
 			if !ok || level == "" {
@@ -297,10 +274,6 @@ func parsePiOptions(values map[string]any) (PiOptions, *acp.RequestError) {
 }
 
 func validatePiOptions(options PiOptions) *acp.RequestError {
-	if options.OutputSchema != nil {
-		return wire.Unsupported(wire.MetaOptionPath(vendor, metaOutputSchemaKey))
-	}
-
 	if options.Model != "" {
 		if _, err := pi.ParseModelRef(options.Model); err != nil {
 			return wire.Unsupported(wire.MetaOptionPath(vendor, metaModelKey))

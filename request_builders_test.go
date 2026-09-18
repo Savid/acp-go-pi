@@ -16,9 +16,6 @@ func TestSessionRequestBuilders(t *testing.T) {
 	request := wire.NewSessionRequest("/w", WithSessionRawEvents(true), WithSessionPiOptions(NewPiOptions(WithPiModel("p/m"))))
 	require.Equal(t, map[string]any{"options": map[string]any{"model": "p/m"}, "rawEvent": map[string]any{"enabled": true}}, request.Meta["pi"])
 
-	resume := wire.ResumeSessionRequest("id", "/w", WithSessionOutputSchema(map[string]any{"type": "object"}))
-	require.Equal(t, map[string]any{"options": map[string]any{"outputSchema": map[string]any{"type": "object"}}}, resume.Meta["pi"])
-
 	require.Equal(t, configModel, SetModelRequest("id", "p/m").ValueId.ConfigId)
 	require.Equal(t, acp.SessionConfigValueId("p/m"), SetModelRequest("id", "p/m").ValueId.Value)
 }

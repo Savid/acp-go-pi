@@ -8,8 +8,8 @@ import (
 	piacp "github.com/savid/acp-go-pi"
 )
 
-// configureTelemetry reads the OTEL_* environment and maps the providers it
-// enables onto the agent's options.
+// configureTelemetry builds the exporters the OTEL_* environment enables and
+// maps the configured providers onto the agent's options.
 func configureTelemetry(ctx context.Context, baseLogger *slog.Logger, version string) (exporters.Bundle, []piacp.Option, error) {
 	bundle, err := exporters.Configure(ctx, exporters.Config{Vendor: "pi", Version: version, Logger: baseLogger})
 	if err != nil {
@@ -17,7 +17,6 @@ func configureTelemetry(ctx context.Context, baseLogger *slog.Logger, version st
 	}
 
 	options := []piacp.Option{piacp.WithTextMapPropagator(bundle.Propagator)}
-
 	if bundle.TracerProvider != nil {
 		options = append(options, piacp.WithTracerProvider(bundle.TracerProvider))
 	}

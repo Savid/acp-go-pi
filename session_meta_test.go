@@ -34,11 +34,6 @@ func TestPiOptionsMetaRoundTrip(t *testing.T) {
 	require.NoError(t, ValidatePiSessionMeta(meta))
 	require.NoError(t, ValidatePiSessionMeta(nil))
 	require.Error(t, ValidatePiSessionMeta(map[string]any{"pi": "x"}))
-	require.Error(t, ValidatePiSessionMeta(WithPiOutputSchemaMeta()))
-}
-
-func WithPiOutputSchemaMeta() map[string]any {
-	return NewPiOptions(WithPiOutputSchema(map[string]any{"type": "object"})).Meta()
 }
 
 func TestParseSessionMetaRawEvents(t *testing.T) {
@@ -71,7 +66,6 @@ func TestParseSessionMetaShapes(t *testing.T) {
 		{"dir element type", map[string]any{"pi": map[string]any{"options": map[string]any{"extraPathDirs": []any{1}}}}, "_meta.pi.options.extraPathDirs[0]"},
 		{"empty thinking", map[string]any{"pi": map[string]any{"options": map[string]any{"thinkingLevel": ""}}}, "_meta.pi.options.thinkingLevel"},
 		{"autoRetry type", map[string]any{"pi": map[string]any{"options": map[string]any{"autoRetry": "yes"}}}, "_meta.pi.options.autoRetry"},
-		{"schema type", map[string]any{"pi": map[string]any{"options": map[string]any{"outputSchema": 1}}}, "_meta.pi.options.outputSchema"},
 	}
 
 	for _, tc := range cases {
