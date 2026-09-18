@@ -262,7 +262,7 @@ func (s *session) startFailure(ctx context.Context, err error) error {
 }
 
 // configureRuntime drives the post-spawn command sequence: retry posture,
-// state, thinking level, model, catalog, and commands.
+// state, model, thinking level, catalog, and commands.
 func (s *session) configureRuntime(ctx context.Context, rt *runtime, model string, expectID string) error {
 	client := rt.client
 
@@ -281,19 +281,6 @@ func (s *session) configureRuntime(ctx context.Context, rt *runtime, model strin
 
 	if state.SessionID == "" || state.SessionFile == "" {
 		return s.startFailure(ctx, errors.New("pi reported no session identity"))
-	}
-
-	if s.options.ThinkingLevel != "" {
-		if levelErr := client.SetThinkingLevel(ctx, s.options.ThinkingLevel); levelErr != nil {
-			return s.startFailure(ctx, levelErr)
-		}
-
-		// pi acknowledges a level it does not apply, so the level read back is
-		// the one the session advertises.
-		state, err = client.GetState(ctx)
-		if err != nil {
-			return s.startFailure(ctx, err)
-		}
 	}
 
 	selected := stateModelRef(state)
@@ -318,6 +305,20 @@ func (s *session) configureRuntime(ctx context.Context, rt *runtime, model strin
 
 		selected = ref.Provider + "/" + chosen.ID
 		contextWindow = chosen.ContextWindow
+	}
+
+	if s.options.ThinkingLevel != "" {
+		if levelErr := client.SetThinkingLevel(ctx, s.options.ThinkingLevel); levelErr != nil {
+			return s.startFailure(ctx, levelErr)
+		}
+	}
+
+	if model != "" || s.options.ThinkingLevel != "" {
+		// Model selection can change the effective thinking level.
+		state, err = client.GetState(ctx)
+		if err != nil {
+			return s.startFailure(ctx, err)
+		}
 	}
 
 	models, err := client.GetAvailableModels(ctx)

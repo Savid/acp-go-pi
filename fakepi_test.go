@@ -262,6 +262,10 @@ func (f *fakePi) dispatch(line []byte) {
 			if model.Provider == command.Provider && model.ID == command.ModelID {
 				chosen := model
 				f.model = &chosen
+				f.thinkingLevel = "medium"
+				if chosen.ID == "text-only" {
+					f.thinkingLevel = "off"
+				}
 				f.respond(command.ID, command.Type, chosen)
 
 				return
@@ -272,6 +276,9 @@ func (f *fakePi) dispatch(line []byte) {
 	case "set_thinking_level":
 		if slices.Contains(pi.ThinkingLevels(), command.Level) {
 			f.thinkingLevel = command.Level
+			if f.model != nil && f.model.ID == "text-only" {
+				f.thinkingLevel = "off"
+			}
 		}
 
 		f.respond(command.ID, command.Type, nil)

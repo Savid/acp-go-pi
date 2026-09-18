@@ -43,3 +43,22 @@ func TestConfigOptionsOmitUnknown(t *testing.T) {
 	require.Len(t, options, 2)
 	require.Equal(t, "select", options[0].Select.Type)
 }
+
+func TestNewSessionReportsEffectiveThinkingLevel(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ model, requested, effective string }{
+		{"fake/text-only", "", "off"},
+		{"fake/text-only", "high", "off"},
+		{"fake/vision", "high", "high"},
+	} {
+		t.Run(tc.model+"/"+tc.requested, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			h.initialize()
+			session := h.newSession(WithSessionPiOptions(NewPiOptions(
+				WithPiModel(tc.model), WithPiThinkingLevel(tc.requested),
+			)))
+			require.Equal(t, acp.SessionConfigValueId(tc.effective), session.ConfigOptions[1].Select.CurrentValue)
+		})
+	}
+}

@@ -147,18 +147,17 @@ func (s *session) setConfigOption(ctx context.Context, configID acp.SessionConfi
 		if setErr := rt.client.SetThinkingLevel(ctx, value); setErr != nil {
 			return nil, s.transportFailure(ctx, rt, setErr)
 		}
-
-		// pi acknowledges a level it does not apply; the level read back is
-		// the one the session advertises.
-		state, stateErr := rt.client.GetState(ctx)
-		if stateErr != nil {
-			return nil, s.transportFailure(ctx, rt, stateErr)
-		}
-
-		s.mu.Lock()
-		s.thinkingLevel = state.ThinkingLevel
-		s.mu.Unlock()
 	}
+
+	// Both model and thinking-level selection can clamp the effective level.
+	state, stateErr := rt.client.GetState(ctx)
+	if stateErr != nil {
+		return nil, s.transportFailure(ctx, rt, stateErr)
+	}
+
+	s.mu.Lock()
+	s.thinkingLevel = state.ThinkingLevel
+	s.mu.Unlock()
 
 	if err := s.commitMirror(ctx); err != nil {
 		return nil, wire.InternalFailure(vendor, "")

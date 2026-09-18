@@ -237,6 +237,14 @@ func TestSetConfigOptions(t *testing.T) {
 	resp, err := h.conn.SetSessionConfigOption(h.ctx(), SetModelRequest(session.SessionId, "fake/text-only"))
 	require.NoError(t, err)
 	require.Equal(t, acp.SessionConfigValueId("fake/text-only"), resp.ConfigOptions[0].Select.CurrentValue)
+	require.Equal(t, acp.SessionConfigValueId("off"), resp.ConfigOptions[1].Select.CurrentValue)
+
+	resp, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, configThoughtLevel, "high"))
+	require.NoError(t, err)
+	require.Equal(t, acp.SessionConfigValueId("off"), resp.ConfigOptions[1].Select.CurrentValue)
+
+	_, err = h.conn.SetSessionConfigOption(h.ctx(), SetModelRequest(session.SessionId, "fake/vision"))
+	require.NoError(t, err)
 
 	_, err = h.conn.SetSessionConfigOption(h.ctx(), SetModelRequest(session.SessionId, "fake/nope"))
 	require.Equal(t, "value", requestErrorData(t, err)["field"])
