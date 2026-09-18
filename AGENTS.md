@@ -62,5 +62,6 @@ changing anything pi-facing.
   dialog or fail open on a denied or cancelled answer.
 - Do not log prompts, tool input or output, or raw native event bodies by
   default.
-- Reject every ACP extension method; the only extension surface is the
-  outbound raw-event notification.
+- Account usage resolves credentials and routes through the session's native
+  model registry, then delegates provider HTTP reads to `acp-go-core/usage`.
+  Reject extension methods other than the advertised account-usage read.

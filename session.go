@@ -77,6 +77,7 @@ type session struct {
 
 // runtime is one pi process generation.
 type runtime struct {
+	usage  pi.UsageEndpoint
 	proc   *process.Process
 	client *pi.Client
 	cancel context.CancelFunc
@@ -157,6 +158,13 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 		return nil, err
 	}
 
+	usage, err := pi.NewUsageEndpoint()
+	if err != nil {
+		return nil, s.startFailure(ctx, err)
+	}
+
+	env = append(env, pi.EnvUsageURL+"="+usage.URL, pi.EnvUsageToken+"="+usage.Token)
+
 	if seedErr := pi.WriteSeedFiles(s.agentDir, s.agent.options.SeedFiles); seedErr != nil {
 		if refusal := wire.SeedFileRefusal(seedErr); refusal != nil {
 			return nil, refusal
@@ -189,7 +197,7 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 		return nil, s.startFailure(ctx, startErr)
 	}
 
-	rt := &runtime{proc: proc, client: client, cancel: cancelRead, done: make(chan struct{})}
+	rt := &runtime{proc: proc, client: client, usage: usage, cancel: cancelRead, done: make(chan struct{})}
 
 	s.mu.Lock()
 	closing := s.closing

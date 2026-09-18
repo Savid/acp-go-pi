@@ -19,6 +19,7 @@ import (
 
 func TestSmokeSessionLifecycle(t *testing.T) {
 	requireIntegration(t)
+	t.Setenv("OPENROUTER_API_KEY", "")
 
 	h := newHarness(t, false)
 	ctx := h.ctx(t)
@@ -33,6 +34,10 @@ func TestSmokeSessionLifecycle(t *testing.T) {
 	session, err := h.conn.NewSession(ctx, wire.NewSessionRequest(cwd))
 	require.NoError(t, err)
 	require.NotEmpty(t, session.SessionId)
+
+	usage, err := h.conn.CallExtension(ctx, piacp.AccountUsageMethod, map[string]any{"sessionId": session.SessionId, "providerId": "openrouter"})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"available":false,"reason":"not_authenticated"}`, string(usage))
 
 	list, err := h.conn.ListSessions(ctx, wire.ListSessionsRequest())
 	require.NoError(t, err)

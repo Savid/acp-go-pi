@@ -14,7 +14,7 @@ func TestPublishExtensions(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), ExtensionDigest())
 	paths, err := PublishExtensions(dir)
 	require.NoError(t, err)
-	require.Equal(t, []string{paths.Bridge, paths.Path}, paths.Paths())
+	require.Equal(t, []string{paths.Bridge, paths.Path, paths.Usage}, paths.Paths())
 	require.True(t, paths.IsWrapperExtension(paths.Bridge))
 	require.False(t, paths.IsWrapperExtension("/elsewhere.ts"))
 	require.False(t, paths.IsWrapperExtension(""))

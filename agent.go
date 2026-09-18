@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -29,6 +30,8 @@ const (
 	// RawEventMethod is the notification carrying one raw pi event when a
 	// session opted in through _meta.pi.rawEvent.enabled.
 	RawEventMethod = "_pi/rawEvent"
+	// AccountUsageMethod reads one provider's account allowance through a session.
+	AccountUsageMethod = "_pi/accountUsage"
 	// SessionStoreFormat identifies the store layout this package writes: raw
 	// pi session JSONL rows under the main subpath plus the adapter's session
 	// record under the config subpath.
@@ -49,10 +52,11 @@ type client interface {
 
 // Agent exposes the pi coding agent through ACP.
 type Agent struct {
-	options   Options
-	log       *slog.Logger
-	observe   *observer.Observer
-	optionErr *acp.RequestError
+	usageTransport http.RoundTripper
+	options        Options
+	log            *slog.Logger
+	observe        *observer.Observer
+	optionErr      *acp.RequestError
 	// processEnv is the adapter's own environment, read once at construction.
 	processEnv []string
 	store      acpcore.SessionStore
@@ -315,7 +319,8 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 
 	capabilityMeta := map[string]any{
 		vendor: map[string]any{
-			"elicitation": map[string]any{"unstable": true, "scope": "session", "tracks": "ACP v1 elicitation"},
+			wire.AccountUsageCapabilityKey: wire.AccountUsageAdvertisement(AccountUsageMethod, wire.AccountUsageScopeSession, "opencode-go", "openrouter"),
+			"elicitation":                  map[string]any{"unstable": true, "scope": "session", "tracks": "ACP v1 elicitation"},
 			metaRawEventKey: map[string]any{
 				capabilityMethodKey: RawEventMethod, "enabledBy": "_meta.pi.rawEvent.enabled",
 				"maxBytes": wire.RawEventMaxBytes, "defaultEnabled": false,
@@ -390,9 +395,12 @@ func (a *Agent) SetSessionMode(_ context.Context, params acp.SetSessionModeReque
 	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
 }
 
-// HandleExtensionMethod answers every extension method with method-not-found.
-// The only extension surface is the outbound RawEventMethod notification.
-func (a *Agent) HandleExtensionMethod(_ context.Context, method string, params json.RawMessage) (any, error) {
+// HandleExtensionMethod dispatches the advertised account read.
+func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
+	if method == AccountUsageMethod {
+		return a.accountUsage(ctx, params)
+	}
+
 	var envelope struct {
 		Meta map[string]any `json:"_meta"` //nolint:tagliatelle // ACP reserves this wire spelling.
 	}

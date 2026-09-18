@@ -19,11 +19,15 @@ var bridgeExtensionSource []byte
 //go:embed ext/acp-path.ts
 var pathExtensionSource []byte
 
+//go:embed ext/acp-usage.ts
+var usageExtensionSource []byte
+
 const (
 	// BridgeExtensionFileName is the wrapper-owned permission bridge extension.
 	BridgeExtensionFileName = "acp-bridge.ts"
 	// PathExtensionFileName is the wrapper-owned native-shell PATH extension.
-	PathExtensionFileName = "acp-path.ts"
+	PathExtensionFileName  = "acp-path.ts"
+	UsageExtensionFileName = "acp-usage.ts"
 
 	// InternalEnvPrefix names the process markers the adapter sets for its own
 	// extensions. They are dropped from every inherited layer and set only for
@@ -83,17 +87,18 @@ func ParsePermissionTitle(title string) (PermissionPrompt, bool) {
 type ExtensionPaths struct {
 	Bridge string
 	Path   string
+	Usage  string
 }
 
 // Paths lists the extensions in pi load order.
 func (p ExtensionPaths) Paths() []string {
-	return []string{p.Bridge, p.Path}
+	return []string{p.Bridge, p.Path, p.Usage}
 }
 
 // IsWrapperExtension reports whether a native extension path names one of the
 // wrapper's own extensions.
 func (p ExtensionPaths) IsWrapperExtension(path string) bool {
-	return path != "" && (path == p.Bridge || path == p.Path)
+	return path != "" && (path == p.Bridge || path == p.Path || path == p.Usage)
 }
 
 // ExtensionDigest names the directory holding this build's extension sources.
@@ -102,7 +107,7 @@ func (p ExtensionPaths) IsWrapperExtension(path string) bool {
 func ExtensionDigest() string {
 	digest := sha256.New()
 
-	for _, source := range [][]byte{bridgeExtensionSource, pathExtensionSource} {
+	for _, source := range [][]byte{bridgeExtensionSource, pathExtensionSource, usageExtensionSource} {
 		digest.Write(source)
 		digest.Write([]byte{0})
 	}
@@ -121,9 +126,10 @@ func PublishExtensions(dir string) (ExtensionPaths, error) {
 	paths := ExtensionPaths{
 		Bridge: filepath.Join(dir, BridgeExtensionFileName),
 		Path:   filepath.Join(dir, PathExtensionFileName),
+		Usage:  filepath.Join(dir, UsageExtensionFileName),
 	}
 
-	for path, contents := range map[string][]byte{paths.Bridge: bridgeExtensionSource, paths.Path: pathExtensionSource} {
+	for path, contents := range map[string][]byte{paths.Bridge: bridgeExtensionSource, paths.Path: pathExtensionSource, paths.Usage: usageExtensionSource} {
 		if err := publishFile(path, contents); err != nil {
 			return ExtensionPaths{}, err
 		}

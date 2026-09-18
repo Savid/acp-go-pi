@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -63,6 +65,31 @@ type fakePi struct {
 }
 
 func runFakePi(args []string) int {
+	listener, err := net.Listen("tcp", strings.TrimPrefix(os.Getenv(pi.EnvUsageURL), "http://"))
+	if err != nil {
+		return 1
+	}
+	usageServer := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+os.Getenv(pi.EnvUsageToken) || r.URL.Path != "/access" {
+			w.WriteHeader(http.StatusForbidden)
+
+			return
+		}
+		if path := os.Getenv("ACP_GO_PI_TEST_USAGE_ACCESS"); path != "" {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+
+				return
+			}
+			_, _ = w.Write(data)
+
+			return
+		}
+		_, _ = io.WriteString(w, `{"configured":false,"custom":false,"routes":[]}`)
+	})}
+	go func() { _ = usageServer.Serve(listener) }()
+	defer func() { _ = usageServer.Close() }()
 	if dump := os.Getenv(fakePiEnvDump); dump != "" {
 		_ = os.WriteFile(dump, []byte(strings.Join(os.Environ(), "\n")+"\n"), 0o600)
 	}

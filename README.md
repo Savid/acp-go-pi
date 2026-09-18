@@ -117,3 +117,18 @@ make test-integration-live    # spends model tokens
 
 Unit tests run the test binary as a scripted fake pi and need no installed
 pi, credentials, or network.
+
+## Account usage
+
+`AccountUsageMethod` (`_pi/accountUsage`) accepts `sessionId` and `providerId`
+(`opencode-go` or `openrouter`). Reads hold the session's foreground gate and
+spend no model tokens. The session extension resolves effective credentials,
+model endpoints, and authentication headers from Pi's native model registry.
+Credentials travel only over an authenticated loopback endpoint and never
+enter the conversation or ACP events.
+
+Official provider routes use `github.com/savid/acp-go-core/usage` to read Go
+percentage windows or OpenRouter USD balances, spending caps, lifetime spend,
+and free-model request counts. Custom provider implementations and unverified
+routes report `not_reported`. Missing credentials report `not_authenticated`.
+The adapter revalidates the native binding after each read.
