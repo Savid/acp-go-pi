@@ -12,12 +12,15 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/savid/acp-go-core/usage/anthropic"
+	"github.com/savid/acp-go-core/usage/openaicodex"
 	"github.com/savid/acp-go-core/usage/opencodego"
 	"github.com/savid/acp-go-core/usage/openrouter"
 	"github.com/savid/acp-go-core/wire"
 )
 
 const (
+	usageAPICodex       = "openai-codex-responses"
 	usageAPIAnthropic   = "anthropic-messages"
 	usageAPICompletions = "openai-completions"
 	EnvUsageURL         = InternalEnvPrefix + "USAGE_URL"
@@ -44,15 +47,17 @@ func NewUsageEndpoint() (UsageEndpoint, error) {
 // UsageAccess keeps credential material inside the adapter.
 type UsageAccess struct {
 	APIKey      string
+	AccountID   string
 	Reason      string
 	Fingerprint [32]byte
 }
 
 type usageRoute struct {
-	API     string            `json:"api"`
-	BaseURL string            `json:"baseUrl"`
-	APIKey  string            `json:"apiKey"`
-	Headers map[string]string `json:"headers"`
+	API       string            `json:"api"`
+	BaseURL   string            `json:"baseUrl"`
+	APIKey    string            `json:"apiKey"`
+	AccountID string            `json:"accountId"`
+	Headers   map[string]string `json:"headers"`
 }
 
 func (e UsageEndpoint) Access(ctx context.Context, providerID, modelID string) (UsageAccess, error) {
@@ -100,8 +105,10 @@ func (e UsageEndpoint) Access(ctx context.Context, providerID, modelID string) (
 	}
 
 	key := payload.Routes[0].APIKey
+
+	accountID := payload.Routes[0].AccountID
 	for _, route := range payload.Routes {
-		if route.APIKey != key || !route.official(providerID) {
+		if route.APIKey != key || route.AccountID != accountID || !route.official(providerID) {
 			return UsageAccess{Reason: wire.AccountUsageNotReported}, nil
 		}
 	}
@@ -110,7 +117,7 @@ func (e UsageEndpoint) Access(ctx context.Context, providerID, modelID string) (
 		return UsageAccess{Reason: wire.AccountUsageNotAuthenticated}, nil
 	}
 
-	return UsageAccess{APIKey: key, Fingerprint: sha256.Sum256(data)}, nil
+	return UsageAccess{APIKey: key, AccountID: accountID, Fingerprint: sha256.Sum256(data)}, nil
 }
 
 func (r usageRoute) official(providerID string) bool {
@@ -121,15 +128,35 @@ func (r usageRoute) official(providerID string) bool {
 		base = strings.TrimSuffix(openrouter.Endpoint, "/key")
 	case opencodego.ProviderID:
 		base = strings.TrimSuffix(opencodego.Endpoint, "/usage")
+	case openaicodex.ProviderID:
+		if strings.TrimSpace(r.AccountID) == "" {
+			return false
+		}
+
+		base = strings.TrimSuffix(openaicodex.Endpoint, "/wham/usage")
+	case anthropic.ProviderID:
+		if r.API != usageAPIAnthropic {
+			return false
+		}
+
+		base = strings.TrimSuffix(anthropic.Endpoint, "/api/oauth/usage")
 	default:
 		return false
 	}
 
 	switch r.API {
+	case usageAPICodex:
+		if providerID != openaicodex.ProviderID {
+			return false
+		}
 	case usageAPIAnthropic:
 		base = strings.TrimSuffix(base, "/v1")
 	case usageAPICompletions, "openai-responses":
 	default:
+		return false
+	}
+
+	if providerID == openaicodex.ProviderID && r.API != usageAPICodex {
 		return false
 	}
 
@@ -147,7 +174,15 @@ func (r usageRoute) official(providerID string) bool {
 			if value != r.APIKey {
 				return false
 			}
+		case "chatgpt-account-id":
+			if providerID != openaicodex.ProviderID || value != r.AccountID {
+				return false
+			}
 		case "http-referer", "x-title", "x-source":
+		case "anthropic-beta", "anthropic-version":
+			if providerID != anthropic.ProviderID {
+				return false
+			}
 		default:
 			return false
 		}

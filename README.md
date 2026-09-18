@@ -121,14 +121,16 @@ pi, credentials, or network.
 ## Account usage
 
 `AccountUsageMethod` (`_pi/accountUsage`) accepts `sessionId` and `providerId`
-(`opencode-go` or `openrouter`). Reads hold the session's foreground gate and
+(`opencode-go`, `openrouter`, `openai-codex`, or `anthropic`). Reads hold the session's foreground gate and
 spend no model tokens. The session extension resolves effective credentials,
 model endpoints, and authentication headers from Pi's native model registry.
 Credentials travel only over an authenticated loopback endpoint and never
 enter the conversation or ACP events.
 
 Official provider routes use `github.com/savid/acp-go-core/usage` to read Go
-percentage windows or OpenRouter USD balances, spending caps, lifetime spend,
-and free-model request counts. Custom provider implementations and unverified
+percentage windows, OpenRouter USD balances and request counts, ChatGPT
+subscription windows, and Claude subscription windows and reported spending.
+ChatGPT account IDs come from the same native access token used for inference.
+Subscription credits are not treated as dollars. Custom provider implementations and unverified
 routes report `not_reported`. Missing credentials report `not_authenticated`.
 The adapter revalidates the native binding after each read.

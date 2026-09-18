@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/savid/acp-go-core/usage"
+	"github.com/savid/acp-go-core/usage/anthropic"
+	"github.com/savid/acp-go-core/usage/openaicodex"
 	"github.com/savid/acp-go-core/usage/opencodego"
 	"github.com/savid/acp-go-core/usage/openrouter"
 	"github.com/savid/acp-go-core/wire"
@@ -35,6 +37,10 @@ func (a *Agent) accountUsage(ctx context.Context, params json.RawMessage) (respo
 		reader = opencodego.Reader{Transport: a.usageTransport}
 	case openrouter.ProviderID:
 		reader = openrouter.Reader{Transport: a.usageTransport}
+	case openaicodex.ProviderID:
+		reader = openaicodex.Reader{Transport: a.usageTransport}
+	case anthropic.ProviderID:
+		reader = anthropic.Reader{Transport: a.usageTransport}
 	default:
 		return wire.AccountUsageResponse{}, wire.Unsupported("providerId")
 	}
@@ -101,7 +107,7 @@ func (s *session) readProviderUsage(ctx context.Context, rt *runtime, providerID
 		return wire.AccountUsageUnavailable(access.Reason), nil
 	}
 
-	response, err := reader.Read(ctx, access.APIKey)
+	response, err := reader.Read(ctx, usage.Credential{Token: access.APIKey, AccountID: access.AccountID})
 	if err != nil {
 		return wire.AccountUsageResponse{}, err
 	}

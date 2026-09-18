@@ -319,7 +319,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 
 	capabilityMeta := map[string]any{
 		vendor: map[string]any{
-			wire.AccountUsageCapabilityKey: wire.AccountUsageAdvertisement(AccountUsageMethod, wire.AccountUsageScopeSession, "opencode-go", "openrouter"),
+			wire.AccountUsageCapabilityKey: wire.AccountUsageAdvertisement(AccountUsageMethod, wire.AccountUsageScopeSession, "opencode-go", "openrouter", "openai-codex", "anthropic"),
 			"elicitation":                  map[string]any{"unstable": true, "scope": "session", "tracks": "ACP v1 elicitation"},
 			metaRawEventKey: map[string]any{
 				capabilityMethodKey: RawEventMethod, "enabledBy": "_meta.pi.rawEvent.enabled",

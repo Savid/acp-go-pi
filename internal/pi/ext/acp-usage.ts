@@ -15,7 +15,7 @@ export default function (pi: ExtensionAPI) {
 		const query = new URL(request.url ?? "/", endpoint);
 		const provider = query.searchParams.get("provider") ?? "";
 		const modelId = query.searchParams.get("model");
-		if (query.pathname !== "/access" || !["opencode-go", "openrouter"].includes(provider)) {
+		if (query.pathname !== "/access" || !["opencode-go", "openrouter", "openai-codex", "anthropic"].includes(provider)) {
 			response.writeHead(404).end();
 			return;
 		}
@@ -32,11 +32,15 @@ export default function (pi: ExtensionAPI) {
 					if (response.destroyed) return;
 					const auth = await registry.getApiKeyAndHeaders(model);
 					if (!auth.ok) throw new Error("Provider authentication unavailable");
+					const headers = { ...registry.getProvider(provider)?.headers, ...model.headers, ...auth.headers };
+					const bearer = Object.entries(headers).find(([name]) => name.toLowerCase() === "authorization")?.[1];
+					const apiKey = auth.apiKey ?? (provider === "anthropic" && bearer?.startsWith("Bearer ") ? bearer.slice(7) : "");
 					routes.add(JSON.stringify({
 						api: model.api,
 						baseUrl: auth.baseUrl ?? model.baseUrl,
-						apiKey: auth.apiKey ?? "",
-						headers: { ...registry.getProvider(provider)?.headers, ...model.headers, ...auth.headers },
+						apiKey,
+						accountId: provider === "openai-codex" ? codexAccountId(apiKey) : "",
+						headers,
 					}));
 				}
 			}
@@ -65,4 +69,13 @@ export default function (pi: ExtensionAPI) {
 		server.closeAllConnections();
 		server.close();
 	});
+}
+
+function codexAccountId(token: string): string {
+	const parts = token.split(".");
+	if (parts.length !== 3) throw new Error("Invalid Codex credential");
+	const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+	const accountId = claims["https://api.openai.com/auth"]?.chatgpt_account_id;
+	if (typeof accountId !== "string" || !accountId.trim()) throw new Error("Codex account missing");
+	return accountId;
 }
