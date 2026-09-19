@@ -246,12 +246,28 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 	cancelReady()
 
 	if readyErr != nil {
+		readyErr = launchFailure(proc, readyErr)
+
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
 		return nil, s.startFailure(ctx, readyErr)
 	}
 
 	return rt, nil
+}
+
+// launchFailure names why a launch ended: a pi that has already exited adds
+// its stderr tail, where a dying harness states its reason.
+func launchFailure(proc *process.Process, err error) error {
+	select {
+	case <-proc.Done():
+		if tail := proc.StderrTail(); tail != "" {
+			return fmt.Errorf("%w: %s", err, tail)
+		}
+	default:
+	}
+
+	return err
 }
 
 // launchEnvironment builds the merged environment for this session's pi

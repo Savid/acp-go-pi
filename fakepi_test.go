@@ -26,6 +26,7 @@ const (
 	fakePiEnvNoModel       = "ACP_GO_PI_TEST_NO_MODEL"
 	fakePiEnvUsageHold     = "ACP_GO_PI_TEST_USAGE_HOLD"
 	fakePiEnvStartupDialog = "ACP_GO_PI_TEST_STARTUP_DIALOG"
+	fakePiEnvStartupDeath  = "ACP_GO_PI_TEST_STARTUP_DEATH"
 	// fakePiEnvResumeHold names a file a resumed fake pi creates before it
 	// stops answering, so a test can act while the adapter is still relaunching.
 	fakePiEnvResumeHold = "ACP_GO_PI_TEST_RESUME_HOLD"
@@ -76,6 +77,12 @@ func runFakePi(args []string) int {
 		if err := json.NewDecoder(os.Stdin).Decode(&response); err != nil || !response.Cancelled {
 			return 1
 		}
+	}
+
+	if reason := os.Getenv(fakePiEnvStartupDeath); reason != "" {
+		fmt.Fprintln(os.Stderr, reason)
+
+		return 1
 	}
 
 	if marker := os.Getenv(fakePiEnvUsageHold); marker != "" {

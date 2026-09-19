@@ -154,7 +154,7 @@ func TestUsageExtensionOwnsEndpoint(t *testing.T) {
 		t.Cleanup(func() { _ = proc.Kill(); _ = proc.Close() })
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 		defer cancel()
-		require.NoError(t, endpoint.Wait(ctx, proc.Done()), proc.StderrLastLine())
+		require.NoError(t, endpoint.Wait(ctx, proc.Done()), proc.StderrTail())
 		require.NotEqual(t, previous, endpoint.URL, "live extensions must own distinct ports")
 		previous = endpoint.URL
 		listener, err := net.Listen("tcp", strings.TrimPrefix(endpoint.URL, "http://"))
@@ -179,7 +179,7 @@ func TestUsageExtensionOwnsEndpoint(t *testing.T) {
 			_, writeErr := io.WriteString(proc.Stdin(), "shutdown\n")
 			require.NoError(t, writeErr)
 			_, waitErr := proc.Wait(shutdownCtx)
-			require.NoError(t, waitErr, proc.StderrLastLine())
+			require.NoError(t, waitErr, proc.StderrTail())
 			require.NoFileExists(t, endpoint.File)
 			stdout, readErr := io.ReadAll(proc.Stdout())
 			require.NoError(t, readErr)

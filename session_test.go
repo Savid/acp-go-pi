@@ -1,9 +1,11 @@
 package piacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -497,6 +499,19 @@ func TestUsageEndpointDirectoryRemovedAfterLaunchFailure(t *testing.T) {
 			require.Empty(t, paths, "failed launch retained a private usage directory")
 		})
 	}
+}
+
+func TestLaunchFailureLogsNativeStderr(t *testing.T) {
+	t.Parallel()
+	var logs bytes.Buffer
+	a := NewAgent(testOptions(t,
+		WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvStartupDeath: "Error: Failed to load extension"}),
+		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+	)...)
+	s := a.newSession(sessionStart{cwd: t.TempDir()})
+	_, err := s.launch(t.Context(), "")
+	require.Equal(t, "pi_internal_failure", requestErrorData(t, err)["error"])
+	require.Contains(t, logs.String(), "exited before readiness: Error: Failed to load extension")
 }
 
 func TestUsageEndpointDirectoryRemovedWhenRuntimeStops(t *testing.T) {

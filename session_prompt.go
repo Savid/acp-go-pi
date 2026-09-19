@@ -279,7 +279,7 @@ func (s *session) dispatchFailure(ctx context.Context, rt *runtime, t *turn, err
 }
 
 // transportFailure recovers the real cause behind a lost native stream: the
-// child's exit status and last stderr line where it died, otherwise the
+// child's exit status and stderr tail where it died, otherwise the
 // transport error.
 func (s *session) transportFailure(ctx context.Context, rt *runtime, err error) error {
 	return wire.TurnFailed(vendor, wire.TransportFailure(ctx, rt.proc, "pi process", err, rt.client.Err))
