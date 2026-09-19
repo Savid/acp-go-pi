@@ -130,7 +130,7 @@ func TestAccountUsageReadsThroughGatewayRoutes(t *testing.T) {
 	response, err := a.accountUsage(t.Context(), params)
 	require.NoError(t, err)
 	require.True(t, response.Available)
-	require.Equal(t, []wire.AccountUsageLimit{{ObservedAt: "2026-09-19T08:40:37Z", ID: "5h", Label: "Claude 5 Hour", WindowSeconds: 18000, UsedPercent: 25, UsageAllowed: new(true), ResetsAt: "2026-09-19T11:29:59Z"}}, response.Limits)
+	require.Equal(t, []wire.AccountUsageLimit{{ObservedAt: "2026-09-19T08:40:37Z", ID: "session", WindowSeconds: 18000, UsedPercent: 25, UsageAllowed: new(true), ResetsAt: "2026-09-19T11:29:59Z"}}, response.Limits)
 	require.Equal(t, []string{"proxy.example/v1/usage Bearer proxy-key", "gateway.example/v1/usage Bearer gateway-key"}, asked, "each valid route is asked in order until one covers the provider")
 
 	params, err = json.Marshal(map[string]any{usageSessionField: session.SessionId, "providerId": "openrouter"})
