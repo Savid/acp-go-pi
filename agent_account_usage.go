@@ -96,28 +96,7 @@ func (s *session) readProviderUsage(ctx context.Context, rt *runtime, providerID
 		modelID = ""
 	}
 
-	access, err := rt.usage.Access(ctx, providerID, modelID)
-	if err != nil {
-		return wire.AccountUsageResponse{}, err
-	}
-
-	if access.Reason != "" {
-		return wire.AccountUsageUnavailable(access.Reason), nil
-	}
-
-	response, err := reader.Read(ctx, usage.Credential{Token: access.APIKey, AccountID: access.AccountID})
-	if err != nil {
-		return wire.AccountUsageResponse{}, err
-	}
-
-	current, err := rt.usage.Access(ctx, providerID, modelID)
-	if err != nil {
-		return wire.AccountUsageResponse{}, err
-	}
-
-	if current != access {
-		return wire.AccountUsageResponse{}, errors.New("provider credentials or route changed")
-	}
-
-	return response, response.Validate()
+	return usage.ReadVerified(ctx, func(ctx context.Context) (usage.Access, error) {
+		return rt.usage.Access(ctx, providerID, modelID)
+	}, reader)
 }

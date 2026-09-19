@@ -22,6 +22,10 @@ import (
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/process"
+	"github.com/savid/acp-go-core/usage/anthropic"
+	"github.com/savid/acp-go-core/usage/openaicodex"
+	"github.com/savid/acp-go-core/usage/opencodego"
+	"github.com/savid/acp-go-core/usage/openrouter"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
@@ -72,7 +76,7 @@ type Agent struct {
 	lifecycle    lifecycle.Negotiated
 	restores     wire.SessionRequests
 	sessions     map[acp.SessionId]*session
-	deleted      map[acp.SessionId]struct{}
+	deleted      map[acp.SessionId]bool
 	clientCalls  chan struct{}
 	incarnations uint64
 
@@ -116,7 +120,7 @@ func NewAgent(opts ...Option) *Agent {
 		processEnv:  os.Environ(),
 		store:       store,
 		sessions:    make(map[acp.SessionId]*session),
-		deleted:     make(map[acp.SessionId]struct{}),
+		deleted:     make(map[acp.SessionId]bool),
 		clientCalls: make(chan struct{}, max(0, options.ConcurrencyLimits.MaxConcurrentClientCalls)),
 	}
 	agent.optionErr = agent.validateOptions()
@@ -139,7 +143,7 @@ func (a *Agent) validateOptions() *acp.RequestError {
 		{"defaultModel", validateOptionalModel(options.DefaultModel)},
 		{"configuredModels", validateConfiguredModels(options.ConfiguredModels)},
 		{metaEnvKey, process.ValidateNames(options.Env)},
-		{"concurrencyLimits", validateConcurrencyLimits(options.ConcurrencyLimits)},
+		{"concurrencyLimits", wire.ValidateConcurrencyLimits(options.ConcurrencyLimits.MaxActiveSessions, options.ConcurrencyLimits.MaxConcurrentClientCalls)},
 		{"imageLimits", options.ImageLimits.core().Validate()},
 	}
 
@@ -179,14 +183,6 @@ func validateConfiguredModels(ids []string) error {
 		}
 
 		seen[id] = struct{}{}
-	}
-
-	return nil
-}
-
-func validateConcurrencyLimits(limits ConcurrencyLimits) error {
-	if limits.MaxActiveSessions < 0 || limits.MaxConcurrentClientCalls < 0 {
-		return errors.New("concurrency limits must not be negative")
 	}
 
 	return nil
@@ -284,6 +280,10 @@ func (a *Agent) ensureOpen() error {
 
 // Initialize implements ACP initialize.
 func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (resp acp.InitializeResponse, err error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.InitializeResponse{}, openErr
+	}
+
 	_, finish := a.observe.StartACP(ctx, params.Meta, acp.AgentMethodInitialize)
 	defer func() { finish(err) }()
 
@@ -317,7 +317,7 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 
 	capabilityMeta := map[string]any{
 		vendor: map[string]any{
-			wire.AccountUsageCapabilityKey: wire.AccountUsageAdvertisement(AccountUsageMethod, wire.AccountUsageScopeSession, "opencode-go", "openrouter", "openai-codex", "anthropic"),
+			wire.AccountUsageCapabilityKey: wire.AccountUsageAdvertisement(AccountUsageMethod, wire.AccountUsageScopeSession, opencodego.ProviderID, openrouter.ProviderID, openaicodex.ProviderID, anthropic.ProviderID),
 			capabilityElicitationKey:       map[string]any{"unstable": true, "scope": "session", "tracks": "ACP v1 elicitation"},
 			metaRawEventKey: map[string]any{
 				capabilityMethodKey: RawEventMethod, "enabledBy": "_meta.pi.rawEvent.enabled",
@@ -367,6 +367,10 @@ func (a *Agent) Initialize(ctx context.Context, params acp.InitializeRequest) (r
 // Authenticate exists because the SDK interface requires it. The harness
 // authenticates itself in its own home, outside ACP.
 func (a *Agent) Authenticate(_ context.Context, params acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.AuthenticateResponse{}, openErr
+	}
+
 	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
 		return acp.AuthenticateResponse{}, wire.ParamRefusal(refusal)
 	}
@@ -376,6 +380,10 @@ func (a *Agent) Authenticate(_ context.Context, params acp.AuthenticateRequest) 
 
 // Logout exists because the SDK interface requires it.
 func (a *Agent) Logout(_ context.Context, params acp.LogoutRequest) (acp.LogoutResponse, error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.LogoutResponse{}, openErr
+	}
+
 	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
 		return acp.LogoutResponse{}, wire.ParamRefusal(refusal)
 	}
@@ -386,6 +394,10 @@ func (a *Agent) Logout(_ context.Context, params acp.LogoutRequest) (acp.LogoutR
 // SetSessionMode exists because the SDK interface requires it. Native modes
 // are config options, never ACP session modes.
 func (a *Agent) SetSessionMode(_ context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return acp.SetSessionModeResponse{}, openErr
+	}
+
 	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
 		return acp.SetSessionModeResponse{}, wire.ParamRefusal(refusal)
 	}
@@ -393,10 +405,20 @@ func (a *Agent) SetSessionMode(_ context.Context, params acp.SetSessionModeReque
 	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
 }
 
-// HandleExtensionMethod dispatches the advertised account read.
+// HandleExtensionMethod serves the account-usage read; every other extension
+// method is method-not-found.
 func (a *Agent) HandleExtensionMethod(ctx context.Context, method string, params json.RawMessage) (any, error) {
+	if openErr := a.ensureOpen(); openErr != nil {
+		return nil, openErr
+	}
+
 	if method == AccountUsageMethod {
-		return a.accountUsage(ctx, params)
+		response, err := a.accountUsage(ctx, params)
+		if err != nil {
+			return nil, err
+		}
+
+		return response, nil
 	}
 
 	var envelope struct {
@@ -507,6 +529,6 @@ func (a *Agent) environment(sessionEnv map[string]string, owned map[string]strin
 	}
 }
 
-// internalClassNativeStart is the one documented pi_internal_failure class: a
-// native pi process that could not be started or configured for a session.
+// internalClassNativeStart is the pi_internal_failure class of a native pi
+// process that could not be started or configured for a session.
 const internalClassNativeStart = "native_start"

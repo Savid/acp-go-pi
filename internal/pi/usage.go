@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/savid/acp-go-core/usage"
 	"github.com/savid/acp-go-core/usage/anthropic"
 	"github.com/savid/acp-go-core/usage/openaicodex"
 	"github.com/savid/acp-go-core/usage/opencodego"
@@ -44,14 +45,6 @@ func NewUsageEndpoint() (UsageEndpoint, error) {
 	return UsageEndpoint{URL: "http://" + address, Token: rand.Text()}, nil
 }
 
-// UsageAccess keeps credential material inside the adapter.
-type UsageAccess struct {
-	APIKey      string
-	AccountID   string
-	Reason      string
-	Fingerprint [32]byte
-}
-
 type usageRoute struct {
 	API       string            `json:"api"`
 	BaseURL   string            `json:"baseUrl"`
@@ -60,12 +53,12 @@ type usageRoute struct {
 	Headers   map[string]string `json:"headers"`
 }
 
-func (e UsageEndpoint) Access(ctx context.Context, providerID, modelID string) (UsageAccess, error) {
+func (e UsageEndpoint) Access(ctx context.Context, providerID, modelID string) (usage.Access, error) {
 	query := url.Values{"provider": {providerID}, "model": {modelID}}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, e.URL+"/access?"+query.Encode(), http.NoBody)
 	if err != nil {
-		return UsageAccess{}, err
+		return usage.Access{}, err
 	}
 
 	request.Header.Set("Authorization", "Bearer "+e.Token)
@@ -74,17 +67,17 @@ func (e UsageEndpoint) Access(ctx context.Context, providerID, modelID string) (
 
 	response, err := client.Do(request)
 	if err != nil {
-		return UsageAccess{}, errors.New("native account access failed")
+		return usage.Access{}, errors.New("native account access failed")
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		return UsageAccess{}, errors.New("native account access refused")
+		return usage.Access{}, errors.New("native account access refused")
 	}
 
 	data, err := io.ReadAll(io.LimitReader(response.Body, (64<<10)+1))
 	if err != nil || len(data) > 64<<10 {
-		return UsageAccess{}, errors.New("native account access invalid")
+		return usage.Access{}, errors.New("native account access invalid")
 	}
 
 	var payload struct {
@@ -93,15 +86,15 @@ func (e UsageEndpoint) Access(ctx context.Context, providerID, modelID string) (
 		Routes     []usageRoute `json:"routes"`
 	}
 	if json.Unmarshal(data, &payload) != nil || payload.Configured == nil || payload.Custom == nil || payload.Routes == nil {
-		return UsageAccess{}, errors.New("native account access invalid")
+		return usage.Access{}, errors.New("native account access invalid")
 	}
 
 	if !*payload.Configured {
-		return UsageAccess{Reason: wire.AccountUsageNotAuthenticated}, nil
+		return usage.Access{Reason: wire.AccountUsageNotAuthenticated}, nil
 	}
 
 	if *payload.Custom || len(payload.Routes) == 0 {
-		return UsageAccess{Reason: wire.AccountUsageNotReported}, nil
+		return usage.Access{Reason: wire.AccountUsageNotReported}, nil
 	}
 
 	key := payload.Routes[0].APIKey
@@ -109,15 +102,15 @@ func (e UsageEndpoint) Access(ctx context.Context, providerID, modelID string) (
 	accountID := payload.Routes[0].AccountID
 	for _, route := range payload.Routes {
 		if route.APIKey != key || route.AccountID != accountID || !route.official(providerID) {
-			return UsageAccess{Reason: wire.AccountUsageNotReported}, nil
+			return usage.Access{Reason: wire.AccountUsageNotReported}, nil
 		}
 	}
 
 	if strings.TrimSpace(key) == "" {
-		return UsageAccess{Reason: wire.AccountUsageNotAuthenticated}, nil
+		return usage.Access{Reason: wire.AccountUsageNotAuthenticated}, nil
 	}
 
-	return UsageAccess{APIKey: key, AccountID: accountID, Fingerprint: sha256.Sum256(data)}, nil
+	return usage.Access{APIKey: key, AccountID: accountID, Fingerprint: sha256.Sum256(data)}, nil
 }
 
 func (r usageRoute) official(providerID string) bool {

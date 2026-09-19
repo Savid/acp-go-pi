@@ -113,6 +113,14 @@ func (s *session) setConfigOption(ctx context.Context, configID acp.SessionConfi
 	}
 	defer release()
 
+	s.mu.Lock()
+	busy := s.cycle != nil
+	s.mu.Unlock()
+
+	if busy {
+		return nil, wire.Backpressure(limitSessionPrompt)
+	}
+
 	rt, err := s.ensureRuntime(ctx)
 	if err != nil {
 		return nil, err

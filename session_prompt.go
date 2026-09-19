@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -283,31 +282,7 @@ func (s *session) dispatchFailure(ctx context.Context, rt *runtime, t *turn, err
 // child's exit status and last stderr line where it died, otherwise the
 // transport error.
 func (s *session) transportFailure(ctx context.Context, rt *runtime, err error) error {
-	waitCtx, cancel := context.WithTimeout(ctx, processExitGrace)
-	defer cancel()
-
-	if result, waitErr := rt.proc.Wait(waitCtx); waitErr == nil {
-		message := fmt.Sprintf("pi process exited with status %d", result.ExitCode)
-		if result.Signal != 0 {
-			message = fmt.Sprintf("pi process was killed by signal %d", result.Signal)
-		}
-
-		if line := rt.proc.StderrLastLine(); line != "" {
-			message += ": " + line
-		}
-
-		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseProcessExit, Message: message})
-	}
-
-	if err == nil {
-		err = rt.client.Err()
-	}
-
-	if err == nil {
-		err = errors.New("pi event stream closed mid-turn")
-	}
-
-	return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseTransport, Message: err.Error()})
+	return wire.TurnFailed(vendor, wire.TransportFailure(ctx, rt.proc, "pi process", err, rt.client.Err))
 }
 
 // cycleVerdict is how one cycle ended, in the terms the lifecycle stream and

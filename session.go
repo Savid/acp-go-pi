@@ -62,13 +62,16 @@ type session struct {
 	commands      []acp.AvailableCommand
 	title         string
 	updatedAt     string
-	closing       bool
-	closeDone     chan struct{}
-	closeErr      error
-	poison        string
-	turn          *turn
-	cycle         *cycle
-	dialogs       map[string]*dialog
+	// installed records that the agent published the session under its id,
+	// so close owes the store its final generation.
+	installed bool
+	closing   bool
+	closeDone chan struct{}
+	closeErr  error
+	poison    string
+	turn      *turn
+	cycle     *cycle
+	dialogs   map[string]*dialog
 
 	mirrorMu sync.Mutex
 	lcMu     sync.Mutex
@@ -153,17 +156,15 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 		return nil, s.startFailure(ctx, err)
 	}
 
-	env, err := s.launchEnvironment()
-	if err != nil {
-		return nil, err
-	}
-
 	usage, err := pi.NewUsageEndpoint()
 	if err != nil {
 		return nil, s.startFailure(ctx, err)
 	}
 
-	env = append(env, pi.EnvUsageURL+"="+usage.URL, pi.EnvUsageToken+"="+usage.Token)
+	env, err := s.launchEnvironment(usage)
+	if err != nil {
+		return nil, err
+	}
 
 	if seedErr := pi.WriteSeedFiles(s.agentDir, s.agent.options.SeedFiles); seedErr != nil {
 		if refusal := wire.SeedFileRefusal(seedErr); refusal != nil {
@@ -225,8 +226,8 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 // launchEnvironment builds the merged environment for this session's pi
 // process: the inherited environment, the agent overlay, the session env,
 // the home when configured, then the adapter's own extension markers.
-func (s *session) launchEnvironment() ([]string, error) {
-	owned := map[string]string{pi.EnvPermissionMode: s.permissionMode()}
+func (s *session) launchEnvironment(usage pi.UsageEndpoint) ([]string, error) {
+	owned := map[string]string{pi.EnvPermissionMode: s.permissionMode(), pi.EnvUsageURL: usage.URL, pi.EnvUsageToken: usage.Token}
 	if len(s.options.ExtraPathDirs) > 0 {
 		owned[pi.EnvExtraPathDirs] = strings.Join(s.options.ExtraPathDirs, string(os.PathListSeparator))
 	}
@@ -830,6 +831,7 @@ func (s *session) close(ctx context.Context) error {
 
 	s.closing = true
 	s.closeDone = make(chan struct{})
+	installed := s.installed
 	t := s.turn
 	rt := s.runtime
 
@@ -862,8 +864,10 @@ func (s *session) close(ctx context.Context) error {
 	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
 	defer cancel()
 
-	if err := s.commitMirror(commitCtx); err != nil {
-		errs = append(errs, err)
+	if installed {
+		if err := s.commitMirror(commitCtx); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	s.mu.Lock()

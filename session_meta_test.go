@@ -93,3 +93,17 @@ func TestCloneAnyAndMerge(t *testing.T) {
 	require.Nil(t, wire.CloneMap(nil))
 	require.Nil(t, maps.Clone(map[string]string(nil)))
 }
+
+func TestSameCarrierIgnoresExplicitPresence(t *testing.T) {
+	t.Parallel()
+
+	cwd := t.TempDir()
+	s := &session{cwd: cwd}
+	request := wire.ResumeSessionRequest("stored-session", cwd, WithSessionPiOptions(NewPiOptions(WithPiAutoRetry(false))))
+	meta, refusal := parseSessionMeta(request.Meta)
+	require.Nil(t, refusal)
+	require.True(t, sameCarrier(s, sessionStart{cwd: cwd, meta: meta}))
+
+	s.options.AutoRetry = true
+	require.False(t, sameCarrier(s, sessionStart{cwd: cwd, meta: meta}))
+}

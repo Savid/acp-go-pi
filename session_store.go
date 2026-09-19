@@ -13,7 +13,6 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 
-	acpcore "github.com/savid/acp-go-core"
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
@@ -108,10 +107,7 @@ type storedSession struct {
 
 // loadStored reads the native rows and required current configuration.
 func (a *Agent) loadStored(ctx context.Context, sessionID acp.SessionId) (storedSession, error) {
-	loadCtx, cancel := context.WithTimeout(ctx, acpcore.SessionStoreTimeout)
-	defer cancel()
-
-	loadCtx, finish := a.observe.StartSessionStore(loadCtx, "load")
+	loadCtx, finish := a.observe.StartSessionStore(ctx, "load")
 
 	var record sessionRecord
 

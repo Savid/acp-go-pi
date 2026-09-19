@@ -163,14 +163,14 @@ func parseSessionMeta(meta map[string]any) (sessionMeta, *acp.RequestError) {
 		return sessionMeta{}, nil
 	}
 
-	piMeta, ok := raw.(map[string]any)
+	vendorMeta, ok := raw.(map[string]any)
 	if !ok {
 		return sessionMeta{}, wire.Unsupported("_meta." + vendor)
 	}
 
 	parsed := sessionMeta{}
 
-	for key := range piMeta {
+	for key := range vendorMeta {
 		switch key {
 		case metaOptionsKey, metaRawEventKey:
 		default:
@@ -178,7 +178,7 @@ func parseSessionMeta(meta map[string]any) (sessionMeta, *acp.RequestError) {
 		}
 	}
 
-	if rawEvent, ok := piMeta[metaRawEventKey]; ok {
+	if rawEvent, ok := vendorMeta[metaRawEventKey]; ok {
 		values, ok := rawEvent.(map[string]any)
 		if !ok {
 			return sessionMeta{}, wire.Unsupported("_meta." + vendor + "." + metaRawEventKey)
@@ -194,7 +194,7 @@ func parseSessionMeta(meta map[string]any) (sessionMeta, *acp.RequestError) {
 		}
 	}
 
-	rawOptions, hasOptions := piMeta[metaOptionsKey]
+	rawOptions, hasOptions := vendorMeta[metaOptionsKey]
 	if !hasOptions {
 		return parsed, nil
 	}

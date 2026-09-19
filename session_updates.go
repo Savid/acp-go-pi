@@ -429,7 +429,11 @@ func availableCommands(commands []pi.SlashCommand) []acp.AvailableCommand {
 // session opted in. An image payload is replaced by its decoded size so
 // diagnostics never carry a second copy of the bytes.
 func (s *session) emitRawEvent(ctx context.Context, event pi.Event) {
-	if !s.rawEvents.Enabled() {
+	s.mu.Lock()
+	rawEvents := s.rawEvents
+	s.mu.Unlock()
+
+	if !rawEvents.Enabled() {
 		return
 	}
 
@@ -449,7 +453,7 @@ func (s *session) emitRawEvent(ctx context.Context, event pi.Event) {
 		return conn.NotifyExtension(ctx, method, params)
 	}
 
-	if err := s.rawEvents.Emit(ctx, notify, payload); err != nil {
+	if err := rawEvents.Emit(ctx, notify, payload); err != nil {
 		s.agent.observe.RecordRawMessageEmitFailure(ctx, err)
 	}
 }
