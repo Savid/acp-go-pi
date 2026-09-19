@@ -106,7 +106,7 @@ func TestAccountUsageReadsThroughGatewayRoutes(t *testing.T) {
 	access := filepath.Join(t.TempDir(), "access.json")
 	require.NoError(t, os.WriteFile(access, []byte(`{"configured":false,"custom":false,"routes":[]}`), 0o600))
 	gateways := filepath.Join(t.TempDir(), "gateways.json")
-	require.NoError(t, os.WriteFile(gateways, []byte(`{"routes":[{"provider":"proxy","baseUrl":"https://proxy.example/v1","apiKey":"proxy-key"},{"provider":"omp","baseUrl":"https://gateway.example/v1","apiKey":"gateway-key"},{"provider":"bad","baseUrl":"gateway.example","apiKey":"x"}]}`), 0o600))
+	require.NoError(t, os.WriteFile(gateways, []byte(`{"routes":[{"provider":"proxy","baseUrl":"https://proxy.example/v1","apiKey":"proxy-key"},{"provider":"gateway","baseUrl":"https://gateway.example/v1","apiKey":"gateway-key"},{"provider":"bad","baseUrl":"gateway.example","apiKey":"x"}]}`), 0o600))
 	a := NewAgent(testOptions(t, WithEnv(map[string]string{fakePiEnv: "1", "ACP_GO_PI_TEST_USAGE_ACCESS": access, fakePiEnvUsageGateways: gateways}))...)
 	t.Cleanup(func() { require.NoError(t, a.Close()) })
 	var asked []string
@@ -164,4 +164,38 @@ func TestAccountUsageRPCRefusals(t *testing.T) {
 	raw, err := h.conn.CallExtension(h.ctx(), AccountUsageMethod, map[string]any{usageSessionField: session.SessionId, "providerId": "openrouter"})
 	require.NoError(t, err)
 	require.JSONEq(t, `{"available":false,"reason":"not_authenticated"}`, string(raw))
+}
+
+func TestGatewayRuntimeBindingMustBeRevalidated(t *testing.T) {
+	access := filepath.Join(t.TempDir(), "access.json")
+	require.NoError(t, os.WriteFile(access, []byte(`{"configured":false,"custom":false,"routes":[]}`), 0600))
+	gateways := filepath.Join(t.TempDir(), "gateways.json")
+	require.NoError(t, os.WriteFile(gateways, []byte(`{"routes":[{"provider":"gateway","baseUrl":"https://gateway.example/v1","apiKey":"first-account"}]}`), 0600))
+	a := NewAgent(testOptions(t, WithEnv(map[string]string{fakePiEnv: "1", "ACP_GO_PI_TEST_USAGE_ACCESS": access, fakePiEnvUsageGateways: gateways}))...)
+	t.Cleanup(func() { _ = a.Close() })
+	a.usageTransport = usageTransportFunc(func(r *http.Request) (*http.Response, error) {
+		require.Equal(t, "Bearer first-account", r.Header.Get("Authorization"))
+		require.NoError(t, os.WriteFile(gateways, []byte(`{"routes":[{"provider":"gateway","baseUrl":"https://gateway.example/v1","apiKey":"second-account"}]}`), 0600))
+		body := `{"reports":[{"provider":"anthropic","fetchedAt":1789807237831,"limits":[{"id":"anthropic:5h","window":{"id":"5h"},"amount":{"usedFraction":0.25,"unit":"percent"}}]}]}`
+
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	session, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	params, err := json.Marshal(map[string]any{usageSessionField: session.SessionId, "providerId": "anthropic"})
+	require.NoError(t, err)
+	response, err := a.accountUsage(t.Context(), params)
+	live, lookupErr := a.session(t.Context(), session.SessionId)
+	require.NoError(t, lookupErr)
+	live.mu.Lock()
+	rt := live.runtime
+	live.mu.Unlock()
+	routes, queryErr := rt.usage.Gateways(t.Context())
+	require.NoError(t, queryErr)
+	require.Len(t, routes, 1)
+	require.Equal(t, "second-account", routes[0].Token)
+	t.Log("verified native /gateways now returns second-account while the completed HTTP read used first-account")
+	require.Error(t, err, "runtime /gateways changed the effective token during the HTTP read; available=%v", response.Available)
 }

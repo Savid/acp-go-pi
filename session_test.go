@@ -539,3 +539,143 @@ func TestUsageEndpointReadinessDrainsStartupDialogs(t *testing.T) {
 	s.stopRuntime(t.Context(), rt)
 	require.NoDirExists(t, filepath.Dir(rt.usage.File))
 }
+
+type cancellingBackgroundClient struct {
+	*recorder
+	agent          *Agent
+	terminalOnly   bool
+	terminalCalled bool
+}
+
+func (c *cancellingBackgroundClient) SessionUpdate(ctx context.Context, notification acp.SessionNotification) error {
+	if c.terminalOnly {
+		envelope, _ := notification.Meta[wire.LifecycleKey].(map[string]any)
+		event, _ := envelope["event"].(map[string]any)
+		if event["state"] != "idle" {
+			return c.recorder.SessionUpdate(ctx, notification)
+		}
+		c.terminalCalled = true
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.agent.Cancel(ctx, wire.CancelRequest(notification.SessionId)) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(time.Second):
+		return context.DeadlineExceeded
+	}
+}
+
+func TestBackgroundPublicationAllowsCancelCallback(t *testing.T) {
+	a := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = a.Close() })
+	rec := newRecorder()
+	a.attach(rec, nil)
+	request := acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}
+	withLifecycle()(&request)
+	_, err := a.Initialize(t.Context(), request)
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	s.mu.Lock()
+	rt := s.runtime
+	s.mu.Unlock()
+	a.attach(&cancellingBackgroundClient{recorder: rec, agent: a}, nil)
+	s.openAgentCycle(t.Context(), rt)
+	a.attach(rec, nil)
+	s.mu.Lock()
+	c := s.cycle
+	s.mu.Unlock()
+	require.NotNil(t, c)
+	require.NoError(t, s.cycleFailure(c))
+	require.True(t, s.cycleCancelled(c))
+	s.settleAgentCycle(t.Context(), rt, c)
+}
+
+func TestCancelAgentOriginResolvesDialogsAndSettlesCancelled(t *testing.T) {
+	a := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = a.Close() })
+	rec := newRecorder()
+	a.attach(rec, nil)
+	request := acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}
+	withLifecycle()(&request)
+	_, err := a.Initialize(t.Context(), request)
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	s.mu.Lock()
+	rt := s.runtime
+	s.mu.Unlock()
+	s.openAgentCycle(t.Context(), rt)
+	s.mu.Lock()
+	c := s.cycle
+	s.mu.Unlock()
+	require.NotNil(t, c)
+	dialogCtx, cancelDialog := context.WithCancelCause(t.Context())
+	defer cancelDialog(nil)
+	unregister := s.registerDialog("permission", cancelDialog)
+	require.NoError(t, s.lc.ActionPending(t.Context(), c.Cycle, "permission", lifecycle.ActionPermission))
+	require.NoError(t, a.Cancel(t.Context(), wire.CancelRequest(created.SessionId)))
+	require.ErrorIs(t, context.Cause(dialogCtx), errDialogCancelled)
+	unregister()
+	lateCtx, cancelLate := context.WithCancelCause(t.Context())
+	defer cancelLate(nil)
+	release := s.registerDialog("late", cancelLate)
+	release()
+	require.ErrorIs(t, context.Cause(lateCtx), errDialogCancelled)
+	require.NoError(t, a.Cancel(t.Context(), wire.CancelRequest(created.SessionId)))
+	prompt := wire.TextPromptRequest(created.SessionId, "HELLO")
+	prompt.Meta = promptMeta(1)
+	_, err = a.Prompt(t.Context(), prompt)
+	require.Equal(t, "backpressure", requestErrorData(t, err)["error"])
+	s.settleAgentCycle(t.Context(), rt, c)
+	s.mu.Lock()
+	active := s.cycle
+	s.mu.Unlock()
+	require.Nil(t, active)
+	cancelled := false
+	for _, notification := range rec.snapshot() {
+		envelope, _ := notification.Meta[wire.LifecycleKey].(map[string]any)
+		event, _ := envelope["event"].(map[string]any)
+		if event["type"] == "state_update" && event["state"] == "idle" && event["outcome"] == "cancelled" {
+			cancelled = true
+		}
+	}
+	require.True(t, cancelled)
+}
+
+func TestTerminalPublicationCannotInterruptNextCycle(t *testing.T) {
+	a := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = a.Close() })
+	rec := newRecorder()
+	a.attach(rec, nil)
+	request := acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}
+	withLifecycle()(&request)
+	_, err := a.Initialize(t.Context(), request)
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	s.mu.Lock()
+	rt := s.runtime
+	s.mu.Unlock()
+	terminalClient := &cancellingBackgroundClient{recorder: rec, agent: a, terminalOnly: true}
+	a.attach(terminalClient, nil)
+	s.openAgentCycle(t.Context(), rt)
+	s.mu.Lock()
+	c := s.cycle
+	s.mu.Unlock()
+	require.NotNil(t, c)
+	require.NoError(t, s.cycleFailure(c))
+	require.False(t, s.cycleCancelled(c))
+	s.settleAgentCycle(t.Context(), rt, c)
+	require.False(t, s.cycleCancelled(c))
+	require.True(t, terminalClient.terminalCalled)
+	s.callbacks.Wait()
+	a.attach(rec, nil)
+}

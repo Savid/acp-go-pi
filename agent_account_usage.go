@@ -106,10 +106,5 @@ func (s *session) readProviderUsage(ctx context.Context, rt *runtime, providerID
 
 	// A provider pi holds no native account for may be brokered by a gateway
 	// an extension registered pi with.
-	routes, err := rt.usage.Gateways(ctx)
-	if err != nil {
-		return wire.AccountUsageResponse{}, err
-	}
-
-	return gateway.ReadRoutes(ctx, s.agent.usageTransport, routes, providerID, response)
+	return gateway.ReadRoutes(ctx, s.agent.usageTransport, rt.usage.Gateways, providerID, response)
 }

@@ -72,6 +72,12 @@ func (s *session) emit(ctx context.Context, updates ...acp.SessionUpdate) error 
 // the cycle can record it, but the native run keeps draining to its settle
 // marker.
 func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event pi.Event) (bool, error) {
+	if s.cycleCancelled(c) {
+		_, settled := event.(pi.AgentSettledEvent)
+
+		return settled, nil
+	}
+
 	state := &c.state
 
 	switch typed := event.(type) {
