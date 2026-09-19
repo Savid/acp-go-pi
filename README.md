@@ -1,186 +1,138 @@
 # acp-go-pi
 
-Go ACP agent that exposes the local pi coding agent CLI as an [Agent Client Protocol](https://agentclientprotocol.com/) agent.
+`acp-go-pi` exposes the [pi](https://github.com/earendil-works/pi-mono) coding
+agent as an [Agent Client Protocol](https://agentclientprotocol.com) agent.
+It launches one `pi --mode rpc` process per ACP session, maps ACP requests
+onto pi's JSONL RPC, and streams ACP session updates back to the client.
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/savid/acp-go-pi.svg)](https://pkg.go.dev/github.com/savid/acp-go-pi)
-[![CI](https://github.com/savid/acp-go-pi/actions/workflows/go-test.yml/badge.svg)](https://github.com/savid/acp-go-pi/actions/workflows/go-test.yml)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-
-It wraps the local `pi` CLI in RPC mode, speaks ACP over JSON-RPC streams, and
-builds on [`github.com/coder/acp-go-sdk`](https://github.com/coder/acp-go-sdk).
-
-Use it as either:
-
-- a standalone ACP subprocess: `acp-go-pi`
-- an embedded Go adapter through `piacp.Serve`
-
-## Install
-
-Library:
+pi inherits the adapter's environment and keeps sessions in its own home. A
+session started over ACP can be continued natively:
 
 ```sh
-go get github.com/savid/acp-go-pi
+acp-go-pi              # host runs a session in /work
+cd /work && pi --session NATIVE_SESSION_ID
 ```
 
-CLI:
+New, load, and resume responses and session-list entries expose the current
+native ID as `_meta.pi.nativeSessionId`. Use it for native CLI continuation.
+ACP requests continue to use the stable ACP `sessionId`. The store's configuration
+record saves both IDs with the matching native history.
+
+## Install
 
 ```sh
 go install github.com/savid/acp-go-pi/cmd/acp-go-pi@latest
 ```
 
-The `acp-go-pi` binary speaks ACP over stdin/stdout; an editor or ACP host
-launches it as a subprocess rather than a human-facing chat UI.
+Verified against `pi` 0.85.1, found on `PATH` or named with `-path`.
 
-## Quickstart
-
-The example programs run from a checkout of this repo, so clone it first:
+## Run
 
 ```sh
-git clone https://github.com/savid/acp-go-pi && cd acp-go-pi
+acp-go-pi [-path pi] [-home DIR] [-scratch-dir DIR] [-model provider/id] [-seed-file rel=host]... [-debug]
 ```
 
-Run a tiny local client against the agent:
+| Flag | Meaning |
+|---|---|
+| `-path` | pi executable; a bare name is searched on `PATH` |
+| `-home` | pi config root, passed as `PI_CODING_AGENT_DIR`; empty inherits pi's own resolution |
+| `-scratch-dir` | parent for ephemeral adapter state; empty means the system temp directory |
+| `-model` | default model for new sessions as `provider/id` |
+| `-seed-file` | `<relpath>=<hostpath>` written into pi's config root before launch; repeatable |
+| `-debug` | debug logs to stderr |
+| `-version` | print the adapter version |
 
-```sh
-go run ./examples/minimal-client \
-  -auth-file "$HOME/.pi/agent/auth.json" \
-  "Reply with a short hello from ACP."
-```
+OpenTelemetry exporters are configured from the standard `OTEL_*` variables.
 
-Start an interactive session against the agent:
-
-```sh
-go run ./examples/interactive-chat -auth-file "$HOME/.pi/agent/auth.json"
-```
-
-Load and resume a stored session transcript:
-
-```sh
-go run ./examples/resume-from-file \
-  -file ./transcript.jsonl \
-  -auth-file "$HOME/.pi/agent/auth.json"
-```
-
-Each example copies the explicitly named credential file into its isolated pi
-agent directory. It never inherits ambient provider keys or reads the normal pi
-home implicitly.
-
-## Embedded Go
+## Embed
 
 ```go
-package main
-
-import (
-	"context"
-	"log"
-	"os"
-
-	piacp "github.com/savid/acp-go-pi"
+err := piacp.Serve(ctx, os.Stdin, os.Stdout,
+    piacp.WithHome("/srv/pi"),
+    piacp.WithSessionStore(store),
 )
-
-func main() {
-	err := piacp.Serve(context.Background(), os.Stdin, os.Stdout,
-		piacp.WithDefaultModel("openai/gpt-4o"),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
 ```
 
-See the [Go API reference](https://pkg.go.dev/github.com/savid/acp-go-pi) for
-options such as the pi executable path, scratch directory, default model,
-session storage, permissions, raw events, and OpenTelemetry providers.
+Options: `WithExecutablePath`, `WithHome`, `WithScratchDir`,
+`WithInputHandoffRoot`, `WithDefaultModel`, `WithConfiguredModels`, `WithEnv`,
+`WithSeedFiles`, `WithSessionStore`, `WithConcurrencyLimits`,
+`WithImageLimits`, `WithLogger`, `WithTracerProvider`, `WithMeterProvider`,
+`WithTextMapPropagator`, `WithAgentName`, `WithAgentTitle`,
+`WithAgentVersion`.
 
-## What It Provides
+### Session options
 
-- ACP session lifecycle: create, prompt, cancel, close, list, load, resume,
-  and extension-based fork.
-- pi RPC-mode subprocess management with ephemeral agent directories or an
-  explicit ordinary durable Home, and a scrubbed child environment.
-- Prompt streaming for messages, thoughts, tool calls, tool results, usage,
-  and session metadata.
-- Permission prompts through a wrapper-owned pi bridge extension with
-  ask/allow modes.
-- Elicitation bridging through the wrapper-owned `question` tool and any
-  explicitly seeded extension dialogs.
-- MCP stdio and HTTP server declarations through a wrapper-owned pi MCP
-  client extension using dependencies supplied by the native installation.
-- Deliberate provider credential injection through the child environment or a
-  seeded `auth.json`, plus an optional seven-leg provider-auth brokerage over
-  Pi's durable native credential home and a values-free ownership ledger.
-- Ordinary same-account execution by default, or embedded host-authority
-  execution with prepare/start/wait/reclaim ownership and no direct fallback —
-  see [security](docs/operations/security.mdx).
-- Optional durable mirroring through a host-provided `SessionStore` and
-  optional raw pi event extension notifications.
-- OpenTelemetry spans, metrics, trace propagation, and structured logs
-  without recording prompt or tool secrets by default.
+`_meta.pi.options` on `session/new`, `session/load`, and `session/resume`, or
+`WithSessionPiOptions` from Go:
 
-## Slash Commands
+| Field | Meaning |
+|---|---|
+| `model` | `provider/id` for the session |
+| `env` | environment overlay for the session's pi process |
+| `extraPathDirs` | absolute directories prepended to `PATH`, in order |
+| `thinkingLevel` | reasoning level passed to pi |
+| `permission` | `ask` (default) requests permission per tool call; `allow` auto-allows |
+| `autoRetry` | opt in to pi's native retry of transient provider errors |
 
-The adapter projects only commands returned by pi's RPC command inventory.
-Ambient extensions, prompt templates, and skills are disabled for isolated
-sessions. Explicit `WithSeedFiles` entries under `extensions/`, `prompts/`,
-and `skills/**/SKILL.md` are loaded by exact path and therefore are reachable;
-the shipped wrapper extensions register no slash commands, so a default
-session still advertises an empty command set. Nothing is synthesized from
-the terminal UI's built-in commands.
+`_meta.pi.rawEvent.enabled` forwards every native pi event on the
+`_pi/rawEvent` notification.
 
-## Docs
+### Config options
 
-- [Overview](docs/overview.mdx)
-- [Run modes](docs/get-started/run-modes.mdx)
-- [Go API](docs/reference/go-api.mdx)
-- [ACP methods](docs/reference/acp-methods.mdx)
-- [Observability](docs/operations/observability.mdx)
+`session/set_config_option` accepts `model` (`provider/id`, from pi's catalog
+plus any `WithConfiguredModels` entries) and `thought_level` (`off`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
 
-Full Go API reference:
-[pkg.go.dev/github.com/savid/acp-go-pi](https://pkg.go.dev/github.com/savid/acp-go-pi).
+### Image input
+
+Images are accepted as inline data or through `WithInputHandoffRoot`. Pi's
+native prompt has separate text and image fields. Put all text, resource
+links, and text resources before the images; images alone and multiple images
+are accepted. Forwarded text after the first image fails with
+`{"error":"unsupported","field":"prompt"}` before native dispatch.
+User-only text excluded from native input does not affect ordering.
+
+### Session store
+
+`WithSessionStore` mirrors pi's session JSONL rows under the main subpath and
+the adapter's session record under `config`, format `pi-session-jsonl-v1`.
+`session/load` and `session/resume` prefer pi's own file when it exists and
+materialize it from the store otherwise.
+Native rows and session configuration commit as one store generation. A
+configuration change is durable even when no native rows were added, and an
+established conversation with no native history yet commits its configuration
+with an empty main record. Replay decodes every stored image, user or
+assistant, through the same output gate as live image output, so a stored
+image that gate refuses fails the whole restore rather than leaving a hole.
 
 ## Development
 
 ```sh
+make test
+make lint
 make audit
-make test-integration-smoke
-make test-integration-live
-make test-integration-attended
-make test-integration-keystore
-make test-integration-native-browser
-make test-integration-cover
+make test-integration-smoke   # needs pi installed, spends no tokens
+make test-integration-live    # spends model tokens
 ```
 
-`make audit` runs the full local gate: formatting, pinned lint, build, the complete
-race and shuffled test suite with a coverage report, cross-compilation, module tidiness,
-vulnerability and modernization checks, docs checks, and module verification.
-Use focused checks while editing; prose-only changes need source review and
-`make docs-audit`. Preserve the canonical lifecycle fixture bytes under
-`testdata/lifecycle/`; coverage alone does not prove protocol or native behavior.
+Unit tests run the test binary as a scripted fake pi and need no installed
+pi, credentials, or network.
 
-Ordinary tests fake the process boundary and need no installed pi or credentials.
-The integration tier includes fake-backed wrapper tests and real-native tests;
-only the latter establish compatibility with the executed pi version. Native
-execution, including smoke and credential-free probes, requires explicit task
-authorization. Tier gates select execution and do not supply that authorization.
+## Account usage
 
-| Target | Execution and prerequisites |
-| --- | --- |
-| `make test-integration-smoke` | Wrapper fixtures and native smoke without model spend. Real-native cases use pi 0.80.6 or newer from `PATH` or `ACP_GO_PI_HARNESS_PATH`; missing pi skips those cases. |
-| `make test-integration-live` | Adds model-token prompts. Requires pi and portable credentials; missing prerequisites fail. Select the source home with `ACP_GO_PI_HOME`, whose `agent/auth.json` is copied into isolated session directories. `ACP_GO_PI_MODEL` can select the live model. |
-| `make test-integration-cover` | Runs the tier without model spend against a command built with `go build -cover`, collects `GOCOVERDIR` counters, and merges them with `go tool covdata`. Native cases need the smoke prerequisites. |
-| `make test-integration-attended` | Real provider login with pi, provider connectivity, and a human approving and answering on stdin. Compiles the selected tests and runs the binary directly to retain stdin; requires actual passes and rejects skips or empty selection. |
-| `make test-integration-keystore` | Canary-only credential-residence fixtures. Linux needs a container runtime; the macOS residence proof runs on macOS. Uses test-owned homes and no real credentials. |
-| `make test-integration-native-browser` | Linux container canary against the pinned real pi distribution, selected with `integration,browsercanary` build tags. Needs a container runtime and fixture build prerequisites; execution is networkless, credential-free, and mounts no host home. Proves browser interception in ordinary execution. |
+`AccountUsageMethod` (`_pi/accountUsage`) accepts `sessionId` and `providerId`
+(`opencode-go`, `openrouter`, `openai-codex`, or `anthropic`). A provider pi holds no
+native account for is read through the gateways extension-registered providers route
+to, when such a gateway publishes a usage report. Reads hold the session's foreground
+gate and spend no model tokens. The session extension resolves effective credentials,
+model endpoints, and authentication headers from Pi's native model registry.
+Credentials travel only over an authenticated loopback endpoint and never
+enter the conversation or ACP events.
 
-Integration execution requires the `integration` build tag and
-`ACP_GO_PI_RUN_INTEGRATION=1`. Live prompts, attended logins, and keystore
-fixtures additionally select `ACP_GO_PI_RUN_LIVE_TOKENS=1`,
-`ACP_GO_PI_RUN_ATTENDED=1`, and `ACP_GO_PI_RUN_KEYSTORE=1`, respectively.
-Inspect the named Makefile target before running it; unrelated tier gates must
-be cleared. Native children use an explicit test-owned `PI_CODING_AGENT_DIR`
-and a scrubbed environment. Provider-auth tests use temporary durable homes
-and ledgers. These targets are separate from `make audit`.
-
-## License
-
-Distributed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
+Official provider routes use `github.com/savid/acp-go-core/usage` to read Go
+percentage windows, OpenRouter USD balances and request counts, ChatGPT
+subscription windows, and Claude subscription windows and reported spending.
+ChatGPT account IDs come from the same native access token used for inference.
+Subscription credits are not treated as dollars. Custom provider implementations and unverified
+routes report `not_reported`. Missing credentials report `not_authenticated`.
+The adapter revalidates the native binding after each read.

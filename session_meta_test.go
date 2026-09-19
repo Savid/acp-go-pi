@@ -1,200 +1,109 @@
 package piacp
 
 import (
-	"os"
+	"maps"
 	"testing"
+
+	"github.com/savid/acp-go-core/wire"
 
 	"github.com/stretchr/testify/require"
 )
 
-func TestPiOptionsMetaAndStrictParsing(t *testing.T) {
+func TestPiOptionsMetaRoundTrip(t *testing.T) {
+	t.Parallel()
+
 	options := NewPiOptions(
-		WithPiModel("fake/model"),
-		WithPiEnv(map[string]string{"TOKEN": "value"}),
-		WithPiExtraPathDirs(absTestPath("opt", "shim", "bin")),
+		WithPiModel("fake/vision"),
+		WithPiEnv(map[string]string{"A": "1"}),
+		WithPiExtraPathDirs("/bin"),
 		WithPiThinkingLevel("high"),
-		WithPiPermission("ask"),
+		WithPiPermission("allow"),
 		WithPiAutoRetry(true),
 	)
+
 	meta := options.Meta()
-	parsed, err := piOptionsFromMeta(meta)
-	require.NoError(t, err)
-	require.Equal(t, options, parsed)
+	parsed, err := parseSessionMeta(meta)
+	require.Nil(t, err)
+	require.Equal(t, options, parsed.options)
+	require.True(t, parsed.presentEnv)
+	require.True(t, parsed.presentExtraPathDirs)
 
-	options.Env["TOKEN"] = "changed"
-	options.ExtraPathDirs[0] = absTestPath("opt", "changed", "bin")
-	require.Equal(t, "value", parsed.Env["TOKEN"])
-	require.Equal(t, []string{absTestPath("opt", "shim", "bin")}, parsed.ExtraPathDirs)
+	options.Env["A"] = "changed"
+	require.Equal(t, "1", parsed.options.Env["A"])
 
-	valid := []map[string]any{
-		nil,
-		{"foreign": map[string]any{"anything": true}},
-		{piMetaKey: map[string]any{}},
-		{piMetaKey: map[string]any{metaRawEventKey: map[string]any{}}},
-		{piMetaKey: map[string]any{metaRawEventKey: map[string]any{metaRawEventEnabledKey: true}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]string{"A": "b"}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"A": "b"}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaAutoRetryKey: false}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []any{absTestPath("opt", "bin")}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []string{absTestPath("opt", "bin"), absTestPath("srv", "bin")}}}},
-	}
-	for _, value := range valid {
-		_, err := piOptionsFromMeta(value)
-		require.NoError(t, err)
-	}
-
-	invalid := []map[string]any{
-		{piMetaKey: nil},
-		{piMetaKey: "bad"},
-		{piMetaKey: map[string]any{"deleted": true}},
-		{piMetaKey: map[string]any{metaRawEventKey: true}},
-		{piMetaKey: map[string]any{metaRawEventKey: map[string]any{"deleted": true}}},
-		{piMetaKey: map[string]any{metaRawEventKey: map[string]any{metaRawEventEnabledKey: "yes"}}},
-		{piMetaKey: map[string]any{metaOptionsKey: true}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{"deleted": true}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaModelKey: true}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaModelKey: "invalid"}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: true}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"A": true}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaEnvKey: map[string]any{"A=B": "x"}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: true}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaOutputSchemaKey: map[string]any{"type": "object"}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaThinkingLevelKey: true}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaThinkingLevelKey: ""}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: true}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaPermissionKey: "bad"}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaAutoRetryKey: "yes"}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: absTestPath("opt", "bin")}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []any{true}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []any{""}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{metaExtraPathDirsKey: []any{"relative/bin"}}}},
-		{piMetaKey: map[string]any{metaOptionsKey: map[string]any{
-			metaExtraPathDirsKey: []any{absTestPath("opt", "bin") + string(os.PathListSeparator) + absTestPath("srv", "bin")},
-		}}},
-	}
-	for _, value := range invalid {
-		_, err := piOptionsFromMeta(value)
-		require.Error(t, err)
-	}
+	require.NoError(t, ValidatePiSessionMeta(meta))
+	require.NoError(t, ValidatePiSessionMeta(nil))
+	require.Error(t, ValidatePiSessionMeta(map[string]any{"pi": "x"}))
 }
 
-// TestPiOptionsThinkingLevelPassesThrough pins that establishment metadata
-// judges the member's shape and nothing else. Only the empty string names no
-// level; whitespace names one pi may not know, which is pi's to answer for.
-func TestPiOptionsThinkingLevelPassesThrough(t *testing.T) {
-	for _, level := range []string{"registry-unknown", " high ", "\t"} {
-		options, err := piOptionsFromMeta(map[string]any{
-			piMetaKey: map[string]any{
-				metaOptionsKey: map[string]any{metaThinkingLevelKey: level},
-			},
-		})
-		require.NoError(t, err)
-		require.Equal(t, level, options.ThinkingLevel)
-	}
-}
-
-func TestExtraPathDirsValidation(t *testing.T) {
+func TestParseSessionMetaRawEvents(t *testing.T) {
 	t.Parallel()
 
-	require.NoError(t, validateExtraPathDirs(nil, metaExtraPathDirsKey))
-	require.NoError(t, validateExtraPathDirs([]string{absTestPath("opt", "bin"), absTestPath("srv", "bin")}, metaExtraPathDirsKey))
+	parsed, err := parseSessionMeta(map[string]any{"pi": map[string]any{"rawEvent": map[string]any{"enabled": true}}})
+	require.Nil(t, err)
+	require.True(t, parsed.rawEvents)
 
-	for _, dirs := range [][]string{
-		{""},
-		{"relative/bin"},
-		{"./bin"},
-		{absTestPath("opt", "bin"), "relative/bin"},
-		{absTestPath("opt", "bin") + string(os.PathListSeparator) + absTestPath("srv", "bin")},
-	} {
-		require.Error(t, validateExtraPathDirs(dirs, metaExtraPathDirsKey))
-	}
+	_, err = parseSessionMeta(map[string]any{"pi": map[string]any{"rawEvent": map[string]any{"enabled": "yes"}}})
+	require.NotNil(t, err)
 
-	requireUnsupportedField(
-		t,
-		validateExtraPathDirs([]string{absTestPath("opt", "bin"), "relative/bin"}, metaExtraPathDirsKey),
-		metaExtraPathDirsKey+"[1]",
-	)
+	_, err = parseSessionMeta(map[string]any{"pi": map[string]any{"rawEvent": true}})
+	require.NotNil(t, err)
 }
 
-func TestPiOptionsMeta(t *testing.T) {
+func TestParseSessionMetaShapes(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name    string
-		options PiOptions
-		want    map[string]any
+	cases := []struct {
+		name  string
+		meta  map[string]any
+		field string
 	}{
-		{
-			name:    "empty options",
-			options: PiOptions{},
-			want:    map[string]any{"pi": map[string]any{"options": map[string]any{}}},
-		},
-		{
-			name:    "present empty output schema",
-			options: PiOptions{OutputSchema: map[string]any{}},
-			want: map[string]any{"pi": map[string]any{"options": map[string]any{
-				"outputSchema": map[string]any{},
-			}}},
-		},
-		{
-			name: "all supported fields",
-			options: PiOptions{
-				Model:         "openai/gpt-4o",
-				Env:           map[string]string{"K": "V"},
-				ExtraPathDirs: []string{absTestPath("opt", "bin")},
-				OutputSchema:  map[string]any{"type": "object"},
-				ThinkingLevel: "high",
-				Permission:    "allow",
-				AutoRetry:     true,
-			},
-			want: map[string]any{"pi": map[string]any{"options": map[string]any{
-				"model":         "openai/gpt-4o",
-				"env":           map[string]string{"K": "V"},
-				"extraPathDirs": []string{absTestPath("opt", "bin")},
-				"outputSchema":  map[string]any{"type": "object"},
-				"thinkingLevel": "high",
-				"permission":    "allow",
-				"autoRetry":     true,
-			}}},
-		},
+		{"options not object", map[string]any{"pi": map[string]any{"options": 1}}, "_meta.pi.options"},
+		{"model type", map[string]any{"pi": map[string]any{"options": map[string]any{"model": 1}}}, "_meta.pi.options.model"},
+		{"env type", map[string]any{"pi": map[string]any{"options": map[string]any{"env": 1}}}, "_meta.pi.options.env"},
+		{"env value type", map[string]any{"pi": map[string]any{"options": map[string]any{"env": map[string]any{"A": 1}}}}, "_meta.pi.options.env.A"},
+		{"dirs type", map[string]any{"pi": map[string]any{"options": map[string]any{"extraPathDirs": "x"}}}, "_meta.pi.options.extraPathDirs"},
+		{"dir element type", map[string]any{"pi": map[string]any{"options": map[string]any{"extraPathDirs": []any{1}}}}, "_meta.pi.options.extraPathDirs[0]"},
+		{"empty thinking", map[string]any{"pi": map[string]any{"options": map[string]any{"thinkingLevel": ""}}}, "_meta.pi.options.thinkingLevel"},
+		{"autoRetry type", map[string]any{"pi": map[string]any{"options": map[string]any{"autoRetry": "yes"}}}, "_meta.pi.options.autoRetry"},
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			require.Equal(t, test.want, test.options.Meta())
+			_, err := parseSessionMeta(tc.meta)
+			require.NotNil(t, err)
+			require.Equal(t, tc.field, requestErrorData(t, err)["field"])
 		})
 	}
+
+	parsed, err := parseSessionMeta(map[string]any{"pi": map[string]any{"options": map[string]any{"env": map[string]string{"A": "1"}, "extraPathDirs": []string{"/x"}}}})
+	require.Nil(t, err)
+	require.Equal(t, map[string]string{"A": "1"}, parsed.options.Env)
+	require.Equal(t, []string{"/x"}, parsed.options.ExtraPathDirs)
 }
 
-func TestPiOptionsMetaClonesMaps(t *testing.T) {
+func TestCloneAnyAndMerge(t *testing.T) {
 	t.Parallel()
 
-	options := PiOptions{
-		Env:           map[string]string{"K": "V"},
-		ExtraPathDirs: []string{"/opt/bin"},
-		OutputSchema:  map[string]any{"type": "object"},
-	}
+	base := map[string]any{"a": map[string]any{"x": 1}, "list": []any{1}, "strs": []string{"a"}}
+	merged := wire.MergeMap(base, map[string]any{"a": map[string]any{"y": 2}, "b": 3})
+	require.Equal(t, map[string]any{"a": map[string]any{"x": 1, "y": 2}, "b": 3, "list": []any{1}, "strs": []string{"a"}}, merged)
+	require.Nil(t, wire.CloneMap(nil))
+	require.Nil(t, maps.Clone(map[string]string(nil)))
+}
 
-	meta := options.Meta()
+func TestSameCarrierIgnoresExplicitPresence(t *testing.T) {
+	t.Parallel()
 
-	piMeta, ok := meta["pi"].(map[string]any)
-	require.True(t, ok)
+	cwd := t.TempDir()
+	s := &session{cwd: cwd}
+	request := wire.ResumeSessionRequest("stored-session", cwd, WithSessionPiOptions(NewPiOptions(WithPiAutoRetry(false))))
+	meta, refusal := parseSessionMeta(request.Meta)
+	require.Nil(t, refusal)
+	require.True(t, sameCarrier(s, sessionStart{cwd: cwd, meta: meta}))
 
-	values, ok := piMeta["options"].(map[string]any)
-	require.True(t, ok)
-
-	envClone, ok := values["env"].(map[string]string)
-	require.True(t, ok)
-
-	envClone["K"] = "mutated"
-	require.Equal(t, "V", options.Env["K"])
-
-	dirsClone, ok := values["extraPathDirs"].([]string)
-	require.True(t, ok)
-
-	dirsClone[0] = "/opt/mutated"
-	require.Equal(t, "/opt/bin", options.ExtraPathDirs[0])
+	s.options.AutoRetry = true
+	require.False(t, sameCarrier(s, sessionStart{cwd: cwd, meta: meta}))
 }
