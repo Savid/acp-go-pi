@@ -121,8 +121,10 @@ pi, credentials, or network.
 ## Account usage
 
 `AccountUsageMethod` (`_pi/accountUsage`) accepts `sessionId` and `providerId`
-(`opencode-go`, `openrouter`, `openai-codex`, or `anthropic`). Reads hold the session's foreground gate and
-spend no model tokens. The session extension resolves effective credentials,
+(`opencode-go`, `openrouter`, `openai-codex`, or `anthropic`). A provider pi holds no
+native account for is read through the gateways extension-registered providers route
+to, when such a gateway publishes a usage report. Reads hold the session's foreground
+gate and spend no model tokens. The session extension resolves effective credentials,
 model endpoints, and authentication headers from Pi's native model registry.
 Credentials travel only over an authenticated loopback endpoint and never
 enter the conversation or ACP events.

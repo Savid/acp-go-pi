@@ -27,6 +27,7 @@ const (
 	fakePiEnvUsageHold     = "ACP_GO_PI_TEST_USAGE_HOLD"
 	fakePiEnvStartupDialog = "ACP_GO_PI_TEST_STARTUP_DIALOG"
 	fakePiEnvStartupDeath  = "ACP_GO_PI_TEST_STARTUP_DEATH"
+	fakePiEnvUsageGateways = "ACP_GO_PI_TEST_USAGE_GATEWAYS"
 	// fakePiEnvResumeHold names a file a resumed fake pi creates before it
 	// stops answering, so a test can act while the adapter is still relaunching.
 	fakePiEnvResumeHold = "ACP_GO_PI_TEST_RESUME_HOLD"
@@ -67,6 +68,44 @@ type fakePi struct {
 	turnDone chan struct{}
 }
 
+// fakeUsageAccess answers the adapter's account-access and gateway queries
+// from the files the test names, or with nothing configured.
+func fakeUsageAccess(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Authorization") != "Bearer "+os.Getenv(pi.EnvUsageToken) || (r.URL.Path != "/access" && r.URL.Path != "/gateways") {
+		w.WriteHeader(http.StatusForbidden)
+
+		return
+	}
+	if r.URL.Path == "/gateways" {
+		if path := os.Getenv(fakePiEnvUsageGateways); path != "" {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+
+				return
+			}
+			_, _ = w.Write(data)
+
+			return
+		}
+		_, _ = io.WriteString(w, `{"routes":[]}`)
+
+		return
+	}
+	if path := os.Getenv("ACP_GO_PI_TEST_USAGE_ACCESS"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+
+			return
+		}
+		_, _ = w.Write(data)
+
+		return
+	}
+	_, _ = io.WriteString(w, `{"configured":false,"custom":false,"routes":[]}`)
+}
+
 func runFakePi(args []string) int {
 	if os.Getenv(fakePiEnvStartupDialog) != "" {
 		request := map[string]any{"type": "extension_ui_request", "id": "startup", "method": "input", "title": "Startup input"}
@@ -98,25 +137,7 @@ func runFakePi(args []string) int {
 	if err != nil {
 		return 1
 	}
-	usageServer := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer "+os.Getenv(pi.EnvUsageToken) || r.URL.Path != "/access" {
-			w.WriteHeader(http.StatusForbidden)
-
-			return
-		}
-		if path := os.Getenv("ACP_GO_PI_TEST_USAGE_ACCESS"); path != "" {
-			data, err := os.ReadFile(path)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-
-				return
-			}
-			_, _ = w.Write(data)
-
-			return
-		}
-		_, _ = io.WriteString(w, `{"configured":false,"custom":false,"routes":[]}`)
-	})}
+	usageServer := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(fakeUsageAccess)}
 	go func() { _ = usageServer.Serve(listener) }()
 	defer func() { _ = usageServer.Close() }()
 	endpointFile := os.Getenv(pi.EnvUsageFile)

@@ -8,6 +8,7 @@ import (
 
 	"github.com/savid/acp-go-core/usage"
 	"github.com/savid/acp-go-core/usage/anthropic"
+	"github.com/savid/acp-go-core/usage/gateway"
 	"github.com/savid/acp-go-core/usage/openaicodex"
 	"github.com/savid/acp-go-core/usage/opencodego"
 	"github.com/savid/acp-go-core/usage/openrouter"
@@ -96,7 +97,19 @@ func (s *session) readProviderUsage(ctx context.Context, rt *runtime, providerID
 		modelID = ""
 	}
 
-	return usage.ReadVerified(ctx, func(ctx context.Context) (usage.Access, error) {
+	response, err := usage.ReadVerified(ctx, func(ctx context.Context) (usage.Access, error) {
 		return rt.usage.Access(ctx, providerID, modelID)
 	}, reader)
+	if err != nil || response.Available {
+		return response, err
+	}
+
+	// A provider pi holds no native account for may be brokered by a gateway
+	// an extension registered pi with.
+	routes, err := rt.usage.Gateways(ctx)
+	if err != nil {
+		return wire.AccountUsageResponse{}, err
+	}
+
+	return gateway.ReadRoutes(ctx, s.agent.usageTransport, routes, providerID, response)
 }

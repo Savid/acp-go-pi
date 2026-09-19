@@ -17,6 +17,7 @@ import (
 
 	"github.com/savid/acp-go-core/usage"
 	"github.com/savid/acp-go-core/usage/anthropic"
+	"github.com/savid/acp-go-core/usage/gateway"
 	"github.com/savid/acp-go-core/usage/openaicodex"
 	"github.com/savid/acp-go-core/usage/opencodego"
 	"github.com/savid/acp-go-core/usage/openrouter"
@@ -114,12 +115,37 @@ type usageRoute struct {
 	Headers   map[string]string `json:"headers"`
 }
 
-func (e UsageEndpoint) Access(ctx context.Context, providerID, modelID string) (usage.Access, error) {
-	query := url.Values{"provider": {providerID}, "model": {modelID}}
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, e.URL+"/access?"+query.Encode(), http.NoBody)
+// Gateways lists the routes of the providers extensions registered with pi
+// and the session holds credentials for, in registration order.
+func (e UsageEndpoint) Gateways(ctx context.Context) ([]gateway.Route, error) {
+	data, err := e.get(ctx, "/gateways")
 	if err != nil {
-		return usage.Access{}, err
+		return nil, err
+	}
+
+	var payload struct {
+		Routes []struct {
+			Provider string `json:"provider"`
+			BaseURL  string `json:"baseUrl"`
+			APIKey   string `json:"apiKey"`
+		} `json:"routes"`
+	}
+	if json.Unmarshal(data, &payload) != nil || payload.Routes == nil {
+		return nil, errors.New("native account access invalid")
+	}
+
+	routes := make([]gateway.Route, 0, len(payload.Routes))
+	for _, route := range payload.Routes {
+		routes = append(routes, gateway.Route{Provider: route.Provider, BaseURL: route.BaseURL, Token: route.APIKey})
+	}
+
+	return routes, nil
+}
+
+func (e UsageEndpoint) get(ctx context.Context, path string) ([]byte, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, e.URL+path, http.NoBody)
+	if err != nil {
+		return nil, err
 	}
 
 	request.Header.Set("Authorization", "Bearer "+e.Token)
@@ -128,17 +154,28 @@ func (e UsageEndpoint) Access(ctx context.Context, providerID, modelID string) (
 
 	response, err := client.Do(request)
 	if err != nil {
-		return usage.Access{}, errors.New("native account access failed")
+		return nil, errors.New("native account access failed")
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		return usage.Access{}, errors.New("native account access refused")
+		return nil, errors.New("native account access refused")
 	}
 
 	data, err := io.ReadAll(io.LimitReader(response.Body, (64<<10)+1))
 	if err != nil || len(data) > 64<<10 {
-		return usage.Access{}, errors.New("native account access invalid")
+		return nil, errors.New("native account access invalid")
+	}
+
+	return data, nil
+}
+
+func (e UsageEndpoint) Access(ctx context.Context, providerID, modelID string) (usage.Access, error) {
+	query := url.Values{"provider": {providerID}, "model": {modelID}}
+
+	data, err := e.get(ctx, "/access?"+query.Encode())
+	if err != nil {
+		return usage.Access{}, err
 	}
 
 	var payload struct {

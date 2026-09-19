@@ -99,6 +99,47 @@ func TestAccountUsageBindsNativeCredentialsAndHoldsGate(t *testing.T) {
 	}
 }
 
+// A provider pi holds no native account for is read through the report of a
+// gateway an extension registered, keyed to that provider's section.
+func TestAccountUsageReadsThroughGatewayRoutes(t *testing.T) {
+	t.Parallel()
+	access := filepath.Join(t.TempDir(), "access.json")
+	require.NoError(t, os.WriteFile(access, []byte(`{"configured":false,"custom":false,"routes":[]}`), 0o600))
+	gateways := filepath.Join(t.TempDir(), "gateways.json")
+	require.NoError(t, os.WriteFile(gateways, []byte(`{"routes":[{"provider":"proxy","baseUrl":"https://proxy.example/v1","apiKey":"proxy-key"},{"provider":"omp","baseUrl":"https://gateway.example/v1","apiKey":"gateway-key"},{"provider":"bad","baseUrl":"gateway.example","apiKey":"x"}]}`), 0o600))
+	a := NewAgent(testOptions(t, WithEnv(map[string]string{fakePiEnv: "1", "ACP_GO_PI_TEST_USAGE_ACCESS": access, fakePiEnvUsageGateways: gateways}))...)
+	t.Cleanup(func() { require.NoError(t, a.Close()) })
+	var asked []string
+	a.usageTransport = usageTransportFunc(func(r *http.Request) (*http.Response, error) {
+		asked = append(asked, r.URL.Host+r.URL.Path+" "+r.Header.Get("Authorization"))
+		if r.URL.Host == "gateway.example" && r.URL.Path == "/v1/usage" && r.Header.Get("Authorization") == "Bearer gateway-key" {
+			body := `{"generatedAt":1,"reports":[{"provider":"anthropic","fetchedAt":1789807237831,"limits":[{"id":"anthropic:5h","label":"Claude 5 Hour","window":{"id":"5h","durationMs":18000000,"resetsAt":1789817399682},"amount":{"usedFraction":0.25,"unit":"percent"},"status":"ok"}],"metadata":{}}]}`
+
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		}
+
+		return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: http.NoBody}, nil
+	})
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	session, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+
+	params, err := json.Marshal(map[string]any{usageSessionField: session.SessionId, "providerId": "anthropic"})
+	require.NoError(t, err)
+	response, err := a.accountUsage(t.Context(), params)
+	require.NoError(t, err)
+	require.True(t, response.Available)
+	require.Equal(t, []wire.AccountUsageLimit{{ObservedAt: "2026-09-19T08:40:37Z", ID: "5h", Label: "Claude 5 Hour", WindowSeconds: 18000, UsedPercent: 25, UsageAllowed: new(true), ResetsAt: "2026-09-19T11:29:59Z"}}, response.Limits)
+	require.Equal(t, []string{"proxy.example/v1/usage Bearer proxy-key", "gateway.example/v1/usage Bearer gateway-key"}, asked, "each valid route is asked in order until one covers the provider")
+
+	params, err = json.Marshal(map[string]any{usageSessionField: session.SessionId, "providerId": "openrouter"})
+	require.NoError(t, err)
+	response, err = a.accountUsage(t.Context(), params)
+	require.NoError(t, err)
+	require.Equal(t, wire.AccountUsageUnavailable(wire.AccountUsageNotAuthenticated), response, "a provider no gateway reports keeps the native answer")
+}
+
 func TestAccountUsageRPCRefusals(t *testing.T) {
 	h := newHarness(t)
 	h.initialize()

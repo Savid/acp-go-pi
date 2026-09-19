@@ -14,6 +14,27 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const query = new URL(request.url ?? "/", "http://127.0.0.1");
+		if (query.pathname === "/gateways") {
+			try {
+				if (!context) throw new Error("Session not ready");
+				const registry = context.modelRegistry;
+				const routes = new Set<string>();
+				for (const provider of new Set(registry.getAll().map(model => model.provider))) {
+					if (!registry.getRegisteredProviderConfig(provider) || !registry.getProviderAuthStatus(provider).configured) continue;
+					const model = registry.getAll().find(candidate => candidate.provider === provider);
+					if (!model) continue;
+					const auth = await registry.getApiKeyAndHeaders(model);
+					const baseUrl = auth.ok ? (auth.baseUrl ?? model.baseUrl) : undefined;
+					if (!auth.ok || !baseUrl || !auth.apiKey) continue;
+					routes.add(JSON.stringify({ provider, baseUrl, apiKey: auth.apiKey }));
+				}
+				response.setHeader("Content-Type", "application/json");
+				response.end(JSON.stringify({ routes: [...routes].map(route => JSON.parse(route)) }));
+			} catch {
+				response.writeHead(500).end();
+			}
+			return;
+		}
 		const provider = query.searchParams.get("provider") ?? "";
 		const modelId = query.searchParams.get("model");
 		if (query.pathname !== "/access" || !["opencode-go", "openrouter", "openai-codex", "anthropic"].includes(provider)) {
