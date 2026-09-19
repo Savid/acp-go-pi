@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/savid/acp-go-core/usage"
 	"github.com/savid/acp-go-core/usage/anthropic"
@@ -24,25 +27,83 @@ const (
 	usageAPICodex       = "openai-codex-responses"
 	usageAPIAnthropic   = "anthropic-messages"
 	usageAPICompletions = "openai-completions"
-	EnvUsageURL         = InternalEnvPrefix + "USAGE_URL"
+	EnvUsageFile        = InternalEnvPrefix + "USAGE_FILE"
 	EnvUsageToken       = InternalEnvPrefix + "USAGE_TOKEN"
 )
 
 // UsageEndpoint addresses the session extension's authenticated credential read.
-type UsageEndpoint struct{ URL, Token string }
+type UsageEndpoint struct {
+	URL, Token, File string
+	dir              string
+}
 
-func NewUsageEndpoint() (UsageEndpoint, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+func NewUsageEndpoint(dir string) (UsageEndpoint, error) {
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return UsageEndpoint{}, err
+	}
+
+	return UsageEndpoint{File: filepath.Join(dir, "endpoint"), Token: rand.Text(), dir: dir}, nil
+}
+
+// Wait reads the address atomically published by the listening extension.
+func (e *UsageEndpoint) Wait(ctx context.Context, exited <-chan struct{}) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		address, err := readUsageAddress(e.File)
+		if err == nil {
+			e.URL = address
+
+			return nil
+		}
+
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-exited:
+			return errors.New("native account access extension exited before readiness")
+		case <-ticker.C:
+		}
+	}
+}
+
+// Close removes only this generation's private endpoint directory.
+func (e *UsageEndpoint) Close() error {
+	if e.dir == "" {
+		return nil
+	}
+
+	return os.RemoveAll(e.dir)
+}
+
+func readUsageAddress(path string) (string, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return UsageEndpoint{}, err
+		return "", err
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, 1025))
+	if err != nil {
+		return "", err
 	}
 
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		return UsageEndpoint{}, err
+	address, err := url.Parse(string(data))
+	if err != nil || len(data) > 1024 || address.Scheme != "http" || address.Hostname() != "127.0.0.1" || address.User != nil || address.Path != "" || address.RawQuery != "" || address.Fragment != "" {
+		return "", errors.New("native account access endpoint invalid")
 	}
 
-	return UsageEndpoint{URL: "http://" + address, Token: rand.Text()}, nil
+	port, err := strconv.Atoi(address.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return "", errors.New("native account access endpoint invalid")
+	}
+
+	return address.String(), nil
 }
 
 type usageRoute struct {

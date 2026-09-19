@@ -6,6 +6,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
+	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -61,4 +62,31 @@ func TestNewSessionReportsEffectiveThinkingLevel(t *testing.T) {
 			require.Equal(t, acp.SessionConfigValueId(tc.effective), session.ConfigOptions[1].Select.CurrentValue)
 		})
 	}
+}
+
+func TestReasoningSelectionSurvivesRuntimeRelaunch(t *testing.T) {
+	t.Parallel()
+
+	a := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir(), WithSessionPiOptions(NewPiOptions(WithPiThinkingLevel("high")))))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	_, err = s.setConfigOption(t.Context(), configThoughtLevel, "low")
+	require.NoError(t, err)
+	s.mu.Lock()
+	rt := s.runtime
+	selected := s.thinkingLevel
+	s.mu.Unlock()
+	require.Equal(t, "low", selected)
+	s.stopRuntime(t.Context(), rt)
+	_, err = s.ensureRuntime(t.Context())
+	require.NoError(t, err)
+	s.mu.Lock()
+	selected = s.thinkingLevel
+	s.mu.Unlock()
+	require.Equal(t, "low", selected, "successful reasoning change reverted on relaunch")
 }

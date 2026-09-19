@@ -402,11 +402,17 @@ func (s *session) publishCommands(ctx context.Context) error {
 }
 
 func (s *session) clearCommands(ctx context.Context) {
+	s.openMu.Lock()
+	defer s.openMu.Unlock()
+
 	s.mu.Lock()
 	s.commands = nil
+	closing := s.closing
 	s.mu.Unlock()
 
-	_ = s.publishCommands(ctx)
+	if !closing {
+		_ = s.publishCommands(ctx)
+	}
 }
 
 // availableCommands converts pi's command catalog, dropping names the shared

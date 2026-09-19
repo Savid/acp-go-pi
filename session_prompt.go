@@ -272,7 +272,7 @@ func (s *session) dispatchFailure(ctx context.Context, rt *runtime, t *turn, err
 	}
 
 	if s.claimFence(t, rt) {
-		s.lc.Fence()
+		s.fenceStream()
 	}
 
 	return failure
@@ -358,7 +358,7 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 
 		if err := s.commitMirror(settleCtx); err != nil {
 			s.stopRuntime(settleCtx, rt)
-			s.lc.Fence()
+			s.fenceStream()
 			verdict.failure = s.mirrorFailure(&t.state, err)
 			verdict.outcome = lifecycle.OutcomeFailed
 		}
@@ -369,7 +369,7 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 	}
 
 	if s.claimFence(t, rt) {
-		s.lc.Fence()
+		s.fenceStream()
 	}
 
 	if verdict.failure != nil {

@@ -2,6 +2,7 @@ package piacp
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -25,6 +26,8 @@ const (
 	sessionShutdownGrace = 2 * time.Second
 	// sessionShutdownTimeout bounds one shutdown rung.
 	sessionShutdownTimeout = 10 * time.Second
+	// sessionUsageStartTimeout bounds the extension's endpoint announcement.
+	sessionUsageStartTimeout = 10 * time.Second
 	// sessionAbortTimeout bounds the native abort a cancel or close sends.
 	sessionAbortTimeout = 5 * time.Second
 	// sessionSettleTimeout bounds one turn's settlement after the native run
@@ -62,9 +65,8 @@ type session struct {
 	commands      []acp.AvailableCommand
 	title         string
 	updatedAt     string
-	// installed records that the agent published the session under its id,
-	// so close owes the store its final generation.
-	installed bool
+	// persisted marks a successfully committed mirror.
+	persisted bool
 	closing   bool
 	closeDone chan struct{}
 	closeErr  error
@@ -73,6 +75,7 @@ type session struct {
 	cycle     *cycle
 	dialogs   map[string]*dialog
 
+	openMu   sync.Mutex
 	mirrorMu sync.Mutex
 	lcMu     sync.Mutex
 	lc       lifecycle.Publisher
@@ -80,6 +83,8 @@ type session struct {
 
 // runtime is one pi process generation.
 type runtime struct {
+	// ending prevents another operation from using this runtime during teardown.
+	ending bool
 	usage  pi.UsageEndpoint
 	proc   *process.Process
 	client *pi.Client
@@ -156,10 +161,22 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 		return nil, s.startFailure(ctx, err)
 	}
 
-	usage, err := pi.NewUsageEndpoint()
+	usageDir, err := s.agent.scratchDir("usage", rand.Text())
 	if err != nil {
 		return nil, s.startFailure(ctx, err)
 	}
+
+	usage, err := pi.NewUsageEndpoint(usageDir)
+	if err != nil {
+		return nil, s.startFailure(ctx, err)
+	}
+
+	bound := false
+	defer func() {
+		if !bound {
+			_ = usage.Close()
+		}
+	}()
 
 	env, err := s.launchEnvironment(usage)
 	if err != nil {
@@ -205,6 +222,7 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 
 	if !closing {
 		s.runtime = rt
+		bound = true
 	}
 	s.mu.Unlock()
 
@@ -220,6 +238,19 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 
 	go s.pump(context.WithoutCancel(ctx), rt)
 
+	// Earlier native startup handlers may wait for UI replies before the
+	// usage extension runs, so the pump must drain throughout readiness.
+	readyCtx, cancelReady := context.WithTimeout(ctx, sessionUsageStartTimeout)
+	readyErr := rt.usage.Wait(readyCtx, proc.Done())
+
+	cancelReady()
+
+	if readyErr != nil {
+		s.stopRuntime(context.WithoutCancel(ctx), rt)
+
+		return nil, s.startFailure(ctx, readyErr)
+	}
+
 	return rt, nil
 }
 
@@ -227,7 +258,7 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 // process: the inherited environment, the agent overlay, the session env,
 // the home when configured, then the adapter's own extension markers.
 func (s *session) launchEnvironment(usage pi.UsageEndpoint) ([]string, error) {
-	owned := map[string]string{pi.EnvPermissionMode: s.permissionMode(), pi.EnvUsageURL: usage.URL, pi.EnvUsageToken: usage.Token}
+	owned := map[string]string{pi.EnvPermissionMode: s.permissionMode(), pi.EnvUsageFile: usage.File, pi.EnvUsageToken: usage.Token}
 	if len(s.options.ExtraPathDirs) > 0 {
 		owned[pi.EnvExtraPathDirs] = strings.Join(s.options.ExtraPathDirs, string(os.PathListSeparator))
 	}
@@ -377,7 +408,17 @@ func stateModelRef(state pi.SessionState) string {
 func (s *session) ensureRuntime(ctx context.Context) (*runtime, error) {
 	s.mu.Lock()
 	rt := s.runtime
+	ending := rt != nil && rt.ending
 	s.mu.Unlock()
+
+	if ending {
+		select {
+		case <-rt.done:
+			return s.ensureRuntime(ctx)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 
 	if rt != nil {
 		return rt, nil
@@ -394,7 +435,7 @@ func (s *session) ensureRuntime(ctx context.Context) (*runtime, error) {
 		return nil, configureErr
 	}
 
-	if openErr := s.publishOpen(ctx); openErr != nil {
+	if openErr := s.openStream(ctx, rt); openErr != nil {
 		return nil, openErr
 	}
 
@@ -541,7 +582,7 @@ func (s *session) settleAgentCycle(ctx context.Context, rt *runtime, c *cycle) {
 		// The incarnation cannot publish what the store does not hold, so it
 		// ends with its generation: the next operation relaunches pi and opens
 		// a new stream.
-		s.lc.Fence()
+		s.fenceStream()
 		s.dropRuntime(rt)
 		s.agent.log.ErrorContext(settleCtx, "mirror commit after agent-origin cycle failed",
 			slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
@@ -575,7 +616,7 @@ func (s *session) runtimeEnded(ctx context.Context, rt *runtime) {
 	var c *cycle
 
 	if bound {
-		s.runtime = nil
+		rt.ending = true
 
 		if !closing {
 			// While closing, the shutdown ladder owns the open cycle so exactly
@@ -585,9 +626,6 @@ func (s *session) runtimeEnded(ctx context.Context, rt *runtime) {
 		}
 	}
 
-	// A turn that already published its terminal event leaves the fence to the
-	// generation that carried it; one still settling fences itself.
-	fence := bound && !closing && (t == nil || t.lcSettled)
 	s.mu.Unlock()
 
 	if bound {
@@ -599,13 +637,23 @@ func (s *session) runtimeEnded(ctx context.Context, rt *runtime) {
 		_ = s.lc.Idle(ctx, c.Cycle, "", lifecycle.OutcomeFailed)
 	}
 
+	s.openMu.Lock()
+	s.mu.Lock()
+	if s.runtime == rt {
+		// A turn may finish while callbacks drain. A settled turn leaves the
+		// fence to this generation; one still settling fences itself.
+		if !s.closing && (t == nil || t.lcSettled) {
+			s.lc.Fence()
+		}
+
+		s.runtime = nil
+	}
+	s.mu.Unlock()
+	s.openMu.Unlock()
+
 	if t != nil {
 		t.settle(turnTransportEnded)
 		t.cancel()
-	}
-
-	if fence {
-		s.lc.Fence()
 	}
 
 	s.releaseRuntime(ctx, rt)
@@ -623,6 +671,7 @@ func (s *session) releaseRuntime(ctx context.Context, rt *runtime) {
 	}
 
 	_ = rt.proc.Close()
+	_ = rt.usage.Close()
 }
 
 // dropRuntime ends the binding to a generation this session can no longer
@@ -830,8 +879,8 @@ func (s *session) close(ctx context.Context) error {
 	}
 
 	s.closing = true
+	joinEstablishment := !s.persisted
 	s.closeDone = make(chan struct{})
-	installed := s.installed
 	t := s.turn
 	rt := s.runtime
 
@@ -859,12 +908,22 @@ func (s *session) close(ctx context.Context) error {
 		s.stopRuntime(ctx, rt)
 	}
 
+	// An initial mirror may not have started yet; its establishment owns the gate.
+	if joinEstablishment {
+		s.gate <- struct{}{}
+		defer func() { <-s.gate }()
+	}
+
+	s.mu.Lock()
+	persisted := s.persisted
+	s.mu.Unlock()
+
 	var errs []error
 
 	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionSettleTimeout)
 	defer cancel()
 
-	if installed {
+	if persisted {
 		if err := s.commitMirror(commitCtx); err != nil {
 			errs = append(errs, err)
 		}
@@ -881,7 +940,7 @@ func (s *session) close(ctx context.Context) error {
 		}
 	}
 
-	s.lc.Fence()
+	s.fenceStream()
 
 	s.mu.Lock()
 	s.closeErr = errors.Join(errs...)

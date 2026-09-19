@@ -87,6 +87,12 @@ func (s *session) commitMirror(ctx context.Context) error {
 	err = sessionlog.Commit(commitCtx, s.agent.store, string(s.id), rows, s.record())
 	finish(err)
 
+	if err == nil {
+		s.mu.Lock()
+		s.persisted = true
+		s.mu.Unlock()
+	}
+
 	if err != nil {
 		return fmt.Errorf("commit session mirror: %w", err)
 	}

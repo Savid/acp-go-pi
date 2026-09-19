@@ -256,9 +256,8 @@ func TestSetConfigOptions(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, acp.SessionConfigValueId("high"), resp.ConfigOptions[1].Select.CurrentValue)
 
-	resp, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, configThoughtLevel, "bogus"))
-	require.NoError(t, err)
-	require.Equal(t, acp.SessionConfigValueId("high"), resp.ConfigOptions[1].Select.CurrentValue)
+	_, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, configThoughtLevel, "bogus"))
+	require.Equal(t, wire.Unsupported("value"), err)
 
 	_, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(session.SessionId, "mode", "x"))
 	require.Equal(t, "configId", requestErrorData(t, err)["field"])

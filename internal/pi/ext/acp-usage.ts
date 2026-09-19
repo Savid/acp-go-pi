@@ -1,10 +1,11 @@
 import { createServer } from "node:http";
+import { rename, rm, writeFile } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
-	const endpoint = process.env.ACP_GO_PI_INTERNAL_USAGE_URL;
+	const endpointFile = process.env.ACP_GO_PI_INTERNAL_USAGE_FILE;
 	const token = process.env.ACP_GO_PI_INTERNAL_USAGE_TOKEN;
-	if (!endpoint || !token) throw new Error("Account usage endpoint missing");
+	if (!endpointFile || !token) throw new Error("Account usage endpoint missing");
 	let context: ExtensionContext | undefined;
 	const server = createServer(async (request, response) => {
 		response.setHeader("Cache-Control", "no-store");
@@ -12,7 +13,7 @@ export default function (pi: ExtensionAPI) {
 			response.writeHead(403).end();
 			return;
 		}
-		const query = new URL(request.url ?? "/", endpoint);
+		const query = new URL(request.url ?? "/", "http://127.0.0.1");
 		const provider = query.searchParams.get("provider") ?? "";
 		const modelId = query.searchParams.get("model");
 		if (query.pathname !== "/access" || !["opencode-go", "openrouter", "openai-codex", "anthropic"].includes(provider)) {
@@ -58,16 +59,30 @@ export default function (pi: ExtensionAPI) {
 		if (server.listening) return;
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
-			server.listen(Number(new URL(endpoint).port), "127.0.0.1", () => {
+			server.listen(0, "127.0.0.1", () => {
 				server.off("error", reject);
 				resolve();
 			});
 		});
+		const staging = `${endpointFile}.tmp`;
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Account usage endpoint unavailable");
+			await writeFile(staging, `http://127.0.0.1:${address.port}`, { mode: 0o600, flag: "wx" });
+			await rename(staging, endpointFile);
+		} catch (error) {
+			server.closeAllConnections();
+			server.close();
+			throw error;
+		} finally {
+			await rm(staging, { force: true });
+		}
 	});
 	pi.on("session_shutdown", async () => {
 		context = undefined;
 		server.closeAllConnections();
 		server.close();
+		await rm(endpointFile, { force: true });
 	});
 }
 

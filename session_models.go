@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -148,7 +149,7 @@ func (s *session) setConfigOption(ctx context.Context, configID acp.SessionConfi
 		s.contextWindow = selected.ContextWindow
 		s.mu.Unlock()
 	case configThoughtLevel:
-		if value == "" {
+		if !slices.Contains(pi.ThinkingLevels(), value) {
 			return nil, wire.Unsupported("value")
 		}
 
@@ -165,6 +166,7 @@ func (s *session) setConfigOption(ctx context.Context, configID acp.SessionConfi
 
 	s.mu.Lock()
 	s.thinkingLevel = state.ThinkingLevel
+	s.options.ThinkingLevel = state.ThinkingLevel
 	s.mu.Unlock()
 
 	if err := s.commitMirror(ctx); err != nil {

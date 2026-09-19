@@ -21,9 +21,11 @@ import (
 // The test binary doubles as a fake pi: TestMain runs fakePi when this
 // variable is set in the environment the adapter launched it with.
 const (
-	fakePiEnv        = "ACP_GO_PI_TEST_FAKE"
-	fakePiEnvDump    = "ACP_GO_PI_TEST_ENV_DUMP"
-	fakePiEnvNoModel = "ACP_GO_PI_TEST_NO_MODEL"
+	fakePiEnv              = "ACP_GO_PI_TEST_FAKE"
+	fakePiEnvDump          = "ACP_GO_PI_TEST_ENV_DUMP"
+	fakePiEnvNoModel       = "ACP_GO_PI_TEST_NO_MODEL"
+	fakePiEnvUsageHold     = "ACP_GO_PI_TEST_USAGE_HOLD"
+	fakePiEnvStartupDialog = "ACP_GO_PI_TEST_STARTUP_DIALOG"
 	// fakePiEnvResumeHold names a file a resumed fake pi creates before it
 	// stops answering, so a test can act while the adapter is still relaunching.
 	fakePiEnvResumeHold = "ACP_GO_PI_TEST_RESUME_HOLD"
@@ -65,7 +67,27 @@ type fakePi struct {
 }
 
 func runFakePi(args []string) int {
-	listener, err := net.Listen("tcp", strings.TrimPrefix(os.Getenv(pi.EnvUsageURL), "http://"))
+	if os.Getenv(fakePiEnvStartupDialog) != "" {
+		request := map[string]any{"type": "extension_ui_request", "id": "startup", "method": "input", "title": "Startup input"}
+		if err := json.NewEncoder(os.Stdout).Encode(request); err != nil {
+			return 1
+		}
+		var response pi.UIResponse
+		if err := json.NewDecoder(os.Stdin).Decode(&response); err != nil || !response.Cancelled {
+			return 1
+		}
+	}
+
+	if marker := os.Getenv(fakePiEnvUsageHold); marker != "" {
+		if err := os.WriteFile(marker, nil, 0o600); err != nil {
+			return 1
+		}
+		time.Sleep(fakePiResumeHold)
+
+		return 1
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 1
 	}
@@ -90,6 +112,13 @@ func runFakePi(args []string) int {
 	})}
 	go func() { _ = usageServer.Serve(listener) }()
 	defer func() { _ = usageServer.Close() }()
+	endpointFile := os.Getenv(pi.EnvUsageFile)
+	if err := os.WriteFile(endpointFile+".tmp", []byte("http://"+listener.Addr().String()), 0o600); err != nil {
+		return 1
+	}
+	if err := os.Rename(endpointFile+".tmp", endpointFile); err != nil {
+		return 1
+	}
 	if dump := os.Getenv(fakePiEnvDump); dump != "" {
 		_ = os.WriteFile(dump, []byte(strings.Join(os.Environ(), "\n")+"\n"), 0o600)
 	}
