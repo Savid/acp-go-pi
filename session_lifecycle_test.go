@@ -2,6 +2,7 @@ package piacp
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -9,6 +10,8 @@ import (
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/stretchr/testify/require"
+
+	"github.com/savid/acp-go-pi/internal/pi"
 )
 
 // reduceAll replays one session's recorded notifications through the core
@@ -354,4 +357,55 @@ func TestCloseBackgroundCycleRequiresCommit(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCapturedNativeAgentOrigin replays the captured pi RPC frames under
+// testdata/native through the real decoder and the session's own event
+// handling with no prompt in flight, proving the agent-origin cycle the
+// lifecycle capability advertises opens on agent_start and settles on
+// agent_settled.
+func TestCapturedNativeAgentOrigin(t *testing.T) {
+	a := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = a.Close() })
+	rec := newRecorder()
+	a.attach(rec, nil)
+	request := acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}
+	withLifecycle()(&request)
+	_, err := a.Initialize(t.Context(), request)
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+	s.mu.Lock()
+	rt := s.runtime
+	require.Nil(t, s.turn)
+	s.mu.Unlock()
+
+	data, err := os.ReadFile("testdata/native/agent-origin.json")
+	require.NoError(t, err)
+	var frames []json.RawMessage
+	require.NoError(t, json.Unmarshal(data, &frames))
+	require.NotEmpty(t, frames)
+
+	before := len(lifecycleEvents(rec.snapshot()))
+	for _, frame := range frames {
+		message, err := pi.DecodeMessage(frame)
+		require.NoError(t, err)
+		require.Equal(t, pi.MessageKindEvent, message.Kind)
+		s.handleEvent(t.Context(), rt, message.Event)
+	}
+
+	events := lifecycleEvents(rec.snapshot())[before:]
+	require.Equal(t, []string{"state_update:running", "state_update:idle"}, eventTypes(events))
+	require.Equal(t, "activity", events[0]["cause"])
+	require.Equal(t, "activity", events[1]["cause"])
+	require.Equal(t, "success", events[1]["outcome"])
+	for _, event := range events {
+		require.NotEqual(t, "prompt_accepted", event["type"])
+	}
+	require.Contains(t, agentText(rec.snapshot()), "2")
+	s.mu.Lock()
+	require.Nil(t, s.cycle)
+	s.mu.Unlock()
 }
