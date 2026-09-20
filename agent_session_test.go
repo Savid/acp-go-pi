@@ -121,6 +121,18 @@ func TestTwoSessionsStayIndependent(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 
+	// Cancel only once the first turn is running, so the cancel reaches a
+	// dispatched turn rather than a prompt still being admitted.
+	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool {
+		for _, update := range updates {
+			if update.SessionId == first.SessionId {
+				return true
+			}
+		}
+
+		return false
+	})
+
 	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(first.SessionId)))
 	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
 }
