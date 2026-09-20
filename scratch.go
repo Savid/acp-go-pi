@@ -1,24 +1,9 @@
 package piacp
 
-import (
-	"fmt"
-	"os"
-	"path/filepath"
-)
+import "github.com/savid/acp-go-core/process"
 
-// scratchDir is the sole scratch accessor. It returns the adapter directory
-// for one purpose under the configured scratch parent, creating the parent
-// 0700 when missing. Names carry the acp-go-pi-<purpose>- prefix so a host
-// can sweep orphans.
+// scratchDir names the adapter directory for one purpose and one name under
+// the configured scratch parent.
 func (a *Agent) scratchDir(purpose string, name string) (string, error) {
-	parent := a.options.ScratchDir
-	if parent == "" {
-		parent = os.TempDir()
-	}
-
-	if err := os.MkdirAll(parent, 0o700); err != nil {
-		return "", fmt.Errorf("create scratch parent: %w", err)
-	}
-
-	return filepath.Join(parent, "acp-go-pi-"+purpose+"-"+name), nil
+	return process.ScratchPath(a.options.ScratchDir, vendor, purpose, name)
 }

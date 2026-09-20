@@ -26,9 +26,6 @@ const (
 	stopReasonAborted   = "aborted"
 	stopReasonError     = "error"
 
-	// extensionFailureMessage is the whole of what a client is told about a
-	// wrapper extension that threw: its path and thrown text are internal.
-	extensionFailureMessage = "a pi extension failed"
 	// processExitGrace is how long failure classification waits for a dead
 	// child to be reaped after its stdout closed.
 	processExitGrace = 2 * time.Second

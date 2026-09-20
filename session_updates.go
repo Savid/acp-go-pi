@@ -129,7 +129,7 @@ func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event
 				slog.String("session_id", string(s.id)), slog.String("event", typed.Event))
 			s.abortAsync(ctx, rt)
 
-			return false, wire.TurnFailed(vendor, wire.TurnFailure{Cause: "extension", Message: extensionFailureMessage})
+			return false, wire.TurnFailed(vendor, wire.TurnFailure{Cause: "extension", Message: typed.Error})
 		}
 
 		return false, nil

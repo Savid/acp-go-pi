@@ -264,7 +264,7 @@ func TestPromptWrapperExtensionFailure(t *testing.T) {
 	_, err := h.prompt(session.SessionId, "EXTERR", nil)
 	data := requestErrorData(t, err)
 	require.Equal(t, "extension", data["cause"])
-	require.Equal(t, extensionFailureMessage, data["message"])
+	require.Equal(t, "boom", data["message"], "the extension's own error text reaches the host")
 }
 
 func TestPromptIdentityDriftPoisons(t *testing.T) {
