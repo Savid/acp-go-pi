@@ -167,6 +167,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	t := &turn{
 		cycle:      cycle{Cycle: lifecycle.Cycle{Origin: lifecycle.CauseSubmission}, state: cycleState{tools: make(map[string]*toolState)}},
 		submission: submission,
+		ctx:        turnCtx,
 		cancel:     cancelTurn,
 		settled:    make(chan struct{}),
 		finished:   make(chan struct{}),

@@ -118,6 +118,10 @@ func WriteRows(path string, rows [][]byte) error {
 	}
 
 	_, writeErr := staging.WriteString(builder.String())
+	if writeErr == nil {
+		writeErr = staging.Sync()
+	}
+
 	if closeErr := staging.Close(); writeErr == nil {
 		writeErr = closeErr
 	}

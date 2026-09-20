@@ -223,7 +223,7 @@ func parsePiOptions(values map[string]any) (PiOptions, *acp.RequestError) {
 		switch key {
 		case metaModelKey:
 			model, ok := item.(string)
-			if !ok {
+			if !ok || model == "" {
 				return PiOptions{}, wire.Unsupported(wire.MetaOptionPath(vendor, key))
 			}
 

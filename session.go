@@ -15,6 +15,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-core/lifecycle"
+	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/process"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
@@ -84,11 +85,12 @@ type session struct {
 // runtime is one pi process generation.
 type runtime struct {
 	// ending prevents another operation from using this runtime during teardown.
-	ending bool
-	usage  pi.UsageEndpoint
-	proc   *process.Process
-	client *pi.Client
-	cancel context.CancelFunc
+	ending  bool
+	usage   pi.UsageEndpoint
+	proc    *process.Process
+	observe *observer.Observer
+	client  *pi.Client
+	cancel  context.CancelFunc
 	// done is closed when the pump has stopped routing this generation.
 	done chan struct{}
 }
@@ -120,6 +122,10 @@ type turn struct {
 	// cancel ends the turn's own context. The turn outlives the request that
 	// created it, so only the session cancels it.
 	cancel context.CancelFunc
+	// ctx is the turn's own lifecycle context, which its dialogs derive from
+	// so a cancelled prompt ends them; cancel ends it. It is not a request
+	// context: only the session cancels it.
+	ctx context.Context //nolint:containedctx // The turn owns this context and cancels it through cancel.
 	// rt is the process generation running this turn. It is nil until the
 	// prompt dispatches, so a turn the session can already cancel is still
 	// invisible to every pump.
@@ -217,7 +223,7 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 		return nil, s.startFailure(ctx, startErr)
 	}
 
-	rt := &runtime{proc: proc, client: client, usage: usage, cancel: cancelRead, done: make(chan struct{})}
+	rt := &runtime{proc: proc, observe: s.agent.observe, client: client, usage: usage, cancel: cancelRead, done: make(chan struct{})}
 
 	s.mu.Lock()
 	closing := s.closing
@@ -686,6 +692,9 @@ func (s *session) releaseRuntime(ctx context.Context, rt *runtime) {
 		_ = rt.proc.Kill()
 	}
 
+	_, waitErr := rt.proc.Wait(shutdownCtx)
+	rt.observe.RecordProcessExit(ctx, "exited", waitErr)
+
 	_ = rt.proc.Close()
 	_ = rt.usage.Close()
 }
@@ -1017,6 +1026,11 @@ type nativeRecord struct {
 	request *pi.UIRequest
 }
 
+// settleRecordBound caps the records held while a turn settles; a native
+// stream that outruns it ends this session's own process rather than the
+// adapter's memory.
+const settleRecordBound = 4096
+
 func (s *session) finishDelivery(ctx context.Context, rt *runtime, t *turn) {
 	events := rt.client.Events()
 	requests := rt.client.UIRequests()
@@ -1024,6 +1038,14 @@ func (s *session) finishDelivery(ctx context.Context, rt *runtime, t *turn) {
 	var pending []nativeRecord
 
 	for {
+		if len(pending) >= settleRecordBound {
+			s.agent.log.ErrorContext(ctx, "pi native records exceeded the settle bound", slog.String("session_id", string(s.id)))
+
+			_ = rt.proc.Kill()
+
+			return
+		}
+
 		select {
 		case <-t.finished:
 			for _, record := range pending {

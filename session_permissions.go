@@ -91,6 +91,14 @@ func (s *session) handleDialog(rt *runtime, request pi.UIRequest) {
 		defer cancel(nil)
 		defer unregister()
 
+		// A prompt's dialogs end with its turn, resolved as cancelled like
+		// every other session-ended dialog; an agent-origin cycle has no turn
+		// and its dialogs end with the session.
+		if t != nil {
+			stop := context.AfterFunc(t.ctx, func() { cancel(errDialogCancelled) })
+			defer stop()
+		}
+
 		if strings.HasPrefix(request.Title, pi.PermissionTitleMarker) {
 			prompt, _ := pi.ParsePermissionTitle(request.Title)
 			s.respond(rt, s.permissionDialog(ctx, c, request, prompt))
