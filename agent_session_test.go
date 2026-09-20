@@ -106,26 +106,28 @@ func TestTwoSessionsStayIndependent(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
-	h.initialize()
+	h.initialize(withLifecycle())
 	first := h.newSession()
 	second := h.newSession()
 
 	done := make(chan acp.PromptResponse, 1)
 
 	go func() {
-		resp, _ := h.prompt(first.SessionId, "SLOW", nil)
+		resp, _ := h.prompt(first.SessionId, "SLOW", promptMeta(1))
 		done <- resp
 	}()
 
-	resp, err := h.prompt(second.SessionId, "HELLO", nil)
+	resp, err := h.prompt(second.SessionId, "HELLO", promptMeta(2))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
 
 	// Cancel only once the first turn is running, so the cancel reaches a
-	// dispatched turn rather than a prompt still being admitted.
+	// dispatched turn rather than a prompt still being admitted. Session
+	// establishment already publishes a commands update, so only the turn's
+	// own content or its running transition proves dispatch.
 	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool {
 		for _, update := range updates {
-			if update.SessionId == first.SessionId {
+			if update.SessionId == first.SessionId && provesDispatch(update) {
 				return true
 			}
 		}
@@ -535,4 +537,17 @@ func TestRestoreWaitsForPreviousOpening(t *testing.T) {
 			require.True(t, s.lc.Active())
 		})
 	}
+}
+
+// provesDispatch reports whether a notification could only have come from a
+// dispatched turn: its content, or the lifecycle transition that opened it.
+func provesDispatch(update acp.SessionNotification) bool {
+	if update.Update.AgentMessageChunk != nil || update.Update.AgentThoughtChunk != nil || update.Update.ToolCall != nil {
+		return true
+	}
+
+	envelope, _ := update.Meta[wire.LifecycleKey].(map[string]any)
+	event, _ := envelope["event"].(map[string]any)
+
+	return event["type"] == "state_update" && event["state"] == "running"
 }
