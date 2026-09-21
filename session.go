@@ -463,6 +463,10 @@ func (s *session) ensureRuntime(ctx context.Context) (*runtime, error) {
 	}
 
 	if openErr := s.openStream(ctx, rt); openErr != nil {
+		if errors.Is(openErr, errSessionClosing) {
+			return nil, s.closingRefusal()
+		}
+
 		return nil, openErr
 	}
 
