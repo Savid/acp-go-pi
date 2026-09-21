@@ -52,6 +52,9 @@ type session struct {
 	agentDir string
 	// sessionFile is the native session file pi writes.
 	sessionFile string
+	// ephemeral marks a session the host deletes without needing it back: it
+	// is never written to the store and never listed.
+	ephemeral bool
 	// gate admits one foreground operation at a time: a prompt, a config
 	// change, or a restore.
 	gate chan struct{}

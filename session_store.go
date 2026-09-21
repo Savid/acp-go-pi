@@ -68,9 +68,10 @@ func (s *session) commitMirror(ctx context.Context) error {
 	s.mu.Lock()
 	path := s.sessionFile
 	mirrored := s.mirrored
+	ephemeral := s.ephemeral
 	s.mu.Unlock()
 
-	if path == "" {
+	if path == "" || ephemeral {
 		return nil
 	}
 

@@ -696,3 +696,55 @@ func TestFailedSessionOpenReleasesActiveSlot(t *testing.T) {
 	_, err = a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
 }
+
+func TestEphemeralSessionNeverReachesTheStore(t *testing.T) {
+	t.Parallel()
+
+	store := acpcore.NewInMemorySessionStore()
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	ephemeral := wire.WithSessionMeta(wire.SessionMeta{Ephemeral: true}.Apply(nil))
+	session := h.newSession(ephemeral)
+
+	_, err := h.prompt(session.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+
+	generation, err := store.Load(context.Background(), string(session.SessionId))
+	require.NoError(t, err)
+	require.Nil(t, generation)
+
+	list, err := h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
+	require.NoError(t, err)
+	require.Empty(t, list.Sessions)
+
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+	_, err = h.conn.UnstableDeleteSession(h.ctx(), wire.DeleteSessionRequest(session.SessionId))
+	require.NoError(t, err)
+
+	// No tombstone either: the store still accepts the id as a fresh one.
+	key := acpcore.SessionKey{SessionID: string(session.SessionId)}
+	require.NoError(t, store.Replace(context.Background(), key, []acpcore.SessionStoreReplacement{{Key: key, Entries: []acpcore.SessionStoreEntry{[]byte(`{}`)}}}))
+	generation, err = store.Load(context.Background(), string(session.SessionId))
+	require.NoError(t, err)
+	require.NotNil(t, generation)
+}
+
+func TestHostSessionMetaIsRefusedWhereItBindsNothing(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, WithSessionStore(acpcore.NewInMemorySessionStore()))
+	h.initialize()
+	session := h.newSession()
+	ephemeral := wire.WithSessionMeta(wire.SessionMeta{Ephemeral: true}.Apply(nil))
+
+	_, err := h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, t.TempDir(), ephemeral))
+	require.Equal(t, "_meta."+wire.SessionMetaKey, requestErrorData(t, err)["field"])
+
+	_, err = h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(session.SessionId, t.TempDir(), ephemeral))
+	require.Equal(t, "_meta."+wire.SessionMetaKey, requestErrorData(t, err)["field"])
+
+	unknown := wire.WithSessionMeta(map[string]any{wire.SessionMetaKey: map[string]any{"persist": false}})
+	_, err = h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir(), unknown))
+	require.Equal(t, "_meta."+wire.SessionMetaKey+".persist", requestErrorData(t, err)["field"])
+}
