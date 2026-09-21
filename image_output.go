@@ -1,216 +1,209 @@
 package piacp
 
 import (
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
-	"fmt"
-	"slices"
+	"context"
 
 	"github.com/coder/acp-go-sdk"
 
+	"github.com/savid/acp-go-core/image"
+	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
-	"github.com/savid/acp-go-pi/internal/raster"
 )
 
-// Image output failure envelope fields and values. Output failures ride the
-// uniform pi_turn_failed shape with cause "transport" plus the optional
-// stage/reason/sizeBytes/maxBytes details.
-const (
-	failureFieldStage  = "stage"
-	failureFieldReason = "reason"
-
-	failureStageImageOutput = "image_output"
-
-	imageReasonNotARaster    = "not_a_raster"
-	imageReasonStorageFailed = "storage_failed"
-
-	// Guidance carried back in place of an image output the adapter will not
-	// ship. Each string is a fixed constant keyed only by the verdict token: it
-	// says what to do next and never describes the size, media type, or bytes
-	// that produced the verdict.
-	imageGuidanceTooLarge       = "the image is too large to send; send a smaller image and try again"
-	imageGuidanceNotRaster      = "the bytes are not a supported raster image; send a PNG, JPEG, GIF, WebP, BMP, or TIFF and try again"
-	imageGuidanceInvalidBase64  = "the image payload could not be decoded; send the image bytes again"
-	imageGuidanceMIMEMismatched = "the declared media type does not match the image; send the image again with a matching media type"
-)
-
-// imageOutputError is one adapter-side image representation failure. The
-// adapter never silently drops an artifact it cannot read, validate, store, or
-// emit: a verdict the model can act on is refused where the image would have
-// gone, and a storage failure is turn-fatal.
-type imageOutputError struct {
-	reason    string
-	message   string
-	sizeBytes int64
-	maxBytes  int64
+// toolState is the exact-id lifecycle published for one native tool call.
+type toolState struct {
+	published bool
+	terminal  bool
+	// content is the last emitted complete content array; each later
+	// content-bearing update merges onto it so no delivered item disappears
+	// under ACP's whole-array replacement.
+	content []toolContentItem
 }
 
-func (e *imageOutputError) Error() string {
-	return e.message
-}
-
-// imageOutputGuidance classifies an image output failure. A recoverable
-// verdict is an ordinary mistake that can be retried — the bytes are too big,
-// are not an image, do not decode, or contradict their declared media type —
-// and comes back with fixed guidance. A storage failure is the adapter's own
-// artifact window breaking, which no retry addresses.
-func imageOutputGuidance(failure *imageOutputError) (string, bool) {
-	switch failure.reason {
-	case imageErrorTooLarge:
-		return imageGuidanceTooLarge, true
-	case imageReasonNotARaster:
-		return imageGuidanceNotRaster, true
-	case imageErrorInvalidBase64:
-		return imageGuidanceInvalidBase64, true
-	case imageErrorMediaTypeMismatch:
-		return imageGuidanceMIMEMismatched, true
-	default:
-		return "", false
-	}
-}
-
-// imageOutputTurnFailure maps an image output failure into the uniform
-// -32603 pi_turn_failed error with machine-readable image-output details.
-func imageOutputTurnFailure(failure *imageOutputError) *acp.RequestError {
-	data := map[string]any{
-		jsonFieldError:     turnFailedError,
-		failureFieldCause:  failureCauseTransport,
-		jsonFieldMessage:   failure.message,
-		failureFieldStage:  failureStageImageOutput,
-		failureFieldReason: failure.reason,
-	}
-
-	if failure.sizeBytes > 0 {
-		data[jsonFieldSizeBytes] = failure.sizeBytes
-	}
-
-	if failure.maxBytes > 0 {
-		data[jsonFieldMaxBytes] = failure.maxBytes
-	}
-
-	return acp.NewInternalError(data)
-}
-
-// storageFailure builds the storage_failed envelope for replay or mirror
-// durability losses.
-func storageFailure(message string) *acp.RequestError {
-	return imageOutputTurnFailure(&imageOutputError{
-		reason:  imageReasonStorageFailed,
-		message: message,
-	})
-}
-
-// replayImageFailure converts a stored artifact's validation failure into the
-// replay outcome: bytes over a current limit stay too_large, while corrupt or
-// unsniffable stored bytes mean the store can no longer reproduce the
-// artifact it once delivered.
-func replayImageFailure(failure *imageOutputError) *imageOutputError {
-	if failure.reason == imageErrorTooLarge {
-		return failure
-	}
-
-	return &imageOutputError{
-		reason:  imageReasonStorageFailed,
-		message: "stored image artifact failed validation: " + failure.message,
-	}
-}
-
-// outputImage is one validated emitted image: the original base64 payload,
-// the truthful sniffed MIME, the decoded size, and the artifact fingerprint.
-type outputImage struct {
-	data        string
-	mime        string
-	fingerprint string
-	sizeBytes   int64
-}
-
-// normalizeOutputImage validates one native image payload for emission.
-// Output is not format-allowlisted: any payload that sniffs as a raster is
-// emitted with its truthful sniffed MIME, bounded by the effective per-image
-// limit. A declared MIME naming a different known raster than the bytes
-// sniff as is a mismatch; any other declared value defers to the sniff.
-func normalizeOutputImage(data string, declaredMIME string, perImageLimit int64) (outputImage, *imageOutputError) {
-	if data == "" {
-		return outputImage{}, &imageOutputError{
-			reason:  imageReasonNotARaster,
-			message: "native image content carries no data",
-		}
-	}
-
-	decoded, err := base64.StdEncoding.DecodeString(data)
-	if err != nil {
-		return outputImage{}, &imageOutputError{
-			reason:  imageErrorInvalidBase64,
-			message: "native image content is not valid base64",
-		}
-	}
-
-	mime, ok := raster.Sniff(decoded)
-	if !ok {
-		return outputImage{}, &imageOutputError{
-			reason:  imageReasonNotARaster,
-			message: "native image content does not sniff as a raster",
-		}
-	}
-
-	if declaredMIMEConflicts(declaredMIME, mime) {
-		return outputImage{}, &imageOutputError{
-			reason:  imageErrorMediaTypeMismatch,
-			message: fmt.Sprintf("native image content declared %s but sniffs as %s", declaredMIME, mime),
-		}
-	}
-
-	size := int64(len(decoded))
-	if size > perImageLimit {
-		return outputImage{}, &imageOutputError{
-			reason:    imageErrorTooLarge,
-			message:   fmt.Sprintf("image output is %d decoded bytes, exceeding the %d-byte per-image limit", size, perImageLimit),
-			sizeBytes: size,
-			maxBytes:  perImageLimit,
-		}
-	}
-
-	digest := sha256.Sum256(decoded)
-
-	return outputImage{
-		data:        data,
-		mime:        mime,
-		fingerprint: hex.EncodeToString(digest[:]),
-		sizeBytes:   size,
-	}, nil
-}
-
-// declaredMIMEConflicts reports whether a native declared MIME names a known
-// raster format other than the sniffed one. Unknown or empty declarations
-// defer to the sniff.
-func declaredMIMEConflicts(declared string, sniffed string) bool {
-	if declared == "" || declared == sniffed {
-		return false
-	}
-
-	switch declared {
-	case raster.MIMEPNG, raster.MIMEJPEG, raster.MIMEGIF, raster.MIMEWebP, raster.MIMEBMP, raster.MIMETIFF:
-		return true
-	default:
-		return false
-	}
-}
-
-// toolContentItem is one entry of a tool call's emitted content snapshot,
-// with the identity key and decoded image size used for replace-semantics
-// accounting.
 type toolContentItem struct {
 	content    acp.ToolCallContent
 	key        string
 	imageBytes int64
 }
 
-// mapToolContentBlocks converts one native tool content array into validated
-// snapshot items. Empty text blocks and unmapped block types are dropped;
-// image blocks pass full output validation.
-func mapToolContentBlocks(blocks []pi.ContentBlock, perImageLimit int64) ([]toolContentItem, *imageOutputError) {
-	items := make([]toolContentItem, 0, len(blocks))
+func (state *cycleState) tool(id string) *toolState {
+	if state.tools == nil {
+		state.tools = make(map[string]*toolState)
+	}
+
+	tool := state.tools[id]
+	if tool == nil {
+		tool = &toolState{}
+		state.tools[id] = tool
+	}
+
+	return tool
+}
+
+// publishPendingTool announces a tool call that is awaiting permission before
+// pi reports its execution.
+func (s *session) publishPendingTool(ctx context.Context, state *cycleState, prompt pi.PermissionPrompt) error {
+	tool := state.tool(prompt.ToolCallID)
+	if tool.published {
+		return nil
+	}
+
+	opts := []acp.ToolCallStartOpt{
+		acp.WithStartKind(toolKindForName(prompt.ToolName)),
+		acp.WithStartStatus(acp.ToolCallStatusPending),
+	}
+	if len(prompt.Input) > 0 {
+		opts = append(opts, acp.WithStartRawInput(prompt.Input))
+	}
+
+	if err := s.emit(ctx, acp.StartToolCall(acp.ToolCallId(prompt.ToolCallID), prompt.ToolName, opts...)); err != nil {
+		return err
+	}
+
+	tool.published = true
+
+	return nil
+}
+
+func (s *session) publishToolStart(ctx context.Context, state *cycleState, event pi.ToolExecutionStartEvent) error {
+	tool := state.tool(event.ToolCallID)
+	if tool.terminal {
+		return nil
+	}
+
+	kind := toolKindForName(event.ToolName)
+
+	if tool.published {
+		opts := []acp.ToolCallUpdateOpt{
+			acp.WithUpdateTitle(event.ToolName),
+			acp.WithUpdateKind(kind),
+			acp.WithUpdateStatus(acp.ToolCallStatusInProgress),
+		}
+		if len(event.Args) > 0 {
+			opts = append(opts, acp.WithUpdateRawInput(event.Args))
+		}
+
+		return s.emit(ctx, acp.UpdateToolCall(acp.ToolCallId(event.ToolCallID), opts...))
+	}
+
+	opts := []acp.ToolCallStartOpt{acp.WithStartKind(kind), acp.WithStartStatus(acp.ToolCallStatusInProgress)}
+	if len(event.Args) > 0 {
+		opts = append(opts, acp.WithStartRawInput(event.Args))
+	}
+
+	if err := s.emit(ctx, acp.StartToolCall(acp.ToolCallId(event.ToolCallID), event.ToolName, opts...)); err != nil {
+		return err
+	}
+
+	tool.published = true
+
+	return nil
+}
+
+// publishToolUpdate emits one partial result as a complete content snapshot.
+// An update that adds nothing is skipped rather than retransmitted.
+func (s *session) publishToolUpdate(ctx context.Context, state *cycleState, toolCallID string, blocks []pi.ContentBlock) error {
+	tool := state.tool(toolCallID)
+	if tool.terminal {
+		return nil
+	}
+
+	snapshot, failure := mapToolContent(tool.content, blocks, s.agent.options.ImageLimits.core())
+	if failure != nil {
+		return s.failToolImage(ctx, state, toolCallID, failure)
+	}
+
+	if len(snapshot) == 0 || len(snapshot) == len(tool.content) {
+		return nil
+	}
+
+	if err := s.emit(ctx, acp.UpdateToolCall(acp.ToolCallId(toolCallID), acp.WithUpdateContent(toolContent(snapshot)))); err != nil {
+		return err
+	}
+
+	s.recordToolContent(state, tool, snapshot)
+
+	return nil
+}
+
+// publishToolTerminal emits the terminal status and, when the result carries
+// mappable content, the complete final snapshot.
+func (s *session) publishToolTerminal(ctx context.Context, state *cycleState, toolCallID string, status acp.ToolCallStatus, result *pi.ToolResult) error {
+	tool := state.tool(toolCallID)
+	if tool.terminal {
+		return nil
+	}
+
+	opts := []acp.ToolCallUpdateOpt{acp.WithUpdateStatus(status)}
+
+	var snapshot []toolContentItem
+
+	if result != nil {
+		var failure *image.OutputError
+
+		snapshot, failure = mapToolContent(tool.content, result.Content, s.agent.options.ImageLimits.core())
+		if failure != nil {
+			return s.failToolImage(ctx, state, toolCallID, failure)
+		}
+
+		if len(snapshot) > 0 {
+			opts = append(opts, acp.WithUpdateContent(toolContent(snapshot)))
+		}
+	}
+
+	if err := s.emit(ctx, acp.UpdateToolCall(acp.ToolCallId(toolCallID), opts...)); err != nil {
+		return err
+	}
+
+	s.recordToolContent(state, tool, snapshot)
+	tool.terminal = true
+
+	return nil
+}
+
+func (s *session) recordToolContent(state *cycleState, tool *toolState, snapshot []toolContentItem) {
+	if len(snapshot) == 0 {
+		return
+	}
+
+	tool.content = snapshot
+
+	for _, item := range snapshot {
+		if item.imageBytes > 0 {
+			state.imagesEmitted = true
+
+			return
+		}
+	}
+}
+
+// failToolImage handles an image the adapter will not ship on tool
+// provenance. A verdict the model can act on carries its guidance as that
+// call's own content and the turn continues; a storage failure ends the turn.
+func (s *session) failToolImage(ctx context.Context, state *cycleState, toolCallID string, failure *image.OutputError) error {
+	tool := state.tool(toolCallID)
+	opts := []acp.ToolCallUpdateOpt{acp.WithUpdateStatus(acp.ToolCallStatusFailed)}
+
+	guidance, recoverable := failure.Guidance()
+	if recoverable {
+		opts = append(opts, acp.WithUpdateContent([]acp.ToolCallContent{acp.ToolContent(acp.TextBlock(guidance))}))
+	}
+
+	err := s.emit(ctx, acp.UpdateToolCall(acp.ToolCallId(toolCallID), opts...))
+	tool.terminal = true
+
+	if recoverable {
+		return err
+	}
+
+	return wire.TurnFailed(vendor, failure.TurnFailure())
+}
+
+// mapToolContent builds the next complete content snapshot from the
+// previously emitted one: text and validated images, merged so an already
+// delivered item never disappears, bounded per tool call.
+func mapToolContent(previous []toolContentItem, blocks []pi.ContentBlock, limits image.Limits) ([]toolContentItem, *image.OutputError) {
+	next := make([]toolContentItem, 0, len(blocks))
 
 	for index := range blocks {
 		block := &blocks[index]
@@ -221,103 +214,65 @@ func mapToolContentBlocks(blocks []pi.ContentBlock, perImageLimit int64) ([]tool
 				continue
 			}
 
-			items = append(items, toolContentItem{
-				content: acp.ToolContent(acp.TextBlock(block.Text)),
-				key:     "text:" + block.Text,
-			})
+			next = append(next, toolContentItem{content: acp.ToolContent(acp.TextBlock(block.Text)), key: "text:" + block.Text})
 		case contentBlockTypeImage:
-			image, failure := normalizeOutputImage(block.Data, block.MimeType, perImageLimit)
+			output, failure := image.DecodeOutput(block.Data, block.MimeType, limits.EffectiveOutputPerImage())
 			if failure != nil {
 				return nil, failure
 			}
 
-			items = append(items, toolContentItem{
-				content:    acp.ToolContent(acp.ImageBlock(image.data, image.mime)),
-				key:        "image:" + image.mime + ":" + image.fingerprint,
-				imageBytes: image.sizeBytes,
+			next = append(next, toolContentItem{
+				content:    acp.ToolContent(acp.ImageBlock(output.Data, output.MIME)),
+				key:        "image:" + output.MIME + ":" + output.Fingerprint,
+				imageBytes: output.SizeBytes,
 			})
 		}
 	}
 
-	return items, nil
-}
+	merged := mergeToolContent(previous, next)
 
-// mergeToolContent builds the next complete snapshot from the previously
-// emitted one: ACP replaces a tool call's content array wholesale, so an
-// already delivered item never disappears from a later array. Repeated
-// occurrences of identical items are matched by count, keeping genuinely
-// distinct duplicates.
-func mergeToolContent(previous []toolContentItem, next []toolContentItem) []toolContentItem {
-	if len(previous) == 0 {
-		return next
-	}
-
-	merged := slices.Clone(previous)
-	counts := make(map[string]int, len(previous))
-
-	for _, item := range previous {
-		counts[item.key]++
-	}
-
-	for _, item := range next {
-		if counts[item.key] > 0 {
-			counts[item.key]--
-
-			continue
-		}
-
-		merged = append(merged, item)
-	}
-
-	return merged
-}
-
-// checkToolContentBudget enforces the per-tool-call aggregate decoded-byte
-// limit over one complete snapshot, attributing the failure to the artifact
-// that crosses the total.
-func checkToolContentBudget(items []toolContentItem, perCallLimit int64) *imageOutputError {
 	var total int64
 
-	for _, item := range items {
-		if item.imageBytes == 0 {
-			continue
-		}
-
+	for _, item := range merged {
 		total += item.imageBytes
-		if total > perCallLimit {
-			return &imageOutputError{
-				reason:    imageErrorTooLarge,
-				message:   fmt.Sprintf("tool call image content totals %d decoded bytes, exceeding the %d-byte per-tool-call limit", total, perCallLimit),
-				sizeBytes: total,
-				maxBytes:  perCallLimit,
+		if item.imageBytes > 0 && total > limits.EffectiveOutputPerToolCall() {
+			return nil, &image.OutputError{
+				Reason:    image.ReasonTooLarge,
+				Message:   "tool call image content exceeds the per-tool-call limit",
+				SizeBytes: total,
+				MaxBytes:  limits.EffectiveOutputPerToolCall(),
 			}
 		}
-	}
-
-	return nil
-}
-
-// buildToolContent produces the complete validated snapshot for one
-// content-bearing tool call update, live and replayed alike.
-func buildToolContent(
-	previous []toolContentItem,
-	blocks []pi.ContentBlock,
-	limits ImageLimits,
-) ([]toolContentItem, *imageOutputError) {
-	next, failure := mapToolContentBlocks(blocks, effectiveOutputImageLimit(limits.MaxOutputBytesPerImage))
-	if failure != nil {
-		return nil, failure
-	}
-
-	merged := mergeToolContent(previous, next)
-	if failure := checkToolContentBudget(merged, effectiveOutputImageLimit(limits.MaxOutputBytesPerToolCall)); failure != nil {
-		return nil, failure
 	}
 
 	return merged, nil
 }
 
-func toolContentSnapshot(items []toolContentItem) []acp.ToolCallContent {
+// mergeToolContent builds the next snapshot: pi's partial results replace
+// text, so the latest text stands, while an image already delivered stays in
+// the array until the call ends.
+func mergeToolContent(previous []toolContentItem, next []toolContentItem) []toolContentItem {
+	if len(previous) == 0 {
+		return next
+	}
+
+	present := make(map[string]struct{}, len(next))
+	for _, item := range next {
+		present[item.key] = struct{}{}
+	}
+
+	merged := make([]toolContentItem, 0, len(previous)+len(next))
+
+	for _, item := range previous {
+		if _, ok := present[item.key]; item.imageBytes > 0 && !ok {
+			merged = append(merged, item)
+		}
+	}
+
+	return append(merged, next...)
+}
+
+func toolContent(items []toolContentItem) []acp.ToolCallContent {
 	content := make([]acp.ToolCallContent, 0, len(items))
 	for _, item := range items {
 		content = append(content, item.content)

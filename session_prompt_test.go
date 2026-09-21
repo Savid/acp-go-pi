@@ -1,992 +1,505 @@
 package piacp
 
 import (
-	"bufio"
-	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
-	"sync"
-	"sync/atomic"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/stretchr/testify/require"
 
-	"github.com/savid/acp-go-pi/internal/lifecycle"
-	"github.com/savid/acp-go-pi/internal/pi"
+	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/image"
+	"github.com/savid/acp-go-core/wire"
 )
 
-type blockingPanicStore struct {
-	*InMemorySessionStore
-	target  string
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
+func TestPromptMappingFlattensContext(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	uri := "file:///tmp/notes.md"
+	request := wire.PromptRequest(session.SessionId,
+		acp.TextBlock("ECHO hello"),
+		acp.ContentBlock{ResourceLink: &acp.ContentBlockResourceLink{Uri: uri, Name: "notes"}},
+		acp.ContentBlock{Resource: &acp.ContentBlockResource{Resource: acp.EmbeddedResourceResource{
+			TextResourceContents: &acp.TextResourceContents{Uri: uri, Text: "a < b"},
+		}}},
+	)
+
+	_, err := h.conn.Prompt(h.ctx(), request)
+	require.NoError(t, err)
+
+	text := agentText(h.rec.snapshot())
+	require.Contains(t, text, "ECHO hello\n"+uri+"\n"+uri+"\n\n<context ref=\""+uri+"\">\na &lt; b\n</context>")
 }
 
-func (s *blockingPanicStore) Append(ctx context.Context, key SessionKey, entries []SessionStoreEntry) error {
-	panicked := false
-	if key.Subpath == s.target {
-		s.once.Do(func() {
-			panicked = true
-			close(s.entered)
-			<-s.release
+func TestMapPromptSkipsUserOnlyText(t *testing.T) {
+	t.Parallel()
+
+	s := &session{agent: NewAgent(testOptions(t)...)}
+
+	mapped, err := s.mapPrompt(context.Background(), []acp.ContentBlock{
+		acp.TextBlock("kept"),
+		{Text: &acp.ContentBlockText{Text: "hidden", Annotations: &acp.Annotations{Audience: []acp.Role{acp.RoleUser}}}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "kept", mapped.message)
+
+	_, err = s.mapPrompt(context.Background(), []acp.ContentBlock{
+		{Text: &acp.ContentBlockText{Text: "hidden", Annotations: &acp.Annotations{Audience: []acp.Role{acp.RoleUser}}}},
+	})
+	require.Equal(t, "prompt", requestErrorData(t, err)["field"])
+}
+
+func TestPromptImagesForwardAndGate(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	_, err := h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId, acp.TextBlock("ECHO with image"), acp.ImageBlock(tinyPNG, "image/png")))
+	require.NoError(t, err)
+	require.Contains(t, agentText(h.rec.snapshot()), "images:1")
+
+	_, err = h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId, acp.ImageBlock("not base64!", "image/png")))
+	data := requestErrorData(t, err)
+	require.Equal(t, "invalid_base64", data["error"])
+	require.Equal(t, "prompt.image", data["field"])
+
+	blob := "application/pdf"
+	_, err = h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId, acp.ContentBlock{Resource: &acp.ContentBlockResource{Resource: acp.EmbeddedResourceResource{
+		BlobResourceContents: &acp.BlobResourceContents{Uri: "file:///x.pdf", Blob: base64.StdEncoding.EncodeToString([]byte("%PDF")), MimeType: &blob},
+	}}}))
+	data = requestErrorData(t, err)
+	require.Equal(t, "unsupported", data["error"])
+	require.Equal(t, "prompt.resource", data["field"])
+}
+
+func TestPromptImageRefusedForTextOnlyModel(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession(WithSessionPiOptions(NewPiOptions(WithPiModel("fake/text-only"))))
+
+	_, err := h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId, acp.TextBlock("look"), acp.ImageBlock(tinyPNG, "image/png")))
+	data := requestErrorData(t, err)
+	require.Equal(t, "unsupported_by_model", data["error"])
+	require.Equal(t, "prompt.image", data["field"])
+	require.EqualValues(t, 0, data["index"])
+}
+
+func TestPromptRejectedByNative(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	_, err := h.prompt(session.SessionId, "REJECT", nil)
+	require.Equal(t, -32603, requestErrorCode(t, err))
+
+	data := requestErrorData(t, err)
+	require.Equal(t, "pi_turn_failed", data["error"])
+	require.Equal(t, "provider", data["cause"])
+	require.Equal(t, "no provider key", data["message"])
+
+	resp, err := h.prompt(session.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
+}
+
+func TestPromptProviderError(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	_, err := h.prompt(session.SessionId, "ERROR", nil)
+	data := requestErrorData(t, err)
+	require.Equal(t, "pi_turn_failed", data["error"])
+	require.Equal(t, "provider", data["cause"])
+	require.Equal(t, "boom", data["message"])
+}
+
+func TestPromptCancelReturnsCancelled(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize(withLifecycle())
+	session := h.newSession()
+
+	type result struct {
+		resp acp.PromptResponse
+		err  error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		resp, err := h.prompt(session.SessionId, "SLOW", promptMeta(1))
+		done <- result{resp, err}
+	}()
+
+	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool { return len(lifecycleEvents(updates)) >= 3 })
+	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
+
+	got := <-done
+	require.NoError(t, got.err)
+	require.Equal(t, acp.StopReasonCancelled, got.resp.StopReason)
+
+	events := lifecycleEvents(h.rec.snapshot())
+	require.Equal(t, "cancelled", events[len(events)-1]["outcome"])
+
+	resp, err := h.prompt(session.SessionId, "HELLO", promptMeta(2))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
+}
+
+// A turn is the session's before the prompt has anything to dispatch, so a
+// session/cancel that lands while pi is still being relaunched ends it there:
+// the prompt answers cancelled, pi never receives the turn, and the lifecycle
+// stream carries nothing for it.
+func TestPromptCancelledWhileRelaunching(t *testing.T) {
+	t.Parallel()
+
+	held := filepath.Join(t.TempDir(), "relaunch-held")
+	store := &mirrorFaultStore{SessionStore: acpcore.NewInMemorySessionStore()}
+	h := newHarness(t, WithSessionStore(store),
+		WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvResumeHold: held}))
+	h.initialize(withLifecycle())
+	session := h.newSession()
+
+	// A failed mirror commit ends the generation, so the next prompt relaunches
+	// pi, and a relaunched fake announces itself and then answers nothing.
+	store.fail.Store(true)
+
+	_, err := h.prompt(session.SessionId, "HELLO", promptMeta(1))
+	require.Equal(t, "pi_turn_failed", requestErrorData(t, err)["error"])
+	store.fail.Store(false)
+
+	type result struct {
+		resp acp.PromptResponse
+		err  error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		resp, promptErr := h.prompt(session.SessionId, "HELLO", promptMeta(2))
+		done <- result{resp, promptErr}
+	}()
+
+	require.Eventually(t, func() bool {
+		_, statErr := os.Stat(held)
+
+		return statErr == nil
+	}, testTimeout, time.Millisecond)
+
+	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
+
+	got := <-done
+	require.NoError(t, got.err)
+	require.Equal(t, acp.StopReasonCancelled, got.resp.StopReason)
+
+	require.Equal(t, []string{"lifecycle_snapshot", "prompt_accepted", "state_update:running"},
+		eventTypes(lifecycleEvents(h.rec.snapshot())),
+		"a prompt pi never received opens no incarnation and publishes no acceptance")
+}
+
+// A turn belongs to its session, not to the request that started it: the
+// pinned SDK cancels a session's previous prompt context before dispatching
+// the next one, so a peer prompt this session refuses must leave the live turn
+// running.
+func TestRefusedPeerPromptLeavesTurnRunning(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize(withLifecycle())
+	session := h.newSession()
+
+	type result struct {
+		resp acp.PromptResponse
+		err  error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		resp, err := h.prompt(session.SessionId, "WAIT", promptMeta(1))
+		done <- result{resp, err}
+	}()
+
+	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool { return len(lifecycleEvents(updates)) >= 3 })
+
+	_, err := h.prompt(session.SessionId, "HELLO", promptMeta(2))
+	require.Equal(t, "backpressure", requestErrorData(t, err)["error"])
+	require.Equal(t, limitSessionPrompt, requestErrorData(t, err)["limit"])
+
+	got := <-done
+	require.NoError(t, got.err)
+	require.Equal(t, acp.StopReasonEndTurn, got.resp.StopReason)
+}
+
+func TestPromptWrapperExtensionFailure(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	_, err := h.prompt(session.SessionId, "EXTERR", nil)
+	data := requestErrorData(t, err)
+	require.Equal(t, "extension", data["cause"])
+	require.Equal(t, "boom", data["message"], "the extension's own error text reaches the host")
+}
+
+func TestPromptIdentityDriftPoisons(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	_, err := h.prompt(session.SessionId, "BADSESSION", nil)
+	require.NoError(t, err)
+
+	_, err = h.prompt(session.SessionId, "HELLO", nil)
+	data := requestErrorData(t, err)
+	require.Equal(t, "pi_session_poisoned", data["error"])
+	require.Equal(t, "native_session_identity_drift", data["cause"])
+
+	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool {
+		for _, update := range updates {
+			if commands := update.Update.AvailableCommandsUpdate; commands != nil && len(commands.AvailableCommands) == 0 {
+				return true
+			}
+		}
+
+		return false
+	})
+
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
+	require.NoError(t, err)
+}
+
+func TestJudgeCycle(t *testing.T) {
+	t.Parallel()
+
+	s := &session{}
+
+	require.Equal(t, "cancelled", s.judgeCycle(&cycle{}, true).stopReason)
+	require.Equal(t, "max_tokens", s.judgeCycle(&cycle{state: cycleState{stopReason: stopReasonLength}}, false).stopReason)
+	require.Equal(t, "cancelled", s.judgeCycle(&cycle{state: cycleState{stopReason: stopReasonAborted}}, false).stopReason)
+	require.Error(t, s.judgeCycle(&cycle{state: cycleState{stopReason: stopReasonError}}, false).failure)
+	require.Equal(t, "end_turn", s.judgeCycle(&cycle{state: cycleState{stopReason: "unrecognized"}}, false).stopReason)
+}
+
+// The handoff form reaches the same native input as the embedded form over the
+// same bytes, the handoff path appears in no native field, and handoff bytes
+// spend the prompt aggregate.
+func TestPromptHandoffImageInput(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+
+	raw, err := base64.StdEncoding.DecodeString(tinyPNG)
+	require.NoError(t, err)
+
+	path := filepath.Join(root, "input.png")
+	require.NoError(t, os.WriteFile(path, raw, 0o600))
+
+	digest := sha256.Sum256(raw)
+	uri := "file://" + path
+
+	block := func(envelope map[string]any) acp.ContentBlock {
+		image := acp.ImageBlock("", "image/png")
+		image.Image.Uri = &uri
+		image.Image.Meta = map[string]any{wire.HandoffKey: envelope}
+
+		return image
+	}
+
+	envelope := map[string]any{"version": 1, "digest": hex.EncodeToString(digest[:]), "sizeBytes": len(raw)}
+	rooted := &session{agent: NewAgent(append(testOptions(t), WithInputHandoffRoot(root))...)}
+
+	embedded, err := rooted.mapPrompt(t.Context(), []acp.ContentBlock{acp.ImageBlock(tinyPNG, "image/png")})
+	require.NoError(t, err)
+
+	transported, err := rooted.mapPrompt(t.Context(), []acp.ContentBlock{block(envelope)})
+	require.NoError(t, err)
+	require.Equal(t, embedded.images, transported.images, "the handoff form reaches the same native input")
+
+	encoded, err := json.Marshal(transported.images)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), root)
+	require.NotContains(t, transported.message, root)
+
+	unrooted := &session{agent: NewAgent(testOptions(t)...)}
+	_, err = unrooted.mapPrompt(t.Context(), []acp.ContentBlock{block(envelope)})
+	require.Equal(t, image.ErrorInvalidHandoff, requestErrorData(t, err)["error"])
+
+	mismatch := map[string]any{"version": 1, "digest": hex.EncodeToString(make([]byte, sha256.Size)), "sizeBytes": len(raw)}
+	_, err = rooted.mapPrompt(t.Context(), []acp.ContentBlock{block(mismatch)})
+	require.Equal(t, image.ErrorDigestMismatch, requestErrorData(t, err)["error"])
+
+	bounded := &session{agent: NewAgent(append(testOptions(t),
+		WithInputHandoffRoot(root), WithImageLimits(ImageLimits{MaxInputBytesPerPrompt: int64(len(raw))}))...)}
+	_, err = bounded.mapPrompt(t.Context(), []acp.ContentBlock{block(envelope), block(envelope)})
+	require.Equal(t, image.ErrorTooLarge, requestErrorData(t, err)["error"], "handoff bytes spend the prompt aggregate")
+}
+
+// A $/cancel_request ends only the addressed handler's context: the turn it
+// was driving stays the session's, completes successfully once, and the
+// session keeps serving prompts.
+func TestCancelRequestSettlesTheOriginalRequestOnce(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	permissionCtx, releasePermission := context.WithCancel(t.Context())
+	defer releasePermission()
+	entered := make(chan struct{}, 1)
+	answer := h.rec.answer
+	h.rec.answer = func(request acp.RequestPermissionRequest) acp.RequestPermissionResponse {
+		entered <- struct{}{}
+		<-permissionCtx.Done()
+
+		return answer(request)
+	}
+	h.initialize(withLifecycle())
+	session := h.newSession()
+
+	request := wire.TextPromptRequest(session.SessionId, "TOOL")
+	request.Meta = promptMeta(1)
+	failed := make(chan error, 1)
+
+	go func() {
+		response, err := h.conn.Prompt(h.ctx(), request)
+		if err == nil && response.StopReason != acp.StopReasonEndTurn {
+			err = errors.New("request cancellation ended the native turn")
+		}
+		failed <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-h.ctx().Done():
+		t.Fatal("native permission request did not arrive")
+	}
+	require.NoError(t, h.input.cancelPrompt())
+
+	_, busyErr := h.prompt(session.SessionId, "HELLO", promptMeta(2))
+	require.Equal(t, "backpressure", requestErrorData(t, busyErr)["error"])
+	releasePermission()
+	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool {
+		return slices.Contains(eventTypes(lifecycleEvents(updates)), "state_update:idle")
+	})
+
+	idles := 0
+
+	for _, update := range h.rec.snapshot() {
+		envelope, _ := update.Meta[wire.LifecycleKey].(map[string]any)
+		event, _ := envelope["event"].(map[string]any)
+		if event["type"] == "state_update" && event["state"] == "idle" {
+			idles++
+			require.Equal(t, "success", event["outcome"])
+			require.Equal(t, string(acp.StopReasonEndTurn), event["stopReason"])
+		}
+	}
+
+	require.Equal(t, 1, idles, "the turn the cancelled request started settles exactly once")
+	require.NoError(t, <-failed)
+
+	resp, err := h.prompt(session.SessionId, "HELLO", promptMeta(3))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, resp.StopReason)
+}
+
+func TestPromptRefusesTextAfterImagesBeforeDispatch(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		tail acp.ContentBlock
+	}{
+		{"text", acp.TextBlock("after")},
+		{"resource link", acp.ContentBlock{ResourceLink: &acp.ContentBlockResourceLink{Uri: "file:///notes.txt", Name: "notes"}}},
+		{"text resource", acp.ContentBlock{Resource: &acp.ContentBlockResource{Resource: acp.EmbeddedResourceResource{
+			TextResourceContents: &acp.TextResourceContents{Uri: "file:///notes.txt", Text: "after"},
+		}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			h.initialize()
+			session := h.newSession()
+			h.rec.waitFor(t, func(updates []acp.SessionNotification) bool {
+				return slices.ContainsFunc(updates, func(update acp.SessionNotification) bool {
+					return update.Update.AvailableCommandsUpdate != nil
+				})
+			})
+			before := h.rec.snapshot()
+			_, err := h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId,
+				acp.TextBlock("before"), acp.ImageBlock(tinyPNG, "image/png"), tc.tail))
+			require.Equal(t, map[string]any{"error": "unsupported", "field": "prompt"}, requestErrorData(t, err))
+			require.Equal(t, before, h.rec.snapshot(), "refusal publishes no turn updates")
+			_, err = h.conn.Prompt(h.ctx(), wire.PromptRequest(session.SessionId, acp.TextBlock("ECHO after refusal")))
+			require.NoError(t, err)
+			require.Contains(t, agentText(h.rec.snapshot()[len(before):]), "after refusal")
+			require.NotContains(t, agentText(h.rec.snapshot()[len(before):]), "images:")
 		})
 	}
-	if panicked {
-		panic("session store panic secret")
-	}
-
-	return s.InMemorySessionStore.Append(ctx, key, entries)
 }
 
-func TestPromptContentMapping(t *testing.T) {
+func TestMapPromptAcceptsImageGroup(t *testing.T) {
+	t.Parallel()
+	s := &session{agent: NewAgent(testOptions(t)...)}
 	mime := "image/png"
-	png := fixtureBase64(t, "valid.png")
-	textResource := acp.EmbeddedResourceResource{TextResourceContents: &acp.TextResourceContents{
-		Uri: "file:///a<&\"'", Text: "body <&>",
-	}}
-	imageResource := acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{
-		Uri: "file:///image", Blob: png, MimeType: &mime,
-	}}
-	userAnnotations := &acp.Annotations{Audience: []acp.Role{acp.RoleUser}}
-	ignored := acp.TextBlock("ignored")
-	ignored.Text.Annotations = userAnnotations
-
-	mapped, err := promptToPi(t.Context(), []acp.ContentBlock{
-		acp.TextBlock("hello"), ignored,
-		acp.ImageBlock(png, "image/png"),
-		acp.ResourceLinkBlock("link", " https://example.test "),
-		acp.ResourceBlock(textResource),
-		acp.ResourceBlock(imageResource),
-	}, defaultImageLimits(), "")
-	require.NoError(t, err)
-	require.Contains(t, mapped.Message, "hello")
-	require.NotContains(t, mapped.Message, "ignored")
-	require.Contains(t, mapped.Message, "https://example.test")
-	require.Contains(t, mapped.Message, "&lt;")
-	require.Len(t, mapped.Images, 2)
-
-	invalid := [][]acp.ContentBlock{
-		nil,
-		{{}},
-		{acp.TextBlock("  ")},
-		{acp.AudioBlock("data", "audio/wav")},
-		{acp.ImageBlock("", "image/png")},
-		{acp.ResourceBlock(acp.EmbeddedResourceResource{})},
-		{acp.ResourceBlock(acp.EmbeddedResourceResource{BlobResourceContents: &acp.BlobResourceContents{Uri: "x", Blob: "data"}})},
-	}
-	for _, blocks := range invalid {
-		_, invalidErr := promptToPi(t.Context(), blocks, defaultImageLimits(), "")
-		requireInvalidParams(t, invalidErr)
-	}
-
-	text, contextText, image, err := resourceToPi(textResource, newPromptImageBudget(defaultImageLimits(), ""))
-	require.NoError(t, err)
-	require.NotEmpty(t, text)
-	require.NotEmpty(t, contextText)
-	require.Nil(t, image)
-	require.Equal(t, "&amp;&lt;&gt;&quot;&apos;", xmlEscape("&<>\"'"))
-}
-
-func TestAcpStopReasonMapping(t *testing.T) {
-	session := &agentSession{agent: &Agent{log: slog.New(slog.DiscardHandler)}}
-	for native, want := range map[string]acp.StopReason{
-		stopReasonStop:      acp.StopReasonEndTurn,
-		stopReasonLength:    acp.StopReasonMaxTokens,
-		stopReasonMaxTokens: acp.StopReasonMaxTokens,
-		stopReasonAborted:   acp.StopReasonCancelled,
-		"unknown":           acp.StopReasonEndTurn,
-	} {
-		require.Equal(t, want, acpStopReason(session, &promptTurnState{stopReason: native}))
-	}
-}
-
-func TestPromptSecondPoisonCheck(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	client := newStubPiClient()
-	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
-	lateCtx := &poisonOnAdmissionContext{session: session}
-
-	_, err := session.Prompt(lateCtx, TextPromptRequest("id", "test-turn", "hi"))
-	require.Error(t, err)
-}
-
-func TestPromptClientPromptFailure(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	client := newStubPiClient()
-	client.promptErr = errors.New("prompt")
-	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
-
-	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "test-turn", "hi"))
-	requirePiTurnFailure(t, err, failureCauseTransport)
-}
-
-func TestPromptExactGenerationFailureEdges(t *testing.T) {
-	newSession := func() (*agentSession, *stubPiClient, *stubProcess, *sessionOutbox) {
-		agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-		client := newStubPiClient()
-		process := newStubProcess(false)
-		session := &agentSession{agent: agent, id: "id", client: client, proc: process}
-		outbox := bindTestOutbox(session)
-
-		return session, client, process, outbox
-	}
-
-	t.Run("foreground claim refused", func(t *testing.T) {
-		session, _, _, _ := newSession()
-		session.promptAdmission = newTurnDelivery()
-		_, err := session.Prompt(t.Context(), TextPromptRequest("id", "claim", "hi"))
-		requireInvalidRequest(t, err)
-	})
-
-	t.Run("close wins after foreground claim", func(t *testing.T) {
-		session, _, process, _ := newSession()
-		process.onExited = func() {
-			session.mu.Lock()
-			session.closing = true
-			session.mu.Unlock()
-		}
-		_, err := session.Prompt(t.Context(), TextPromptRequest("id", "reserve", "hi"))
-		requireInvalidParams(t, err)
-	})
-
-	t.Run("unaccepted write failure fences generation", func(t *testing.T) {
-		session, client, process, _ := newSession()
-		client.promptErr = errors.New("prompt write")
-		_, err := session.Prompt(t.Context(), TextPromptRequest("id", "write", "hi"))
-		requirePiTurnFailure(t, err, failureCauseTransport)
-		require.Equal(t, 1, process.closeCalls)
-	})
-
-	t.Run("poison outranks unaccepted write failure", func(t *testing.T) {
-		session, client, _, _ := newSession()
-		client.promptFunc = func(context.Context, string) error {
-			session.mu.Lock()
-			session.poisonCause = "write poisoned"
-			session.mu.Unlock()
-
-			return errors.New("prompt write")
-		}
-		_, err := session.Prompt(t.Context(), TextPromptRequest("id", "poison", "hi"))
-		require.ErrorContains(t, err, "write poisoned")
-	})
-
-	t.Run("cancelled turn observes structural transport owner", func(t *testing.T) {
-		session, client, _, outbox := newSession()
-		client.err = pi.ErrJSONLStructural
-		cancelled, cancel := context.WithCancel(t.Context())
-		cancel()
-		outcome := session.runPromptTurn(cancelled, outbox, newTurnDelivery(), &promptTurnState{})
-		require.True(t, outcome.transportEnded)
-		require.False(t, outcome.contextEnded)
-	})
-}
-
-func TestPromptRecoversEndedGenerationBeforeReservingSuccessor(t *testing.T) {
-	agent := NewAgent(
-		WithLogger(slog.New(slog.DiscardHandler)),
-		WithSessionStore(NewInMemorySessionStore()),
-	)
-	connection := newDirectAgentClient()
-	agent.setConnection(connection)
-
-	oldClient := newStubPiClient()
-	oldProcess := newStubProcess(true)
-	successorClient := newStubPiClient()
-	successorProcess := newStubProcess(false)
-
-	sessionFile := filepath.Join(t.TempDir(), "session.jsonl")
-	require.NoError(t, os.WriteFile(sessionFile, []byte("{\"type\":\"session\"}\n"), 0o600))
-	successorClient.state = pi.SessionState{SessionID: "id", SessionFile: sessionFile}
-	successorClient.stats = pi.SessionStats{SessionID: "id"}
-
-	session := &agentSession{
-		agent:           agent,
-		id:              "id",
-		client:          oldClient,
-		proc:            oldProcess,
-		sessionFilePath: sessionFile,
-	}
-	prepareRelaunchFixture(t, session)
-
-	starts := 0
-	agent.startPiProcess = func(context.Context, pi.LaunchSpec) (piProcess, piClient, error) {
-		starts++
-
-		return successorProcess, successorClient, nil
-	}
-
-	var prompts atomic.Int32
-	successorClient.promptFunc = func(ctx context.Context, message string) error {
-		prompts.Add(1)
-
-		go func() {
-			for session.outboxRouter().foreground() == nil {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(time.Millisecond):
-				}
-			}
-
-			for _, event := range []pi.Event{
-				pi.MessageStartEvent{Message: pi.AgentMessage{Role: messageRoleAssistant}},
-				pi.MessageUpdateEvent{AssistantMessageEvent: pi.AssistantMessageEvent{
-					Type: assistantEventTextDelta, Delta: "reply:" + message,
-				}},
-				pi.MessageEndEvent{Message: pi.AgentMessage{Role: messageRoleAssistant, StopReason: stopReasonStop}},
-				pi.AgentSettledEvent{},
-			} {
-				select {
-				case successorClient.events <- event:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-
-		return nil
-	}
-
-	startTestPump(session, oldClient)
-	session.mu.Lock()
-	oldPumpDone := session.pumpDone
-	session.mu.Unlock()
-	close(oldClient.events)
-	close(oldClient.uiRequests)
-	<-oldPumpDone
-
-	readText := func(start int) string {
-		var output strings.Builder
-		for _, update := range connection.updates[start:] {
-			if update.AgentMessageChunk != nil && update.AgentMessageChunk.Content.Text != nil {
-				output.WriteString(update.AgentMessageChunk.Content.Text.Text)
-			}
-		}
-
-		return output.String()
-	}
-
-	firstUpdate := len(connection.updates)
-	first, err := session.Prompt(t.Context(), TextPromptRequest("id", "first", "one"))
-	require.NoError(t, err)
-	require.Equal(t, acp.StopReasonEndTurn, first.StopReason)
-	require.Contains(t, readText(firstUpdate), "reply:one")
-	require.Equal(t, 1, starts)
-	require.Equal(t, int32(1), prompts.Load())
-	require.Equal(t, 1, oldProcess.closeCalls)
-	require.Zero(t, successorProcess.shutdownCalls)
-	require.Zero(t, successorProcess.closeCalls)
-
-	secondUpdate := len(connection.updates)
-	second, err := session.Prompt(t.Context(), TextPromptRequest("id", "second", "two"))
-	require.NoError(t, err)
-	require.Equal(t, acp.StopReasonEndTurn, second.StopReason)
-	require.Contains(t, readText(secondUpdate), "reply:two")
-	require.Equal(t, int32(2), prompts.Load())
-	require.Zero(t, successorProcess.shutdownCalls)
-	require.Zero(t, successorProcess.closeCalls)
-
-	session.stopPump()
-}
-
-func TestPromptParentCancellationContainsProcessTree(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	client := newStubPiClient()
-	process := newStubProcess(false)
-	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
-	startTestPump(session, client)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	promptDone := make(chan struct {
-		response acp.PromptResponse
-		err      error
-	}, 1)
-	go func() {
-		response, err := session.Prompt(ctx, TextPromptRequest("id", "parent-cancel", "hang"))
-		promptDone <- struct {
-			response acp.PromptResponse
-			err      error
-		}{response: response, err: err}
-	}()
-
-	require.Eventually(t, func() bool { return session.activeTurnDelivery() != nil }, time.Second, time.Millisecond)
-	cancel()
-	result := <-promptDone
-	require.NoError(t, result.err)
-	require.Equal(t, acp.StopReasonCancelled, result.response.StopReason)
-	require.Equal(t, 1, process.killCalls)
-	require.Equal(t, 1, process.closeCalls)
-}
-
-func TestPromptParentCancellationReturnsContainmentFailure(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	client := newStubPiClient()
-	process := newStubProcess(false)
-	process.close = ErrContainmentIncomplete
-	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
-	startTestPump(session, client)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	promptDone := make(chan error, 1)
-	go func() {
-		_, err := session.Prompt(ctx, TextPromptRequest("id", "parent-cancel-incomplete", "hang"))
-		promptDone <- err
-	}()
-
-	require.Eventually(t, func() bool { return session.activeTurnDelivery() != nil }, time.Second, time.Millisecond)
-	cancel()
-	require.ErrorIs(t, <-promptDone, ErrContainmentIncomplete)
-}
-
-// TestSettlementReportsAnIncompleteContainmentBoundary pins that a boundary
-// which did not complete outranks the terminal event it precedes: every accepted
-// exit reports the containment failure and none of them commits or settles.
-func TestSettlementReportsAnIncompleteContainmentBoundary(t *testing.T) {
-	fenceErr := ErrContainmentIncomplete
-	var timedOut atomic.Bool
-
-	for name, outcome := range map[string]promptOutcome{
-		"transport ended":  {transportEnded: true},
-		"context ended":    {contextEnded: true},
-		"natively settled": {settled: true},
-	} {
-		t.Run(name, func(t *testing.T) {
-			done := make(chan struct{})
-			close(done)
-			session := &agentSession{
-				agent:            NewAgent(WithLogger(slog.New(slog.DiscardHandler))),
-				turnFenceStarted: true,
-				turnFenceDone:    done,
-				turnFenceErr:     fenceErr,
-			}
-
-			_, err := session.settlePrompt(
-				t.Context(), TextPromptRequest("id", "turn", "done"), &promptTurnState{}, outcome, &timedOut,
-			)
-			require.ErrorIs(t, err, fenceErr)
-		})
-	}
-}
-
-func TestPromptTransportEndReturnsContainmentProofFailure(t *testing.T) {
-	fenceErr := ErrContainmentIncomplete
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	client := newStubPiClient()
-	process := newStubProcess(false)
-	process.close = fenceErr
-	session := &agentSession{agent: agent, id: "id", client: client, proc: process}
-	startTestPump(session, client)
-	t.Cleanup(session.stopPump)
-
-	go func() {
-		deadline := time.Now().Add(time.Second)
-		for session.activeTurnDelivery() == nil && time.Now().Before(deadline) {
-			time.Sleep(time.Millisecond)
-		}
-
-		close(client.events)
-		close(client.uiRequests)
-	}()
-
-	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "transport-end", "hang"))
-	require.ErrorIs(t, err, fenceErr)
-}
-
-func TestPromptHandleTurnEventEmitFailure(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	connection := newDirectAgentClient()
-	want := errors.New("emit")
-	connection.updateErr = want
-	agent.setConnection(connection)
-	session := &agentSession{agent: agent, id: "id"}
-	delivery := &turnDelivery{events: make(chan pi.Event, 1)}
-	delivery.events <- pi.ToolExecutionStartEvent{ToolCallID: "call", ToolName: "bash"}
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-
-	outcome := session.runPromptTurn(ctx, nil, delivery, &promptTurnState{})
-	require.ErrorIs(t, outcome.failure, want)
-	require.False(t, outcome.settled)
-	require.False(t, outcome.transportEnded)
-	state := session.lockToolCallState("call")
-	defer state.mu.Unlock()
-	require.False(t, state.published, "failed tool start was marked delivered")
-	require.False(t, state.nativeStartPublished)
-}
-
-func TestMessageEndIdentityEmitFailure(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	connection := newDirectAgentClient()
-	connection.updateErr = errors.New("emit identity")
-	agent.setConnection(connection)
-	session := &agentSession{agent: agent, id: "id"}
-
-	_, err := session.handleTurnEvent(t.Context(), pi.MessageEndEvent{Message: pi.AgentMessage{
-		Role: messageRoleAssistant, ACPMessageID: "018f47ad-839d-7f70-b7f7-c01d6d97b675",
-	}}, &promptTurnState{})
-	require.ErrorContains(t, err, "emit identity")
-}
-
-func TestSettlementCommitMirrorFailure(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithTurnTimeout(time.Second))
-	connection := newDirectAgentClient()
-	agent.setConnection(connection)
-	client := newStubPiClient()
-	client.stats = pi.SessionStats{SessionID: "id"}
-	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false), sessionFilePath: t.TempDir()}
-
-	var timedOut atomic.Bool
-	settled := promptOutcome{settled: true}
-	_, err := session.settlePrompt(t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, settled, &timedOut)
-	require.Error(t, err)
-
-	session.turnCancelled = true
-	session.turnCommitOnCancel = true
-	session.turnNativeSettled = true
-	_, err = session.settlePrompt(t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, settled, &timedOut)
-	require.Error(t, err, "a settled cancellation must not hide its mirror failure")
-}
-
-func TestSettledCancelCommitsMirrorBeforeItsTerminalIdle(t *testing.T) {
-	store := NewInMemorySessionStore()
-	agent := NewAgent(
-		WithLogger(slog.New(slog.DiscardHandler)),
-		WithSessionStore(store),
-	)
-	path := filepath.Join(t.TempDir(), "session.jsonl")
-	require.NoError(t, os.WriteFile(path, []byte("{\"type\":\"session\"}\n{\"type\":\"message\"}\n"), 0o600))
-	session := &agentSession{
-		agent:              agent,
-		id:                 "id",
-		sessionFilePath:    path,
-		turnCancelled:      true,
-		turnCommitOnCancel: true,
-		turnNativeSettled:  true,
-	}
-
-	var timedOut atomic.Bool
-	timedOut.Store(true)
-	response, err := session.settlePrompt(
-		t.Context(), TextPromptRequest("id", "test-turn", "title"), &promptTurnState{}, promptOutcome{settled: true}, &timedOut,
-	)
-	require.NoError(t, err)
-	require.Equal(t, acp.StopReasonCancelled, response.StopReason,
-		"an explicit cancel must win a simultaneous timeout")
-	entries, err := store.Load(t.Context(), SessionKey{SessionID: "id"})
-	require.NoError(t, err)
-	require.Len(t, entries, 2, "the durable cancelled generation must precede the response")
-}
-
-func TestTurnEventAndUsageBranches(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	connection := newDirectAgentClient()
-	agent.setConnection(connection)
-	client := newStubPiClient()
-	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false), contextWindowSize: 123}
-	state := &promptTurnState{}
-
-	settled, err := session.handleTurnEvent(t.Context(), pi.AgentSettledEvent{}, state)
-	require.NoError(t, err)
-	require.True(t, settled)
-	_, err = session.handleTurnEvent(t.Context(), pi.MessageStartEvent{Message: pi.AgentMessage{Role: messageRoleAssistant, Model: "m", Provider: "p"}}, state)
-	require.NoError(t, err)
-	require.Equal(t, "m", state.model)
-
-	for _, delta := range []pi.AssistantMessageEvent{
-		{Type: assistantEventTextDelta, Delta: "text"},
-		{Type: assistantEventTextDelta},
-		{Type: assistantEventThinkingDelta, Delta: "thought"},
-		{Type: assistantEventThinkingDelta},
-		{Type: "unknown", Delta: "ignored"},
-	} {
-		_, err = session.handleTurnEvent(t.Context(), pi.MessageUpdateEvent{AssistantMessageEvent: delta}, state)
+	blob := acp.ContentBlock{Resource: &acp.ContentBlockResource{Resource: acp.EmbeddedResourceResource{
+		BlobResourceContents: &acp.BlobResourceContents{Uri: "file:///provenance.png", MimeType: &mime, Blob: tinyPNG},
+	}}}
+	for _, prefix := range [][]acp.ContentBlock{nil, {acp.TextBlock("caption")}} {
+		blocks := append(slices.Clone(prefix), acp.ImageBlock(tinyPNG, "image/png"), blob,
+			acp.ContentBlock{Text: &acp.ContentBlockText{Text: "display only", Annotations: &acp.Annotations{Audience: []acp.Role{acp.RoleUser}}}})
+		mapped, err := s.mapPrompt(t.Context(), blocks)
 		require.NoError(t, err)
+		require.Len(t, mapped.images, 2)
+		require.NotContains(t, mapped.message, "provenance")
+		require.NotContains(t, mapped.message, "display only")
+		if len(prefix) == 0 {
+			require.Empty(t, mapped.message)
+		} else {
+			require.Equal(t, "caption", mapped.message)
+		}
 	}
-
-	usage := &pi.Usage{Input: 1, Output: 2, CacheRead: 3, CacheWrite: 4, Cost: &pi.UsageCost{Total: 0.5}}
-	_, err = session.handleTurnEvent(t.Context(), pi.MessageEndEvent{Message: pi.AgentMessage{
-		Role: messageRoleAssistant, Model: "model", Provider: "provider", StopReason: stopReasonStop,
-		ErrorMessage: "error", Usage: usage, ACPMessageID: "018f47ad-839d-7f70-b7f7-c01d6d97b675",
-	}}, state)
-	require.NoError(t, err)
-	require.Equal(t, 10, state.usage.TotalTokens)
-	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675", state.nativeMessageID)
-	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675",
-		anyMap(t, connection.notifications[len(connection.notifications)-1].Meta[piMetaKey])[jsonFieldMessageID])
-	mergeTurnUsage(state.usage, nil)
-	mergeTurnUsage(state.usage, &pi.Usage{Input: 2})
-	require.Equal(t, 12, state.usage.TotalTokens)
-
-	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionStartEvent{ToolCallID: "call", ToolName: "bash", Args: json.RawMessage(`{"x":true}`)}, state)
-	require.NoError(t, err)
-	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionUpdateEvent{ToolCallID: "call"}, state)
-	require.NoError(t, err)
-	result := &pi.ToolResult{Content: []pi.ContentBlock{{Type: contentBlockTypeText, Text: "output"}}}
-	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionUpdateEvent{ToolCallID: "call", PartialResult: result}, state)
-	require.NoError(t, err)
-	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionEndEvent{ToolCallID: "call", IsError: true, Result: result}, state)
-	require.NoError(t, err)
-	_, err = session.handleTurnEvent(t.Context(), pi.ToolExecutionEndEvent{ToolCallID: "call"}, state)
-	require.NoError(t, err)
-	_, err = session.handleTurnEvent(t.Context(), pi.AgentStartEvent{}, state)
-	require.NoError(t, err)
-
-	require.EqualValues(t, 123, session.currentModelContextWindow())
-	client.statsErr = errors.New("stats")
-	require.Nil(t, session.settledSessionStats(t.Context()))
-	client.statsErr = nil
-	tokens := int64(7)
-	client.stats = pi.SessionStats{ContextUsage: &pi.ContextUsage{Tokens: &tokens, ContextWindow: 456}}
-	require.NotNil(t, session.settledSessionStats(t.Context()))
-	session.emitTurnUsageUpdate(t.Context(), &promptTurnState{}, nil)
-	session.emitTurnUsageUpdate(t.Context(), state, &client.stats)
-	require.NotEmpty(t, connection.updates)
 }
 
-func TestTurnTerminationBranches(t *testing.T) {
-	previousGrace := processExitClassifyGrace
-	processExitClassifyGrace = time.Millisecond
-	t.Cleanup(func() { processExitClassifyGrace = previousGrace })
-
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithTurnTimeout(time.Second))
-	client := newStubPiClient()
-	session := &agentSession{agent: agent, client: client, proc: newStubProcess(false)}
-	var timedOut atomic.Bool
-
-	request := TextPromptRequest("id", "turn", "done")
-	settle := func(outcome promptOutcome) (acp.PromptResponse, error) {
-		return session.settlePrompt(t.Context(), request, &promptTurnState{}, outcome, &timedOut)
-	}
-
-	response, err := settle(promptOutcome{transportEnded: true})
-	requirePiTurnFailure(t, err, failureCauseTransport)
-	require.Empty(t, response.StopReason)
-	client.err = errors.New("native stream")
-	_, err = settle(promptOutcome{transportEnded: true})
-	requirePiTurnFailure(t, err, failureCauseTransport)
-
-	timedOut.Store(true)
-	_, err = settle(promptOutcome{transportEnded: true})
-	requirePiTurnFailure(t, err, failureCauseTimeout)
-	_, err = settle(promptOutcome{contextEnded: true})
-	requirePiTurnFailure(t, err, failureCauseTimeout)
-	timedOut.Store(false)
-	response, err = settle(promptOutcome{contextEnded: true})
+// Handler cancellation can precede native dispatch; only session cancellation owns the turn.
+func TestPromptOwnsCancellationBeforeDispatch(t *testing.T) {
+	t.Parallel()
+	a := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = a.Close() })
+	a.attach(newRecorder(), nil)
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
 	require.NoError(t, err)
-	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
-
-	session.turnCancelled = true
-	response, err = settle(promptOutcome{transportEnded: true})
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
 	require.NoError(t, err)
-	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
-	response, err = settle(promptOutcome{contextEnded: true})
-	require.NoError(t, err)
-	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
-
-	session.turnCancelled = false
-	session.proc = newStubProcess(true)
-	_, err = settle(promptOutcome{transportEnded: true})
-	requirePiTurnFailure(t, err, failureCauseProcessExit)
-
-	session.proc = newStubProcess(false)
-	session.client = nil
-	requirePiTurnFailure(t, session.transportFailure(t.Context()), failureCauseTransport)
-}
-
-func TestPromptAndSettlementErrorBranches(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithTurnTimeout(time.Second))
-	connection := newDirectAgentClient()
-	agent.setConnection(connection)
-	client := newStubPiClient()
-	client.stats = pi.SessionStats{SessionID: "id"}
-	session := &agentSession{agent: agent, id: "id", client: client, proc: newStubProcess(false)}
-
-	session.poisonCause = "poisoned"
-	_, err := session.Prompt(t.Context(), TextPromptRequest("id", "test-turn", "hello"))
-	require.Error(t, err)
-	session.poisonCause = ""
-	release, err := session.acquireTurn(t.Context())
-	require.NoError(t, err)
-	_, err = session.Prompt(t.Context(), TextPromptRequest("id", "test-turn", "hello"))
-	requireInvalidRequest(t, err)
-	release()
-	_, err = session.Prompt(t.Context(), PromptRequest("id", "test-turn"))
-	requireInvalidParams(t, err)
-	session.proc = nil
-	_, err = session.Prompt(t.Context(), TextPromptRequest("id", "test-turn", "hello"))
-	requirePiTurnFailure(t, err, failureCauseTransport)
-
-	finish := func(state *promptTurnState, timedOut bool) (acp.PromptResponse, error) {
-		var timeout atomic.Bool
-		timeout.Store(timedOut)
-
-		return session.settlePrompt(t.Context(), TextPromptRequest("id", "test-turn", "title"), state, promptOutcome{settled: true}, &timeout)
-	}
-	session.proc = newStubProcess(false)
-	client.stats = pi.SessionStats{SessionID: "other"}
-	_, err = finish(&promptTurnState{}, false)
-	require.Error(t, err)
-	session.poisonCause = ""
-	client.stats = pi.SessionStats{SessionID: "id"}
-	connection.updateErr = errors.New("update")
-	_, err = finish(&promptTurnState{}, false)
-	require.Error(t, err)
-	connection.updateErr = nil
-	session.turnCancelled = true
-	response, err := finish(&promptTurnState{}, false)
-	require.NoError(t, err)
-	require.Equal(t, acp.StopReasonCancelled, response.StopReason)
-	session.turnCancelled = false
-	_, err = finish(&promptTurnState{}, true)
-	requirePiTurnFailure(t, err, failureCauseTimeout)
-	_, err = finish(&promptTurnState{stopReason: stopReasonError, errorMessage: "provider"}, false)
-	requirePiTurnFailure(t, err, failureCauseProvider)
-	response, err = finish(&promptTurnState{
-		stopReason: stopReasonStop, nativeMessageID: "018f47ad-839d-7f70-b7f7-c01d6d97b675",
-	}, false)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	response, err := a.Prompt(ctx, wire.TextPromptRequest(created.SessionId, "HELLO"))
 	require.NoError(t, err)
 	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
-	require.Equal(t, "018f47ad-839d-7f70-b7f7-c01d6d97b675",
-		anyMap(t, response.Meta[piMetaKey])[jsonFieldMessageID])
-}
-
-// TestPromptRejectsMalformedLifecycleCorrelation pins the validation order:
-// the lifecycle submission identity is validated right after the route, so a
-// negotiated prompt carrying neither a valid version nor a valid submission
-// fails before admission and creates neither submission nor turn.
-func TestPromptRejectsMalformedLifecycleCorrelation(t *testing.T) {
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
-	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
-	session := &agentSession{agent: agent, id: "id", client: newStubPiClient(), proc: newStubProcess(false)}
-
-	missing := TextPromptRequest("id", "turn", "hi")
-	_, err := session.Prompt(t.Context(), missing)
-	require.Error(t, err, "a negotiated prompt without its correlation fails")
-
-	malformed := TextPromptRequest("id", "turn", "hi")
-	malformed.Meta[lifecycleMetaKey] = decodeMeta(t, `{"version":1.5}`)
-	_, err = session.Prompt(t.Context(), malformed)
-	require.Error(t, err, "a fractional version is no negotiated version")
-}
-
-// decodeMeta decodes a lifecycle correlation value the way the wire delivers
-// it, so numbers arrive as the float64 a real host's decoder produces.
-func decodeMeta(t *testing.T, raw string) map[string]any {
-	t.Helper()
-	var meta map[string]any
-	require.NoError(t, json.Unmarshal([]byte(raw), &meta))
-
-	return meta
-}
-
-// TestPromptAcceptanceDeliveryFailureFailsTheTurn pins that a prompt whose
-// prompt_accepted event cannot be delivered still runs the whole settlement
-// order and answers with the failure: the incarnation fences, the boundary
-// record commits, and no terminal idle is published.
-func TestPromptAcceptanceDeliveryFailureFailsTheTurn(t *testing.T) {
-	store := NewInMemorySessionStore()
-	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)), WithSessionStore(store))
-	agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true, ActivityKinds: []lifecycle.ActivityKind{}}
-	connection := newDirectAgentClient()
-	agent.setConnection(connection)
-	session := &agentSession{agent: agent, id: "id", client: newStubPiClient(), proc: newStubProcess(false)}
-	generation := startTestPump(session, session.client)
-	t.Cleanup(session.stopPump)
-	require.NoError(t, session.openLifecycleStream(t.Context(), generation))
-
-	connection.updateErr = errors.New("accept delivery")
-	request := TextPromptRequest("id", "turn", "hi")
-	request.Meta[lifecycleMetaKey] = decodeMeta(t, `{"version":1,"submission":{"submissionId":"submission","clientNonce":"nonce"}}`)
-	_, err := session.Prompt(t.Context(), request)
-	require.ErrorContains(t, err, "accept delivery")
-	require.True(t, session.lc.fenced, "an undeliverable acceptance fences the incarnation")
-
-	entries, loadErr := store.Load(t.Context(), SessionKey{SessionID: "id", Subpath: SessionStoreLifecycleSubpath})
-	require.NoError(t, loadErr)
-	require.Len(t, entries, 1, "the failed cycle still records how the incarnation ended")
-	require.Contains(t, string(entries[0]), `"outcome":"failed"`)
-}
-
-// TestAwaitSettlementWaitsForTheWholeOrder pins the latch semantics: close and
-// delete block until settlement has finished the whole order and then observe
-// its result, and a completed latch settles nothing twice.
-func TestAwaitSettlementWaitsForTheWholeOrder(t *testing.T) {
-	session := &agentSession{}
-	require.NoError(t, session.awaitSettlement(), "no armed settlement settles nothing")
-
-	session.openSettlement()
-	session.mu.Lock()
-	settlement := session.settlement
-	session.mu.Unlock()
-	settleErr := errors.New("settlement commit failed")
-	done := make(chan error, 1)
-	go func() { done <- session.awaitSettlement() }()
-
-	<-settlement.waiting
-	select {
-	case err := <-done:
-		t.Fatalf("awaitSettlement returned before the order completed: %v", err)
-	default:
-	}
-
-	session.completeSettlement(settleErr)
-	require.ErrorIs(t, <-done, settleErr)
-	require.ErrorIs(t, session.awaitSettlement(), settleErr, "the completed latch keeps its immutable result")
-}
-
-func TestPromptSettlementStorePanicContainsOnceAgainstClose(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		target string
-	}{
-		{name: "mirror panic", target: ""},
-		{name: "journal panic", target: SessionStoreLifecycleSubpath},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			store := &blockingPanicStore{
-				InMemorySessionStore: NewInMemorySessionStore(),
-				target:               test.target,
-				entered:              make(chan struct{}),
-				release:              make(chan struct{}),
-			}
-			logs := &strings.Builder{}
-			agent := NewAgent(testContainmentOption(), WithSessionStore(store),
-				WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
-			agent.lifecycle = lifecycle.Negotiated{Version: 1, UpdatesOutsidePrompt: true}
-			connection := newDirectAgentClient()
-			agent.setConnection(connection)
-			process := newStubProcess(false)
-			shutdownEntered := make(chan struct{})
-			process.shutdownFunc = func(context.Context) error {
-				close(shutdownEntered)
-
-				return nil
-			}
-			native := newStubPiClient()
-			session := &agentSession{agent: agent, id: "settlement-panic", proc: process, client: native}
-			outbox := newTestSessionOutbox(1)
-			bindTestRuntime(outbox, process, native, nil, nil, nil)
-			session.outbox = outbox
-			session.pumpGeneration = 1
-			session.sessionFilePath = filepath.Join(t.TempDir(), "session.jsonl")
-			require.NoError(t, os.WriteFile(session.sessionFilePath, []byte("{\"type\":\"message\"}\n"), 0o600))
-			require.NoError(t, session.openLifecycleStream(t.Context(), 1))
-			require.NoError(t, session.lifecycleAcceptTurn(t.Context(), testSubmission()))
-			session.openSettlement()
-			baseline := len(connection.notifications)
-
-			type promptResult struct {
-				response acp.PromptResponse
-				err      error
-			}
-			settled := make(chan promptResult, 1)
-			go func() {
-				var timedOut atomic.Bool
-				response, err := session.settlePrompt(context.Background(),
-					TextPromptRequest(session.id, "turn", "hello"),
-					&promptTurnState{stopReason: stopReasonStop}, promptOutcome{settled: true}, &timedOut)
-				settled <- promptResult{response: response, err: err}
-			}()
-			<-store.entered
-
-			closed := make(chan error, 1)
-			go func() { closed <- session.Close(context.Background()) }()
-			<-shutdownEntered
-			close(store.release)
-
-			result := <-settled
-			require.Zero(t, result.response)
-			require.ErrorIs(t, result.err, errPromptSettlement)
-			require.NotContains(t, result.err.Error(), "session store panic secret")
-			closeErr := <-closed
-			require.ErrorIs(t, closeErr, errPromptSettlement)
-			require.Equal(t, 1, process.shutdownCalls)
-			require.Equal(t, 1, process.closeCalls)
-			require.NotContains(t, logs.String(), "session store panic secret")
-			for _, notification := range connection.notifications[baseline:] {
-				rawEnvelope, ok := notification.Meta[lifecycleMetaKey]
-				if !ok {
-					continue
-				}
-				envelope := anyMap(t, rawEnvelope)
-				event := anyMap(t, envelope["event"])
-				require.NotEqual(t, "idle", event["state"])
-			}
-			require.ErrorIs(t, session.awaitSettlement(), errPromptSettlement)
-			require.ErrorIs(t, session.Close(t.Context()), errPromptSettlement)
-		})
-	}
-}
-
-func TestTurnOutcomeForStopReason(t *testing.T) {
-	require.Equal(t, lifecycle.OutcomeLimit, turnOutcomeForStopReason(acp.StopReasonMaxTokens))
-	require.Equal(t, lifecycle.OutcomeLimit, turnOutcomeForStopReason(acp.StopReasonMaxTurnRequests))
-	require.Equal(t, lifecycle.OutcomeCancelled, turnOutcomeForStopReason(acp.StopReasonCancelled))
-	require.Equal(t, lifecycle.OutcomeRefused, turnOutcomeForStopReason(acp.StopReasonRefusal))
-	require.Equal(t, lifecycle.OutcomeSuccess, turnOutcomeForStopReason(acp.StopReasonEndTurn))
-}
-
-// TestAssistantTextIsAppendOnly is the conformance proof that
-// agent_message_chunk and agent_thought_chunk are append-only deltas. A client
-// renders a turn's assistant text as the in-order concatenation of every chunk
-// it received, so this replays real native fixtures through the same mapper a
-// live turn uses and asserts that concatenation against the native final text.
-//
-// Each fixture is a native JSONL transcript, decoded by the production codec:
-// a scripted Go event list would prove the mapper agrees with itself rather
-// than with what pi actually writes.
-func TestAssistantTextIsAppendOnly(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		// fixture is the native transcript replayed through the mapper.
-		fixture string
-		// text is the exact concatenation of every emitted message chunk.
-		text string
-		// thought is the exact concatenation of every emitted thought chunk.
-		thought string
-		// messageChunks is how many message chunks the turn may emit.
-		messageChunks int
-	}{
-		{
-			// A terminal frame that repeats the streamed text contributes only
-			// the suffix the deltas did not carry.
-			name:          "terminal frame repeats the streamed text",
-			fixture:       "terminal-frame-repeats-stream.jsonl",
-			text:          "Hello, world and the tail the deltas never carried.",
-			thought:       "Weighing the answer. And the unstreamed rest.",
-			messageChunks: 3,
-		},
-		{
-			// A deltas-free harness yields exactly one chunk.
-			name:          "terminal frame with no deltas at all",
-			fixture:       "terminal-frame-only.jsonl",
-			text:          "The whole answer arrived at once.",
-			messageChunks: 1,
-		},
-		{
-			// Deltas that carried everything leave the terminal frame with
-			// nothing to add, and a repeated native identity adds nothing
-			// either: dedup is on identity, never on text.
-			name:          "terminal frame the deltas fully carried, repeated",
-			fixture:       "terminal-frame-fully-streamed.jsonl",
-			text:          "Fully streamed.",
-			messageChunks: 2,
-		},
-		{
-			// Two native messages saying the same thing each emit once: the
-			// second is a different native identity, not a repeat of the first.
-			name:          "multi-message turn emits each message once",
-			fixture:       "multi-message-turn.jsonl",
-			text:          "Same words.Same words.",
-			messageChunks: 3,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			connection := newDirectAgentClient()
-			agent := NewAgent(testContainmentOption())
-			agent.setConnection(connection)
-			session := &agentSession{agent: agent, id: "append-only"}
-			state := &promptTurnState{}
-
-			for _, event := range replayNativeFixture(t, test.fixture) {
-				settled, err := session.handleTurnEvent(t.Context(), event, state)
-				require.NoError(t, err)
-				require.False(t, settled)
-			}
-
-			text, thought, chunks := collectAssistantText(connection.updates)
-
-			require.Equal(t, test.text, text,
-				"the concatenation of every message chunk is the native final text exactly once")
-			require.Equal(t, test.thought, thought,
-				"the concatenation of every thought chunk is the native final thinking exactly once")
-			require.Equal(t, test.messageChunks, chunks)
-		})
-	}
-}
-
-// replayNativeFixture decodes one native JSONL transcript with the production
-// codec, so the fixtures stay wire records rather than Go values.
-func replayNativeFixture(t *testing.T, name string) []pi.Event {
-	t.Helper()
-
-	raw, err := os.ReadFile(filepath.Join("testdata", "append-only", name))
-	require.NoError(t, err)
-
-	events := make([]pi.Event, 0, 8)
-	scanner := bufio.NewScanner(bytes.NewReader(raw))
-
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-
-		message, decodeErr := pi.DecodeMessage(line)
-		require.NoError(t, decodeErr)
-		require.Equal(t, pi.MessageKindEvent, message.Kind)
-		events = append(events, message.Event)
-	}
-
-	require.NoError(t, scanner.Err())
-
-	return events
-}
-
-// collectAssistantText renders the turn the way a client does: the in-order
-// concatenation of every text-carrying chunk.
-func collectAssistantText(updates []acp.SessionUpdate) (string, string, int) {
-	var text, thought strings.Builder
-
-	chunks := 0
-
-	for index := range updates {
-		update := updates[index]
-
-		switch {
-		case update.AgentMessageChunk != nil && update.AgentMessageChunk.Content.Text != nil:
-			text.WriteString(update.AgentMessageChunk.Content.Text.Text)
-
-			chunks++
-		case update.AgentThoughtChunk != nil && update.AgentThoughtChunk.Content.Text != nil:
-			thought.WriteString(update.AgentThoughtChunk.Content.Text.Text)
-		}
-	}
-
-	return text.String(), thought.String(), chunks
-}
-
-// TestAssistantTextSuffixFailsTheTurnOnADeliveryFailure pins that a terminal
-// frame whose suffix cannot be delivered fails the turn rather than being
-// dropped: the client would otherwise render a turn missing its last words.
-func TestAssistantTextSuffixFailsTheTurnOnADeliveryFailure(t *testing.T) {
-	t.Parallel()
-
-	connection := newDirectAgentClient()
-	connection.updateErr = errSecret("host refused the chunk")
-
-	agent := NewAgent(testContainmentOption())
-	agent.setConnection(connection)
-	session := &agentSession{agent: agent, id: "append-only-failure"}
-
-	_, err := session.handleTurnEvent(t.Context(), pi.MessageEndEvent{Message: pi.AgentMessage{
-		ACPMessageID: "msg-1",
-		Role:         messageRoleAssistant,
-		Content:      json.RawMessage(`[{"type":"text","text":"Never delivered."}]`),
-	}}, &promptTurnState{})
-	require.Error(t, err)
 }
