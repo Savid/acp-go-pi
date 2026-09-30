@@ -19,6 +19,7 @@ const (
 	EventTypeToolExecutionUpdate = "tool_execution_update"
 	EventTypeToolExecutionEnd    = "tool_execution_end"
 	EventTypeExtensionError      = "extension_error"
+	EventTypeCompactionEnd       = "compaction_end"
 )
 
 // Event is one decoded pi RPC agent event.
@@ -38,20 +39,11 @@ func (e baseEvent) RawJSON() json.RawMessage {
 
 // Usage is per-assistant-message token usage as reported by the harness.
 type Usage struct {
-	Input      int64      `json:"input"`
-	Output     int64      `json:"output"`
-	CacheRead  int64      `json:"cacheRead"`
-	CacheWrite int64      `json:"cacheWrite"`
-	Cost       *UsageCost `json:"cost,omitempty"`
-}
-
-// UsageCost is per-assistant-message cost as reported by the harness.
-type UsageCost struct {
-	Input      float64 `json:"input"`
-	Output     float64 `json:"output"`
-	CacheRead  float64 `json:"cacheRead"`
-	CacheWrite float64 `json:"cacheWrite"`
-	Total      float64 `json:"total"`
+	Input       int64 `json:"input"`
+	Output      int64 `json:"output"`
+	CacheRead   int64 `json:"cacheRead"`
+	CacheWrite  int64 `json:"cacheWrite"`
+	TotalTokens int64 `json:"totalTokens"`
 }
 
 // ContentBlock is one message content block (text, thinking, toolCall, or
@@ -200,9 +192,21 @@ type ExtensionErrorEvent struct {
 	Error         string `json:"error"`
 }
 
+// CompactionEndEvent signals a compaction attempt finished. Result is present
+// only when pi replaced the context with a summary.
+type CompactionEndEvent struct {
+	baseEvent
+
+	Result *CompactionResult `json:"result,omitempty"`
+}
+
+// CompactionResult marks a completed compaction; only its presence is read.
+type CompactionResult struct{}
+
 // UnknownEvent carries an event type this package does not model: a queue
-// report, compaction, an automatic retry pair, or a type pi added. The adapter
-// acts on none of them and keeps the raw payload for raw-event forwarding.
+// report, a compaction start, an automatic retry pair, or a type pi added.
+// The adapter acts on none of them and keeps the raw payload for raw-event
+// forwarding.
 type UnknownEvent struct {
 	baseEvent
 
@@ -254,6 +258,10 @@ func decodeEvent(eventType string, line []byte, raw json.RawMessage) (Event, err
 		event = typed
 	case EventTypeExtensionError:
 		typed := ExtensionErrorEvent{baseEvent: base}
+		err = json.Unmarshal(line, &typed)
+		event = typed
+	case EventTypeCompactionEnd:
+		typed := CompactionEndEvent{baseEvent: base}
 		err = json.Unmarshal(line, &typed)
 		event = typed
 	default:

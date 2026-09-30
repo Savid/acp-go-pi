@@ -405,6 +405,10 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 		require.NotEqual(t, "prompt_accepted", event["type"])
 	}
 	require.Contains(t, agentText(rec.snapshot()), "2")
+	usage := usageUpdates(rec.snapshot())
+	require.Len(t, usage, 2)
+	require.Equal(t, acp.SessionUsageUpdate{Size: 1000, Used: 1744}, usage[0])
+	require.NotNil(t, usage[1].Cost, "settlement reports pi's statistics")
 	s.mu.Lock()
 	require.Nil(t, s.cycle)
 	s.mu.Unlock()
