@@ -37,9 +37,9 @@ const (
 
 // cycleState accumulates what one cycle streamed.
 type cycleState struct {
-	// usage sums every response's tokens; context is what the last usable
-	// response left occupied, 0 when none has since the cycle opened or pi
-	// last compacted.
+	// usage sums every response's reported tokens; context is what the last
+	// usable response left occupied, 0 when none has since the cycle opened
+	// or pi last compacted.
 	usage         *acp.Usage
 	context       int
 	stopReason    string
@@ -307,8 +307,20 @@ func observeAssistantMessageEnd(message pi.AgentMessage, state *cycleState) {
 		state.errorMessage = message.ErrorMessage
 	}
 
-	if message.Usage != nil {
+	if message.Usage != nil && callUsage(message.Usage).Known() {
 		state.usage = mergeUsage(state.usage, message.Usage)
+	}
+}
+
+// callUsage is the token breakdown pi reported for one response. pi reports
+// input without the cache tokens it read or wrote and output with any
+// reasoning included, and records a figure its provider omitted as 0.
+func callUsage(usage *pi.Usage) wire.CallUsage {
+	return wire.CallUsage{
+		InputTokens:       new(int(usage.Input)),
+		CachedReadTokens:  new(int(usage.CacheRead)),
+		CachedWriteTokens: new(int(usage.CacheWrite)),
+		OutputTokens:      new(int(usage.Output)),
 	}
 }
 
@@ -328,10 +340,12 @@ func mergeUsage(total *acp.Usage, next *pi.Usage) *acp.Usage {
 
 // contextTokens is the context an assistant response leaves occupied, counted
 // as pi counts it: the reported total, else the sum of input, output, and
-// cache tokens. Aborted, failed, and empty responses carry no usable figure.
+// cache tokens. Aborted and failed responses carry no usable figure, and a
+// response reporting no token at all, as a gateway replaying a cached
+// response does, states nothing.
 func contextTokens(message pi.AgentMessage) (int, bool) {
 	usage := message.Usage
-	if usage == nil || message.StopReason == stopReasonAborted || message.StopReason == stopReasonError {
+	if usage == nil || message.StopReason == stopReasonAborted || message.StopReason == stopReasonError || !callUsage(usage).Known() {
 		return 0, false
 	}
 
@@ -345,7 +359,9 @@ func contextTokens(message pi.AgentMessage) (int, bool) {
 
 // emitResponseInput reports the context an assistant response was sent with,
 // its input and cache tokens, when pi holds them before the response streams
-// its output. size is the session's known context window.
+// its output. A provider that reports usage only when the stream ends leaves
+// them zero here, which states nothing. size is the session's known context
+// window.
 func (s *session) emitResponseInput(ctx context.Context, usage *pi.Usage) error {
 	if usage == nil {
 		return nil
@@ -360,7 +376,9 @@ func (s *session) emitResponseInput(ctx context.Context, usage *pi.Usage) error 
 }
 
 // emitResponseUsage reports the context a finished assistant response leaves
-// occupied. size is the session's known context window.
+// occupied, with the response's token breakdown. A response with no usable
+// figure leaves the cycle's last figure in place. size is the session's known
+// context window.
 func (s *session) emitResponseUsage(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
 	used, ok := contextTokens(message)
 	if !ok {
@@ -369,14 +387,18 @@ func (s *session) emitResponseUsage(ctx context.Context, message pi.AgentMessage
 
 	state.context = used
 
-	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: s.knownContextWindow(), Used: used}})
+	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
+		Size: s.knownContextWindow(), Used: used, Meta: callUsage(message.Usage).Apply(nil),
+	}})
 }
 
 // emitSettledUsage reports pi's statistics once a cycle settles. used is pi's
-// context estimate, else the context the cycle's last response left; after a
-// compaction no response has followed, pi has no estimate and nothing is
-// sent. size is the context window get_session_stats reports, which becomes
-// the session's known window; cost is the session's cumulative cost.
+// context estimate, else the context the cycle's last response left; an
+// estimate of zero tokens is unknown, since no model call has an empty
+// context. After a compaction no response has followed, pi has no estimate
+// and nothing is sent. size is the context window get_session_stats reports,
+// which becomes the session's known window; cost is the session's cumulative
+// cost.
 func (s *session) emitSettledUsage(ctx context.Context, state *cycleState, stats *pi.SessionStats) {
 	if stats == nil {
 		return
@@ -389,7 +411,7 @@ func (s *session) emitSettledUsage(ctx context.Context, state *cycleState, stats
 	if usage := stats.ContextUsage; usage != nil {
 		size = usage.ContextWindow
 
-		if usage.Tokens != nil {
+		if usage.Tokens != nil && *usage.Tokens > 0 {
 			used, known = int(*usage.Tokens), true
 		}
 	}
@@ -416,24 +438,24 @@ func (s *session) knownContextWindow() int {
 	return int(s.contextWindow)
 }
 
-// emitRestoredUsage reports the restored session's context usage when pi
-// knows it.
+// emitRestoredUsage records the restored session's context window and
+// reports its context when pi estimates a non-zero one.
 func (s *session) emitRestoredUsage(ctx context.Context, rt *runtime) {
 	stats, err := rt.client.GetSessionStats(ctx)
 	if err != nil || stats.ContextUsage == nil || stats.ContextUsage.ContextWindow <= 0 {
 		return
 	}
 
-	used := 0
-	if stats.ContextUsage.Tokens != nil {
-		used = int(*stats.ContextUsage.Tokens)
-	}
-
 	s.mu.Lock()
 	s.contextWindow = stats.ContextUsage.ContextWindow
 	s.mu.Unlock()
 
-	_ = s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: int(stats.ContextUsage.ContextWindow), Used: used}})
+	tokens := stats.ContextUsage.Tokens
+	if tokens == nil || *tokens <= 0 {
+		return
+	}
+
+	_ = s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: int(stats.ContextUsage.ContextWindow), Used: int(*tokens)}})
 }
 
 // emitSessionInfo records the turn's time and, on the first prompt, a title.

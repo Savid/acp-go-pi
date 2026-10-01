@@ -334,6 +334,19 @@ func usageUpdates(updates []acp.SessionNotification) []acp.SessionUsageUpdate {
 	return usage
 }
 
+// callMeta is the usage_update meta carrying one response's token breakdown,
+// as the client decodes it.
+func callMeta(input int, cacheRead int, cacheWrite int, output int) map[string]any {
+	encoded, _ := json.Marshal(wire.CallUsage{
+		InputTokens: new(input), CachedReadTokens: new(cacheRead), CachedWriteTokens: new(cacheWrite), OutputTokens: new(output),
+	}.Apply(nil))
+
+	var meta map[string]any
+	_ = json.Unmarshal(encoded, &meta)
+
+	return meta
+}
+
 // usageCost is the session's cumulative cost after calls fake model calls.
 func usageCost(calls int) *acp.Cost {
 	return &acp.Cost{Amount: float64(calls) * fakeCallCost, Currency: costCurrency}

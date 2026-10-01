@@ -28,6 +28,9 @@ const (
 	fakePiEnvStartupDialog = "ACP_GO_PI_TEST_STARTUP_DIALOG"
 	fakePiEnvStartupDeath  = "ACP_GO_PI_TEST_STARTUP_DEATH"
 	fakePiEnvUsageGateways = "ACP_GO_PI_TEST_USAGE_GATEWAYS"
+	// fakePiEnvZeroEstimate makes get_session_stats estimate a context of
+	// zero tokens.
+	fakePiEnvZeroEstimate = "ACP_GO_PI_TEST_ZERO_ESTIMATE"
 	// fakePiEnvResumeHold names a file a resumed fake pi creates before it
 	// stops answering, so a test can act while the adapter is still relaunching.
 	fakePiEnvResumeHold = "ACP_GO_PI_TEST_RESUME_HOLD"
@@ -228,6 +231,7 @@ func runFakePi(args []string) int {
 
 		f.sessionID = header.ID
 		f.entries = len(rows)
+		f.context = lastUsableContext(rows)
 	}
 
 	f.statsID = f.sessionID
@@ -427,7 +431,12 @@ func (f *fakePi) sessionStats() pi.SessionStats {
 	}
 
 	stats.ContextUsage = &pi.ContextUsage{ContextWindow: f.model.ContextWindow}
-	if !f.compacted {
+
+	switch {
+	case f.compacted:
+	case os.Getenv(fakePiEnvZeroEstimate) != "":
+		stats.ContextUsage.Tokens = new(int64(0))
+	default:
 		stats.ContextUsage.Tokens = new(f.context + f.trailing)
 	}
 
@@ -490,7 +499,15 @@ func fakeUsage(input int, cacheRead int, output int) map[string]any {
 		"cost": map[string]any{"input": 0.125, "output": 0.125, "cacheRead": 0, "cacheWrite": 0, "total": fakeCallCost}}
 }
 
-// fakeCallCost is every model call's cost, exact in binary so sums compare.
+// zeroUsage is the usage of a model call a gateway answered from its response
+// cache: every figure and the cost zero.
+func zeroUsage() map[string]any {
+	return map[string]any{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+		"cost": map[string]any{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}
+}
+
+// fakeCallCost is every model call's cost, exact in binary so sums compare. A
+// call reporting no tokens costs nothing.
 const fakeCallCost = 0.25
 
 // endAssistant finishes one model call: its message_end, its session row,
@@ -506,11 +523,35 @@ func (f *fakePi) endAssistant(message map[string]any) {
 	f.statsMu.Lock()
 	defer f.statsMu.Unlock()
 
-	f.cost += fakeCallCost
+	if tokens > 0 {
+		f.cost += fakeCallCost
+	}
 
 	if tokens > 0 && stopReason != "aborted" && stopReason != "error" {
 		f.context, f.trailing, f.compacted = int64(tokens), 0, false
 	}
+}
+
+// lastUsableContext is the context the last usable response in a session's
+// rows left, from which pi estimates a resumed session's context.
+func lastUsableContext(rows [][]byte) int64 {
+	var context int64
+
+	for _, raw := range rows {
+		var row struct {
+			Message pi.AgentMessage `json:"message"`
+		}
+
+		if json.Unmarshal(raw, &row) != nil || row.Message.Role != "assistant" || row.Message.Usage == nil {
+			continue
+		}
+
+		if stop := row.Message.StopReason; stop != "aborted" && stop != "error" && row.Message.Usage.TotalTokens > 0 {
+			context = row.Message.Usage.TotalTokens
+		}
+	}
+
+	return context
 }
 
 // awaitStats waits for the adapter to read the statistics of the run that
@@ -553,6 +594,24 @@ func (f *fakePi) multiCall(message string) map[string]any {
 	}
 
 	return fakeUsage(40, 1200, 10)
+}
+
+// gatewayCalls runs every model call of a script whose usage arrives only at
+// the end of the stream but the last, and returns the last call's usage. A
+// call a gateway answered from its response cache reports every figure zero.
+func (f *fakePi) gatewayCalls(message string) map[string]any {
+	f.partial(zeroUsage())
+
+	switch {
+	case strings.HasPrefix(message, "LATEUSAGE"):
+		return fakeUsage(100, 1000, 20)
+	case strings.HasPrefix(message, "REPLAY"):
+		// A real call, then a replayed one.
+		f.step(fakeUsage(100, 1000, 20))
+		f.partial(zeroUsage())
+	}
+
+	return zeroUsage()
 }
 
 // repeatEnd sends the final message's terminal frame a second time for the
@@ -690,6 +749,9 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 	case strings.HasPrefix(message, "MULTI"), strings.HasPrefix(message, "EARLY"):
 		content = append(content, textBlock("done"))
 		usage = f.multiCall(message)
+	case strings.HasPrefix(message, "LATEUSAGE"), strings.HasPrefix(message, "REPLAY"), strings.HasPrefix(message, "CACHED"):
+		content = append(content, textBlock("done"))
+		usage = f.gatewayCalls(message)
 	case strings.HasPrefix(message, "COMPACT"):
 		content = append(content, textBlock("long"))
 		usage = fakeUsage(100, 800, 50)
