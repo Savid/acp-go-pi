@@ -320,6 +320,25 @@ func agentText(updates []acp.SessionNotification) string {
 	return text.String()
 }
 
+// usageUpdates returns the recorded usage_update payloads in delivery order,
+// without the variant discriminator the wire decoding fills in.
+func usageUpdates(updates []acp.SessionNotification) []acp.SessionUsageUpdate {
+	var usage []acp.SessionUsageUpdate
+
+	for _, update := range updates {
+		if payload := update.Update.UsageUpdate; payload != nil {
+			usage = append(usage, acp.SessionUsageUpdate{Size: payload.Size, Used: payload.Used, Cost: payload.Cost, Meta: payload.Meta})
+		}
+	}
+
+	return usage
+}
+
+// usageCost is the session's cumulative cost after calls fake model calls.
+func usageCost(calls int) *acp.Cost {
+	return &acp.Cost{Amount: float64(calls) * fakeCallCost, Currency: costCurrency}
+}
+
 // lifecycleEvents extracts the lifecycle envelopes in delivery order.
 func lifecycleEvents(updates []acp.SessionNotification) []map[string]any {
 	events := make([]map[string]any, 0)

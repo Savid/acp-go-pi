@@ -30,12 +30,18 @@ const (
 
 	assistantEventTextDelta     = "text_delta"
 	assistantEventThinkingDelta = "thinking_delta"
+
+	// costCurrency is the currency of every cost pi reports.
+	costCurrency = "USD"
 )
 
 // cycleState accumulates what one cycle streamed.
 type cycleState struct {
+	// usage sums every response's tokens; context is what the last usable
+	// response left occupied, 0 when none has since the cycle opened or pi
+	// last compacted.
 	usage         *acp.Usage
-	cost          *pi.UsageCost
+	context       int
 	stopReason    string
 	errorMessage  string
 	imagesEmitted bool
@@ -103,7 +109,17 @@ func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event
 			return false, err
 		}
 
-		return false, s.emitAssistantImages(ctx, typed.Message, state)
+		if err := s.emitAssistantImages(ctx, typed.Message, state); err != nil {
+			return false, err
+		}
+
+		return false, s.emitResponseUsage(ctx, typed.Message, state)
+	case pi.CompactionEndEvent:
+		if typed.Result != nil {
+			state.context = 0
+		}
+
+		return false, nil
 	case pi.ToolExecutionStartEvent:
 		return false, s.publishToolStart(ctx, state, typed)
 	case pi.ToolExecutionUpdateEvent:
@@ -276,10 +292,6 @@ func observeAssistantMessageEnd(message pi.AgentMessage, state *cycleState) {
 
 	if message.Usage != nil {
 		state.usage = mergeUsage(state.usage, message.Usage)
-
-		if message.Usage.Cost != nil {
-			state.cost = message.Usage.Cost
-		}
 	}
 }
 
@@ -297,41 +309,78 @@ func mergeUsage(total *acp.Usage, next *pi.Usage) *acp.Usage {
 	return total
 }
 
-// emitUsage reports harness-reported usage. size is the model's context
-// window from get_session_stats, else the selected model's catalog value,
-// else 0.
-func (s *session) emitUsage(ctx context.Context, state *cycleState, stats *pi.SessionStats) {
-	used := 0
-	if state.usage != nil {
-		used = state.usage.TotalTokens
+// contextTokens is the context an assistant response leaves occupied, counted
+// as pi counts it: the reported total, else the sum of input, output, and
+// cache tokens. Aborted, failed, and empty responses carry no usable figure.
+func contextTokens(message pi.AgentMessage) (int, bool) {
+	usage := message.Usage
+	if usage == nil || message.StopReason == stopReasonAborted || message.StopReason == stopReasonError {
+		return 0, false
 	}
 
-	var size int64
-
-	if stats != nil && stats.ContextUsage != nil {
-		if stats.ContextUsage.Tokens != nil {
-			used = int(*stats.ContextUsage.Tokens)
-		}
-
-		size = stats.ContextUsage.ContextWindow
+	tokens := usage.TotalTokens
+	if tokens == 0 {
+		tokens = usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
 	}
 
-	if size == 0 {
-		s.mu.Lock()
-		size = s.contextWindow
-		s.mu.Unlock()
+	return int(tokens), tokens > 0
+}
+
+// emitResponseUsage reports the context a finished assistant response leaves
+// occupied. size is the session's known context window.
+func (s *session) emitResponseUsage(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
+	used, ok := contextTokens(message)
+	if !ok {
+		return nil
 	}
 
-	if state.usage == nil && used == 0 && size == 0 {
+	state.context = used
+
+	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: s.knownContextWindow(), Used: used}})
+}
+
+// emitSettledUsage reports pi's statistics once a cycle settles. used is pi's
+// context estimate, else the context the cycle's last response left; after a
+// compaction no response has followed, pi has no estimate and nothing is
+// sent. size is the context window get_session_stats reports, which becomes
+// the session's known window; cost is the session's cumulative cost.
+func (s *session) emitSettledUsage(ctx context.Context, state *cycleState, stats *pi.SessionStats) {
+	if stats == nil {
 		return
 	}
 
-	update := &acp.SessionUsageUpdate{Size: int(size), Used: used}
-	if state.cost != nil {
-		update.Cost = &acp.Cost{Amount: state.cost.Total, Currency: "USD"}
+	used, known := state.context, state.context > 0
+
+	var size int64
+
+	if usage := stats.ContextUsage; usage != nil {
+		size = usage.ContextWindow
+
+		if usage.Tokens != nil {
+			used, known = int(*usage.Tokens), true
+		}
 	}
 
-	_ = s.emit(ctx, acp.SessionUpdate{UsageUpdate: update})
+	s.mu.Lock()
+	s.contextWindow = size
+	s.mu.Unlock()
+
+	if !known {
+		return
+	}
+
+	_ = s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
+		Size: int(size), Used: used, Cost: &acp.Cost{Amount: stats.Cost, Currency: costCurrency},
+	}})
+}
+
+// knownContextWindow is the selected model's context window as pi last
+// reported it, else 0.
+func (s *session) knownContextWindow() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return int(s.contextWindow)
 }
 
 // emitRestoredUsage reports the restored session's context usage when pi

@@ -354,7 +354,7 @@ func (s *session) settleTurn(ctx context.Context, rt *runtime, t *turn, params a
 	if t.ended == turnSettled {
 		if !cancelled {
 			stats := s.settledStats(settleCtx, rt)
-			s.emitUsage(settleCtx, &t.state, stats)
+			s.emitSettledUsage(settleCtx, &t.state, stats)
 			s.emitSessionInfo(settleCtx, params.Prompt)
 		}
 

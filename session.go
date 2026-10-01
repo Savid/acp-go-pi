@@ -546,7 +546,7 @@ func (s *session) handleEvent(ctx context.Context, rt *runtime, event pi.Event) 
 		if settled {
 			t.settle(turnSettled)
 
-			s.finishDelivery(ctx, rt, t)
+			s.deliverRecords(ctx, rt, s.holdRecords(ctx, rt, t.finished))
 		}
 	case c != nil:
 		settled, err := s.projectEvent(ctx, rt, c, event)
@@ -598,14 +598,32 @@ func (s *session) openAgentCycle(ctx context.Context, rt *runtime) {
 }
 
 // settleAgentCycle runs the agent-origin settlement on the pump: usage, the
-// mirror commit, then the terminal idle.
+// mirror commit, then the terminal idle. Records pi sends while its statistics
+// are read are delivered once the cycle has ended.
 func (s *session) settleAgentCycle(ctx context.Context, rt *runtime, c *cycle) {
 	s.beginSettlement(c)
 
 	settleCtx, cancel := context.WithTimeout(ctx, sessionSettleTimeout)
 	defer cancel()
 
-	s.emitUsage(settleCtx, &c.state, nil)
+	var pending []nativeRecord
+
+	if !s.cycleCancelled(c) {
+		var stats *pi.SessionStats
+
+		read := make(chan struct{})
+
+		go func() {
+			defer close(read)
+
+			stats = s.settledStats(settleCtx, rt)
+		}()
+
+		pending = s.holdRecords(ctx, rt, read)
+		<-read
+
+		s.emitSettledUsage(settleCtx, &c.state, stats)
+	}
 
 	if err := s.commitMirror(settleCtx); err != nil {
 		// The incarnation cannot publish what the store does not hold, so it
@@ -629,6 +647,8 @@ func (s *session) settleAgentCycle(ctx context.Context, rt *runtime, c *cycle) {
 		s.cycle = nil
 	}
 	s.mu.Unlock()
+
+	s.deliverRecords(ctx, rt, pending)
 }
 
 // runtimeEnded records that a process generation stopped producing events. The
@@ -1026,19 +1046,22 @@ func (s *session) close(ctx context.Context) error {
 	return s.closeErr
 }
 
-// nativeRecord preserves event and dialog order while a completed foreground
-// turn commits its mirror and reads its final statistics.
+// nativeRecord preserves event and dialog order while a settling cycle
+// commits its mirror and reads its final statistics.
 type nativeRecord struct {
 	event   pi.Event
 	request *pi.UIRequest
 }
 
-// settleRecordBound caps the records held while a turn settles; a native
+// settleRecordBound caps the records held while a cycle settles; a native
 // stream that outruns it ends this session's own process rather than the
 // adapter's memory.
 const settleRecordBound = 4096
 
-func (s *session) finishDelivery(ctx context.Context, rt *runtime, t *turn) {
+// holdRecords drains pi's records until done closes, so a settlement waiting
+// on pi never stalls its stream. A process that ended or outran the bound
+// leaves nothing to deliver.
+func (s *session) holdRecords(ctx context.Context, rt *runtime, done <-chan struct{}) []nativeRecord {
 	events := rt.client.Events()
 	requests := rt.client.UIRequests()
 
@@ -1050,22 +1073,14 @@ func (s *session) finishDelivery(ctx context.Context, rt *runtime, t *turn) {
 
 			_ = rt.proc.Kill()
 
-			return
+			return nil
 		}
 
 		select {
-		case <-t.finished:
-			for _, record := range pending {
-				if record.request != nil {
-					s.handleUIRequest(rt, *record.request)
-				} else {
-					s.handleEvent(ctx, rt, record.event)
-				}
-			}
-
-			return
+		case <-done:
+			return pending
 		case <-rt.proc.Done():
-			return
+			return nil
 		case event, ok := <-events:
 			if !ok {
 				events = nil
@@ -1082,6 +1097,17 @@ func (s *session) finishDelivery(ctx context.Context, rt *runtime, t *turn) {
 			}
 
 			pending = append(pending, nativeRecord{request: &request})
+		}
+	}
+}
+
+// deliverRecords routes held records as the pump would have.
+func (s *session) deliverRecords(ctx context.Context, rt *runtime, records []nativeRecord) {
+	for _, record := range records {
+		if record.request != nil {
+			s.handleUIRequest(rt, *record.request)
+		} else {
+			s.handleEvent(ctx, rt, record.event)
 		}
 	}
 }

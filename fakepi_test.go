@@ -51,11 +51,24 @@ type fakePi struct {
 	sessionID     string
 	sessionFile   string
 	bridgePath    string
-	model         *pi.Model
 	thinkingLevel string
 	autoRetry     bool
-	statsID       string
 	entries       int
+
+	// statsMu guards the model and the statistics a run changes while
+	// commands read them. context is the last usable response's context,
+	// trailing the estimate of the user messages after it, and cost the
+	// session's summed cost; compacted holds from a compaction until a usable
+	// response follows it.
+	statsMu   sync.Mutex
+	model     *pi.Model
+	statsID   string
+	context   int64
+	trailing  int64
+	cost      float64
+	compacted bool
+	// statsRead signals each answered get_session_stats.
+	statsRead chan struct{}
 
 	writeMu sync.Mutex
 	out     *bufio.Writer
@@ -159,6 +172,7 @@ func runFakePi(args []string) int {
 		thinkingLevel: "medium",
 		out:           bufio.NewWriter(os.Stdout),
 		dialogs:       make(map[string]chan pi.UIResponse),
+		statsRead:     make(chan struct{}, 1),
 	}
 
 	if f.agentDir == "" {
@@ -309,8 +323,12 @@ func (f *fakePi) dispatch(line []byte) {
 			waiter <- pi.UIResponse{ID: command.ID, Value: command.Value, Confirmed: command.Confirmed, Cancelled: command.Cancelled}
 		}
 	case "get_state":
+		f.statsMu.Lock()
+		model := f.model
+		f.statsMu.Unlock()
+
 		f.respond(command.ID, command.Type, pi.SessionState{
-			Model: f.model, ThinkingLevel: f.thinkingLevel, SessionFile: f.sessionFile, SessionID: f.sessionID,
+			Model: model, ThinkingLevel: f.thinkingLevel, SessionFile: f.sessionFile, SessionID: f.sessionID,
 		})
 	case "get_available_models":
 		f.respond(command.ID, command.Type, map[string]any{"models": fakeModels})
@@ -318,7 +336,9 @@ func (f *fakePi) dispatch(line []byte) {
 		for _, model := range fakeModels {
 			if model.Provider == command.Provider && model.ID == command.ModelID {
 				chosen := model
+				f.statsMu.Lock()
 				f.model = &chosen
+				f.statsMu.Unlock()
 				f.thinkingLevel = "medium"
 				if chosen.ID == "text-only" {
 					f.thinkingLevel = "off"
@@ -333,9 +353,11 @@ func (f *fakePi) dispatch(line []byte) {
 	case "set_thinking_level":
 		if slices.Contains(pi.ThinkingLevels(), command.Level) {
 			f.thinkingLevel = command.Level
+			f.statsMu.Lock()
 			if f.model != nil && f.model.ID == "text-only" {
 				f.thinkingLevel = "off"
 			}
+			f.statsMu.Unlock()
 		}
 
 		f.respond(command.ID, command.Type, nil)
@@ -343,11 +365,12 @@ func (f *fakePi) dispatch(line []byte) {
 		f.autoRetry = command.Enabled
 		f.respond(command.ID, command.Type, nil)
 	case "get_session_stats":
-		tokens := int64(42)
-		f.respond(command.ID, command.Type, pi.SessionStats{
-			SessionID:    f.statsID,
-			ContextUsage: &pi.ContextUsage{Tokens: &tokens, ContextWindow: 1000},
-		})
+		f.respond(command.ID, command.Type, f.sessionStats())
+
+		select {
+		case f.statsRead <- struct{}{}:
+		default:
+		}
 
 	case "get_commands":
 		f.respond(command.ID, command.Type, map[string]any{"commands": []pi.SlashCommand{
@@ -391,6 +414,26 @@ func (f *fakePi) dispatch(line []byte) {
 	}
 }
 
+// sessionStats answers as pi does: the summed cost of every response, and a
+// context estimate only for a model with a window, unknown after a compaction
+// until a usable response follows it.
+func (f *fakePi) sessionStats() pi.SessionStats {
+	f.statsMu.Lock()
+	defer f.statsMu.Unlock()
+
+	stats := pi.SessionStats{SessionID: f.statsID, Cost: f.cost}
+	if f.model == nil || f.model.ContextWindow <= 0 {
+		return stats
+	}
+
+	stats.ContextUsage = &pi.ContextUsage{ContextWindow: f.model.ContextWindow}
+	if !f.compacted {
+		stats.ContextUsage.Tokens = new(f.context + f.trailing)
+	}
+
+	return stats
+}
+
 func (f *fakePi) dialog(request map[string]any) pi.UIResponse {
 	id := fakeUUID()
 	waiter := make(chan pi.UIResponse, 1)
@@ -428,12 +471,10 @@ func (f *fakePi) appendRow(message map[string]any) {
 	_ = file.Close()
 }
 
-func (f *fakePi) assistantMessage(content []map[string]any, stopReason string, errorMessage string) map[string]any {
+func (f *fakePi) assistantMessage(content []map[string]any, stopReason string, errorMessage string, usage map[string]any) map[string]any {
 	message := map[string]any{
 		"role": "assistant", "content": content, "api": "fake", "provider": "fake", "model": "vision",
-		"usage": map[string]any{"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15,
-			"cost": map[string]any{"input": 0.001, "output": 0.009, "cacheRead": 0, "cacheWrite": 0, "total": 0.01}},
-		"stopReason": stopReason, "timestamp": time.Now().UnixMilli(), "acpMessageId": fakeUUID(),
+		"usage": usage, "stopReason": stopReason, "timestamp": time.Now().UnixMilli(), "acpMessageId": fakeUUID(),
 	}
 	if errorMessage != "" {
 		message["errorMessage"] = errorMessage
@@ -442,17 +483,89 @@ func (f *fakePi) assistantMessage(content []map[string]any, stopReason string, e
 	return message
 }
 
+// fakeUsage is one model call's native usage: the new input, the cached
+// prefix the call resent, and the output.
+func fakeUsage(input int, cacheRead int, output int) map[string]any {
+	return map[string]any{"input": input, "output": output, "cacheRead": cacheRead, "cacheWrite": 0, "totalTokens": input + cacheRead + output,
+		"cost": map[string]any{"input": 0.125, "output": 0.125, "cacheRead": 0, "cacheWrite": 0, "total": fakeCallCost}}
+}
+
+// fakeCallCost is every model call's cost, exact in binary so sums compare.
+const fakeCallCost = 0.25
+
+// endAssistant finishes one model call: its message_end, its session row,
+// and its usage in the session's statistics, counted as pi counts it.
+func (f *fakePi) endAssistant(message map[string]any) {
+	f.event(map[string]any{"type": "message_end", "message": message})
+	f.appendRow(message)
+
+	usage, _ := message["usage"].(map[string]any)
+	tokens, _ := usage["totalTokens"].(int)
+	stopReason, _ := message["stopReason"].(string)
+
+	f.statsMu.Lock()
+	defer f.statsMu.Unlock()
+
+	f.cost += fakeCallCost
+
+	if tokens > 0 && stopReason != "aborted" && stopReason != "error" {
+		f.context, f.trailing, f.compacted = int64(tokens), 0, false
+	}
+}
+
+// awaitStats waits for the adapter to read the statistics of the run that
+// just settled, so later background work cannot change what it reads.
+func (f *fakePi) awaitStats() {
+	select {
+	case <-f.statsRead:
+	case <-time.After(5 * time.Second):
+	}
+}
+
 func textBlock(text string) map[string]any { return map[string]any{"type": "text", "text": text} }
+
+// aborted waits up to wait for the adapter to abort the run.
+func aborted(abort <-chan struct{}, wait time.Duration) bool {
+	select {
+	case <-abort:
+		return true
+	case <-time.After(wait):
+		return false
+	}
+}
+
+// step finishes one tool-using model call and opens the next.
+func (f *fakePi) step(usage map[string]any) {
+	assistant := f.assistantMessage([]map[string]any{textBlock("step")}, "toolUse", "", usage)
+	f.endAssistant(assistant)
+	f.event(map[string]any{"type": "turn_end", "message": assistant, "toolResults": []any{}})
+	f.event(map[string]any{"type": "turn_start"})
+	f.event(map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant", "content": []any{}}})
+}
 
 // runTurn drives one scripted run: the keyword at the start of the message
 // selects the script.
 func (f *fakePi) runTurn(message string, imageCount int, abort <-chan struct{}, done chan struct{}) {
 	defer close(done)
 
+	// Only a read after this run settles releases its background work.
+	select {
+	case <-f.statsRead:
+	default:
+	}
+
 	f.appendRow(map[string]any{"role": "user", "content": []map[string]any{textBlock(message)}, "timestamp": time.Now().UnixMilli()})
+
+	// pi estimates a message after the last usable response at four
+	// characters a token.
+	f.statsMu.Lock()
+	f.trailing += int64((len(message) + 3) / 4)
+	f.statsMu.Unlock()
+
 	f.run(message, imageCount, abort)
 
 	if strings.HasPrefix(message, "AGENTWORK") {
+		f.awaitStats()
 		f.run("HELLO background", 0, make(chan struct{}))
 	}
 
@@ -475,6 +588,7 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 	content := []map[string]any{}
 	stopReason := "stop"
 	errorMessage := ""
+	usage := fakeUsage(10, 0, 5)
 
 	delta := func(kind string, text string) {
 		f.event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": kind, "contentIndex": 0, "delta": text}})
@@ -507,31 +621,67 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 		stopReason = "error"
 		errorMessage = "boom"
 	case strings.HasPrefix(message, "SLOW"):
-		select {
-		case <-abort:
+		if aborted(abort, 30*time.Second) {
 			stopReason = "aborted"
-		case <-time.After(30 * time.Second):
 		}
 	case strings.HasPrefix(message, "WAIT"):
-		select {
-		case <-abort:
+		if aborted(abort, 2*time.Second) {
 			stopReason = "aborted"
-		case <-time.After(2 * time.Second):
+		} else {
 			content = append(content, textBlock("waited"))
 		}
 	case strings.HasPrefix(message, "EXTERR"):
 		f.event(map[string]any{"type": "extension_error", "extensionPath": f.bridgePath, "event": "tool_call", "error": "boom"})
 
-		select {
-		case <-abort:
+		if aborted(abort, 5*time.Second) {
 			stopReason = "aborted"
-		case <-time.After(5 * time.Second):
 		}
 	case strings.HasPrefix(message, "BADSESSION"):
+		f.statsMu.Lock()
 		f.statsID = "00000000-0000-4000-8000-000000000000"
+		f.statsMu.Unlock()
+
 		content = append(content, textBlock("drifted"))
+	case strings.HasPrefix(message, "SWITCH"):
+		// An extension moves the session to another model mid-run.
+		f.statsMu.Lock()
+		model := fakeModels[1]
+		f.model = &model
+		f.statsMu.Unlock()
+
+		content = append(content, textBlock("switched"))
 	case strings.HasPrefix(message, "ECHO"):
 		content = append(content, textBlock(message))
+	case strings.HasPrefix(message, "MULTI"):
+		// Three model calls, each resending the context the previous one left.
+		for _, step := range []map[string]any{fakeUsage(100, 1000, 20), fakeUsage(50, 1120, 30)} {
+			f.step(step)
+		}
+
+		content = append(content, textBlock("done"))
+		usage = fakeUsage(40, 1200, 10)
+	case strings.HasPrefix(message, "COMPACT"):
+		content = append(content, textBlock("long"))
+		usage = fakeUsage(100, 800, 50)
+	case strings.HasPrefix(message, "STEPSLOW"):
+		f.step(fakeUsage(100, 1000, 20))
+
+		if aborted(abort, 30*time.Second) {
+			stopReason = "aborted"
+		}
+	case strings.HasPrefix(message, "FLAKY"):
+		// The provider fails one call and pi retries it automatically.
+		failed := f.assistantMessage([]map[string]any{}, "error", "overloaded", fakeUsage(100, 1000, 0))
+		f.endAssistant(failed)
+		f.event(map[string]any{"type": "turn_end", "message": failed, "toolResults": []any{}})
+		f.event(map[string]any{"type": "agent_end", "messages": []any{failed}, "willRetry": true})
+		f.event(map[string]any{"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 0, "errorMessage": "overloaded"})
+		f.event(map[string]any{"type": "agent_start"})
+		f.event(map[string]any{"type": "turn_start"})
+		f.event(map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant", "content": []any{}}})
+
+		content = append(content, textBlock("recovered"))
+		usage = fakeUsage(100, 1000, 20)
 	default:
 		delta("text_delta", "Hello")
 		delta("text_delta", " world")
@@ -542,11 +692,21 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 		content = append(content, textBlock(fmt.Sprintf("images:%d", imageCount)))
 	}
 
-	assistant := f.assistantMessage(content, stopReason, errorMessage)
-	f.event(map[string]any{"type": "message_end", "message": assistant})
-	f.appendRow(assistant)
+	assistant := f.assistantMessage(content, stopReason, errorMessage, usage)
+	f.endAssistant(assistant)
 	f.event(map[string]any{"type": "turn_end", "message": assistant, "toolResults": []any{}})
 	f.event(map[string]any{"type": "agent_end", "messages": []any{assistant}, "willRetry": false})
+
+	if strings.HasPrefix(message, "COMPACT") {
+		// The response crossed the threshold, so pi compacts before settling.
+		f.event(map[string]any{"type": "compaction_start", "reason": "threshold"})
+		f.statsMu.Lock()
+		f.compacted = true
+		f.statsMu.Unlock()
+		f.event(map[string]any{"type": "compaction_end", "reason": "threshold", "aborted": false, "willRetry": false,
+			"result": map[string]any{"summary": "summary", "firstKeptEntryId": "e2", "tokensBefore": 950, "estimatedTokensAfter": 120}})
+	}
+
 	f.event(map[string]any{"type": "agent_settled"})
 
 	if strings.HasPrefix(message, "QUIT") {

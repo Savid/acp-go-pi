@@ -61,17 +61,21 @@ type SlashCommand struct {
 }
 
 // ContextUsage is the current context-window estimate inside
-// get_session_stats. Tokens and Percent are null immediately after
-// compaction.
+// get_session_stats, present only for a model with a positive context window.
+// Tokens is the last usable response's context plus an estimate of the
+// messages after it; Tokens and Percent are null after a compaction until a
+// response follows it.
 type ContextUsage struct {
 	Tokens        *int64   `json:"tokens"`
 	ContextWindow int64    `json:"contextWindow"`
 	Percent       *float64 `json:"percent"`
 }
 
-// SessionStats is the get_session_stats response payload.
+// SessionStats is the get_session_stats response payload. Cost is the
+// session's cumulative cost in USD.
 type SessionStats struct {
 	SessionID    string        `json:"sessionId"`
+	Cost         float64       `json:"cost"`
 	ContextUsage *ContextUsage `json:"contextUsage,omitempty"`
 }
 

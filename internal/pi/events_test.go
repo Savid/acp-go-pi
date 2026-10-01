@@ -26,6 +26,7 @@ func TestDecodeEventKinds(t *testing.T) {
 		EventTypeToolExecutionUpdate: {`{"type":"tool_execution_update","toolCallId":"c","toolName":"bash","partialResult":{"content":[]}}`, ToolExecutionUpdateEvent{}},
 		EventTypeToolExecutionEnd:    {`{"type":"tool_execution_end","toolCallId":"c","toolName":"bash","isError":false}`, ToolExecutionEndEvent{}},
 		EventTypeExtensionError:      {`{"type":"extension_error","extensionPath":"/x.ts","event":"tool_call","error":"boom"}`, ExtensionErrorEvent{}},
+		EventTypeCompactionEnd:       {`{"type":"compaction_end","reason":"threshold","aborted":false,"willRetry":false}`, CompactionEndEvent{}},
 		"queue_update":               {`{"type":"queue_update","steering":[],"followUp":["x"]}`, UnknownEvent{}},
 		"compaction_start":           {`{"type":"compaction_start","reason":"threshold"}`, UnknownEvent{}},
 		"auto_retry_end":             {`{"type":"auto_retry_end","success":true,"attempt":1}`, UnknownEvent{}},
@@ -39,6 +40,29 @@ func TestDecodeEventKinds(t *testing.T) {
 			require.NoError(t, err)
 			require.IsType(t, tc.event, message.Event)
 			require.JSONEq(t, tc.line, string(message.Event.RawJSON()))
+		})
+	}
+}
+
+func TestCompactionEndResult(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		line      string
+		compacted bool
+	}{
+		"compacted": {`{"type":"compaction_end","reason":"threshold","result":{"summary":"s","firstKeptEntryId":"e2","tokensBefore":900,"estimatedTokensAfter":120},"aborted":false,"willRetry":false}`, true},
+		"failed":    {`{"type":"compaction_end","reason":"threshold","aborted":false,"willRetry":false,"errorMessage":"Auto-compaction failed: boom"}`, false},
+		"aborted":   {`{"type":"compaction_end","reason":"manual","result":null,"aborted":true,"willRetry":false}`, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			message, err := DecodeMessage([]byte(tc.line))
+			require.NoError(t, err)
+			event, ok := message.Event.(CompactionEndEvent)
+			require.True(t, ok)
+			require.Equal(t, tc.compacted, event.Result != nil)
 		})
 	}
 }
