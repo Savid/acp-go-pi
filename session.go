@@ -354,8 +354,7 @@ func (s *session) configureRuntime(ctx context.Context, rt *runtime, model strin
 
 		chosen, setErr := client.SetModel(ctx, ref.Provider, ref.ID)
 		if setErr != nil {
-			var commandErr *pi.CommandError
-			if errors.As(setErr, &commandErr) {
+			if _, ok := errors.AsType[*pi.CommandError](setErr); ok {
 				return wire.Unsupported(wire.MetaOptionPath(vendor, metaModelKey))
 			}
 

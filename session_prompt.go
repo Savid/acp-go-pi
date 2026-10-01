@@ -162,7 +162,8 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	defer cancelTurn()
 
 	t := &turn{
-		cycle:      cycle{Cycle: lifecycle.Cycle{Origin: lifecycle.CauseSubmission}, state: cycleState{tools: make(map[string]*toolState)}},
+		Origin:     lifecycle.CauseSubmission,
+		state:      cycleState{tools: make(map[string]*toolState)},
 		submission: submission,
 		ctx:        turnCtx,
 		cancel:     cancelTurn,
@@ -257,8 +258,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 // failure is reported: the next prompt relaunches pi instead of failing on
 // the same dead generation.
 func (s *session) dispatchFailure(ctx context.Context, rt *runtime, t *turn, err error) error {
-	var commandErr *pi.CommandError
-	if errors.As(err, &commandErr) {
+	if commandErr, ok := errors.AsType[*pi.CommandError](err); ok {
 		return wire.TurnFailed(vendor, wire.TurnFailure{Cause: wire.CauseProvider, Message: commandErr.Message})
 	}
 

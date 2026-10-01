@@ -136,8 +136,7 @@ func (s *session) setConfigOption(ctx context.Context, configID acp.SessionConfi
 
 		selected, setErr := rt.client.SetModel(ctx, ref.Provider, ref.ID)
 		if setErr != nil {
-			var commandErr *pi.CommandError
-			if errors.As(setErr, &commandErr) {
+			if _, ok := errors.AsType[*pi.CommandError](setErr); ok {
 				return nil, wire.Unsupported("value")
 			}
 
