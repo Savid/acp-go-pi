@@ -139,11 +139,15 @@ type MessageStartEvent struct {
 	Message AgentMessage `json:"message"`
 }
 
-// MessageUpdateEvent streams one assistant message delta.
+// MessageUpdateEvent streams one assistant message delta with the usage the
+// streaming message holds after it. A provider that reports its input when
+// the response starts fills the usage before the first delta; one that
+// reports only at the end leaves it zero until message_end.
 type MessageUpdateEvent struct {
 	baseEvent
 
 	AssistantMessageEvent AssistantMessageEvent `json:"assistantMessageEvent"`
+	Usage                 *Usage                `json:"usage,omitempty"`
 }
 
 // MessageEndEvent signals a message completed. For assistant messages the

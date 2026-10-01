@@ -534,6 +534,41 @@ func aborted(abort <-chan struct{}, wait time.Duration) bool {
 	}
 }
 
+// multiCall runs every model call of a multi-call script but the last and
+// returns the last call's usage.
+func (f *fakePi) multiCall(message string) map[string]any {
+	if strings.HasPrefix(message, "EARLY") {
+		// Two model calls from a provider that reports each call's input when
+		// the response starts, before its first delta.
+		f.partial(map[string]any{"input": 100, "output": 1, "cacheRead": 1000, "cacheWrite": 50, "totalTokens": 1151})
+		f.step(map[string]any{"input": 100, "output": 30, "cacheRead": 1000, "cacheWrite": 50, "totalTokens": 1180})
+		f.partial(map[string]any{"input": 60, "output": 1, "cacheRead": 1180, "cacheWrite": 0, "totalTokens": 1241})
+
+		return map[string]any{"input": 60, "output": 20, "cacheRead": 1180, "cacheWrite": 0, "totalTokens": 1260}
+	}
+
+	// Three model calls, each resending the context the previous one left.
+	for _, step := range []map[string]any{fakeUsage(100, 1000, 20), fakeUsage(50, 1120, 30)} {
+		f.step(step)
+	}
+
+	return fakeUsage(40, 1200, 10)
+}
+
+// repeatEnd sends the final message's terminal frame a second time for the
+// REPEAT script.
+func (f *fakePi) repeatEnd(message string, assistant map[string]any) {
+	if strings.HasPrefix(message, "REPEAT") {
+		f.event(map[string]any{"type": "message_end", "message": assistant})
+	}
+}
+
+// partial streams the first delta of a response whose streaming message
+// already holds the given usage.
+func (f *fakePi) partial(usage map[string]any) {
+	f.event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_start", "contentIndex": 0}, "usage": usage})
+}
+
 // step finishes one tool-using model call and opens the next.
 func (f *fakePi) step(usage map[string]any) {
 	assistant := f.assistantMessage([]map[string]any{textBlock("step")}, "toolUse", "", usage)
@@ -652,14 +687,9 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 		content = append(content, textBlock("switched"))
 	case strings.HasPrefix(message, "ECHO"):
 		content = append(content, textBlock(message))
-	case strings.HasPrefix(message, "MULTI"):
-		// Three model calls, each resending the context the previous one left.
-		for _, step := range []map[string]any{fakeUsage(100, 1000, 20), fakeUsage(50, 1120, 30)} {
-			f.step(step)
-		}
-
+	case strings.HasPrefix(message, "MULTI"), strings.HasPrefix(message, "EARLY"):
 		content = append(content, textBlock("done"))
-		usage = fakeUsage(40, 1200, 10)
+		usage = f.multiCall(message)
 	case strings.HasPrefix(message, "COMPACT"):
 		content = append(content, textBlock("long"))
 		usage = fakeUsage(100, 800, 50)
@@ -694,6 +724,7 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 
 	assistant := f.assistantMessage(content, stopReason, errorMessage, usage)
 	f.endAssistant(assistant)
+	f.repeatEnd(message, assistant)
 	f.event(map[string]any{"type": "turn_end", "message": assistant, "toolResults": []any{}})
 	f.event(map[string]any{"type": "agent_end", "messages": []any{assistant}, "willRetry": false})
 

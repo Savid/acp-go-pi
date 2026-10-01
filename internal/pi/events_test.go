@@ -67,6 +67,17 @@ func TestCompactionEndResult(t *testing.T) {
 	}
 }
 
+func TestMessageUpdateUsage(t *testing.T) {
+	t.Parallel()
+
+	message, err := DecodeMessage([]byte(`{"type":"message_update","usage":{"input":100,"output":1,"cacheRead":1000,"cacheWrite":50,"totalTokens":1151},"assistantMessageEvent":{"type":"text_start","contentIndex":0}}`))
+	require.NoError(t, err)
+	event, ok := message.Event.(MessageUpdateEvent)
+	require.True(t, ok)
+	require.Equal(t, &Usage{Input: 100, Output: 1, CacheRead: 1000, CacheWrite: 50, TotalTokens: 1151}, event.Usage)
+	require.Equal(t, "text_start", event.AssistantMessageEvent.Type)
+}
+
 func TestAgentMessageContentBlocks(t *testing.T) {
 	t.Parallel()
 

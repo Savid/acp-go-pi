@@ -45,13 +45,21 @@ type cycleState struct {
 	stopReason    string
 	errorMessage  string
 	imagesEmitted bool
+	// inputPending holds from an assistant message's start until its first
+	// delta, the earliest point pi can report the input the response was
+	// sent with.
+	inputPending bool
 	// streamedText and streamedThought hold what the open assistant message
 	// already streamed, so its terminal frame contributes only the suffix.
 	streamedText    string
 	streamedThought string
-	finalized       map[string]struct{}
-	agentImages     map[string]struct{}
-	tools           map[string]*toolState
+	// finalized is the last assistant message whose terminal frame was
+	// projected, and agentImages the images that message emitted, so a
+	// repeated terminal frame adds nothing.
+	finalized   string
+	agentImages map[string]struct{}
+	// tools holds each tool call until pi ends its execution.
+	tools map[string]*toolState
 }
 
 // emit delivers session updates to the host. A session with no attached
@@ -93,15 +101,34 @@ func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event
 		if typed.Message.Role == messageRoleAssistant {
 			state.streamedText = ""
 			state.streamedThought = ""
+			state.inputPending = true
 		}
 
 		return false, nil
 	case pi.MessageUpdateEvent:
+		if state.inputPending {
+			state.inputPending = false
+
+			if err := s.emitResponseInput(ctx, typed.Usage); err != nil {
+				return false, err
+			}
+		}
+
 		return false, s.emitAssistantDelta(ctx, typed.AssistantMessageEvent, state)
 	case pi.MessageEndEvent:
 		if typed.Message.Role != messageRoleAssistant {
 			return false, nil
 		}
+
+		if id := typed.Message.ACPMessageID; id != "" {
+			if id == state.finalized {
+				return false, nil
+			}
+
+			state.finalized, state.agentImages = id, nil
+		}
+
+		state.inputPending = false
 
 		observeAssistantMessageEnd(typed.Message, state)
 
@@ -133,6 +160,9 @@ func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event
 		if typed.IsError {
 			status = acp.ToolCallStatusFailed
 		}
+
+		// pi says nothing more about a tool call once its execution ends.
+		defer delete(state.tools, typed.ToolCallID)
 
 		return false, s.publishToolTerminal(ctx, state, typed.ToolCallID, status, typed.Result)
 	case pi.ExtensionErrorEvent:
@@ -174,21 +204,8 @@ func (s *session) emitAssistantDelta(ctx context.Context, delta pi.AssistantMess
 }
 
 // emitAssistantTextSuffix projects the terminal message frame's text as
-// append-only deltas: only what the streamed deltas did not carry, once per
-// native message identity.
+// append-only deltas: only what the streamed deltas did not carry.
 func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
-	if state.finalized == nil {
-		state.finalized = make(map[string]struct{})
-	}
-
-	if message.ACPMessageID != "" {
-		if _, seen := state.finalized[message.ACPMessageID]; seen {
-			return nil
-		}
-
-		state.finalized[message.ACPMessageID] = struct{}{}
-	}
-
 	blocks, _ := message.ContentBlocks()
 
 	var text, thinking strings.Builder
@@ -324,6 +341,22 @@ func contextTokens(message pi.AgentMessage) (int, bool) {
 	}
 
 	return int(tokens), tokens > 0
+}
+
+// emitResponseInput reports the context an assistant response was sent with,
+// its input and cache tokens, when pi holds them before the response streams
+// its output. size is the session's known context window.
+func (s *session) emitResponseInput(ctx context.Context, usage *pi.Usage) error {
+	if usage == nil {
+		return nil
+	}
+
+	used := int(usage.Input + usage.CacheRead + usage.CacheWrite)
+	if used <= 0 {
+		return nil
+	}
+
+	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: s.knownContextWindow(), Used: used}})
 }
 
 // emitResponseUsage reports the context a finished assistant response leaves

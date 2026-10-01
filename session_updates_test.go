@@ -131,6 +131,48 @@ func TestUsageFollowsEachResponse(t *testing.T) {
 	require.Equal(t, 3570, resp.Usage.TotalTokens)
 }
 
+// TestUsageReportsResponseInputBeforeOutput proves a provider that reports a
+// call's input when its response starts yields that context before the
+// response streams, then the context the finished response left.
+func TestUsageReportsResponseInputBeforeOutput(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	resp, err := h.prompt(session.SessionId, "EARLY", nil)
+	require.NoError(t, err)
+
+	require.Equal(t, []acp.SessionUsageUpdate{
+		{Size: 1000, Used: 1150},
+		{Size: 1000, Used: 1180},
+		{Size: 1000, Used: 1240},
+		{Size: 1000, Used: 1260},
+		{Size: 1000, Used: 1260, Cost: usageCost(2)},
+	}, usageUpdates(h.rec.snapshot()))
+	require.Equal(t, 2440, resp.Usage.TotalTokens)
+}
+
+// TestRepeatedResponseFrameAddsNothing proves a terminal frame repeated for
+// the same message streams no text and reports no usage a second time.
+func TestRepeatedResponseFrameAddsNothing(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	resp, err := h.prompt(session.SessionId, "REPEAT", nil)
+	require.NoError(t, err)
+	require.Equal(t, "Hello world", agentText(h.rec.snapshot()))
+	require.Equal(t, []acp.SessionUsageUpdate{
+		{Size: 1000, Used: 15},
+		{Size: 1000, Used: 15, Cost: usageCost(1)},
+	}, usageUpdates(h.rec.snapshot()))
+	require.Equal(t, 15, resp.Usage.TotalTokens)
+}
+
 // TestUnusableResponsesReportNoUsage proves a failed or aborted model call
 // inside a turn reports no context of its own while its cost still counts.
 func TestUnusableResponsesReportNoUsage(t *testing.T) {
