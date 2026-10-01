@@ -50,6 +50,17 @@ func TestDecodeMessage(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, message.UIRequest.IsDialog())
 
+	message, err = DecodeMessage([]byte(`{"type":"extension_ui_request","id":"u","method":"setStatus","statusKey":"acp-go-pi:response","statusText":"gen-1790864381-f5Fi7D0M1fyN1HUUIrAz"}`))
+	require.NoError(t, err)
+	require.Equal(t, MessageKindEvent, message.Kind, "the bridge's response-id relay is an event in stream order")
+	relay, ok := message.Event.(ResponseIDEvent)
+	require.True(t, ok)
+	require.Equal(t, "gen-1790864381-f5Fi7D0M1fyN1HUUIrAz", relay.ResponseID)
+
+	message, err = DecodeMessage([]byte(`{"type":"extension_ui_request","id":"u","method":"setStatus","statusKey":"other","statusText":"gen-1"}`))
+	require.NoError(t, err)
+	require.Equal(t, MessageKindUIRequest, message.Kind, "another extension's status stays a UI request")
+
 	message, err = DecodeMessage([]byte(`{"type":"agent_start"}`))
 	require.NoError(t, err)
 	require.Equal(t, MessageKindEvent, message.Kind)

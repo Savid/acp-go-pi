@@ -47,12 +47,20 @@ func TestReplayUpdates(t *testing.T) {
 
 	updates, failure = replayMessage(t, messageRoleAssistant,
 		`[{"type":"thinking","thinking":"t"},{"type":"text","text":"a"},{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"ls"}},{"type":"image","data":"`+tinyPNG+`","mimeType":"image/png"}]`,
-		func(m *pi.AgentMessage) { m.ACPMessageID = "m1" })
+		func(m *pi.AgentMessage) { m.ResponseID = "gen-1790864381-f5Fi7D0M1fyN1HUUIrAz" })
 	require.Nil(t, failure)
 	require.Len(t, updates, 4)
-	require.Equal(t, "m1", *updates[1].AgentMessageChunk.MessageId)
+	require.Equal(t, "gen-1790864381-f5Fi7D0M1fyN1HUUIrAz", *updates[0].AgentThoughtChunk.MessageId)
+	require.Equal(t, "gen-1790864381-f5Fi7D0M1fyN1HUUIrAz", *updates[1].AgentMessageChunk.MessageId)
 	require.NotNil(t, updates[2].ToolCall)
+	require.Equal(t, "gen-1790864381-f5Fi7D0M1fyN1HUUIrAz", *updates[3].AgentMessageChunk.MessageId)
 	require.NotNil(t, updates[3].AgentMessageChunk.Content.Image)
+
+	updates, failure = replayMessage(t, messageRoleAssistant, `[{"type":"thinking","thinking":"t"},{"type":"text","text":"a"}]`)
+	require.Nil(t, failure)
+	require.Len(t, updates, 2)
+	require.Nil(t, updates[0].AgentThoughtChunk.MessageId, "a response without a gateway id has no messageId")
+	require.Nil(t, updates[1].AgentMessageChunk.MessageId)
 
 	_, failure = replayMessage(t, messageRoleAssistant, `[{"type":"image","data":"!!"}]`)
 	require.NotNil(t, failure)

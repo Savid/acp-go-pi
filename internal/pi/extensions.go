@@ -49,6 +49,11 @@ const (
 	// the title is the JSON-encoded PermissionPrompt.
 	PermissionTitleMarker = "acp-go-pi:permission:"
 
+	// ResponseStatusKey is the status key under which the bridge extension
+	// relays the id the model gateway returned for the streaming assistant
+	// response.
+	ResponseStatusKey = "acp-go-pi:response"
+
 	// PermissionOptionAllow is the select option that allows the tool call.
 	PermissionOptionAllow = "allow"
 	// PermissionOptionDeny is the select option that blocks the tool call.

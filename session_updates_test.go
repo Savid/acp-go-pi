@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -237,23 +238,90 @@ func TestRestoredUsage(t *testing.T) {
 	}
 }
 
-// TestRepeatedResponseFrameAddsNothing proves a terminal frame repeated for
-// the same message streams no text and reports no usage a second time.
-func TestRepeatedResponseFrameAddsNothing(t *testing.T) {
+// TestResponseIDCorrelatesChunksAndUsage proves every text, thought and image
+// chunk of a model call, streamed or terminal, carries the id the gateway
+// returned for the call as messageId, the call's usage breakdown carries the
+// same id, each call has its own, and session/load replays each chunk with it.
+// The bridge extension's relay never reaches the raw-event channel.
+func TestResponseIDCorrelatesChunksAndUsage(t *testing.T) {
+	t.Parallel()
+
+	for prompt, calls := range map[string]int{"HELLO": 1, "THINK": 1, "SUFFIX": 1, "IMAGE": 1, "EARLY": 2, "MULTI": 3} {
+		t.Run(prompt, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			h.initialize()
+			session := h.newSession(WithSessionRawEvents(true))
+
+			_, err := h.prompt(session.SessionId, prompt, nil)
+			require.NoError(t, err)
+
+			live := h.rec.snapshot()
+			responses := breakdownResponseIDs(live)
+			require.Len(t, responses, calls)
+			require.Len(t, slices.Compact(slices.Clone(responses)), calls, "each call has its own id")
+
+			for _, id := range responses {
+				require.True(t, strings.HasPrefix(id, "gen-"))
+			}
+
+			// Each call's chunks precede its breakdown.
+			call := 0
+			for _, update := range live {
+				if payload := update.Update.UsageUpdate; payload != nil {
+					if _, breakdown := callResponseID(payload); breakdown {
+						call++
+					}
+
+					continue
+				}
+
+				for _, id := range chunkMessageIDs([]acp.SessionNotification{update}) {
+					require.Less(t, call, calls, "no chunk follows the last call's breakdown")
+					require.Equal(t, responses[call], id)
+				}
+			}
+
+			h.rec.mu.Lock()
+			for _, raw := range h.rec.raw {
+				require.NotContains(t, string(raw), pi.ResponseStatusKey)
+			}
+			h.rec.mu.Unlock()
+
+			before := len(h.rec.snapshot())
+			_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, sessionCwd(t, h, session.SessionId)))
+			require.NoError(t, err)
+
+			replayed := slices.Compact(chunkMessageIDs(h.rec.snapshot()[before:]))
+			require.Equal(t, responses, replayed, "replay carries each call's id")
+		})
+	}
+}
+
+// TestResponseWithoutGatewayIDHasNoMessageID proves a response whose provider
+// exposes no id streams and replays its chunks without messageId and reports
+// its breakdown without responseId.
+func TestResponseWithoutGatewayIDHasNoMessageID(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
 	h.initialize()
 	session := h.newSession()
 
-	resp, err := h.prompt(session.SessionId, "REPEAT", nil)
+	_, err := h.prompt(session.SessionId, "NOID", nil)
 	require.NoError(t, err)
-	require.Equal(t, "Hello world", agentText(h.rec.snapshot()))
+	require.Equal(t, []string{"", ""}, chunkMessageIDs(h.rec.snapshot()))
+	require.Equal(t, []string{""}, breakdownResponseIDs(h.rec.snapshot()))
 	require.Equal(t, []acp.SessionUsageUpdate{
 		{Size: 1000, Used: 15, Meta: callMeta(10, 0, 0, 5)},
 		{Size: 1000, Used: 15, Cost: usageCost(1)},
 	}, usageUpdates(h.rec.snapshot()))
-	require.Equal(t, 15, resp.Usage.TotalTokens)
+
+	before := len(h.rec.snapshot())
+	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, sessionCwd(t, h, session.SessionId)))
+	require.NoError(t, err)
+	require.Equal(t, []string{""}, chunkMessageIDs(h.rec.snapshot()[before:]))
 }
 
 // TestUnusableResponsesReportNoUsage proves a failed or aborted model call

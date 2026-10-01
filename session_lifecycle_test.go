@@ -3,6 +3,7 @@ package piacp
 import (
 	"encoding/json"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -365,36 +366,10 @@ func TestCloseBackgroundCycleRequiresCommit(t *testing.T) {
 // lifecycle capability advertises opens on agent_start and settles on
 // agent_settled.
 func TestCapturedNativeAgentOrigin(t *testing.T) {
-	a := NewAgent(testOptions(t)...)
-	t.Cleanup(func() { _ = a.Close() })
-	rec := newRecorder()
-	a.attach(rec, nil)
-	request := acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}
-	withLifecycle()(&request)
-	_, err := a.Initialize(t.Context(), request)
-	require.NoError(t, err)
-	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
-	require.NoError(t, err)
-	s, err := a.session(t.Context(), created.SessionId)
-	require.NoError(t, err)
-	s.mu.Lock()
-	rt := s.runtime
-	require.Nil(t, s.turn)
-	s.mu.Unlock()
-
-	data, err := os.ReadFile("testdata/native/agent-origin.json")
-	require.NoError(t, err)
-	var frames []json.RawMessage
-	require.NoError(t, json.Unmarshal(data, &frames))
-	require.NotEmpty(t, frames)
+	s, rec := capturedSession(t)
 
 	before := len(lifecycleEvents(rec.snapshot()))
-	for _, frame := range frames {
-		message, err := pi.DecodeMessage(frame)
-		require.NoError(t, err)
-		require.Equal(t, pi.MessageKindEvent, message.Kind)
-		s.handleEvent(t.Context(), rt, message.Event)
-	}
+	replayCapture(t, s, "testdata/native/agent-origin.json")
 
 	events := lifecycleEvents(rec.snapshot())[before:]
 	require.Equal(t, []string{"state_update:running", "state_update:idle"}, eventTypes(events))
@@ -410,10 +385,72 @@ func TestCapturedNativeAgentOrigin(t *testing.T) {
 	require.Equal(t, acp.SessionUsageUpdate{Size: 1000, Used: 1744, Meta: wire.CallUsage{
 		InputTokens: new(1706), CachedReadTokens: new(0), CachedWriteTokens: new(0), OutputTokens: new(38),
 	}.Apply(nil)}, usage[0], "the response reports once, with its breakdown")
+	require.Equal(t, []string{"chatcmpl-070dd4a4-b61a-44f8-ab71-fc54e465b4b2"}, breakdownResponseIDs(rec.snapshot()),
+		"the breakdown carries the id pi recorded for the response")
 	require.NotNil(t, usage[1].Cost, "settlement reports pi's statistics")
 	s.mu.Lock()
 	require.Nil(t, s.cycle)
 	s.mu.Unlock()
+}
+
+// TestCapturedNativeResponseID replays a captured prompt turn whose frames
+// include the bridge extension's response-id relay, proving every streamed
+// and terminal chunk of the response and its usage breakdown carry the id the
+// gateway returned.
+func TestCapturedNativeResponseID(t *testing.T) {
+	const responseID = "gen-1790864381-f5Fi7D0M1fyN1HUUIrAz"
+
+	s, rec := capturedSession(t)
+	replayCapture(t, s, "testdata/native/prompt-response.json")
+
+	require.Equal(t, slices.Repeat([]string{responseID}, 5), chunkMessageIDs(rec.snapshot()), "four thought deltas and one text delta")
+	require.Equal(t, []string{responseID}, breakdownResponseIDs(rec.snapshot()))
+	require.Equal(t, "hi", agentText(rec.snapshot()))
+}
+
+// capturedSession opens a session whose recorder sees what replayCapture
+// feeds it.
+func capturedSession(t *testing.T) (*session, *recorder) {
+	t.Helper()
+
+	a := NewAgent(testOptions(t)...)
+	t.Cleanup(func() { _ = a.Close() })
+	rec := newRecorder()
+	a.attach(rec, nil)
+	request := acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}
+	withLifecycle()(&request)
+	_, err := a.Initialize(t.Context(), request)
+	require.NoError(t, err)
+	created, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+	s, err := a.session(t.Context(), created.SessionId)
+	require.NoError(t, err)
+
+	return s, rec
+}
+
+// replayCapture feeds captured pi RPC frames through the real decoder and the
+// session's own event handling with no prompt in flight.
+func replayCapture(t *testing.T, s *session, path string) {
+	t.Helper()
+
+	s.mu.Lock()
+	rt := s.runtime
+	require.Nil(t, s.turn)
+	s.mu.Unlock()
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var frames []json.RawMessage
+	require.NoError(t, json.Unmarshal(data, &frames))
+	require.NotEmpty(t, frames)
+
+	for _, frame := range frames {
+		message, err := pi.DecodeMessage(frame)
+		require.NoError(t, err)
+		require.Equal(t, pi.MessageKindEvent, message.Kind)
+		s.handleEvent(t.Context(), rt, message.Event)
+	}
 }
 
 // negotiatedAnswer decodes the lifecycle answer the initialize response carries.

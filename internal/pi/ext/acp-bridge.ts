@@ -13,15 +13,17 @@
  * Question tool: lets the model ask the user one question; the adapter relays
  * the dialog as an ACP elicitation.
  *
- * Message identity: stamps a UUID onto each finalized assistant message before
- * pi persists it, so live updates and session/load replay carry one durable id.
+ * Response identity: pi's RPC message_update omits the streaming message, so
+ * the first update that holds the id the model gateway returned for the
+ * response relays it as a status under the response marker key, ahead of that
+ * update's own frame.
  */
-import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const PERMISSION_MARKER = "acp-go-pi:permission:";
 const QUESTION_TOOL = "question";
+const RESPONSE_STATUS_KEY = "acp-go-pi:response";
 
 export default function (pi: ExtensionAPI) {
 	pi.registerTool({
@@ -47,20 +49,20 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("message_end", (event) => {
+	let relayedResponseId: string | undefined;
+
+	pi.on("message_start", () => {
+		relayedResponseId = undefined;
+	});
+
+	pi.on("message_update", (event, ctx) => {
 		if (event.message.role !== "assistant") return;
 
-		const message = event.message as typeof event.message & {
-			acpMessageId?: string;
-		};
-		if (message.acpMessageId) return;
+		const responseId = event.message.responseId;
+		if (!responseId || responseId === relayedResponseId) return;
 
-		return {
-			message: {
-				...message,
-				acpMessageId: randomUUID(),
-			} as typeof event.message,
-		};
+		relayedResponseId = responseId;
+		ctx.ui.setStatus(RESPONSE_STATUS_KEY, responseId);
 	});
 
 	if (process.env.ACP_GO_PI_INTERNAL_PERMISSION === "allow") {

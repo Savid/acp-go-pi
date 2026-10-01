@@ -49,15 +49,13 @@ type cycleState struct {
 	// delta, the earliest point pi can report the input the response was
 	// sent with.
 	inputPending bool
+	// responseID is the id the model gateway returned for the open assistant
+	// message, once pi holds it; its streamed chunks carry it as messageId.
+	responseID string
 	// streamedText and streamedThought hold what the open assistant message
 	// already streamed, so its terminal frame contributes only the suffix.
 	streamedText    string
 	streamedThought string
-	// finalized is the last assistant message whose terminal frame was
-	// projected, and agentImages the images that message emitted, so a
-	// repeated terminal frame adds nothing.
-	finalized   string
-	agentImages map[string]struct{}
 	// tools holds each tool call until pi ends its execution.
 	tools map[string]*toolState
 }
@@ -99,10 +97,15 @@ func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event
 		return true, nil
 	case pi.MessageStartEvent:
 		if typed.Message.Role == messageRoleAssistant {
+			state.responseID = typed.Message.ResponseID
 			state.streamedText = ""
 			state.streamedThought = ""
 			state.inputPending = true
 		}
+
+		return false, nil
+	case pi.ResponseIDEvent:
+		state.responseID = typed.ResponseID
 
 		return false, nil
 	case pi.MessageUpdateEvent:
@@ -120,14 +123,7 @@ func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event
 			return false, nil
 		}
 
-		if id := typed.Message.ACPMessageID; id != "" {
-			if id == state.finalized {
-				return false, nil
-			}
-
-			state.finalized, state.agentImages = id, nil
-		}
-
+		state.responseID = ""
 		state.inputPending = false
 
 		observeAssistantMessageEnd(typed.Message, state)
@@ -189,15 +185,21 @@ func (s *session) emitAssistantDelta(ctx context.Context, delta pi.AssistantMess
 		return nil
 	}
 
+	messageID := optionalString(state.responseID)
+
 	switch delta.Type {
 	case assistantEventTextDelta:
 		state.streamedText += delta.Delta
 
-		return s.emit(ctx, acp.UpdateAgentMessageText(delta.Delta))
+		return s.emit(ctx, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+			Content: acp.TextBlock(delta.Delta), MessageId: messageID,
+		}})
 	case assistantEventThinkingDelta:
 		state.streamedThought += delta.Delta
 
-		return s.emit(ctx, acp.UpdateAgentThoughtText(delta.Delta))
+		return s.emit(ctx, acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content: acp.TextBlock(delta.Delta), MessageId: messageID,
+		}})
 	default:
 		return nil
 	}
@@ -219,7 +221,7 @@ func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentM
 		}
 	}
 
-	messageID := optionalString(message.ACPMessageID)
+	messageID := optionalString(message.ResponseID)
 	updates := make([]acp.SessionUpdate, 0, 2)
 
 	if suffix := wire.UnstreamedSuffix(state.streamedThought, thinking.String()); suffix != "" {
@@ -241,11 +243,11 @@ func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentM
 }
 
 // emitAssistantImages projects image blocks of a finalized assistant message
-// as agent chunks, one image per chunk, deduplicated on message identity plus
-// fingerprint. A refused image is replaced by its guidance as agent text.
+// as agent chunks, one image per chunk. A refused image is replaced by its
+// guidance as agent text.
 func (s *session) emitAssistantImages(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
 	blocks, _ := message.ContentBlocks()
-	messageID := optionalString(message.ACPMessageID)
+	messageID := optionalString(message.ResponseID)
 
 	for index := range blocks {
 		if blocks[index].Type != contentBlockTypeImage {
@@ -267,23 +269,12 @@ func (s *session) emitAssistantImages(ctx context.Context, message pi.AgentMessa
 			continue
 		}
 
-		key := message.ACPMessageID + ":" + output.Fingerprint
-
-		if state.agentImages == nil {
-			state.agentImages = make(map[string]struct{})
-		}
-
-		if _, seen := state.agentImages[key]; seen {
-			continue
-		}
-
 		if err := s.emit(ctx, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
 			Content: acp.ImageBlock(output.Data, output.MIME), MessageId: messageID,
 		}}); err != nil {
 			return err
 		}
 
-		state.agentImages[key] = struct{}{}
 		state.imagesEmitted = true
 	}
 
@@ -376,9 +367,9 @@ func (s *session) emitResponseInput(ctx context.Context, usage *pi.Usage) error 
 }
 
 // emitResponseUsage reports the context a finished assistant response leaves
-// occupied, with the response's token breakdown. A response with no usable
-// figure leaves the cycle's last figure in place. size is the session's known
-// context window.
+// occupied, with the response's token breakdown and the id the model gateway
+// returned for it. A response with no usable figure leaves the cycle's last
+// figure in place. size is the session's known context window.
 func (s *session) emitResponseUsage(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
 	used, ok := contextTokens(message)
 	if !ok {
@@ -387,8 +378,11 @@ func (s *session) emitResponseUsage(ctx context.Context, message pi.AgentMessage
 
 	state.context = used
 
+	breakdown := callUsage(message.Usage)
+	breakdown.ResponseID = message.ResponseID
+
 	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
-		Size: s.knownContextWindow(), Used: used, Meta: callUsage(message.Usage).Apply(nil),
+		Size: s.knownContextWindow(), Used: used, Meta: breakdown.Apply(nil),
 	}})
 }
 
@@ -542,9 +536,14 @@ func availableCommands(commands []pi.SlashCommand) []acp.AvailableCommand {
 }
 
 // emitRawEvent forwards one native record on the raw-event channel when the
-// session opted in. An image payload is replaced by its decoded size so
-// diagnostics never carry a second copy of the bytes.
+// session opted in. The bridge extension's response-id relay is a UI request,
+// which the channel does not carry. An image payload is replaced by its
+// decoded size so diagnostics never carry a second copy of the bytes.
 func (s *session) emitRawEvent(ctx context.Context, event pi.Event) {
+	if _, relay := event.(pi.ResponseIDEvent); relay {
+		return
+	}
+
 	s.mu.Lock()
 	rawEvents := s.rawEvents
 	s.mu.Unlock()

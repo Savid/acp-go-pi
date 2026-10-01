@@ -24,7 +24,7 @@ record saves both IDs with the matching native history.
 go install github.com/savid/acp-go-pi/cmd/acp-go-pi@latest
 ```
 
-Verified against `pi` 0.85.1, found on `PATH` or named with `-path`.
+Verified against `pi` 0.87.1, found on `PATH` or named with `-path`.
 
 ## Run
 
@@ -91,6 +91,17 @@ links, and text resources before the images; images alone and multiple images
 are accepted. Forwarded text after the first image fails with
 `{"error":"unsupported","field":"prompt"}` before native dispatch.
 User-only text excluded from native input does not affect ordering.
+
+### Response identity and usage
+
+Agent text, thought, and image chunks carry the id the model gateway returned
+for their response (`gen-…`, `chatcmpl-…`, `msg_…`, `resp_…`) as ACP
+`messageId`, live and on `session/load` replay. The `usage_update` reporting a
+finished response carries its token breakdown under
+`_meta["acp-go.dev/callUsage"]`, with the same id as `responseId`. pi's RPC
+stream omits the streaming message, so the bridge extension relays the id from
+the first update that holds it. A response pi holds no id for, such as one
+that failed before the gateway answered, carries neither.
 
 ### Session store
 

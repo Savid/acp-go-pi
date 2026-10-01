@@ -60,11 +60,13 @@ type ContentBlock struct {
 }
 
 // AgentMessage is one pi conversation message. Role selects which fields are
-// populated: assistant messages carry usage/stopReason/errorMessage, tool
-// result messages carry toolCallId/isError.
+// populated: assistant messages carry responseId/usage/stopReason/errorMessage,
+// tool result messages carry toolCallId/isError. responseId is the id the model
+// gateway returned for the response, absent when pi holds none, as for a call
+// that failed before the gateway answered.
 type AgentMessage struct {
-	ACPMessageID string          `json:"acpMessageId,omitempty"`
 	Role         string          `json:"role"`
+	ResponseID   string          `json:"responseId,omitempty"`
 	Content      json.RawMessage `json:"content,omitempty"`
 	Usage        *Usage          `json:"usage,omitempty"`
 	StopReason   string          `json:"stopReason,omitempty"`
@@ -148,6 +150,16 @@ type MessageUpdateEvent struct {
 
 	AssistantMessageEvent AssistantMessageEvent `json:"assistantMessageEvent"`
 	Usage                 *Usage                `json:"usage,omitempty"`
+}
+
+// ResponseIDEvent carries the id the model gateway returned for the streaming
+// assistant response. pi's message_update frames omit the streaming message,
+// so the bridge extension relays the id from the first update that holds it,
+// ahead of that update's frame.
+type ResponseIDEvent struct {
+	baseEvent
+
+	ResponseID string
 }
 
 // MessageEndEvent signals a message completed. For assistant messages the

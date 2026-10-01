@@ -82,6 +82,12 @@ type fakePi struct {
 	turnMu   sync.Mutex
 	abort    chan struct{}
 	turnDone chan struct{}
+
+	// response is the id the gateway returned for the open assistant
+	// response, empty when it exposes none, and relayed whether the bridge
+	// extension relayed it yet. Only the run goroutine touches them.
+	response string
+	relayed  bool
 }
 
 // fakeUsageAccess answers the adapter's account-access and gateway queries
@@ -482,14 +488,53 @@ func (f *fakePi) appendRow(message map[string]any) {
 
 func (f *fakePi) assistantMessage(content []map[string]any, stopReason string, errorMessage string, usage map[string]any) map[string]any {
 	message := map[string]any{
-		"role": "assistant", "content": content, "api": "fake", "provider": "fake", "model": "vision",
-		"usage": usage, "stopReason": stopReason, "timestamp": time.Now().UnixMilli(), "acpMessageId": fakeUUID(),
+		"role": "assistant", "content": content, "api": "openai-completions", "provider": "fake", "model": "vision",
+		"usage": usage, "stopReason": stopReason, "timestamp": time.Now().UnixMilli(),
+	}
+	if f.response != "" {
+		message["responseId"] = f.response
 	}
 	if errorMessage != "" {
 		message["errorMessage"] = errorMessage
 	}
 
 	return message
+}
+
+// fakeResponseID is an id shaped as OpenRouter returns for a completion.
+func fakeResponseID() string {
+	raw := make([]byte, 10)
+	_, _ = rand.Read(raw)
+
+	return fmt.Sprintf("gen-%d-%x", time.Now().Unix(), raw)
+}
+
+// startAssistant opens a model call as pi's OpenAI completions path does:
+// message_start precedes the gateway's first chunk, so it carries no
+// responseId. gateway reports whether the gateway answers with an id.
+func (f *fakePi) startAssistant(gateway bool) {
+	f.response, f.relayed = "", false
+	if gateway {
+		f.response = fakeResponseID()
+	}
+
+	f.event(map[string]any{"type": "message_start", "message": map[string]any{
+		"role": "assistant", "content": []any{}, "api": "openai-completions", "provider": "fake", "model": "vision",
+		"usage": zeroUsage(), "stopReason": "pending", "timestamp": time.Now().UnixMilli(),
+	}})
+}
+
+// update streams one message_update holding usage. The first update of a
+// response whose id the gateway returned is preceded by the bridge
+// extension's relay of that id.
+func (f *fakePi) update(assistantEvent map[string]any, usage map[string]any) {
+	if f.response != "" && !f.relayed && f.bridgePath != "" {
+		f.relayed = true
+		f.event(map[string]any{"type": "extension_ui_request", "id": fakeUUID(), "method": "setStatus",
+			"statusKey": pi.ResponseStatusKey, "statusText": f.response})
+	}
+
+	f.event(map[string]any{"type": "message_update", "usage": usage, "assistantMessageEvent": assistantEvent})
 }
 
 // fakeUsage is one model call's native usage: the new input, the cached
@@ -614,18 +659,10 @@ func (f *fakePi) gatewayCalls(message string) map[string]any {
 	return zeroUsage()
 }
 
-// repeatEnd sends the final message's terminal frame a second time for the
-// REPEAT script.
-func (f *fakePi) repeatEnd(message string, assistant map[string]any) {
-	if strings.HasPrefix(message, "REPEAT") {
-		f.event(map[string]any{"type": "message_end", "message": assistant})
-	}
-}
-
 // partial streams the first delta of a response whose streaming message
 // already holds the given usage.
 func (f *fakePi) partial(usage map[string]any) {
-	f.event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_start", "contentIndex": 0}, "usage": usage})
+	f.update(map[string]any{"type": "text_start", "contentIndex": 0}, usage)
 }
 
 // step finishes one tool-using model call and opens the next.
@@ -634,7 +671,7 @@ func (f *fakePi) step(usage map[string]any) {
 	f.endAssistant(assistant)
 	f.event(map[string]any{"type": "turn_end", "message": assistant, "toolResults": []any{}})
 	f.event(map[string]any{"type": "turn_start"})
-	f.event(map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant", "content": []any{}}})
+	f.startAssistant(true)
 }
 
 // runTurn drives one scripted run: the keyword at the start of the message
@@ -668,6 +705,13 @@ func (f *fakePi) runTurn(message string, imageCount int, abort <-chan struct{}, 
 	}
 }
 
+// gatewayAnswers reports whether a script's first call gets a response id: a
+// call that failed before the gateway answered, and one through a provider
+// whose stream exposes no response id, carry none.
+func gatewayAnswers(message string) bool {
+	return !strings.HasPrefix(message, "ERROR") && !strings.HasPrefix(message, "NOID")
+}
+
 func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 	f.event(map[string]any{"type": "agent_start"})
 
@@ -677,7 +721,7 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 	}
 
 	f.event(map[string]any{"type": "turn_start"})
-	f.event(map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant", "content": []any{}}})
+	f.startAssistant(gatewayAnswers(message))
 
 	content := []map[string]any{}
 	stopReason := "stop"
@@ -685,7 +729,7 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 	usage := fakeUsage(10, 0, 5)
 
 	delta := func(kind string, text string) {
-		f.event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": kind, "contentIndex": 0, "delta": text}})
+		f.update(map[string]any{"type": kind, "contentIndex": 0, "delta": text}, zeroUsage())
 	}
 
 	switch {
@@ -770,7 +814,7 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 		f.event(map[string]any{"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 0, "errorMessage": "overloaded"})
 		f.event(map[string]any{"type": "agent_start"})
 		f.event(map[string]any{"type": "turn_start"})
-		f.event(map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant", "content": []any{}}})
+		f.startAssistant(true)
 
 		content = append(content, textBlock("recovered"))
 		usage = fakeUsage(100, 1000, 20)
@@ -786,7 +830,6 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 
 	assistant := f.assistantMessage(content, stopReason, errorMessage, usage)
 	f.endAssistant(assistant)
-	f.repeatEnd(message, assistant)
 	f.event(map[string]any{"type": "turn_end", "message": assistant, "toolResults": []any{}})
 	f.event(map[string]any{"type": "agent_end", "messages": []any{assistant}, "willRetry": false})
 
