@@ -97,8 +97,8 @@ User-only text excluded from native input does not affect ordering.
 Agent text, thought, and image chunks carry the id the model gateway returned
 for their response (`gen-…`, `chatcmpl-…`, `msg_…`, `resp_…`) as ACP
 `messageId`, live and on `session/load` replay. The `usage_update` reporting a
-finished response carries its token breakdown under
-`_meta["acp-go.dev/callUsage"]`, with the same id as `responseId`. pi's RPC
+finished response carries its token breakdown as `acp-go-core`'s
+`wire.CallUsage`, with the same id as `responseId`. pi's RPC
 stream omits the streaming message, so the bridge extension relays the id from
 the first update that holds it. A response pi holds no id for, such as one
 that failed before the gateway answered, carries neither.
