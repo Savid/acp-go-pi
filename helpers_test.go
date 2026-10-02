@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -321,17 +322,104 @@ func agentText(updates []acp.SessionNotification) string {
 }
 
 // usageUpdates returns the recorded usage_update payloads in delivery order,
-// without the variant discriminator the wire decoding fills in.
+// without the variant discriminator the wire decoding fills in and without the
+// call breakdown's response id, which callResponseID reads.
 func usageUpdates(updates []acp.SessionNotification) []acp.SessionUsageUpdate {
 	var usage []acp.SessionUsageUpdate
 
 	for _, update := range updates {
 		if payload := update.Update.UsageUpdate; payload != nil {
-			usage = append(usage, acp.SessionUsageUpdate{Size: payload.Size, Used: payload.Used, Cost: payload.Cost, Meta: payload.Meta})
+			usage = append(usage, acp.SessionUsageUpdate{Size: payload.Size, Used: payload.Used, Cost: payload.Cost, Meta: withoutResponseID(payload.Meta)})
 		}
 	}
 
 	return usage
+}
+
+// withoutResponseID copies meta with the call breakdown's response id removed.
+func withoutResponseID(meta map[string]any) map[string]any {
+	switch breakdown := meta[wire.CallUsageKey].(type) {
+	case wire.CallUsage:
+		breakdown.ResponseID = ""
+		meta = maps.Clone(meta)
+		meta[wire.CallUsageKey] = breakdown
+	case map[string]any:
+		breakdown = maps.Clone(breakdown)
+		delete(breakdown, "responseId")
+		meta = maps.Clone(meta)
+		meta[wire.CallUsageKey] = breakdown
+	}
+
+	return meta
+}
+
+// chunkMessageIDs lists the messageId of every agent text and thought chunk
+// in delivery order, "" for a chunk without one.
+func chunkMessageIDs(updates []acp.SessionNotification) []string {
+	var ids []string
+
+	for _, update := range updates {
+		switch {
+		case update.Update.AgentMessageChunk != nil:
+			ids = append(ids, derefString(update.Update.AgentMessageChunk.MessageId))
+		case update.Update.AgentThoughtChunk != nil:
+			ids = append(ids, derefString(update.Update.AgentThoughtChunk.MessageId))
+		}
+	}
+
+	return ids
+}
+
+// breakdownResponseIDs lists the response id of every usage_update that
+// carries a call breakdown, in delivery order, "" for one without an id.
+func breakdownResponseIDs(updates []acp.SessionNotification) []string {
+	var ids []string
+
+	for _, update := range updates {
+		if payload := update.Update.UsageUpdate; payload != nil {
+			if id, breakdown := callResponseID(payload); breakdown {
+				ids = append(ids, id)
+			}
+		}
+	}
+
+	return ids
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+
+	return *value
+}
+
+// callResponseID is the response id a usage_update's call breakdown carries;
+// breakdown is false for an update with no breakdown.
+func callResponseID(update *acp.SessionUsageUpdate) (id string, breakdown bool) {
+	switch value := update.Meta[wire.CallUsageKey].(type) {
+	case wire.CallUsage:
+		return value.ResponseID, true
+	case map[string]any:
+		id, _ := value["responseId"].(string)
+
+		return id, true
+	default:
+		return "", false
+	}
+}
+
+// callMeta is the usage_update meta carrying one response's token breakdown,
+// as the client decodes it.
+func callMeta(input int, cacheRead int, cacheWrite int, output int) map[string]any {
+	encoded, _ := json.Marshal(wire.CallUsage{
+		InputTokens: new(input), CachedReadTokens: new(cacheRead), CachedWriteTokens: new(cacheWrite), OutputTokens: new(output),
+	}.Apply(nil))
+
+	var meta map[string]any
+	_ = json.Unmarshal(encoded, &meta)
+
+	return meta
 }
 
 // usageCost is the session's cumulative cost after calls fake model calls.

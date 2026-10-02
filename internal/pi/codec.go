@@ -71,7 +71,8 @@ func trimRecord(line []byte) []byte {
 type MessageKind int
 
 const (
-	// MessageKindEvent is an agent event record.
+	// MessageKindEvent is an agent event record, or the bridge extension's
+	// response-id relay.
 	MessageKindEvent MessageKind = iota
 	// MessageKindResponse is a command response record.
 	MessageKindResponse
@@ -120,7 +121,12 @@ type UIRequest struct {
 	Message     string   `json:"message,omitempty"`
 	Placeholder string   `json:"placeholder,omitempty"`
 	Prefill     string   `json:"prefill,omitempty"`
+	StatusKey   string   `json:"statusKey,omitempty"`
+	StatusText  string   `json:"statusText,omitempty"`
 }
+
+// uiMethodSetStatus is the fire-and-forget method that sets a keyed status.
+const uiMethodSetStatus = "setStatus"
 
 // IsDialog reports whether the request blocks the extension until answered.
 func (r UIRequest) IsDialog() bool {
@@ -191,6 +197,10 @@ func DecodeMessage(line []byte) (Message, error) {
 		var request UIRequest
 		if err := json.Unmarshal(line, &request); err != nil {
 			return Message{}, fmt.Errorf("decode extension ui request: %w", err)
+		}
+
+		if request.Method == uiMethodSetStatus && request.StatusKey == ResponseStatusKey {
+			return Message{Kind: MessageKindEvent, Event: ResponseIDEvent{baseEvent: baseEvent{raw: raw}, ResponseID: request.StatusText}}, nil
 		}
 
 		return Message{Kind: MessageKindUIRequest, UIRequest: request}, nil

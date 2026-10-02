@@ -28,6 +28,9 @@ const (
 	fakePiEnvStartupDialog = "ACP_GO_PI_TEST_STARTUP_DIALOG"
 	fakePiEnvStartupDeath  = "ACP_GO_PI_TEST_STARTUP_DEATH"
 	fakePiEnvUsageGateways = "ACP_GO_PI_TEST_USAGE_GATEWAYS"
+	// fakePiEnvZeroEstimate makes get_session_stats estimate a context of
+	// zero tokens.
+	fakePiEnvZeroEstimate = "ACP_GO_PI_TEST_ZERO_ESTIMATE"
 	// fakePiEnvResumeHold names a file a resumed fake pi creates before it
 	// stops answering, so a test can act while the adapter is still relaunching.
 	fakePiEnvResumeHold = "ACP_GO_PI_TEST_RESUME_HOLD"
@@ -79,6 +82,12 @@ type fakePi struct {
 	turnMu   sync.Mutex
 	abort    chan struct{}
 	turnDone chan struct{}
+
+	// response is the id the gateway returned for the open assistant
+	// response, empty when it exposes none, and relayed whether the bridge
+	// extension relayed it yet. Only the run goroutine touches them.
+	response string
+	relayed  bool
 }
 
 // fakeUsageAccess answers the adapter's account-access and gateway queries
@@ -228,6 +237,7 @@ func runFakePi(args []string) int {
 
 		f.sessionID = header.ID
 		f.entries = len(rows)
+		f.context = lastUsableContext(rows)
 	}
 
 	f.statsID = f.sessionID
@@ -427,7 +437,12 @@ func (f *fakePi) sessionStats() pi.SessionStats {
 	}
 
 	stats.ContextUsage = &pi.ContextUsage{ContextWindow: f.model.ContextWindow}
-	if !f.compacted {
+
+	switch {
+	case f.compacted:
+	case os.Getenv(fakePiEnvZeroEstimate) != "":
+		stats.ContextUsage.Tokens = new(int64(0))
+	default:
 		stats.ContextUsage.Tokens = new(f.context + f.trailing)
 	}
 
@@ -473,14 +488,53 @@ func (f *fakePi) appendRow(message map[string]any) {
 
 func (f *fakePi) assistantMessage(content []map[string]any, stopReason string, errorMessage string, usage map[string]any) map[string]any {
 	message := map[string]any{
-		"role": "assistant", "content": content, "api": "fake", "provider": "fake", "model": "vision",
-		"usage": usage, "stopReason": stopReason, "timestamp": time.Now().UnixMilli(), "acpMessageId": fakeUUID(),
+		"role": "assistant", "content": content, "api": "openai-completions", "provider": "fake", "model": "vision",
+		"usage": usage, "stopReason": stopReason, "timestamp": time.Now().UnixMilli(),
+	}
+	if f.response != "" {
+		message["responseId"] = f.response
 	}
 	if errorMessage != "" {
 		message["errorMessage"] = errorMessage
 	}
 
 	return message
+}
+
+// fakeResponseID is an id shaped as OpenRouter returns for a completion.
+func fakeResponseID() string {
+	raw := make([]byte, 10)
+	_, _ = rand.Read(raw)
+
+	return fmt.Sprintf("gen-%d-%x", time.Now().Unix(), raw)
+}
+
+// startAssistant opens a model call as pi's OpenAI completions path does:
+// message_start precedes the gateway's first chunk, so it carries no
+// responseId. gateway reports whether the gateway answers with an id.
+func (f *fakePi) startAssistant(gateway bool) {
+	f.response, f.relayed = "", false
+	if gateway {
+		f.response = fakeResponseID()
+	}
+
+	f.event(map[string]any{"type": "message_start", "message": map[string]any{
+		"role": "assistant", "content": []any{}, "api": "openai-completions", "provider": "fake", "model": "vision",
+		"usage": zeroUsage(), "stopReason": "pending", "timestamp": time.Now().UnixMilli(),
+	}})
+}
+
+// update streams one message_update holding usage. The first update of a
+// response whose id the gateway returned is preceded by the bridge
+// extension's relay of that id.
+func (f *fakePi) update(assistantEvent map[string]any, usage map[string]any) {
+	if f.response != "" && !f.relayed && f.bridgePath != "" {
+		f.relayed = true
+		f.event(map[string]any{"type": "extension_ui_request", "id": fakeUUID(), "method": "setStatus",
+			"statusKey": pi.ResponseStatusKey, "statusText": f.response})
+	}
+
+	f.event(map[string]any{"type": "message_update", "usage": usage, "assistantMessageEvent": assistantEvent})
 }
 
 // fakeUsage is one model call's native usage: the new input, the cached
@@ -490,7 +544,15 @@ func fakeUsage(input int, cacheRead int, output int) map[string]any {
 		"cost": map[string]any{"input": 0.125, "output": 0.125, "cacheRead": 0, "cacheWrite": 0, "total": fakeCallCost}}
 }
 
-// fakeCallCost is every model call's cost, exact in binary so sums compare.
+// zeroUsage is the usage of a model call a gateway answered from its response
+// cache: every figure and the cost zero.
+func zeroUsage() map[string]any {
+	return map[string]any{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+		"cost": map[string]any{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}
+}
+
+// fakeCallCost is every model call's cost, exact in binary so sums compare. A
+// call reporting no tokens costs nothing.
 const fakeCallCost = 0.25
 
 // endAssistant finishes one model call: its message_end, its session row,
@@ -506,11 +568,35 @@ func (f *fakePi) endAssistant(message map[string]any) {
 	f.statsMu.Lock()
 	defer f.statsMu.Unlock()
 
-	f.cost += fakeCallCost
+	if tokens > 0 {
+		f.cost += fakeCallCost
+	}
 
 	if tokens > 0 && stopReason != "aborted" && stopReason != "error" {
 		f.context, f.trailing, f.compacted = int64(tokens), 0, false
 	}
+}
+
+// lastUsableContext is the context the last usable response in a session's
+// rows left, from which pi estimates a resumed session's context.
+func lastUsableContext(rows [][]byte) int64 {
+	var context int64
+
+	for _, raw := range rows {
+		var row struct {
+			Message pi.AgentMessage `json:"message"`
+		}
+
+		if json.Unmarshal(raw, &row) != nil || row.Message.Role != "assistant" || row.Message.Usage == nil {
+			continue
+		}
+
+		if stop := row.Message.StopReason; stop != "aborted" && stop != "error" && row.Message.Usage.TotalTokens > 0 {
+			context = row.Message.Usage.TotalTokens
+		}
+	}
+
+	return context
 }
 
 // awaitStats waits for the adapter to read the statistics of the run that
@@ -534,13 +620,58 @@ func aborted(abort <-chan struct{}, wait time.Duration) bool {
 	}
 }
 
+// multiCall runs every model call of a multi-call script but the last and
+// returns the last call's usage.
+func (f *fakePi) multiCall(message string) map[string]any {
+	if strings.HasPrefix(message, "EARLY") {
+		// Two model calls from a provider that reports each call's input when
+		// the response starts, before its first delta.
+		f.partial(map[string]any{"input": 100, "output": 1, "cacheRead": 1000, "cacheWrite": 50, "totalTokens": 1151})
+		f.step(map[string]any{"input": 100, "output": 30, "cacheRead": 1000, "cacheWrite": 50, "totalTokens": 1180})
+		f.partial(map[string]any{"input": 60, "output": 1, "cacheRead": 1180, "cacheWrite": 0, "totalTokens": 1241})
+
+		return map[string]any{"input": 60, "output": 20, "cacheRead": 1180, "cacheWrite": 0, "totalTokens": 1260}
+	}
+
+	// Three model calls, each resending the context the previous one left.
+	for _, step := range []map[string]any{fakeUsage(100, 1000, 20), fakeUsage(50, 1120, 30)} {
+		f.step(step)
+	}
+
+	return fakeUsage(40, 1200, 10)
+}
+
+// gatewayCalls runs every model call of a script whose usage arrives only at
+// the end of the stream but the last, and returns the last call's usage. A
+// call a gateway answered from its response cache reports every figure zero.
+func (f *fakePi) gatewayCalls(message string) map[string]any {
+	f.partial(zeroUsage())
+
+	switch {
+	case strings.HasPrefix(message, "LATEUSAGE"):
+		return fakeUsage(100, 1000, 20)
+	case strings.HasPrefix(message, "REPLAY"):
+		// A real call, then a replayed one.
+		f.step(fakeUsage(100, 1000, 20))
+		f.partial(zeroUsage())
+	}
+
+	return zeroUsage()
+}
+
+// partial streams the first delta of a response whose streaming message
+// already holds the given usage.
+func (f *fakePi) partial(usage map[string]any) {
+	f.update(map[string]any{"type": "text_start", "contentIndex": 0}, usage)
+}
+
 // step finishes one tool-using model call and opens the next.
 func (f *fakePi) step(usage map[string]any) {
 	assistant := f.assistantMessage([]map[string]any{textBlock("step")}, "toolUse", "", usage)
 	f.endAssistant(assistant)
 	f.event(map[string]any{"type": "turn_end", "message": assistant, "toolResults": []any{}})
 	f.event(map[string]any{"type": "turn_start"})
-	f.event(map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant", "content": []any{}}})
+	f.startAssistant(true)
 }
 
 // runTurn drives one scripted run: the keyword at the start of the message
@@ -574,6 +705,13 @@ func (f *fakePi) runTurn(message string, imageCount int, abort <-chan struct{}, 
 	}
 }
 
+// gatewayAnswers reports whether a script's first call gets a response id: a
+// call that failed before the gateway answered, and one through a provider
+// whose stream exposes no response id, carry none.
+func gatewayAnswers(message string) bool {
+	return !strings.HasPrefix(message, "ERROR") && !strings.HasPrefix(message, "NOID")
+}
+
 func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 	f.event(map[string]any{"type": "agent_start"})
 
@@ -583,7 +721,7 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 	}
 
 	f.event(map[string]any{"type": "turn_start"})
-	f.event(map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant", "content": []any{}}})
+	f.startAssistant(gatewayAnswers(message))
 
 	content := []map[string]any{}
 	stopReason := "stop"
@@ -591,7 +729,7 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 	usage := fakeUsage(10, 0, 5)
 
 	delta := func(kind string, text string) {
-		f.event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": kind, "contentIndex": 0, "delta": text}})
+		f.update(map[string]any{"type": kind, "contentIndex": 0, "delta": text}, zeroUsage())
 	}
 
 	switch {
@@ -652,14 +790,12 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 		content = append(content, textBlock("switched"))
 	case strings.HasPrefix(message, "ECHO"):
 		content = append(content, textBlock(message))
-	case strings.HasPrefix(message, "MULTI"):
-		// Three model calls, each resending the context the previous one left.
-		for _, step := range []map[string]any{fakeUsage(100, 1000, 20), fakeUsage(50, 1120, 30)} {
-			f.step(step)
-		}
-
+	case strings.HasPrefix(message, "MULTI"), strings.HasPrefix(message, "EARLY"):
 		content = append(content, textBlock("done"))
-		usage = fakeUsage(40, 1200, 10)
+		usage = f.multiCall(message)
+	case strings.HasPrefix(message, "LATEUSAGE"), strings.HasPrefix(message, "REPLAY"), strings.HasPrefix(message, "CACHED"):
+		content = append(content, textBlock("done"))
+		usage = f.gatewayCalls(message)
 	case strings.HasPrefix(message, "COMPACT"):
 		content = append(content, textBlock("long"))
 		usage = fakeUsage(100, 800, 50)
@@ -678,7 +814,7 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 		f.event(map[string]any{"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 0, "errorMessage": "overloaded"})
 		f.event(map[string]any{"type": "agent_start"})
 		f.event(map[string]any{"type": "turn_start"})
-		f.event(map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant", "content": []any{}}})
+		f.startAssistant(true)
 
 		content = append(content, textBlock("recovered"))
 		usage = fakeUsage(100, 1000, 20)

@@ -3,6 +3,8 @@ package piacp
 import (
 	"encoding/base64"
 	"encoding/json"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -101,7 +103,7 @@ func TestUsageAndSessionInfoUpdates(t *testing.T) {
 	}
 
 	require.Equal(t, []acp.SessionUsageUpdate{
-		{Size: 1000, Used: 15},
+		{Size: 1000, Used: 15, Meta: callMeta(10, 0, 0, 5)},
 		{Size: 1000, Used: 15, Cost: usageCost(1)},
 	}, usageUpdates(h.rec.snapshot()))
 	require.NotNil(t, info)
@@ -122,13 +124,204 @@ func TestUsageFollowsEachResponse(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, []acp.SessionUsageUpdate{
-		{Size: 1000, Used: 1120},
-		{Size: 1000, Used: 1200},
-		{Size: 1000, Used: 1250},
+		{Size: 1000, Used: 1120, Meta: callMeta(100, 1000, 0, 20)},
+		{Size: 1000, Used: 1200, Meta: callMeta(50, 1120, 0, 30)},
+		{Size: 1000, Used: 1250, Meta: callMeta(40, 1200, 0, 10)},
 		{Size: 1000, Used: 1250, Cost: usageCost(3)},
 	}, usageUpdates(h.rec.snapshot()))
 	require.NotNil(t, resp.Usage)
 	require.Equal(t, 3570, resp.Usage.TotalTokens)
+}
+
+// TestUsageReportsResponseInputBeforeOutput proves a provider that reports a
+// call's input when its response starts yields that context before the
+// response streams, then the context the finished response left.
+func TestUsageReportsResponseInputBeforeOutput(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	resp, err := h.prompt(session.SessionId, "EARLY", nil)
+	require.NoError(t, err)
+
+	require.Equal(t, []acp.SessionUsageUpdate{
+		{Size: 1000, Used: 1150},
+		{Size: 1000, Used: 1180, Meta: callMeta(100, 1000, 50, 30)},
+		{Size: 1000, Used: 1240},
+		{Size: 1000, Used: 1260, Meta: callMeta(60, 1180, 0, 20)},
+		{Size: 1000, Used: 1260, Cost: usageCost(2)},
+	}, usageUpdates(h.rec.snapshot()))
+	require.Equal(t, 2440, resp.Usage.TotalTokens)
+}
+
+// TestEmptyUsageStatesNothing proves a usage report whose every figure is
+// zero, as a provider that reports usage only when the stream ends sends while
+// it streams and a gateway replaying a cached response sends at the end,
+// emits nothing and leaves the last figure for settlement, even when pi
+// estimates the context at zero tokens.
+func TestEmptyUsageStatesNothing(t *testing.T) {
+	t.Parallel()
+
+	reported := []acp.SessionUsageUpdate{
+		{Size: 1000, Used: 1120, Meta: callMeta(100, 1000, 0, 20)},
+		{Size: 1000, Used: 1120, Cost: usageCost(1)},
+	}
+
+	for name, tc := range map[string]struct {
+		prompt string
+		env    map[string]string
+		want   []acp.SessionUsageUpdate
+		total  int
+	}{
+		"zero first update":                {"LATEUSAGE", nil, reported, 1120},
+		"zero first update, zero estimate": {"LATEUSAGE", map[string]string{fakePiEnvZeroEstimate: "1"}, reported, 1120},
+		"cache replay":                     {"REPLAY", nil, reported, 1120},
+		"cache replay, zero estimate":      {"REPLAY", map[string]string{fakePiEnvZeroEstimate: "1"}, reported, 1120},
+		"only a cache replay":              {"CACHED", map[string]string{fakePiEnvZeroEstimate: "1"}, nil, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			env := map[string]string{fakePiEnv: "1"}
+			maps.Copy(env, tc.env)
+
+			h := newHarness(t, WithEnv(env))
+			h.initialize()
+			session := h.newSession()
+
+			resp, err := h.prompt(session.SessionId, tc.prompt, nil)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, usageUpdates(h.rec.snapshot()))
+
+			if tc.total == 0 {
+				require.Nil(t, resp.Usage, "a turn whose calls reported nothing has no usage")
+
+				return
+			}
+
+			require.Equal(t, tc.total, resp.Usage.TotalTokens)
+		})
+	}
+}
+
+// TestRestoredUsage proves a restored session reports pi's estimate of its
+// context, and nothing when pi estimates it at zero tokens.
+func TestRestoredUsage(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		env  map[string]string
+		want []acp.SessionUsageUpdate
+	}{
+		"estimate":      {map[string]string{"ACP_GO_PI_TEST_ROTATED": "1"}, []acp.SessionUsageUpdate{{Size: 1000, Used: 15}}},
+		"zero estimate": {map[string]string{fakePiEnvZeroEstimate: "1"}, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			h.initialize()
+			session := h.newSession()
+
+			_, err := h.prompt(session.SessionId, "HELLO", nil)
+			require.NoError(t, err)
+
+			before := len(h.rec.snapshot())
+
+			_, err = h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(session.SessionId, sessionCwd(t, h, session.SessionId),
+				WithSessionPiOptions(NewPiOptions(WithPiEnv(tc.env)))))
+			require.NoError(t, err)
+			require.Equal(t, tc.want, usageUpdates(h.rec.snapshot()[before:]))
+		})
+	}
+}
+
+// TestResponseIDCorrelatesChunksAndUsage proves every text, thought and image
+// chunk of a model call, streamed or terminal, carries the id the gateway
+// returned for the call as messageId, the call's usage breakdown carries the
+// same id, each call has its own, and session/load replays each chunk with it.
+// The bridge extension's relay never reaches the raw-event channel.
+func TestResponseIDCorrelatesChunksAndUsage(t *testing.T) {
+	t.Parallel()
+
+	for prompt, calls := range map[string]int{"HELLO": 1, "THINK": 1, "SUFFIX": 1, "IMAGE": 1, "EARLY": 2, "MULTI": 3} {
+		t.Run(prompt, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			h.initialize()
+			session := h.newSession(WithSessionRawEvents(true))
+
+			_, err := h.prompt(session.SessionId, prompt, nil)
+			require.NoError(t, err)
+
+			live := h.rec.snapshot()
+			responses := breakdownResponseIDs(live)
+			require.Len(t, responses, calls)
+			require.Len(t, slices.Compact(slices.Clone(responses)), calls, "each call has its own id")
+
+			for _, id := range responses {
+				require.True(t, strings.HasPrefix(id, "gen-"))
+			}
+
+			// Each call's chunks precede its breakdown.
+			call := 0
+			for _, update := range live {
+				if payload := update.Update.UsageUpdate; payload != nil {
+					if _, breakdown := callResponseID(payload); breakdown {
+						call++
+					}
+
+					continue
+				}
+
+				for _, id := range chunkMessageIDs([]acp.SessionNotification{update}) {
+					require.Less(t, call, calls, "no chunk follows the last call's breakdown")
+					require.Equal(t, responses[call], id)
+				}
+			}
+
+			h.rec.mu.Lock()
+			for _, raw := range h.rec.raw {
+				require.NotContains(t, string(raw), pi.ResponseStatusKey)
+			}
+			h.rec.mu.Unlock()
+
+			before := len(h.rec.snapshot())
+			_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, sessionCwd(t, h, session.SessionId)))
+			require.NoError(t, err)
+
+			replayed := slices.Compact(chunkMessageIDs(h.rec.snapshot()[before:]))
+			require.Equal(t, responses, replayed, "replay carries each call's id")
+		})
+	}
+}
+
+// TestResponseWithoutGatewayIDHasNoMessageID proves a response whose provider
+// exposes no id streams and replays its chunks without messageId and reports
+// its breakdown without responseId.
+func TestResponseWithoutGatewayIDHasNoMessageID(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.initialize()
+	session := h.newSession()
+
+	_, err := h.prompt(session.SessionId, "NOID", nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{"", ""}, chunkMessageIDs(h.rec.snapshot()))
+	require.Equal(t, []string{""}, breakdownResponseIDs(h.rec.snapshot()))
+	require.Equal(t, []acp.SessionUsageUpdate{
+		{Size: 1000, Used: 15, Meta: callMeta(10, 0, 0, 5)},
+		{Size: 1000, Used: 15, Cost: usageCost(1)},
+	}, usageUpdates(h.rec.snapshot()))
+
+	before := len(h.rec.snapshot())
+	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, sessionCwd(t, h, session.SessionId)))
+	require.NoError(t, err)
+	require.Equal(t, []string{""}, chunkMessageIDs(h.rec.snapshot()[before:]))
 }
 
 // TestUnusableResponsesReportNoUsage proves a failed or aborted model call
@@ -141,7 +334,7 @@ func TestUnusableResponsesReportNoUsage(t *testing.T) {
 		want   []acp.SessionUsageUpdate
 	}{
 		"failed call retried": {"FLAKY", []acp.SessionUsageUpdate{
-			{Size: 1000, Used: 1120},
+			{Size: 1000, Used: 1120, Meta: callMeta(100, 1000, 0, 20)},
 			{Size: 1000, Used: 1120, Cost: usageCost(2)},
 		}},
 		"aborted call": {"EXTERR", []acp.SessionUsageUpdate{
@@ -183,13 +376,13 @@ func TestSettledUsageAfterCompaction(t *testing.T) {
 
 			_, err := h.prompt(session.SessionId, "COMPACT", nil)
 			require.NoError(t, err)
-			require.Equal(t, []acp.SessionUsageUpdate{{Size: tc.size, Used: 950}}, usageUpdates(h.rec.snapshot()))
+			require.Equal(t, []acp.SessionUsageUpdate{{Size: tc.size, Used: 950, Meta: callMeta(100, 800, 0, 50)}}, usageUpdates(h.rec.snapshot()))
 
 			_, err = h.prompt(session.SessionId, "HELLO", nil)
 			require.NoError(t, err)
 			require.Equal(t, []acp.SessionUsageUpdate{
-				{Size: tc.size, Used: 950},
-				{Size: tc.size, Used: 15},
+				{Size: tc.size, Used: 950, Meta: callMeta(100, 800, 0, 50)},
+				{Size: tc.size, Used: 15, Meta: callMeta(10, 0, 0, 5)},
 				{Size: tc.size, Used: 15, Cost: usageCost(2)},
 			}, usageUpdates(h.rec.snapshot()))
 		})
@@ -211,9 +404,9 @@ func TestSettledUsageAdoptsNativeModelWindow(t *testing.T) {
 	}
 
 	require.Equal(t, []acp.SessionUsageUpdate{
-		{Size: 1000, Used: 15},
+		{Size: 1000, Used: 15, Meta: callMeta(10, 0, 0, 5)},
 		{Size: 500, Used: 15, Cost: usageCost(1)},
-		{Size: 500, Used: 15},
+		{Size: 500, Used: 15, Meta: callMeta(10, 0, 0, 5)},
 		{Size: 500, Used: 15, Cost: usageCost(2)},
 	}, usageUpdates(h.rec.snapshot()))
 }
@@ -236,7 +429,7 @@ func TestCancelledTurnReportsNoUsageAfterCancel(t *testing.T) {
 	require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(session.SessionId)))
 	require.Equal(t, acp.StopReasonCancelled, (<-done).StopReason)
 
-	require.Equal(t, []acp.SessionUsageUpdate{{Size: 1000, Used: 1120}}, usageUpdates(h.rec.snapshot()))
+	require.Equal(t, []acp.SessionUsageUpdate{{Size: 1000, Used: 1120, Meta: callMeta(100, 1000, 0, 20)}}, usageUpdates(h.rec.snapshot()))
 }
 
 func TestAgentOriginUsageReportsSettledStatistics(t *testing.T) {
@@ -252,9 +445,9 @@ func TestAgentOriginUsageReportsSettledStatistics(t *testing.T) {
 	h.rec.waitFor(t, func(updates []acp.SessionNotification) bool { return idleTransitions(updates, session.SessionId) == 2 })
 
 	require.Equal(t, []acp.SessionUsageUpdate{
-		{Size: 1000, Used: 15},
+		{Size: 1000, Used: 15, Meta: callMeta(10, 0, 0, 5)},
 		{Size: 1000, Used: 15, Cost: usageCost(1)},
-		{Size: 1000, Used: 15},
+		{Size: 1000, Used: 15, Meta: callMeta(10, 0, 0, 5)},
 		{Size: 1000, Used: 15, Cost: usageCost(2)},
 	}, usageUpdates(h.rec.snapshot()))
 }
@@ -280,7 +473,7 @@ func TestCancelledAgentOriginCycleReportsNoUsage(t *testing.T) {
 	events := lifecycleEvents(h.rec.snapshot())
 	require.Equal(t, "cancelled", events[len(events)-1]["outcome"])
 	require.Equal(t, []acp.SessionUsageUpdate{
-		{Size: 1000, Used: 15},
+		{Size: 1000, Used: 15, Meta: callMeta(10, 0, 0, 5)},
 		{Size: 1000, Used: 15, Cost: usageCost(1)},
 	}, usageUpdates(h.rec.snapshot()))
 }
@@ -297,6 +490,7 @@ func TestContextTokens(t *testing.T) {
 		"summed":         {pi.AgentMessage{Usage: &pi.Usage{Input: 1, Output: 2, CacheRead: 3, CacheWrite: 4}}, 10, true},
 		"no usage":       {pi.AgentMessage{}, 0, false},
 		"empty":          {pi.AgentMessage{Usage: &pi.Usage{}}, 0, false},
+		"total only":     {pi.AgentMessage{Usage: &pi.Usage{TotalTokens: 9}}, 0, false},
 		"aborted":        {pi.AgentMessage{StopReason: stopReasonAborted, Usage: &pi.Usage{Input: 1}}, 0, false},
 		"failed":         {pi.AgentMessage{StopReason: stopReasonError, Usage: &pi.Usage{Input: 1}}, 0, false},
 	} {

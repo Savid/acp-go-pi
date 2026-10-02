@@ -37,21 +37,27 @@ const (
 
 // cycleState accumulates what one cycle streamed.
 type cycleState struct {
-	// usage sums every response's tokens; context is what the last usable
-	// response left occupied, 0 when none has since the cycle opened or pi
-	// last compacted.
+	// usage sums every response's reported tokens; context is what the last
+	// usable response left occupied, 0 when none has since the cycle opened
+	// or pi last compacted.
 	usage         *acp.Usage
 	context       int
 	stopReason    string
 	errorMessage  string
 	imagesEmitted bool
+	// inputPending holds from an assistant message's start until its first
+	// delta, the earliest point pi can report the input the response was
+	// sent with.
+	inputPending bool
+	// responseID is the id the model gateway returned for the open assistant
+	// message, once pi holds it; its streamed chunks carry it as messageId.
+	responseID string
 	// streamedText and streamedThought hold what the open assistant message
 	// already streamed, so its terminal frame contributes only the suffix.
 	streamedText    string
 	streamedThought string
-	finalized       map[string]struct{}
-	agentImages     map[string]struct{}
-	tools           map[string]*toolState
+	// tools holds each tool call until pi ends its execution.
+	tools map[string]*toolState
 }
 
 // emit delivers session updates to the host. A session with no attached
@@ -91,17 +97,34 @@ func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event
 		return true, nil
 	case pi.MessageStartEvent:
 		if typed.Message.Role == messageRoleAssistant {
+			state.responseID = typed.Message.ResponseID
 			state.streamedText = ""
 			state.streamedThought = ""
+			state.inputPending = true
 		}
 
 		return false, nil
+	case pi.ResponseIDEvent:
+		state.responseID = typed.ResponseID
+
+		return false, nil
 	case pi.MessageUpdateEvent:
+		if state.inputPending {
+			state.inputPending = false
+
+			if err := s.emitResponseInput(ctx, typed.Usage); err != nil {
+				return false, err
+			}
+		}
+
 		return false, s.emitAssistantDelta(ctx, typed.AssistantMessageEvent, state)
 	case pi.MessageEndEvent:
 		if typed.Message.Role != messageRoleAssistant {
 			return false, nil
 		}
+
+		state.responseID = ""
+		state.inputPending = false
 
 		observeAssistantMessageEnd(typed.Message, state)
 
@@ -134,6 +157,9 @@ func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event
 			status = acp.ToolCallStatusFailed
 		}
 
+		// pi says nothing more about a tool call once its execution ends.
+		defer delete(state.tools, typed.ToolCallID)
+
 		return false, s.publishToolTerminal(ctx, state, typed.ToolCallID, status, typed.Result)
 	case pi.ExtensionErrorEvent:
 		// A failure in the wrapper's own extensions means the permission gate
@@ -159,36 +185,29 @@ func (s *session) emitAssistantDelta(ctx context.Context, delta pi.AssistantMess
 		return nil
 	}
 
+	messageID := optionalString(state.responseID)
+
 	switch delta.Type {
 	case assistantEventTextDelta:
 		state.streamedText += delta.Delta
 
-		return s.emit(ctx, acp.UpdateAgentMessageText(delta.Delta))
+		return s.emit(ctx, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
+			Content: acp.TextBlock(delta.Delta), MessageId: messageID,
+		}})
 	case assistantEventThinkingDelta:
 		state.streamedThought += delta.Delta
 
-		return s.emit(ctx, acp.UpdateAgentThoughtText(delta.Delta))
+		return s.emit(ctx, acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
+			Content: acp.TextBlock(delta.Delta), MessageId: messageID,
+		}})
 	default:
 		return nil
 	}
 }
 
 // emitAssistantTextSuffix projects the terminal message frame's text as
-// append-only deltas: only what the streamed deltas did not carry, once per
-// native message identity.
+// append-only deltas: only what the streamed deltas did not carry.
 func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
-	if state.finalized == nil {
-		state.finalized = make(map[string]struct{})
-	}
-
-	if message.ACPMessageID != "" {
-		if _, seen := state.finalized[message.ACPMessageID]; seen {
-			return nil
-		}
-
-		state.finalized[message.ACPMessageID] = struct{}{}
-	}
-
 	blocks, _ := message.ContentBlocks()
 
 	var text, thinking strings.Builder
@@ -202,7 +221,7 @@ func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentM
 		}
 	}
 
-	messageID := optionalString(message.ACPMessageID)
+	messageID := optionalString(message.ResponseID)
 	updates := make([]acp.SessionUpdate, 0, 2)
 
 	if suffix := wire.UnstreamedSuffix(state.streamedThought, thinking.String()); suffix != "" {
@@ -224,11 +243,11 @@ func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentM
 }
 
 // emitAssistantImages projects image blocks of a finalized assistant message
-// as agent chunks, one image per chunk, deduplicated on message identity plus
-// fingerprint. A refused image is replaced by its guidance as agent text.
+// as agent chunks, one image per chunk. A refused image is replaced by its
+// guidance as agent text.
 func (s *session) emitAssistantImages(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
 	blocks, _ := message.ContentBlocks()
-	messageID := optionalString(message.ACPMessageID)
+	messageID := optionalString(message.ResponseID)
 
 	for index := range blocks {
 		if blocks[index].Type != contentBlockTypeImage {
@@ -250,23 +269,12 @@ func (s *session) emitAssistantImages(ctx context.Context, message pi.AgentMessa
 			continue
 		}
 
-		key := message.ACPMessageID + ":" + output.Fingerprint
-
-		if state.agentImages == nil {
-			state.agentImages = make(map[string]struct{})
-		}
-
-		if _, seen := state.agentImages[key]; seen {
-			continue
-		}
-
 		if err := s.emit(ctx, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
 			Content: acp.ImageBlock(output.Data, output.MIME), MessageId: messageID,
 		}}); err != nil {
 			return err
 		}
 
-		state.agentImages[key] = struct{}{}
 		state.imagesEmitted = true
 	}
 
@@ -290,8 +298,20 @@ func observeAssistantMessageEnd(message pi.AgentMessage, state *cycleState) {
 		state.errorMessage = message.ErrorMessage
 	}
 
-	if message.Usage != nil {
+	if message.Usage != nil && callUsage(message.Usage).Known() {
 		state.usage = mergeUsage(state.usage, message.Usage)
+	}
+}
+
+// callUsage is the token breakdown pi reported for one response. pi reports
+// input without the cache tokens it read or wrote and output with any
+// reasoning included, and records a figure its provider omitted as 0.
+func callUsage(usage *pi.Usage) wire.CallUsage {
+	return wire.CallUsage{
+		InputTokens:       new(int(usage.Input)),
+		CachedReadTokens:  new(int(usage.CacheRead)),
+		CachedWriteTokens: new(int(usage.CacheWrite)),
+		OutputTokens:      new(int(usage.Output)),
 	}
 }
 
@@ -311,10 +331,12 @@ func mergeUsage(total *acp.Usage, next *pi.Usage) *acp.Usage {
 
 // contextTokens is the context an assistant response leaves occupied, counted
 // as pi counts it: the reported total, else the sum of input, output, and
-// cache tokens. Aborted, failed, and empty responses carry no usable figure.
+// cache tokens. Aborted and failed responses carry no usable figure, and a
+// response reporting no token at all, as a gateway replaying a cached
+// response does, states nothing.
 func contextTokens(message pi.AgentMessage) (int, bool) {
 	usage := message.Usage
-	if usage == nil || message.StopReason == stopReasonAborted || message.StopReason == stopReasonError {
+	if usage == nil || message.StopReason == stopReasonAborted || message.StopReason == stopReasonError || !callUsage(usage).Known() {
 		return 0, false
 	}
 
@@ -326,8 +348,28 @@ func contextTokens(message pi.AgentMessage) (int, bool) {
 	return int(tokens), tokens > 0
 }
 
+// emitResponseInput reports the context an assistant response was sent with,
+// its input and cache tokens, when pi holds them before the response streams
+// its output. A provider that reports usage only when the stream ends leaves
+// them zero here, which states nothing. size is the session's known context
+// window.
+func (s *session) emitResponseInput(ctx context.Context, usage *pi.Usage) error {
+	if usage == nil {
+		return nil
+	}
+
+	used := int(usage.Input + usage.CacheRead + usage.CacheWrite)
+	if used <= 0 {
+		return nil
+	}
+
+	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: s.knownContextWindow(), Used: used}})
+}
+
 // emitResponseUsage reports the context a finished assistant response leaves
-// occupied. size is the session's known context window.
+// occupied, with the response's token breakdown and the id the model gateway
+// returned for it. A response with no usable figure leaves the cycle's last
+// figure in place. size is the session's known context window.
 func (s *session) emitResponseUsage(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
 	used, ok := contextTokens(message)
 	if !ok {
@@ -336,14 +378,21 @@ func (s *session) emitResponseUsage(ctx context.Context, message pi.AgentMessage
 
 	state.context = used
 
-	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: s.knownContextWindow(), Used: used}})
+	breakdown := callUsage(message.Usage)
+	breakdown.ResponseID = message.ResponseID
+
+	return s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{
+		Size: s.knownContextWindow(), Used: used, Meta: breakdown.Apply(nil),
+	}})
 }
 
 // emitSettledUsage reports pi's statistics once a cycle settles. used is pi's
-// context estimate, else the context the cycle's last response left; after a
-// compaction no response has followed, pi has no estimate and nothing is
-// sent. size is the context window get_session_stats reports, which becomes
-// the session's known window; cost is the session's cumulative cost.
+// context estimate, else the context the cycle's last response left; an
+// estimate of zero tokens is unknown, since no model call has an empty
+// context. After a compaction no response has followed, pi has no estimate
+// and nothing is sent. size is the context window get_session_stats reports,
+// which becomes the session's known window; cost is the session's cumulative
+// cost.
 func (s *session) emitSettledUsage(ctx context.Context, state *cycleState, stats *pi.SessionStats) {
 	if stats == nil {
 		return
@@ -356,7 +405,7 @@ func (s *session) emitSettledUsage(ctx context.Context, state *cycleState, stats
 	if usage := stats.ContextUsage; usage != nil {
 		size = usage.ContextWindow
 
-		if usage.Tokens != nil {
+		if usage.Tokens != nil && *usage.Tokens > 0 {
 			used, known = int(*usage.Tokens), true
 		}
 	}
@@ -383,24 +432,24 @@ func (s *session) knownContextWindow() int {
 	return int(s.contextWindow)
 }
 
-// emitRestoredUsage reports the restored session's context usage when pi
-// knows it.
+// emitRestoredUsage records the restored session's context window and
+// reports its context when pi estimates a non-zero one.
 func (s *session) emitRestoredUsage(ctx context.Context, rt *runtime) {
 	stats, err := rt.client.GetSessionStats(ctx)
 	if err != nil || stats.ContextUsage == nil || stats.ContextUsage.ContextWindow <= 0 {
 		return
 	}
 
-	used := 0
-	if stats.ContextUsage.Tokens != nil {
-		used = int(*stats.ContextUsage.Tokens)
-	}
-
 	s.mu.Lock()
 	s.contextWindow = stats.ContextUsage.ContextWindow
 	s.mu.Unlock()
 
-	_ = s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: int(stats.ContextUsage.ContextWindow), Used: used}})
+	tokens := stats.ContextUsage.Tokens
+	if tokens == nil || *tokens <= 0 {
+		return
+	}
+
+	_ = s.emit(ctx, acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Size: int(stats.ContextUsage.ContextWindow), Used: int(*tokens)}})
 }
 
 // emitSessionInfo records the turn's time and, on the first prompt, a title.
@@ -487,9 +536,14 @@ func availableCommands(commands []pi.SlashCommand) []acp.AvailableCommand {
 }
 
 // emitRawEvent forwards one native record on the raw-event channel when the
-// session opted in. An image payload is replaced by its decoded size so
-// diagnostics never carry a second copy of the bytes.
+// session opted in. The bridge extension's response-id relay is a UI request,
+// which the channel does not carry. An image payload is replaced by its
+// decoded size so diagnostics never carry a second copy of the bytes.
 func (s *session) emitRawEvent(ctx context.Context, event pi.Event) {
+	if _, relay := event.(pi.ResponseIDEvent); relay {
+		return
+	}
+
 	s.mu.Lock()
 	rawEvents := s.rawEvents
 	s.mu.Unlock()

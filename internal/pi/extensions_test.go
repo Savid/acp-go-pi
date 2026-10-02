@@ -22,6 +22,7 @@ func TestPublishExtensions(t *testing.T) {
 	bridge, err := os.ReadFile(paths.Bridge)
 	require.NoError(t, err)
 	require.Contains(t, string(bridge), PermissionTitleMarker)
+	require.Contains(t, string(bridge), ResponseStatusKey)
 	require.Contains(t, string(bridge), EnvPermissionMode)
 
 	path, err := os.ReadFile(paths.Path)

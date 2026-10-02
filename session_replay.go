@@ -134,7 +134,7 @@ func replayUpdates(message pi.AgentMessage, blocks []pi.ContentBlock, limits ima
 
 func assistantReplayUpdates(message pi.AgentMessage, blocks []pi.ContentBlock, limits image.Limits) ([]acp.SessionUpdate, *image.OutputError) {
 	updates := make([]acp.SessionUpdate, 0, len(blocks))
-	messageID := optionalString(message.ACPMessageID)
+	messageID := optionalString(message.ResponseID)
 
 	for index := range blocks {
 		block := &blocks[index]
