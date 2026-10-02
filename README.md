@@ -24,7 +24,7 @@ record saves both IDs with the matching native history.
 go install github.com/savid/acp-go-pi/cmd/acp-go-pi@latest
 ```
 
-Verified against `pi` 0.87.1, found on `PATH` or named with `-path`.
+`pi` is found on `PATH` or named with `-path`.
 
 ## Run
 
