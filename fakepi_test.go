@@ -31,6 +31,9 @@ const (
 	// fakePiEnvZeroEstimate makes get_session_stats estimate a context of
 	// zero tokens.
 	fakePiEnvZeroEstimate = "ACP_GO_PI_TEST_ZERO_ESTIMATE"
+	// fakePiEnvNativeWork names a file each fake pi process appends one line
+	// to when it starts.
+	fakePiEnvNativeWork = "ACP_GO_PI_TEST_NATIVE_WORK"
 	// fakePiEnvResumeHold names a file a resumed fake pi creates before it
 	// stops answering, so a test can act while the adapter is still relaunching.
 	fakePiEnvResumeHold = "ACP_GO_PI_TEST_RESUME_HOLD"
@@ -129,6 +132,15 @@ func fakeUsageAccess(w http.ResponseWriter, r *http.Request) {
 }
 
 func runFakePi(args []string) int {
+	if path := os.Getenv(fakePiEnvNativeWork); path != "" {
+		file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return 1
+		}
+		_, _ = file.WriteString("start\n")
+		_ = file.Close()
+	}
+
 	if os.Getenv(fakePiEnvStartupDialog) != "" {
 		request := map[string]any{"type": "extension_ui_request", "id": "startup", "method": "input", "title": "Startup input"}
 		if err := json.NewEncoder(os.Stdout).Encode(request); err != nil {

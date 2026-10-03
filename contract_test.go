@@ -3,6 +3,7 @@ package piacp
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	"github.com/coder/acp-go-sdk"
@@ -305,17 +306,45 @@ func TestPromptBackpressure(t *testing.T) {
 func TestActiveSessionLimit(t *testing.T) {
 	t.Parallel()
 
-	h := newHarness(t, WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}))
+	work := filepath.Join(t.TempDir(), "native-work")
+	h := newHarness(t, WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}), WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvNativeWork: work}))
 	h.initialize()
+	cwd := t.TempDir()
+	stored, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: stored.SessionId})
+	require.NoError(t, err)
 	h.newSession()
+	before := nativeWork(t, work)
 
-	_, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir()))
-	require.Equal(t, "backpressure", requestErrorData(t, err)["error"])
-	require.Equal(t, "active_sessions", requestErrorData(t, err)["limit"])
+	establish := map[string]func() error{
+		acp.AgentMethodSessionNew: func() error {
+			_, newErr := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir()))
+
+			return newErr
+		},
+		acp.AgentMethodSessionLoad: func() error {
+			_, loadErr := h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(stored.SessionId, cwd))
+
+			return loadErr
+		},
+		acp.AgentMethodSessionResume: func() error {
+			_, resumeErr := h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(stored.SessionId, cwd))
+
+			return resumeErr
+		},
+	}
+	for method, call := range establish {
+		err = call()
+		require.Equal(t, "backpressure", requestErrorData(t, err)["error"], method)
+		require.Equal(t, "active_sessions", requestErrorData(t, err)["limit"], method)
+	}
+
+	require.Equal(t, before, nativeWork(t, work), "a refused establishment did native work")
 
 	listed, err := h.conn.ListSessions(h.ctx(), wire.ListSessionsRequest())
 	require.NoError(t, err)
-	require.Len(t, listed.Sessions, 1)
+	require.Len(t, listed.Sessions, 2)
 }
 
 func TestClosedAgentRefusesRequests(t *testing.T) {
