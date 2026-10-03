@@ -460,6 +460,59 @@ func TestFailedRestoreCloseReleasesSlot(t *testing.T) {
 	}
 }
 
+// An establishment holds its active-session slot through its native start, so
+// a concurrent establishment is refused without native work, and a failed
+// start frees the slot for the next one.
+func TestEstablishmentHoldsActiveSlot(t *testing.T) {
+	t.Parallel()
+
+	held, work := filepath.Join(t.TempDir(), "start-held"), filepath.Join(t.TempDir(), "native-work")
+	a := NewAgent(testOptions(t, WithConcurrencyLimits(ConcurrencyLimits{MaxActiveSessions: 1}),
+		WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvNativeWork: work}))...)
+	t.Cleanup(func() { _ = a.Close() })
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	hold := wire.WithSessionMetaValue(map[string]any{vendor: map[string]any{"options": map[string]any{"env": map[string]string{fakePiEnvUsageHold: held}}}})
+	first := make(chan error, 1)
+	go func() {
+		_, startErr := a.NewSession(ctx, wire.NewSessionRequest(t.TempDir(), hold))
+		first <- startErr
+	}()
+	require.Eventually(t, func() bool {
+		_, statErr := os.Stat(held)
+
+		return statErr == nil
+	}, testTimeout, time.Millisecond)
+
+	second := make(chan error, 1)
+	go func() {
+		_, startErr := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+		second <- startErr
+	}()
+	select {
+	case err = <-second:
+		require.Equal(t, "backpressure", requestErrorData(t, err)["error"])
+		require.Equal(t, "active_sessions", requestErrorData(t, err)["limit"])
+		require.Equal(t, 1, nativeWork(t, work), "the refused establishment did native work")
+	case <-time.After(testTimeout):
+		t.Fatal("a concurrent establishment waited on the held native start")
+	}
+
+	cancel()
+	select {
+	case err = <-first:
+		require.Equal(t, map[string]any{"error": "pi_internal_failure", "class": "native_start"}, requestErrorData(t, err))
+	case <-time.After(testTimeout):
+		t.Fatal("the held establishment did not fail")
+	}
+
+	_, err = a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err, "a failed establishment kept its active-session slot")
+}
+
 // blockedOpeningClient keeps the first publication in progress until released.
 type blockedOpeningClient struct {
 	*recorder
