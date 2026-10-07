@@ -28,7 +28,9 @@ const (
 	// sessionShutdownTimeout bounds one shutdown rung.
 	sessionShutdownTimeout = 10 * time.Second
 	// sessionUsageStartTimeout bounds the extension's endpoint announcement.
-	sessionUsageStartTimeout = 10 * time.Second
+	// pi announces only after every extension factory has resolved, and a
+	// configured extension may wait on the network before it does.
+	sessionUsageStartTimeout = 60 * time.Second
 	// sessionAbortTimeout bounds the native abort a cancel or close sends.
 	sessionAbortTimeout = 5 * time.Second
 	// sessionSettleTimeout bounds one turn's settlement after the native run
@@ -267,15 +269,11 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 	return rt, nil
 }
 
-// launchFailure names why a launch ended: a pi that has already exited adds
-// its stderr tail, where a dying harness states its reason.
+// launchFailure names why a launch ended with pi's stderr tail, where a dying
+// harness states its reason and a stalled one may have warned.
 func launchFailure(proc *process.Process, err error) error {
-	select {
-	case <-proc.Done():
-		if tail := proc.StderrTail(); tail != "" {
-			return fmt.Errorf("%w: %s", err, tail)
-		}
-	default:
+	if tail := proc.StderrTail(); tail != "" {
+		return fmt.Errorf("%w: %s", err, tail)
 	}
 
 	return err
