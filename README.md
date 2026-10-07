@@ -147,3 +147,17 @@ ChatGPT account IDs come from the same native access token used for inference.
 Subscription credits are not treated as dollars. Custom provider implementations and unverified
 routes report `not_reported`. Missing credentials report `not_authenticated`.
 The adapter revalidates the native binding after each read.
+
+## Context compaction
+
+Reports starts, completions, failures, and cancellations, including an
+overflow recovery failure without a start. The native trigger and before/after
+context counts are included when reported; `contextAfter` is Pi's native
+estimate.
+
+Notifications carry `acp-go.dev/compaction` on the notification’s `_meta`,
+with an otherwise empty `session_info_update`. The value is `acp-go-core`
+`wire.Compaction`: a required `compactionId` and `status`, and optional
+`trigger`, `contextBefore`, and `contextAfter`. A start and its outcome share
+an ID. Unknown facts are omitted. These are live notifications; historical
+replay emits none. Usage accounting is independent.

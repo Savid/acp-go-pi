@@ -20,6 +20,7 @@ const (
 	EventTypeToolExecutionEnd    = "tool_execution_end"
 	EventTypeExtensionError      = "extension_error"
 	EventTypeCompactionEnd       = "compaction_end"
+	EventTypeCompactionStart     = "compaction_start"
 )
 
 // Event is one decoded pi RPC agent event.
@@ -208,19 +209,29 @@ type ExtensionErrorEvent struct {
 	Error         string `json:"error"`
 }
 
+type CompactionStartEvent struct {
+	baseEvent
+	Reason string `json:"reason"`
+}
+
 // CompactionEndEvent signals a compaction attempt finished. Result is present
 // only when pi replaced the context with a summary.
 type CompactionEndEvent struct {
 	baseEvent
 
-	Result *CompactionResult `json:"result,omitempty"`
+	Result       *CompactionResult `json:"result,omitempty"`
+	Reason       string            `json:"reason"`
+	Aborted      bool              `json:"aborted"`
+	ErrorMessage string            `json:"errorMessage"`
 }
 
-// CompactionResult marks a completed compaction; only its presence is read.
-type CompactionResult struct{}
+type CompactionResult struct {
+	TokensBefore         *int `json:"tokensBefore"`
+	EstimatedTokensAfter *int `json:"estimatedTokensAfter"`
+}
 
 // UnknownEvent carries an event type this package does not model: a queue
-// report, a compaction start, an automatic retry pair, or a type pi added.
+// report, an automatic retry pair, or a type pi added.
 // The adapter acts on none of them and keeps the raw payload for raw-event
 // forwarding.
 type UnknownEvent struct {
@@ -274,6 +285,10 @@ func decodeEvent(eventType string, line []byte, raw json.RawMessage) (Event, err
 		event = typed
 	case EventTypeExtensionError:
 		typed := ExtensionErrorEvent{baseEvent: base}
+		err = json.Unmarshal(line, &typed)
+		event = typed
+	case EventTypeCompactionStart:
+		typed := CompactionStartEvent{baseEvent: base}
 		err = json.Unmarshal(line, &typed)
 		event = typed
 	case EventTypeCompactionEnd:

@@ -28,7 +28,7 @@ func TestDecodeEventKinds(t *testing.T) {
 		EventTypeExtensionError:      {`{"type":"extension_error","extensionPath":"/x.ts","event":"tool_call","error":"boom"}`, ExtensionErrorEvent{}},
 		EventTypeCompactionEnd:       {`{"type":"compaction_end","reason":"threshold","aborted":false,"willRetry":false}`, CompactionEndEvent{}},
 		"queue_update":               {`{"type":"queue_update","steering":[],"followUp":["x"]}`, UnknownEvent{}},
-		"compaction_start":           {`{"type":"compaction_start","reason":"threshold"}`, UnknownEvent{}},
+		EventTypeCompactionStart:     {`{"type":"compaction_start","reason":"threshold"}`, CompactionStartEvent{}},
 		"auto_retry_end":             {`{"type":"auto_retry_end","success":true,"attempt":1}`, UnknownEvent{}},
 	}
 

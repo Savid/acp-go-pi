@@ -89,6 +89,8 @@ type session struct {
 
 // runtime is one pi process generation.
 type runtime struct {
+	compactions   wire.Compactions
+	compactionKey string
 	// ending prevents another operation from using this runtime during teardown.
 	ending  bool
 	usage   pi.UsageEndpoint
@@ -553,6 +555,15 @@ func (s *session) handleEvent(ctx context.Context, rt *runtime, event pi.Event) 
 			s.settleAgentCycle(ctx, rt, c)
 		}
 	default:
+		if handled, err := s.projectCompaction(ctx, rt, nil, event); handled {
+			if err != nil {
+				s.agent.log.WarnContext(ctx, "compaction notification failed",
+					slog.String("session_id", string(s.id)), slog.String("reason", err.Error()))
+			}
+
+			return
+		}
+
 		if _, opens := event.(pi.AgentStartEvent); opens && !closing {
 			s.openAgentCycle(ctx, rt)
 		}
