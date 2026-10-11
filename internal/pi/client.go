@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unicode"
+
+	"github.com/savid/acp-go-core/wire"
 )
 
 // ErrTransportClosed reports that the pi stdout stream ended before a command
@@ -26,7 +28,7 @@ const commandTypeKey = "type"
 // are in flight.
 type Client struct {
 	stdin io.Writer
-	lines *LineReader
+	lines *wire.LineReader
 
 	writeMu sync.Mutex
 
@@ -47,7 +49,7 @@ type Client struct {
 func NewClient(stdin io.Writer, stdout io.Reader) *Client {
 	return &Client{
 		stdin:      stdin,
-		lines:      NewLineReader(stdout),
+		lines:      wire.NewLineReader(stdout, wire.NativeLineMaxBytes),
 		pending:    make(map[string]chan Response, 4),
 		events:     make(chan Event),
 		uiRequests: make(chan UIRequest),

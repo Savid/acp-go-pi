@@ -240,25 +240,34 @@ type UnknownEvent struct {
 	EventType string
 }
 
-func decodeEvent(eventType string, line []byte, raw json.RawMessage) (Event, error) {
-	base := baseEvent{raw: raw}
+// decodeEvent decodes one event record, retaining line as its raw bytes. A
+// type that carries no modelled member is only validated.
+func decodeEvent(eventType string, line []byte) (Event, error) {
+	base := baseEvent{raw: line}
 
 	var (
 		event Event
 		err   error
 	)
 
+	decoded := true
+
 	switch eventType {
 	case EventTypeAgentStart:
 		event = AgentStartEvent{baseEvent: base}
+		decoded = false
 	case EventTypeAgentEnd:
 		event = AgentEndEvent{baseEvent: base}
+		decoded = false
 	case EventTypeAgentSettled:
 		event = AgentSettledEvent{baseEvent: base}
+		decoded = false
 	case EventTypeTurnStart:
 		event = TurnStartEvent{baseEvent: base}
+		decoded = false
 	case EventTypeTurnEnd:
 		event = TurnEndEvent{baseEvent: base}
+		decoded = false
 	case EventTypeMessageStart:
 		typed := MessageStartEvent{baseEvent: base}
 		err = json.Unmarshal(line, &typed)
@@ -297,6 +306,11 @@ func decodeEvent(eventType string, line []byte, raw json.RawMessage) (Event, err
 		event = typed
 	default:
 		event = UnknownEvent{baseEvent: base, EventType: eventType}
+		decoded = false
+	}
+
+	if !decoded && !json.Valid(line) {
+		err = ErrJSONLStructural
 	}
 
 	if err != nil {

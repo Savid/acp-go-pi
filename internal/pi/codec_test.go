@@ -1,37 +1,10 @@
 package pi
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
-
-func TestLineReaderStrictLF(t *testing.T) {
-	t.Parallel()
-
-	reader := NewLineReader(strings.NewReader("{\"a\":1}\r\n{\"b\":\"x y\"}\n"))
-
-	line, err := reader.Next()
-	require.NoError(t, err)
-	require.Equal(t, `{"a":1}`, string(line))
-
-	line, err = reader.Next()
-	require.NoError(t, err)
-	require.Equal(t, "{\"b\":\"x y\"}", string(line))
-
-	_, err = reader.Next()
-	require.Error(t, err)
-}
-
-func TestLineReaderUnterminatedRecordIsStructural(t *testing.T) {
-	t.Parallel()
-
-	reader := NewLineReader(strings.NewReader(`{"a":1}`))
-
-	_, err := reader.Next()
-	require.ErrorIs(t, err, ErrJSONLStructural)
-}
 
 func TestDecodeMessage(t *testing.T) {
 	t.Parallel()
@@ -90,4 +63,52 @@ func TestUIResponses(t *testing.T) {
 	require.False(t, *confirm.Confirmed)
 
 	require.True(t, UICancelResponse("1").Cancelled)
+}
+
+func TestDecodeMessageTypePlacement(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		line string
+		kind MessageKind
+	}{
+		{"id before type", `{"id":"acp-1","type":"response","command":"get_state","success":true,"data":{"a":1}}`, MessageKindResponse},
+		{"compound before type", `{"data":{"type":"x"},"id":"acp-1","type":"response","command":"c","success":true}`, MessageKindResponse},
+		{"escaped type", `{"type":"extension_ui_request","id":"u","method":"confirm"}`, MessageKindUIRequest},
+		{"type last", `{"message":{"role":"user"},"type":"message_end"}`, MessageKindEvent},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			message, err := DecodeMessage([]byte(tc.line))
+			require.NoError(t, err)
+			require.Equal(t, tc.kind, message.Kind)
+		})
+	}
+
+	message, err := DecodeMessage([]byte(`{"data":{"type":"x"},"type":"message_end","message":{"role":"assistant"}}`))
+	require.NoError(t, err)
+	require.Equal(t, "assistant", message.Event.(MessageEndEvent).Message.Role)
+}
+
+func TestDecodeMessageRetainsLine(t *testing.T) {
+	t.Parallel()
+
+	line := []byte(`{"type":"agent_start"}`)
+
+	message, err := DecodeMessage(line)
+	require.NoError(t, err)
+	require.Same(t, &line[0], &message.Event.RawJSON()[0], "the record is retained, not copied")
+}
+
+func TestDecodeMessageRejectsMalformedTail(t *testing.T) {
+	t.Parallel()
+
+	for _, line := range []string{`{"type":"agent_start",}`, `{"type":"queue_update","x":}`, `{"type":"turn_end"`} {
+		_, err := DecodeMessage([]byte(line))
+		require.Error(t, err, line)
+	}
 }

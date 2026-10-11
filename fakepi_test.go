@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -270,7 +271,7 @@ func fakeUUID() string {
 }
 
 func (f *fakePi) serve(input io.Reader) int {
-	lines := pi.NewLineReader(input)
+	lines := wire.NewLineReader(input, 0)
 
 	for {
 		line, err := lines.Next()

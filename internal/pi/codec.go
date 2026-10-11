@@ -5,67 +5,16 @@
 package pi
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 )
 
-// maxLineBytes bounds one JSONL record. pi lines can be large (base64 image
-// payloads inside events), so the cap is generous; beyond it the stream is
-// considered broken.
-const maxLineBytes = 64 << 20
-
-// ErrJSONLStructural reports a malformed or non-LF-terminated native record.
-// It deliberately carries no record bytes or decoder detail.
+// ErrJSONLStructural reports a native record that is not a JSON object of a
+// shape this package decodes. It deliberately carries no record bytes or
+// decoder detail.
 var ErrJSONLStructural = errors.New("pi jsonl stream structural error")
-
-// LineReader reads strict JSONL records: LF is the only record delimiter and
-// an optional trailing CR is stripped. It never splits on Unicode separators
-// (U+2028/U+2029 are valid inside JSON strings), per pi's RPC framing rules.
-type LineReader struct {
-	reader *bufio.Reader
-}
-
-// NewLineReader wraps r in a strict-LF JSONL record reader.
-func NewLineReader(r io.Reader) *LineReader {
-	return &LineReader{reader: bufio.NewReaderSize(r, 64<<10)}
-}
-
-// Next returns the next record without its delimiter. Any unterminated record
-// is a structural stream failure and is never returned as a record.
-func (l *LineReader) Next() ([]byte, error) {
-	var line []byte
-
-	for {
-		chunk, err := l.reader.ReadSlice('\n')
-		line = append(line, chunk...)
-
-		if len(line) > maxLineBytes {
-			return nil, ErrJSONLStructural
-		}
-
-		switch {
-		case err == nil:
-			return trimRecord(line), nil
-		case err == bufio.ErrBufferFull:
-			continue
-		case err == io.EOF && len(line) > 0:
-			return nil, ErrJSONLStructural
-		default:
-			return nil, err
-		}
-	}
-}
-
-func trimRecord(line []byte) []byte {
-	line = bytes.TrimSuffix(line, []byte("\n"))
-	line = bytes.TrimSuffix(line, []byte("\r"))
-
-	return line
-}
 
 // MessageKind classifies one stdout JSONL record.
 type MessageKind int
@@ -176,16 +125,16 @@ type envelope struct {
 	Type string `json:"type"`
 }
 
-// DecodeMessage classifies and decodes one stdout JSONL record.
+// DecodeMessage classifies and decodes one stdout JSONL record, parsing it
+// once. The record is retained as an event's raw bytes, so the caller hands
+// over a line it no longer writes to.
 func DecodeMessage(line []byte) (Message, error) {
-	var env envelope
-	if err := json.Unmarshal(line, &env); err != nil {
-		return Message{}, fmt.Errorf("decode jsonl record: %w", err)
+	recordType, err := messageType(line)
+	if err != nil {
+		return Message{}, err
 	}
 
-	raw := json.RawMessage(append([]byte(nil), line...))
-
-	switch env.Type {
+	switch recordType {
 	case "response":
 		var response Response
 		if err := json.Unmarshal(line, &response); err != nil {
@@ -200,16 +149,66 @@ func DecodeMessage(line []byte) (Message, error) {
 		}
 
 		if request.Method == uiMethodSetStatus && request.StatusKey == ResponseStatusKey {
-			return Message{Kind: MessageKindEvent, Event: ResponseIDEvent{baseEvent: baseEvent{raw: raw}, ResponseID: request.StatusText}}, nil
+			return Message{Kind: MessageKindEvent, Event: ResponseIDEvent{baseEvent: baseEvent{raw: line}, ResponseID: request.StatusText}}, nil
 		}
 
 		return Message{Kind: MessageKindUIRequest, UIRequest: request}, nil
 	default:
-		event, err := decodeEvent(env.Type, line, raw)
+		event, err := decodeEvent(recordType, line)
 		if err != nil {
 			return Message{}, err
 		}
 
 		return Message{Kind: MessageKindEvent, Event: event}, nil
 	}
+}
+
+// messageType reads a record's type member. pi writes it among the leading
+// scalar members, so only the record's head is read; a record whose type
+// follows a compound member is decoded whole.
+func messageType(line []byte) (string, error) {
+	if recordType, ok := leadingType(line); ok {
+		return recordType, nil
+	}
+
+	var env envelope
+	if err := json.Unmarshal(line, &env); err != nil {
+		return "", fmt.Errorf("decode jsonl record: %w", err)
+	}
+
+	return env.Type, nil
+}
+
+// leadingType returns the string type member of a JSON object when only
+// scalar members precede it.
+func leadingType(line []byte) (string, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(line))
+
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return "", false
+	}
+
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return "", false
+		}
+
+		value, err := decoder.Token()
+		if err != nil {
+			return "", false
+		}
+
+		if _, compound := value.(json.Delim); compound {
+			return "", false
+		}
+
+		if key == "type" {
+			recordType, ok := value.(string)
+
+			return recordType, ok
+		}
+	}
+
+	return "", false
 }
