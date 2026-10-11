@@ -172,11 +172,16 @@ func (a *Agent) hydrate(ctx context.Context, s *session, stored storedSession, c
 // is used while it still names a file under the agent directory; otherwise the
 // header row's timestamp reproduces the name pi gives it. A committed
 // conversation with no native history carries no header row, so the recorded
-// path is the only identity it has.
+// path is the only identity it has, and one outside the agent directory is
+// refused.
 func (a *Agent) nativePath(ctx context.Context, sessionID acp.SessionId, stored storedSession, cwd string, agentDir string) (string, error) {
 	path := stored.record.NativePath
 
 	if len(stored.rows) == 0 {
+		if !underDir(agentDir, path) {
+			return "", wire.RestoreRefused(ctx, a.log, vendor, sessionID, errors.New("native session path is outside the agent directory"))
+		}
+
 		return path, nil
 	}
 
@@ -190,12 +195,18 @@ func (a *Agent) nativePath(ctx context.Context, sessionID acp.SessionId, stored 
 		return "", wire.RestoreRefused(ctx, a.log, vendor, sessionID, err)
 	}
 
-	relative, pathErr := filepath.Rel(agentDir, path)
-	if pathErr != nil || !filepath.IsLocal(relative) || !fileExists(path) {
+	if !underDir(agentDir, path) || !fileExists(path) {
 		path = pi.SessionFile(agentDir, cwd, stored.record.NativeSessionID, stamp)
 	}
 
 	return path, nil
+}
+
+// underDir reports whether path names an entry below dir.
+func underDir(dir string, path string) bool {
+	relative, err := filepath.Rel(dir, path)
+
+	return err == nil && relative != "." && filepath.IsLocal(relative)
 }
 
 func fileExists(path string) bool {

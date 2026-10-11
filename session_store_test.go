@@ -986,3 +986,23 @@ func TestRelaunchCutsTornTail(t *testing.T) {
 		require.JSONEq(t, string(rows[index]), string(row))
 	}
 }
+
+// A stored conversation with no native rows has only its recorded path, which
+// a restore uses only below the agent directory.
+func TestNativePathWithoutRowsStaysInAgentDirectory(t *testing.T) {
+	t.Parallel()
+
+	agent := NewAgent(WithLogger(slog.New(slog.DiscardHandler)))
+
+	for _, recorded := range []string{"/etc/hosts", "/agent/../etc/hosts", "/agent"} {
+		stored := storedSession{found: true, record: sessionRecord{NativePath: recorded}}
+
+		_, err := agent.nativePath(t.Context(), "s", stored, "/work", "/agent")
+		require.Equal(t, "pi_restore_failed", requestErrorData(t, err)["error"], recorded)
+	}
+
+	inside := "/agent/sessions/--work--/empty.jsonl"
+	path, err := agent.nativePath(t.Context(), "s", storedSession{found: true, record: sessionRecord{NativePath: inside}}, "/work", "/agent")
+	require.NoError(t, err)
+	require.Equal(t, inside, path)
+}
