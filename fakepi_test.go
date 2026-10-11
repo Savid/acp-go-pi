@@ -846,15 +846,7 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 	f.event(map[string]any{"type": "turn_end", "message": assistant, "toolResults": []any{}})
 	f.event(map[string]any{"type": "agent_end", "messages": []any{assistant}, "willRetry": false})
 
-	if strings.HasPrefix(message, "COMPACT") {
-		// The response crossed the threshold, so pi compacts before settling.
-		f.event(map[string]any{"type": "compaction_start", "reason": "threshold"})
-		f.statsMu.Lock()
-		f.compacted = true
-		f.statsMu.Unlock()
-		f.event(map[string]any{"type": "compaction_end", "reason": "threshold", "aborted": false, "willRetry": false,
-			"result": map[string]any{"summary": "summary", "firstKeptEntryId": "e2", "tokensBefore": 950, "estimatedTokensAfter": 120}})
-	}
+	f.compact(message, abort)
 
 	f.event(map[string]any{"type": "agent_settled"})
 
@@ -873,6 +865,36 @@ func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 		_, _ = f.out.WriteString("not a json record at all\n")
 		_ = f.out.Flush()
 		f.writeMu.Unlock()
+	}
+}
+
+// compact runs the compaction a COMPACT script's response leaves due.
+func (f *fakePi) compact(message string, abort <-chan struct{}) {
+	if strings.HasPrefix(message, "COMPACTSLOW") {
+		// pi runs this compaction to its end before an abort takes effect,
+		// for longer than a cancelled turn's settle grace; the end reports
+		// whether an abort arrived while it ran.
+		f.event(map[string]any{"type": "compaction_start", "reason": "threshold"})
+		time.Sleep(sessionAbortTimeout + time.Second)
+
+		end := map[string]any{"type": "compaction_end", "reason": "threshold", "aborted": true, "willRetry": false}
+
+		select {
+		case <-abort:
+		default:
+			end["aborted"] = false
+			end["result"] = map[string]any{"summary": "summary", "firstKeptEntryId": "e2", "tokensBefore": 950, "estimatedTokensAfter": 120}
+		}
+
+		f.event(end)
+	} else if strings.HasPrefix(message, "COMPACT") {
+		// The response crossed the threshold, so pi compacts before settling.
+		f.event(map[string]any{"type": "compaction_start", "reason": "threshold"})
+		f.statsMu.Lock()
+		f.compacted = true
+		f.statsMu.Unlock()
+		f.event(map[string]any{"type": "compaction_end", "reason": "threshold", "aborted": false, "willRetry": false,
+			"result": map[string]any{"summary": "summary", "firstKeptEntryId": "e2", "tokensBefore": 950, "estimatedTokensAfter": 120}})
 	}
 }
 

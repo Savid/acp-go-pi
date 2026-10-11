@@ -32,8 +32,15 @@ const (
 	// pi announces only after every extension factory has resolved, and a
 	// configured extension may wait on the network before it does.
 	sessionUsageStartTimeout = 60 * time.Second
-	// sessionAbortTimeout bounds the native abort a cancel or close sends.
+	// sessionAbortTimeout bounds the native abort a cancel or close sends,
+	// and how long a cancelled turn then has to settle before its process is
+	// stopped.
 	sessionAbortTimeout = 5 * time.Second
+	// sessionCompactionWait bounds how long an interrupt waits for a
+	// compaction in progress to end. pi bounds a compaction only by its
+	// summarization calls, and a process stopped mid-compaction loses the
+	// summary it was paying for.
+	sessionCompactionWait = 5 * time.Minute
 	// sessionSettleTimeout bounds one turn's settlement after the native run
 	// ended: the stats read, the mirror commit, and the terminal lifecycle
 	// event.
@@ -95,6 +102,9 @@ type session struct {
 type runtime struct {
 	compactions   wire.Compactions
 	compactionKey string
+	// compacting is closed when the compaction in progress ends, and nil
+	// while none is. The session's mu guards it.
+	compacting chan struct{}
 	// ending prevents another operation from using this runtime during teardown.
 	ending  bool
 	usage   pi.UsageEndpoint
@@ -516,6 +526,13 @@ func (s *session) dispatchedTurn(rt *runtime) *turn {
 func (s *session) handleEvent(ctx context.Context, rt *runtime, event pi.Event) {
 	s.emitRawEvent(ctx, event)
 
+	if _, settled := event.(pi.AgentSettledEvent); settled {
+		// pi settles only once idle, so no compaction an interrupt waits for
+		// is still running; a settlement joining that interrupt never waits
+		// on a compaction end the blocked pump would have to deliver.
+		s.trackCompaction(rt, false)
+	}
+
 	s.mu.Lock()
 	t := s.dispatchedTurn(rt)
 	c := s.cycle
@@ -771,13 +788,52 @@ func (s *session) stopRuntime(ctx context.Context, rt *runtime) {
 }
 
 // abort interrupts the native run under a bounded context detached from the
-// caller's cancellation.
+// caller's cancellation, once any compaction in progress has ended.
 func (s *session) abort(ctx context.Context, rt *runtime) {
+	s.awaitCompaction(rt, nil)
+
 	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionAbortTimeout)
 	defer cancel()
 
 	if err := rt.client.Abort(abortCtx); err != nil {
 		s.agent.log.DebugContext(abortCtx, "pi abort failed", slog.String("session_id", string(s.id)))
+	}
+}
+
+// awaitCompaction waits, up to sessionCompactionWait, for a compaction in
+// progress on rt to end, so an interrupt never lands mid-compaction. It
+// returns early when stop closes or rt's pump ends.
+func (s *session) awaitCompaction(rt *runtime, stop <-chan struct{}) {
+	s.mu.Lock()
+	compacting := rt.compacting
+	s.mu.Unlock()
+
+	if compacting == nil {
+		return
+	}
+
+	timer := time.NewTimer(sessionCompactionWait)
+	defer timer.Stop()
+
+	select {
+	case <-compacting:
+	case <-stop:
+	case <-rt.done:
+	case <-timer.C:
+	}
+}
+
+// trackCompaction records whether a compaction is in progress on rt.
+func (s *session) trackCompaction(rt *runtime, inProgress bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch {
+	case inProgress && rt.compacting == nil:
+		rt.compacting = make(chan struct{})
+	case !inProgress && rt.compacting != nil:
+		close(rt.compacting)
+		rt.compacting = nil
 	}
 }
 
@@ -1003,6 +1059,7 @@ func (s *session) close(ctx context.Context) error {
 	}
 
 	if rt != nil {
+		s.awaitCompaction(rt, nil)
 		s.stopRuntime(ctx, rt)
 	}
 

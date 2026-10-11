@@ -237,6 +237,10 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	select {
 	case <-t.settled:
 	case <-turnCtx.Done():
+		// The abort waits for a compaction in progress to end, so the grace
+		// for the turn to settle runs from then.
+		s.awaitCompaction(rt, t.settled)
+
 		select {
 		case <-t.settled:
 		case <-time.After(sessionAbortTimeout):

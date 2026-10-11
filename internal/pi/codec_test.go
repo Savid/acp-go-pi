@@ -91,7 +91,9 @@ func TestDecodeMessageTypePlacement(t *testing.T) {
 
 	message, err := DecodeMessage([]byte(`{"data":{"type":"x"},"type":"message_end","message":{"role":"assistant"}}`))
 	require.NoError(t, err)
-	require.Equal(t, "assistant", message.Event.(MessageEndEvent).Message.Role)
+	end, ok := message.Event.(MessageEndEvent)
+	require.True(t, ok)
+	require.Equal(t, "assistant", end.Message.Role)
 }
 
 func TestDecodeMessageRetainsLine(t *testing.T) {

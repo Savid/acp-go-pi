@@ -20,11 +20,13 @@ func (s *session) projectCompaction(ctx context.Context, rt *runtime, state *cyc
 		}
 
 		key = rt.compactionKey
+		s.trackCompaction(rt, true)
 
 		value.Status = wire.CompactionInProgress
 		reason = typed.Reason
 	case pi.CompactionEndEvent:
 		rt.compactionKey = ""
+		s.trackCompaction(rt, false)
 
 		reason = typed.Reason
 		switch {

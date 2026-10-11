@@ -169,3 +169,73 @@ func TestCompactionSendFailureKeepsRuntime(t *testing.T) {
 	require.True(t, rec.failed)
 	require.Len(t, compactionReports(t, rec.snapshot()), 1)
 }
+
+// An interrupt that arrives while pi compacts waits for the compaction to
+// end: a cancel aborts afterwards and pi keeps serving the session, and a
+// close stops pi only once the compaction completed.
+func TestInterruptWaitsForCompaction(t *testing.T) {
+	t.Parallel()
+
+	for _, interrupt := range []string{"cancel", "close"} {
+		t.Run(interrupt, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			h.initialize(withLifecycle())
+			created := h.newSession()
+
+			type result struct {
+				response acp.PromptResponse
+				err      error
+			}
+
+			done := make(chan result, 1)
+
+			go func() {
+				response, err := h.prompt(created.SessionId, "COMPACTSLOW", promptMeta(1))
+				done <- result{response, err}
+			}()
+
+			h.rec.waitFor(t, func(updates []acp.SessionNotification) bool {
+				return len(compactionReports(t, updates)) == 1
+			})
+
+			if interrupt == "close" {
+				_, err := h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: created.SessionId})
+				require.NoError(t, err)
+			} else {
+				require.NoError(t, h.conn.Cancel(h.ctx(), wire.CancelRequest(created.SessionId)))
+			}
+
+			got := <-done
+			require.NoError(t, got.err)
+			require.Equal(t, acp.StopReasonCancelled, got.response.StopReason)
+
+			reports := compactionReports(t, h.rec.snapshot())
+			require.Len(t, reports, 2)
+			require.Equal(t, wire.CompactionCompleted, reports[1].Status, "the interrupt never landed mid-compaction")
+
+			if interrupt == "close" {
+				return
+			}
+
+			streams := func() int {
+				count := 0
+
+				for _, kind := range eventTypes(lifecycleEvents(h.rec.snapshot())) {
+					if kind == "lifecycle_snapshot" {
+						count++
+					}
+				}
+
+				return count
+			}
+			before := streams()
+
+			response, err := h.prompt(created.SessionId, "HELLO", promptMeta(2))
+			require.NoError(t, err)
+			require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+			require.Equal(t, before, streams(), "the same pi process served the next prompt")
+		})
+	}
+}

@@ -166,3 +166,8 @@ with an otherwise empty `session_info_update`. The value is `acp-go-core`
 `trigger`, `contextBefore`, and `contextAfter`. A start and its outcome share
 an ID. Unknown facts are omitted. These are live notifications; historical
 replay emits none. Usage accounting is independent.
+
+A `session/cancel` or `session/close` that arrives while pi compacts waits for
+the compaction to end, up to five minutes, before it aborts the run or stops
+the process, so the summary pi is generating is kept. A cancelled turn then
+has five seconds to settle before its process is stopped.
