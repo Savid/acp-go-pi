@@ -17,6 +17,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/process"
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
@@ -1072,4 +1073,46 @@ func TestMirrorRepublishIsLogged(t *testing.T) {
 	require.Contains(t, logs.String(), "session mirror republished")
 	require.Contains(t, logs.String(), "reason=append_failed")
 	require.Contains(t, logs.String(), "session_id="+string(created.SessionId))
+}
+
+// A relaunch over a session file waits for the last unbound pi to exit
+// first. While that process lives, the launch fails without touching the
+// file; once it has exited, the relaunch goes ahead.
+func TestRelaunchWaitsForRetiredProcess(t *testing.T) {
+	t.Parallel()
+
+	agent := NewAgent(testOptions(t)...)
+	s := agent.newSession(sessionStart{cwd: t.TempDir()})
+	s.sessionFile = filepath.Join(t.TempDir(), "session.jsonl")
+
+	torn := `{"type":"session","id":"x"}` + "\n" + `{"type":"mess`
+	require.NoError(t, os.WriteFile(s.sessionFile, []byte(torn), 0o600))
+
+	proc, err := process.Start(t.Context(), process.Request{Executable: "/bin/sleep", Args: []string{"30"}})
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = proc.Kill()
+		_ = proc.Close()
+	})
+
+	s.retired = &runtime{proc: proc}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err = s.ensureRuntime(ctx)
+	require.Error(t, err)
+
+	untouched, err := os.ReadFile(s.sessionFile)
+	require.NoError(t, err)
+	require.Equal(t, torn, string(untouched), "a live previous process keeps the file untouched")
+
+	require.NoError(t, proc.Kill())
+	require.NoError(t, s.awaitRetired(t.Context()))
+
+	s.mu.Lock()
+	retired := s.retired
+	s.mu.Unlock()
+	require.Nil(t, retired, "an exited process is no longer waited for")
 }

@@ -71,6 +71,9 @@ type session struct {
 
 	mu      sync.Mutex
 	runtime *runtime
+	// retired is the last unbound generation, whose process may still be
+	// exiting; a relaunch waits for it before touching the session file.
+	retired *runtime
 	// mirror publishes this session's store generation; nil until the
 	// session has an id.
 	mirror        *sessionlog.Mirror
@@ -456,6 +459,10 @@ func (s *session) ensureRuntime(ctx context.Context) (*runtime, error) {
 		return rt, nil
 	}
 
+	if err := s.awaitRetired(ctx); err != nil {
+		return nil, s.startFailure(ctx, err)
+	}
+
 	// pi completes an unterminated last line when it loads a session file,
 	// which would make the bytes a killed process left mid-write a row.
 	if err := s.cutTornTail(ctx, s.sessionFile); err != nil {
@@ -482,6 +489,38 @@ func (s *session) ensureRuntime(ctx context.Context) (*runtime, error) {
 	}
 
 	return rt, nil
+}
+
+// awaitRetired waits, bounded by sessionShutdownTimeout, for the process of
+// the last unbound generation to exit, so no dying pi writes into the session
+// file a relaunch is about to repair and continue.
+func (s *session) awaitRetired(ctx context.Context) error {
+	s.mu.Lock()
+	retired := s.retired
+	s.mu.Unlock()
+
+	if retired == nil {
+		return nil
+	}
+
+	timer := time.NewTimer(sessionShutdownTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-retired.proc.Done():
+	case <-timer.C:
+		return errors.New("previous pi process has not exited")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	s.mu.Lock()
+	if s.retired == retired {
+		s.retired = nil
+	}
+	s.mu.Unlock()
+
+	return nil
 }
 
 // pump routes every native record of one process generation. It is the sole
@@ -724,6 +763,7 @@ func (s *session) runtimeEnded(ctx context.Context, rt *runtime) {
 		}
 
 		s.runtime = nil
+		s.retired = rt
 	}
 	s.mu.Unlock()
 	s.openMu.Unlock()
@@ -760,6 +800,7 @@ func (s *session) dropRuntime(rt *runtime) {
 	s.mu.Lock()
 	if s.runtime == rt {
 		s.runtime = nil
+		s.retired = rt
 	}
 	s.mu.Unlock()
 
@@ -792,6 +833,7 @@ func (s *session) stopRuntime(ctx context.Context, rt *runtime) {
 	s.mu.Lock()
 	if s.runtime == rt {
 		s.runtime = nil
+		s.retired = rt
 	}
 	s.mu.Unlock()
 }
