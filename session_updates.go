@@ -52,10 +52,9 @@ type cycleState struct {
 	// responseID is the id the model gateway returned for the open assistant
 	// message, once pi holds it; its streamed chunks carry it as messageId.
 	responseID string
-	// streamedText and streamedThought hold what the open assistant message
+	// streamed holds the text and thinking the open assistant message
 	// already streamed, so its terminal frame contributes only the suffix.
-	streamedText    string
-	streamedThought string
+	streamed wire.StreamedText
 	// tools holds each tool call until pi ends its execution.
 	tools map[string]*toolState
 }
@@ -102,8 +101,7 @@ func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event
 	case pi.MessageStartEvent:
 		if typed.Message.Role == messageRoleAssistant {
 			state.responseID = typed.Message.ResponseID
-			state.streamedText = ""
-			state.streamedThought = ""
+			state.streamed.Reset()
 			state.inputPending = true
 		}
 
@@ -132,11 +130,13 @@ func (s *session) projectEvent(ctx context.Context, rt *runtime, c *cycle, event
 
 		observeAssistantMessageEnd(typed.Message, state)
 
-		if err := s.emitAssistantTextSuffix(ctx, typed.Message, state); err != nil {
+		blocks, _ := typed.Message.ContentBlocks()
+
+		if err := s.emitAssistantTextSuffix(ctx, typed.Message, blocks, state); err != nil {
 			return false, err
 		}
 
-		if err := s.emitAssistantImages(ctx, typed.Message, state); err != nil {
+		if err := s.emitAssistantImages(ctx, typed.Message, blocks, state); err != nil {
 			return false, err
 		}
 
@@ -187,13 +187,13 @@ func (s *session) emitAssistantDelta(ctx context.Context, delta pi.AssistantMess
 
 	switch delta.Type {
 	case assistantEventTextDelta:
-		state.streamedText += delta.Delta
+		state.streamed.Add(contentBlockTypeText, delta.Delta)
 
 		return s.emit(ctx, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
 			Content: acp.TextBlock(delta.Delta), MessageId: messageID,
 		}})
 	case assistantEventThinkingDelta:
-		state.streamedThought += delta.Delta
+		state.streamed.Add(contentBlockTypeThinking, delta.Delta)
 
 		return s.emit(ctx, acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
 			Content: acp.TextBlock(delta.Delta), MessageId: messageID,
@@ -205,9 +205,7 @@ func (s *session) emitAssistantDelta(ctx context.Context, delta pi.AssistantMess
 
 // emitAssistantTextSuffix projects the terminal message frame's text as
 // append-only deltas: only what the streamed deltas did not carry.
-func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
-	blocks, _ := message.ContentBlocks()
-
+func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentMessage, blocks []pi.ContentBlock, state *cycleState) error {
 	var text, thinking strings.Builder
 
 	for index := range blocks {
@@ -222,20 +220,19 @@ func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentM
 	messageID := optionalString(message.ResponseID)
 	updates := make([]acp.SessionUpdate, 0, 2)
 
-	if suffix := wire.UnstreamedSuffix(state.streamedThought, thinking.String()); suffix != "" {
+	if suffix := state.streamed.Suffix(contentBlockTypeThinking, thinking.String()); suffix != "" {
 		updates = append(updates, acp.SessionUpdate{AgentThoughtChunk: &acp.SessionUpdateAgentThoughtChunk{
 			Content: acp.TextBlock(suffix), MessageId: messageID,
 		}})
 	}
 
-	if suffix := wire.UnstreamedSuffix(state.streamedText, text.String()); suffix != "" {
+	if suffix := state.streamed.Suffix(contentBlockTypeText, text.String()); suffix != "" {
 		updates = append(updates, acp.SessionUpdate{AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{
 			Content: acp.TextBlock(suffix), MessageId: messageID,
 		}})
 	}
 
-	state.streamedText = ""
-	state.streamedThought = ""
+	state.streamed.Reset()
 
 	return s.emit(ctx, updates...)
 }
@@ -243,8 +240,7 @@ func (s *session) emitAssistantTextSuffix(ctx context.Context, message pi.AgentM
 // emitAssistantImages projects image blocks of a finalized assistant message
 // as agent chunks, one image per chunk. A refused image is replaced by its
 // guidance as agent text.
-func (s *session) emitAssistantImages(ctx context.Context, message pi.AgentMessage, state *cycleState) error {
-	blocks, _ := message.ContentBlocks()
+func (s *session) emitAssistantImages(ctx context.Context, message pi.AgentMessage, blocks []pi.ContentBlock, state *cycleState) error {
 	messageID := optionalString(message.ResponseID)
 
 	for index := range blocks {

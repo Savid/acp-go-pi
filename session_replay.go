@@ -17,7 +17,7 @@ import (
 func messageRow(row []byte) (pi.AgentMessage, []pi.ContentBlock, bool, error) {
 	var entry struct {
 		Type    string          `json:"type"`
-		Message json.RawMessage `json:"message"`
+		Message pi.AgentMessage `json:"message"`
 	}
 
 	if err := json.Unmarshal(row, &entry); err != nil {
@@ -28,10 +28,7 @@ func messageRow(row []byte) (pi.AgentMessage, []pi.ContentBlock, bool, error) {
 		return pi.AgentMessage{}, nil, false, nil
 	}
 
-	var message pi.AgentMessage
-	if err := json.Unmarshal(entry.Message, &message); err != nil {
-		return pi.AgentMessage{}, nil, false, err
-	}
+	message := entry.Message
 
 	blocks, err := message.ContentBlocks()
 	if err != nil {

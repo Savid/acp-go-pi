@@ -95,4 +95,11 @@ func TestAgentMessageContentBlocks(t *testing.T) {
 
 	_, err = AgentMessage{Content: json.RawMessage(`{}`)}.ContentBlocks()
 	require.Error(t, err)
+
+	_, err = AgentMessage{Content: json.RawMessage(`"unterminated`)}.ContentBlocks()
+	require.Error(t, err)
+
+	blocks, err = AgentMessage{Content: json.RawMessage(` "spaced"`)}.ContentBlocks()
+	require.NoError(t, err)
+	require.Equal(t, "spaced", blocks[0].Text)
 }

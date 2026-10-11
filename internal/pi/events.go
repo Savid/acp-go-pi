@@ -1,6 +1,7 @@
 package pi
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -77,14 +78,18 @@ type AgentMessage struct {
 }
 
 // ContentBlocks decodes the message content, which is either a plain string
-// (user messages) or an array of content blocks.
+// (user messages) or an array of content blocks, parsing it once.
 func (m AgentMessage) ContentBlocks() ([]ContentBlock, error) {
 	if len(m.Content) == 0 {
 		return nil, nil
 	}
 
-	var text string
-	if err := json.Unmarshal(m.Content, &text); err == nil {
+	if bytes.HasPrefix(bytes.TrimLeft(m.Content, " \t\r\n"), []byte{'"'}) {
+		var text string
+		if err := json.Unmarshal(m.Content, &text); err != nil {
+			return nil, fmt.Errorf("decode message content text: %w", err)
+		}
+
 		return []ContentBlock{{Type: "text", Text: text}}, nil
 	}
 
