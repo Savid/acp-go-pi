@@ -105,23 +105,15 @@ that failed before the gateway answered, carries neither.
 
 ### Session store
 
-`WithSessionStore` mirrors pi's session JSONL rows under the main subpath and
-the adapter's session record under `config`, format `pi-session-jsonl-v2`. The
-record names pi's session file as `nativePath` and carries the session title,
-so `session/list` reads only records.
-`session/load` and `session/resume` prefer pi's own file when it exists and
-materialize it from the store otherwise. A restore, and a relaunch after pi
-exited, first cut any bytes after the file's last complete line, so a line a
-killed process left half-written never becomes a row.
-Native rows and session configuration commit as one store generation through
-`acp-go-core`'s `sessionlog.Mirror`: after the first generation, a commit reads
-only the lines pi appended since the last one and appends them, rewriting the
-record only when it changed, and writes nothing when neither changed. A
-configuration change is durable even when no native rows were added, and an
-established conversation with no native history yet commits its configuration
-with an empty main record. Replay decodes every stored image, user or
-assistant, through the same output gate as live image output, so a stored
-image that gate refuses fails the whole restore rather than leaving a hole.
+`WithSessionStore` mirrors pi's session file,
+`$PI_CODING_AGENT_DIR/sessions/--<cwd>--/<timestamp>_<id>.jsonl`, under the main
+subpath and the adapter's session record under `config`, format
+`pi-session-jsonl-v2`. Commit, restore, and recovery follow
+[Sessions and the Session Store](https://github.com/savid/acp-go-core/blob/master/docs/03-sessions-and-store.md).
+The record holds the session id, the native session id, `cwd`, additional
+directories, the session file as `nativePath`, the title, the session
+environment and ordered path directories, the model, the thinking level, the
+permission mode, and the retry posture.
 
 ## Development
 
