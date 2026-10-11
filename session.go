@@ -458,7 +458,7 @@ func (s *session) ensureRuntime(ctx context.Context) (*runtime, error) {
 
 	// pi completes an unterminated last line when it loads a session file,
 	// which would make the bytes a killed process left mid-write a row.
-	if err := sessionlog.CutTornTail(s.sessionFile); err != nil {
+	if err := s.cutTornTail(ctx, s.sessionFile); err != nil {
 		return nil, s.startFailure(ctx, err)
 	}
 

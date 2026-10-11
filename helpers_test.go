@@ -1,6 +1,7 @@
 package piacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -550,4 +551,24 @@ func appendNativeRow(t *testing.T, store acpcore.SessionStore, sessionID acp.Ses
 	_, err = file.WriteString(row + "\n")
 	require.NoError(t, err)
 	require.NoError(t, file.Close())
+}
+
+// logBuffer collects log output written from any goroutine.
+type logBuffer struct {
+	mu   sync.Mutex
+	data bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.data.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.data.String()
 }

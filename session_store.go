@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -72,8 +73,11 @@ func (s *session) commitMirror(ctx context.Context) error {
 	}
 
 	commitCtx, finish := s.agent.observe.StartSessionStore(ctx, observer.SessionStoreCommit)
-	err := mirror.Commit(commitCtx, sessionlog.File(path), func(sessionlog.Tail) (any, error) { return s.record(), nil })
+	report, err := mirror.Commit(commitCtx, sessionlog.File(path), func(sessionlog.Tail) (any, error) { return s.record(), nil })
+	s.agent.observe.RecordRepublish(commitCtx, string(report.Republish))
 	finish(err)
+
+	s.logRepublish(ctx, report)
 
 	if err != nil {
 		return fmt.Errorf("commit session mirror: %w", err)
@@ -160,12 +164,54 @@ func (a *Agent) hydrate(ctx context.Context, s *session, stored storedSession, c
 		return "", nil, err
 	}
 
-	rows, err := s.mirror.Hydrate(ctx, path, stored.rows, stored.record, validateRows)
+	rows, hydrated, err := s.mirror.Hydrate(ctx, path, stored.rows, stored.record, validateRows)
 	if err != nil {
 		return "", nil, wire.RestoreRefused(ctx, a.log, vendor, s.id, err)
 	}
 
+	if hydrated.Changed() {
+		a.log.WarnContext(ctx, "native session file repaired on restore",
+			slog.String("session_id", string(s.id)),
+			slog.Int64("torn_bytes_cut", hydrated.Tail.Cut),
+			slog.Bool("record_terminated", hydrated.Tail.Terminated),
+			slog.Int64("invalid_bytes_cut", hydrated.InvalidCut),
+			slog.Bool("rewritten_from_store", hydrated.Rewritten))
+	}
+
+	s.logRepublish(ctx, hydrated.Commit)
+
 	return path, rows, nil
+}
+
+// logRepublish warns once for a commit that republished the whole
+// generation for a reason other than its first publication.
+func (s *session) logRepublish(ctx context.Context, report sessionlog.CommitReport) {
+	if !report.Recovery() {
+		return
+	}
+
+	s.agent.log.WarnContext(ctx, "session mirror republished",
+		slog.String("session_id", string(s.id)),
+		slog.String("reason", string(report.Republish)),
+		slog.Any("append_error", report.AppendErr))
+}
+
+// cutTornTail cuts a final session-file line a dead pi left torn, and warns
+// once when it changed the file.
+func (s *session) cutTornTail(ctx context.Context, path string) error {
+	torn, err := sessionlog.CutTornTail(path)
+	if err != nil {
+		return err
+	}
+
+	if torn.Changed() {
+		s.agent.log.WarnContext(ctx, "native session file tail repaired",
+			slog.String("session_id", string(s.id)),
+			slog.Int64("bytes_cut", torn.Cut),
+			slog.Bool("record_terminated", torn.Terminated))
+	}
+
+	return nil
 }
 
 // nativePath locates the session file a restore continues. The recorded path

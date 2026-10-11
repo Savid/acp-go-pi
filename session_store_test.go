@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -649,7 +650,8 @@ func TestNativeBindingSurvivesLoadAndResume(t *testing.T) {
 	require.Equal(t, wire.NativeSessionMeta(vendor, record.NativeSessionID), created.Meta)
 	id := acp.SessionId("acp-conversation-independent-of-native-id")
 	record.SessionID = string(id)
-	require.NoError(t, sessionlog.NewMirror(store, string(id)).Commit(t.Context(), sessionlog.Rows(rows), func(sessionlog.Tail) (any, error) { return record, nil }))
+	_, err = sessionlog.NewMirror(store, string(id)).Commit(t.Context(), sessionlog.Rows(rows), func(sessionlog.Tail) (any, error) { return record, nil })
+	require.NoError(t, err)
 	require.NoError(t, store.Delete(t.Context(), acpcore.SessionKey{SessionID: string(created.SessionId)}))
 
 	before := len(h.rec.snapshot())
@@ -950,7 +952,8 @@ func TestRelaunchCutsTornTail(t *testing.T) {
 	t.Parallel()
 
 	store := acpcore.NewInMemorySessionStore()
-	h := newHarness(t, WithSessionStore(store))
+	logs := &logBuffer{}
+	h := newHarness(t, WithSessionStore(store), WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
 	h.initialize()
 	created := h.newSession()
 
@@ -974,6 +977,8 @@ func TestRelaunchCutsTornTail(t *testing.T) {
 	native, err := os.ReadFile(record.NativePath)
 	require.NoError(t, err)
 	require.NotContains(t, string(native), `"torn"`)
+	require.Contains(t, logs.String(), "native session file tail repaired")
+	require.Contains(t, logs.String(), "bytes_cut="+strconv.Itoa(len(`{"type":"message","id":"torn","mess`)))
 
 	rows, err := readNativeRows(record.NativePath)
 	require.NoError(t, err)
@@ -1005,4 +1010,66 @@ func TestNativePathWithoutRowsStaysInAgentDirectory(t *testing.T) {
 	path, err := agent.nativePath(t.Context(), "s", storedSession{found: true, record: sessionRecord{NativePath: inside}}, "/work", "/agent")
 	require.NoError(t, err)
 	require.Equal(t, inside, path)
+}
+
+// A restore that repairs pi's session file warns once with what it changed.
+func TestRestoreRepairIsLogged(t *testing.T) {
+	t.Parallel()
+
+	store := acpcore.NewInMemorySessionStore()
+	logs := &logBuffer{}
+	h := newHarness(t, WithSessionStore(store), WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
+	h.initialize()
+	cwd := t.TempDir()
+	created, err := h.conn.NewSession(h.ctx(), wire.NewSessionRequest(cwd))
+	require.NoError(t, err)
+
+	_, err = h.prompt(created.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: created.SessionId})
+	require.NoError(t, err)
+
+	var record sessionRecord
+
+	found, err := sessionlog.LoadRecord(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	file, err := os.OpenFile(record.NativePath, os.O_APPEND|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = file.WriteString(`{"type":"mess`)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	_, err = h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(created.SessionId, cwd))
+	require.NoError(t, err)
+	require.Contains(t, logs.String(), "native session file repaired on restore")
+	require.Contains(t, logs.String(), "session_id="+string(created.SessionId))
+	require.Contains(t, logs.String(), "torn_bytes_cut=13")
+}
+
+// appendRefusal fails every Append, so each commit after the first
+// republishes the whole generation.
+type appendRefusal struct {
+	acpcore.SessionStore
+}
+
+func (appendRefusal) Append(context.Context, acpcore.SessionKey, int, []acpcore.SessionStoreEntry, []acpcore.SessionStoreReplacement) error {
+	return errors.New("append unavailable")
+}
+
+// A commit that falls back to republishing the generation warns with why.
+func TestMirrorRepublishIsLogged(t *testing.T) {
+	t.Parallel()
+
+	logs := &logBuffer{}
+	h := newHarness(t, WithSessionStore(appendRefusal{acpcore.NewInMemorySessionStore()}), WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
+	h.initialize()
+	created := h.newSession()
+
+	_, err := h.prompt(created.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+	require.Contains(t, logs.String(), "session mirror republished")
+	require.Contains(t, logs.String(), "reason=append_failed")
+	require.Contains(t, logs.String(), "session_id="+string(created.SessionId))
 }
