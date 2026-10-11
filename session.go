@@ -92,10 +92,9 @@ type session struct {
 	cycle     *cycle
 	dialogs   map[string]*dialog
 
-	openMu   sync.Mutex
-	mirrorMu sync.Mutex
-	lcMu     sync.Mutex
-	lc       lifecycle.Publisher
+	openMu sync.Mutex
+	lcMu   sync.Mutex
+	lc     lifecycle.Publisher
 }
 
 // runtime is one pi process generation.
@@ -452,6 +451,12 @@ func (s *session) ensureRuntime(ctx context.Context) (*runtime, error) {
 
 	if rt != nil {
 		return rt, nil
+	}
+
+	// pi completes an unterminated last line when it loads a session file,
+	// which would make the bytes a killed process left mid-write a row.
+	if err := sessionlog.CutTornTail(s.sessionFile); err != nil {
+		return nil, s.startFailure(ctx, err)
 	}
 
 	rt, err := s.launch(ctx, s.sessionFile)

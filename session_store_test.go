@@ -649,7 +649,7 @@ func TestNativeBindingSurvivesLoadAndResume(t *testing.T) {
 	require.Equal(t, wire.NativeSessionMeta(vendor, record.NativeSessionID), created.Meta)
 	id := acp.SessionId("acp-conversation-independent-of-native-id")
 	record.SessionID = string(id)
-	require.NoError(t, sessionlog.NewMirror(store, string(id)).Commit(t.Context(), sessionlog.Rows(rows), record))
+	require.NoError(t, sessionlog.NewMirror(store, string(id)).Commit(t.Context(), sessionlog.Rows(rows), func(sessionlog.Tail) (any, error) { return record, nil }))
 	require.NoError(t, store.Delete(t.Context(), acpcore.SessionKey{SessionID: string(created.SessionId)}))
 
 	before := len(h.rec.snapshot())
@@ -940,5 +940,49 @@ func BenchmarkCommitMirror(b *testing.B) {
 				require.NoError(b, s.commitMirror(b.Context()))
 			}
 		})
+	}
+}
+
+// A pi killed part way through appending a row leaves an unterminated line,
+// which pi would complete when it loads the file. The relaunch cuts it first,
+// so the next turn commits only whole rows.
+func TestRelaunchCutsTornTail(t *testing.T) {
+	t.Parallel()
+
+	store := acpcore.NewInMemorySessionStore()
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	created := h.newSession()
+
+	_, err := h.prompt(created.SessionId, "TORN", nil)
+	require.Error(t, err)
+
+	var record sessionRecord
+
+	found, err := sessionlog.LoadRecord(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	torn, err := os.ReadFile(record.NativePath)
+	require.NoError(t, err)
+	require.NotEqual(t, byte('\n'), torn[len(torn)-1])
+
+	response, err := h.prompt(created.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, response.StopReason)
+
+	native, err := os.ReadFile(record.NativePath)
+	require.NoError(t, err)
+	require.NotContains(t, string(native), `"torn"`)
+
+	rows, err := readNativeRows(record.NativePath)
+	require.NoError(t, err)
+
+	generation, err := store.Load(t.Context(), string(created.SessionId))
+	require.NoError(t, err)
+	require.Len(t, generation[acpcore.SessionStoreMainSubpath], len(rows))
+
+	for index, row := range generation[acpcore.SessionStoreMainSubpath] {
+		require.JSONEq(t, string(rows[index]), string(row))
 	}
 }

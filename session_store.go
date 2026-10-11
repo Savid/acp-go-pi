@@ -12,6 +12,7 @@ import (
 
 	"github.com/coder/acp-go-sdk"
 
+	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
@@ -57,11 +58,9 @@ func (s *session) record() sessionRecord {
 
 // commitMirror publishes the rows pi appended to its session file since the
 // last commit, with the current session configuration, as one durable
-// generation. mirrorMu keeps each configuration snapshot in commit order.
+// generation. The record is taken under the mirror's lock after the read, so
+// it describes the rows it commits; the caller must not hold s.mu.
 func (s *session) commitMirror(ctx context.Context) error {
-	s.mirrorMu.Lock()
-	defer s.mirrorMu.Unlock()
-
 	s.mu.Lock()
 	path := s.sessionFile
 	mirror := s.mirror
@@ -72,8 +71,8 @@ func (s *session) commitMirror(ctx context.Context) error {
 		return nil
 	}
 
-	commitCtx, finish := s.agent.observe.StartSessionStore(ctx, "commit")
-	err := mirror.Commit(commitCtx, sessionlog.File(path), s.record())
+	commitCtx, finish := s.agent.observe.StartSessionStore(ctx, observer.SessionStoreCommit)
+	err := mirror.Commit(commitCtx, sessionlog.File(path), func(sessionlog.Tail) (any, error) { return s.record(), nil })
 	finish(err)
 
 	if err != nil {
@@ -96,7 +95,7 @@ type storedSession struct {
 
 // loadStored reads the native rows and required current configuration.
 func (a *Agent) loadStored(ctx context.Context, sessionID acp.SessionId) (storedSession, error) {
-	loadCtx, finish := a.observe.StartSessionStore(ctx, "load")
+	loadCtx, finish := a.observe.StartSessionStore(ctx, observer.SessionStoreLoad)
 
 	var record sessionRecord
 
@@ -117,7 +116,7 @@ func (a *Agent) loadStored(ctx context.Context, sessionID acp.SessionId) (stored
 // loadRecord reads only the configuration record of a stored session, as
 // listing needs no native rows.
 func (a *Agent) loadRecord(ctx context.Context, sessionID acp.SessionId) (sessionRecord, bool, error) {
-	loadCtx, finish := a.observe.StartSessionStore(ctx, "load")
+	loadCtx, finish := a.observe.StartSessionStore(ctx, observer.SessionStoreLoadRecord)
 
 	var record sessionRecord
 

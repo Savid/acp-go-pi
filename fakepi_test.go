@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -233,24 +234,10 @@ func runFakePi(args []string) int {
 		})
 		_ = os.WriteFile(f.sessionFile, append(header, '\n'), 0o600)
 		f.entries = 1
-	} else {
-		rows, err := readNativeRows(f.sessionFile)
-		if err != nil || len(rows) == 0 {
-			fmt.Fprintln(os.Stderr, "fake pi: session file unreadable")
+	} else if err := f.resume(); err != nil {
+		fmt.Fprintln(os.Stderr, "fake pi:", err)
 
-			return 1
-		}
-
-		header, ok := pi.ParseHeader(rows[0])
-		if !ok {
-			fmt.Fprintln(os.Stderr, "fake pi: session file has no header")
-
-			return 1
-		}
-
-		f.sessionID = header.ID
-		f.entries = len(rows)
-		f.context = lastUsableContext(rows)
+		return 1
 	}
 
 	f.statsID = f.sessionID
@@ -728,10 +715,7 @@ func gatewayAnswers(message string) bool {
 func (f *fakePi) run(message string, imageCount int, abort <-chan struct{}) {
 	f.event(map[string]any{"type": "agent_start"})
 
-	if strings.HasPrefix(message, "DIE") {
-		fmt.Fprintln(os.Stderr, "fatal: dead")
-		os.Exit(3)
-	}
+	f.die(message)
 
 	f.event(map[string]any{"type": "turn_start"})
 	f.startAssistant(gatewayAnswers(message))
@@ -895,6 +879,52 @@ func (f *fakePi) compact(message string, abort <-chan struct{}) {
 		f.statsMu.Unlock()
 		f.event(map[string]any{"type": "compaction_end", "reason": "threshold", "aborted": false, "willRetry": false,
 			"result": map[string]any{"summary": "summary", "firstKeptEntryId": "e2", "tokensBefore": 950, "estimatedTokensAfter": 120}})
+	}
+}
+
+// resume loads an existing session file as pi does, completing an
+// unterminated last line.
+func (f *fakePi) resume() error {
+	rows, err := readNativeRows(f.sessionFile)
+	if err != nil || len(rows) == 0 {
+		return errors.New("session file unreadable")
+	}
+
+	header, ok := pi.ParseHeader(rows[0])
+	if !ok {
+		return errors.New("session file has no header")
+	}
+
+	if data, readErr := os.ReadFile(f.sessionFile); readErr == nil && len(data) > 0 && data[len(data)-1] != '\n' {
+		file, openErr := os.OpenFile(f.sessionFile, os.O_APPEND|os.O_WRONLY, 0o600)
+		if openErr == nil {
+			_, _ = file.WriteString("\n")
+			_ = file.Close()
+		}
+	}
+
+	f.sessionID = header.ID
+	f.entries = len(rows)
+	f.context = lastUsableContext(rows)
+
+	return nil
+}
+
+// die ends the process for the scripts that kill pi mid-run: DIE exits with a
+// stderr reason, and TORN exits part way through appending a row.
+func (f *fakePi) die(message string) {
+	if strings.HasPrefix(message, "TORN") {
+		if file, err := os.OpenFile(f.sessionFile, os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+			_, _ = file.WriteString(`{"type":"message","id":"torn","mess`)
+			_ = file.Close()
+		}
+
+		os.Exit(3)
+	}
+
+	if strings.HasPrefix(message, "DIE") {
+		fmt.Fprintln(os.Stderr, "fatal: dead")
+		os.Exit(3)
 	}
 }
 

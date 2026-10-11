@@ -110,7 +110,9 @@ the adapter's session record under `config`, format `pi-session-jsonl-v2`. The
 record names pi's session file as `nativePath` and carries the session title,
 so `session/list` reads only records.
 `session/load` and `session/resume` prefer pi's own file when it exists and
-materialize it from the store otherwise.
+materialize it from the store otherwise. A restore, and a relaunch after pi
+exited, first cut any bytes after the file's last complete line, so a line a
+killed process left half-written never becomes a row.
 Native rows and session configuration commit as one store generation through
 `acp-go-core`'s `sessionlog.Mirror`: after the first generation, a commit reads
 only the lines pi appended since the last one and appends them, rewriting the
