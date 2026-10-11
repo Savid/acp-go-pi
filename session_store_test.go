@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,14 +41,14 @@ func TestMirrorCommitsRowsAndRecord(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, string(session.SessionId), header.ID)
 
-	records, err := loadEntries(context.Background(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: configSubpath})
+	records, err := loadEntries(context.Background(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: sessionlog.ConfigSubpath})
 	require.NoError(t, err)
 	require.NotEmpty(t, records)
 
 	var record sessionRecord
 	require.NoError(t, json.Unmarshal(records[len(records)-1], &record))
 	require.Equal(t, string(session.SessionId), record.SessionID)
-	require.FileExists(t, record.SessionFile)
+	require.FileExists(t, record.NativePath)
 	require.Equal(t, "fake/vision", record.Model)
 }
 
@@ -134,7 +136,7 @@ func TestHydrateMaterializesFromStore(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, matches, 1)
 
-	rows, err := pi.ReadRows(matches[0])
+	rows, err := readNativeRows(matches[0])
 	require.NoError(t, err)
 	require.Len(t, rows, 3)
 
@@ -156,14 +158,14 @@ func TestHydrateAdoptsNativeRowsWrittenOutsideACP(t *testing.T) {
 	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
 	require.NoError(t, err)
 
-	records, err := loadEntries(context.Background(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: configSubpath})
+	records, err := loadEntries(context.Background(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: sessionlog.ConfigSubpath})
 	require.NoError(t, err)
 
 	var record sessionRecord
 	require.NoError(t, json.Unmarshal(records[len(records)-1], &record))
 
 	native := `{"type":"message","id":"n1","parentId":"e3","timestamp":"2026-09-11T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"typed in a shell"}],"timestamp":1}}`
-	file, err := os.OpenFile(record.SessionFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	file, err := os.OpenFile(record.NativePath, os.O_APPEND|os.O_WRONLY, 0o600)
 	require.NoError(t, err)
 	_, err = file.WriteString(native + "\n")
 	require.NoError(t, err)
@@ -204,33 +206,20 @@ func TestHydrateDisagreementFailsRestore(t *testing.T) {
 	_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: session.SessionId})
 	require.NoError(t, err)
 
-	records, err := loadEntries(context.Background(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: configSubpath})
+	records, err := loadEntries(context.Background(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: sessionlog.ConfigSubpath})
 	require.NoError(t, err)
 
 	var record sessionRecord
 	require.NoError(t, json.Unmarshal(records[len(records)-1], &record))
 
-	rows, err := pi.ReadRows(record.SessionFile)
+	rows, err := readNativeRows(record.NativePath)
 	require.NoError(t, err)
 	rows[1] = []byte(`{"type":"message","id":"x","parentId":null,"timestamp":"t","message":{"role":"user","content":"other"}}`)
-	require.NoError(t, pi.WriteRows(record.SessionFile, rows))
+	require.NoError(t, writeNativeRows(record.NativePath, rows))
 
 	_, err = h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(session.SessionId, t.TempDir()))
 	require.Equal(t, -32603, requestErrorCode(t, err))
 	require.Equal(t, "pi_restore_failed", requestErrorData(t, err)["error"])
-}
-
-func TestStoredTitle(t *testing.T) {
-	t.Parallel()
-
-	rows := [][]byte{
-		[]byte(`{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/work"}`),
-		[]byte(`{"type":"message","id":"1","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}`),
-		[]byte(`{"type":"message","id":"2","message":{"role":"user","content":"  ask   me "}}`),
-	}
-
-	require.Equal(t, "ask me", storedTitle("abc", rows))
-	require.Equal(t, "abc", storedTitle("abc", rows[:2]))
 }
 
 func TestLoadUnknownSession(t *testing.T) {
@@ -255,7 +244,7 @@ func TestConfigurationCommitsWithoutNewNativeRows(t *testing.T) {
 	require.NoError(t, err)
 	_, err = h.conn.SetSessionConfigOption(h.ctx(), SetModelRequest(session.SessionId, "fake/text-only"))
 	require.NoError(t, err)
-	records, err := loadEntries(t.Context(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: configSubpath})
+	records, err := loadEntries(t.Context(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: sessionlog.ConfigSubpath})
 	require.NoError(t, err)
 	require.Len(t, records, 1)
 	var record sessionRecord
@@ -281,7 +270,7 @@ func TestMalformedStoreRecordFailsRestore(t *testing.T) {
 	main := acpcore.SessionKey{SessionID: string(session.SessionId)}
 	require.NoError(t, store.Replace(t.Context(), main, []acpcore.SessionStoreReplacement{
 		{Key: main, Entries: rows},
-		{Key: acpcore.SessionKey{SessionID: main.SessionID, Subpath: configSubpath}, Entries: []acpcore.SessionStoreEntry{[]byte(`{"sessionId":"wrong"}`)}},
+		{Key: acpcore.SessionKey{SessionID: main.SessionID, Subpath: sessionlog.ConfigSubpath}, Entries: []acpcore.SessionStoreEntry{[]byte(`{"sessionId":"wrong"}`)}},
 	}))
 	_, err = h.conn.LoadSession(h.ctx(), wire.LoadSessionRequest(session.SessionId, t.TempDir()))
 	require.Equal(t, "pi_restore_failed", requestErrorData(t, err)["error"])
@@ -298,6 +287,14 @@ func (s *mirrorFaultStore) Replace(ctx context.Context, key acpcore.SessionKey, 
 	}
 
 	return s.SessionStore.Replace(ctx, key, replacements)
+}
+
+func (s *mirrorFaultStore) Append(ctx context.Context, key acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, replacements []acpcore.SessionStoreReplacement) error {
+	if s.fail.Load() {
+		return errors.New("mirror unavailable")
+	}
+
+	return s.SessionStore.Append(ctx, key, base, entries, replacements)
 }
 
 func TestMirrorFailureFencesTurnAndAllowsRetry(t *testing.T) {
@@ -364,14 +361,14 @@ func TestRelativeNativeHomeUsesSessionCwd(t *testing.T) {
 	session := h.newSession()
 	_, err := h.prompt(session.SessionId, "HELLO", nil)
 	require.NoError(t, err)
-	rows, err := loadEntries(t.Context(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: configSubpath})
+	rows, err := loadEntries(t.Context(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: sessionlog.ConfigSubpath})
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	var record sessionRecord
 	require.NoError(t, json.Unmarshal(rows[0], &record))
-	require.True(t, filepath.IsAbs(record.SessionFile))
-	require.Contains(t, record.SessionFile, filepath.Join(record.Cwd, "native-home"))
-	require.FileExists(t, record.SessionFile)
+	require.True(t, filepath.IsAbs(record.NativePath))
+	require.Contains(t, record.NativePath, filepath.Join(record.Cwd, "native-home"))
+	require.FileExists(t, record.NativePath)
 }
 
 func TestNewSessionFailsWhenInitialMirrorFails(t *testing.T) {
@@ -454,7 +451,7 @@ func TestLiveResumeAppliesOptionsAndRetainsDirectories(t *testing.T) {
 	_, err = h.conn.ResumeSession(h.ctx(), wire.ResumeSessionRequest(session.SessionId, cwd,
 		WithSessionPiOptions(NewPiOptions(WithPiModel("fake/text-only"), WithPiAutoRetry(false)))))
 	require.NoError(t, err)
-	rows, err := loadEntries(h.ctx(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: configSubpath})
+	rows, err := loadEntries(h.ctx(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: sessionlog.ConfigSubpath})
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	var record sessionRecord
@@ -485,15 +482,15 @@ func TestRestoreIntoDifferentNativeHome(t *testing.T) {
 	require.NoError(t, err)
 	_, err = restored.prompt(session.SessionId, "HELLO", nil)
 	require.NoError(t, err)
-	rows, err := loadEntries(restored.ctx(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: configSubpath})
+	rows, err := loadEntries(restored.ctx(), store, acpcore.SessionKey{SessionID: string(session.SessionId), Subpath: sessionlog.ConfigSubpath})
 	require.NoError(t, err)
 	var record sessionRecord
 	require.Len(t, rows, 1)
 	require.NoError(t, json.Unmarshal(rows[0], &record))
-	relative, err := filepath.Rel(home, record.SessionFile)
+	relative, err := filepath.Rel(home, record.NativePath)
 	require.NoError(t, err)
 	require.True(t, filepath.IsLocal(relative))
-	require.FileExists(t, record.SessionFile)
+	require.FileExists(t, record.NativePath)
 }
 
 // An established conversation with no native rows commits an empty main record
@@ -512,6 +509,7 @@ func TestEmptyConversationCommitsAndRestores(t *testing.T) {
 		cwd:         cwd,
 		agentDir:    home,
 		sessionFile: filepath.Join(home, "sessions", "empty.jsonl"),
+		mirror:      sessionlog.NewMirror(store, "s1"),
 	}
 	require.NoError(t, s.commitMirror(t.Context()))
 
@@ -521,14 +519,16 @@ func TestEmptyConversationCommitsAndRestores(t *testing.T) {
 	rows, present := generation[acpcore.SessionStoreMainSubpath]
 	require.True(t, present, "the empty main record is committed")
 	require.Empty(t, rows)
-	require.Len(t, generation[configSubpath], 1)
+	require.Len(t, generation[sessionlog.ConfigSubpath], 1)
 
 	stored, err := agent.loadStored(t.Context(), "s1")
 	require.NoError(t, err)
 	require.True(t, stored.found, "an empty native history is a found session, not a missing one")
 	require.Empty(t, stored.rows)
 
-	path, hydrated, err := agent.hydrate(t.Context(), "s1", stored, cwd, home)
+	restored := &session{agent: agent, id: "s1", agentDir: home, mirror: sessionlog.NewMirror(store, "s1")}
+
+	path, hydrated, err := agent.hydrate(t.Context(), restored, stored, cwd)
 	require.NoError(t, err)
 	require.Equal(t, s.sessionFile, path, "the record's path is the identity a headerless generation has")
 	require.Empty(t, hydrated)
@@ -546,7 +546,7 @@ func TestResidualNativeStateIsNeverAdopted(t *testing.T) {
 
 	orphan := "00000000-0000-4000-8000-00000000abcd"
 	path := pi.SessionFile(home, cwd, orphan, time.Now())
-	require.NoError(t, pi.WriteRows(path, [][]byte{
+	require.NoError(t, writeNativeRows(path, [][]byte{
 		[]byte(`{"type":"session","version":3,"id":"` + orphan + `","timestamp":"2026-09-15T00:00:00Z","cwd":"` + cwd + `"}`),
 	}))
 
@@ -621,6 +621,14 @@ func (s *recoveryFaultStore) Replace(ctx context.Context, main acpcore.SessionKe
 	return s.SessionStore.Replace(ctx, main, replacements)
 }
 
+func (s *recoveryFaultStore) Append(ctx context.Context, main acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, replacements []acpcore.SessionStoreReplacement) error {
+	if s.fail.Load() {
+		return errors.New("injected store failure")
+	}
+
+	return s.SessionStore.Append(ctx, main, base, entries, replacements)
+}
+
 func TestNativeBindingSurvivesLoadAndResume(t *testing.T) {
 	t.Parallel()
 	store := acpcore.NewInMemorySessionStore()
@@ -641,7 +649,7 @@ func TestNativeBindingSurvivesLoadAndResume(t *testing.T) {
 	require.Equal(t, wire.NativeSessionMeta(vendor, record.NativeSessionID), created.Meta)
 	id := acp.SessionId("acp-conversation-independent-of-native-id")
 	record.SessionID = string(id)
-	require.NoError(t, sessionlog.Commit(t.Context(), store, string(id), rows, record))
+	require.NoError(t, sessionlog.NewMirror(store, string(id)).Commit(t.Context(), sessionlog.Rows(rows), record))
 	require.NoError(t, store.Delete(t.Context(), acpcore.SessionKey{SessionID: string(created.SessionId)}))
 
 	before := len(h.rec.snapshot())
@@ -785,4 +793,152 @@ func TestHostSessionMetaIsRefusedWhereItBindsNothing(t *testing.T) {
 	unknown := wire.WithSessionMeta(map[string]any{wire.SessionMetaKey: map[string]any{"persist": false}})
 	_, err = h.conn.NewSession(h.ctx(), wire.NewSessionRequest(t.TempDir(), unknown))
 	require.Equal(t, "_meta."+wire.SessionMetaKey+".persist", requestErrorData(t, err)["field"])
+}
+
+// appendRecorder counts the store writes a session's mirror makes.
+type appendRecorder struct {
+	acpcore.SessionStore
+
+	mu       sync.Mutex
+	replaces int
+	appends  []recordedAppend
+}
+
+type recordedAppend struct {
+	base    int
+	entries int
+	config  bool
+}
+
+func (s *appendRecorder) Replace(ctx context.Context, main acpcore.SessionKey, replacements []acpcore.SessionStoreReplacement) error {
+	s.mu.Lock()
+	s.replaces++
+	s.mu.Unlock()
+
+	return s.SessionStore.Replace(ctx, main, replacements)
+}
+
+func (s *appendRecorder) Append(ctx context.Context, main acpcore.SessionKey, base int, entries []acpcore.SessionStoreEntry, replacements []acpcore.SessionStoreReplacement) error {
+	s.mu.Lock()
+	s.appends = append(s.appends, recordedAppend{base: base, entries: len(entries), config: len(replacements) > 0})
+	s.mu.Unlock()
+
+	return s.SessionStore.Append(ctx, main, base, entries, replacements)
+}
+
+func (s *appendRecorder) writes() (int, []recordedAppend) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.replaces, slices.Clone(s.appends)
+}
+
+// After the establishing generation, each commit appends only the rows pi
+// added, rewrites the configuration record only when it changed, and writes
+// nothing when neither changed.
+func TestMirrorAppendsOnlyNewRows(t *testing.T) {
+	t.Parallel()
+
+	store := &appendRecorder{SessionStore: acpcore.NewInMemorySessionStore()}
+	h := newHarness(t, WithSessionStore(store))
+	h.initialize()
+	created := h.newSession()
+
+	replaces, appends := store.writes()
+	require.Equal(t, 1, replaces)
+	require.Empty(t, appends)
+
+	committedRows := func() int {
+		generation, err := store.Load(t.Context(), string(created.SessionId))
+		require.NoError(t, err)
+
+		return len(generation[acpcore.SessionStoreMainSubpath])
+	}
+	before := committedRows()
+
+	_, err := h.prompt(created.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+
+	replaces, appends = store.writes()
+	require.Equal(t, 1, replaces, "a turn never republishes the whole generation")
+	require.Len(t, appends, 1)
+	require.Equal(t, before, appends[0].base)
+	require.Equal(t, committedRows()-before, appends[0].entries)
+	require.Positive(t, appends[0].entries)
+	require.True(t, appends[0].config, "the first prompt records the session title")
+
+	before = committedRows()
+
+	_, err = h.prompt(created.SessionId, "HELLO", nil)
+	require.NoError(t, err)
+
+	replaces, appends = store.writes()
+	require.Equal(t, 1, replaces)
+	require.Len(t, appends, 2)
+	require.Equal(t, before, appends[1].base)
+	require.Positive(t, appends[1].entries)
+	require.False(t, appends[1].config, "an unchanged configuration is not rewritten")
+
+	_, err = h.conn.SetSessionConfigOption(h.ctx(), wire.SetConfigOptionRequest(created.SessionId, configThoughtLevel, "medium"))
+	require.NoError(t, err)
+
+	_, after := store.writes()
+	require.Len(t, after, 2, "a commit with nothing new writes nothing")
+
+	var record sessionRecord
+
+	found, err := sessionlog.LoadRecord(t.Context(), store, string(created.SessionId), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "HELLO", record.Title)
+}
+
+// BenchmarkCommitMirror measures one turn's commit against a large session
+// file: an incremental append of the turn's rows, and the whole-generation
+// republish the mirror falls back to.
+func BenchmarkCommitMirror(b *testing.B) {
+	const (
+		historyRows = 20000
+		turnRows    = 10
+	)
+
+	row := []byte(`{"type":"message","id":"x","message":{"role":"assistant","content":[{"type":"text","text":"` + strings.Repeat("a", 1024) + `"}]}}`)
+
+	for _, mode := range []string{"append", "republish"} {
+		b.Run(mode, func(b *testing.B) {
+			store := acpcore.NewInMemorySessionStore()
+			agent := NewAgent(WithSessionStore(store), WithLogger(slog.New(slog.DiscardHandler)))
+			path := filepath.Join(b.TempDir(), "session.jsonl")
+
+			rows := make([][]byte, historyRows)
+			for index := range rows {
+				rows[index] = row
+			}
+
+			_, err := sessionlog.WriteJSONL(path, rows)
+			require.NoError(b, err)
+
+			s := &session{agent: agent, id: "bench", nativeID: "bench", cwd: "/", sessionFile: path, mirror: sessionlog.NewMirror(store, "bench")}
+			require.NoError(b, s.commitMirror(b.Context()))
+
+			file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+			require.NoError(b, err)
+
+			b.Cleanup(func() { _ = file.Close() })
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				for range turnRows {
+					_, _ = file.Write(append(row, '\n'))
+				}
+
+				if mode == "republish" {
+					s.mirror.Reset()
+				}
+
+				require.NoError(b, s.commitMirror(b.Context()))
+			}
+		})
+	}
 }

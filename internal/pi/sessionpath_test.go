@@ -1,7 +1,6 @@
 package pi
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -30,32 +29,13 @@ func TestSessionLayout(t *testing.T) {
 	require.Equal(t, "/agent/sessions/--w--/2026-09-11T01-02-03-456Z_abc.jsonl", SessionFile("/agent", "/w", "abc", stamp))
 }
 
-func TestRowsRoundTrip(t *testing.T) {
+func TestParseHeader(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(t.TempDir(), "nested", "s.jsonl")
-	rows := [][]byte{[]byte(`{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/w"}`), []byte(`{"type":"message"}`)}
-
-	require.NoError(t, WriteRows(path, rows))
-
-	read, err := ReadRows(path)
-	require.NoError(t, err)
-	require.Equal(t, rows, read)
-
-	header, ok := ParseHeader(read[0])
+	header, ok := ParseHeader([]byte(`{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/w"}`))
 	require.True(t, ok)
 	require.Equal(t, "abc", header.ID)
 
-	_, ok = ParseHeader(read[1])
+	_, ok = ParseHeader([]byte(`{"type":"message"}`))
 	require.False(t, ok)
-
-	missing, err := ReadRows(filepath.Join(t.TempDir(), "missing"))
-	require.NoError(t, err)
-	require.Nil(t, missing)
-
-	require.Equal(t, [][]byte{[]byte("a")}, SplitRows([]byte("\n a \n\n")))
-
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 }

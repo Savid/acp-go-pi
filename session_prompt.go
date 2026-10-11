@@ -436,7 +436,7 @@ func (s *session) settledStats(ctx context.Context, rt *runtime) *pi.SessionStat
 	}
 
 	if stats.SessionID != "" && stats.SessionID != s.nativeID {
-		s.poisonSession(ctx, "native_session_identity_drift")
+		s.poisonSession(ctx, wire.CauseNativeSessionIdentityDrift)
 
 		return nil
 	}

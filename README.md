@@ -106,10 +106,15 @@ that failed before the gateway answered, carries neither.
 ### Session store
 
 `WithSessionStore` mirrors pi's session JSONL rows under the main subpath and
-the adapter's session record under `config`, format `pi-session-jsonl-v1`.
+the adapter's session record under `config`, format `pi-session-jsonl-v2`. The
+record names pi's session file as `nativePath` and carries the session title,
+so `session/list` reads only records.
 `session/load` and `session/resume` prefer pi's own file when it exists and
 materialize it from the store otherwise.
-Native rows and session configuration commit as one store generation. A
+Native rows and session configuration commit as one store generation through
+`acp-go-core`'s `sessionlog.Mirror`: after the first generation, a commit reads
+only the lines pi appended since the last one and appends them, rewriting the
+record only when it changed, and writes nothing when neither changed. A
 configuration change is durable even when no native rows were added, and an
 established conversation with no native history yet commits its configuration
 with an empty main record. Replay decodes every stored image, user or

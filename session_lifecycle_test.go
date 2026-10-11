@@ -336,6 +336,10 @@ func TestCloseBackgroundCycleRequiresCommit(t *testing.T) {
 				return len(events) >= 5 && events[4]["state"] == "running"
 			})
 			before := len(lifecycleEvents(h.rec.snapshot()))
+			if fail {
+				// The close commit owes a row pi wrote during the open cycle.
+				appendNativeRow(t, store, created.SessionId, `{"type":"custom","id":"hang"}`)
+			}
 			store.fail.Store(fail)
 			_, err = h.conn.CloseSession(h.ctx(), acp.CloseSessionRequest{SessionId: created.SessionId})
 			store.fail.Store(false)

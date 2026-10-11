@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -18,25 +17,22 @@ import (
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
-// configSubpath holds the current session configuration.
-const configSubpath = sessionlog.ConfigSubpath
-
-// sessionRecord is the adapter-owned state a session needs to resume: where
-// pi keeps the native file and the configuration the session was established
-// with.
+// sessionRecord is the adapter-owned state a session needs to resume and be
+// listed: where pi keeps the native file, the configuration the session was
+// established with, and its title.
 type sessionRecord struct {
 	SessionID             string            `json:"sessionId"`
 	NativeSessionID       string            `json:"nativeSessionId"`
 	Cwd                   string            `json:"cwd"`
 	AdditionalDirectories []string          `json:"additionalDirectories,omitempty"`
-	SessionFile           string            `json:"sessionFile"`
+	NativePath            string            `json:"nativePath"`
+	Title                 string            `json:"title,omitempty"`
 	Env                   map[string]string `json:"env,omitempty"`
 	ExtraPathDirs         []string          `json:"extraPathDirs,omitempty"`
 	Model                 string            `json:"model,omitempty"`
 	ThinkingLevel         string            `json:"thinkingLevel,omitempty"`
 	Permission            string            `json:"permission,omitempty"`
 	AutoRetry             bool              `json:"autoRetry,omitempty"`
-	UpdatedAtUnixMilli    int64             `json:"updatedAtUnixMilli"`
 }
 
 func (s *session) record() sessionRecord {
@@ -48,58 +44,44 @@ func (s *session) record() sessionRecord {
 		NativeSessionID:       s.nativeID,
 		Cwd:                   s.cwd,
 		AdditionalDirectories: slices.Clone(s.additionalDirectories),
-		SessionFile:           s.sessionFile,
+		NativePath:            s.sessionFile,
+		Title:                 s.title,
 		Env:                   maps.Clone(s.options.Env),
 		ExtraPathDirs:         slices.Clone(s.options.ExtraPathDirs),
 		Model:                 s.model,
 		ThinkingLevel:         s.thinkingLevel,
 		Permission:            s.options.Permission,
 		AutoRetry:             s.options.AutoRetry,
-		UpdatedAtUnixMilli:    time.Now().UnixMilli(),
 	}
 }
 
-// commitMirror publishes the native rows and current session configuration
-// as one durable generation.
+// commitMirror publishes the rows pi appended to its session file since the
+// last commit, with the current session configuration, as one durable
+// generation. mirrorMu keeps each configuration snapshot in commit order.
 func (s *session) commitMirror(ctx context.Context) error {
 	s.mirrorMu.Lock()
 	defer s.mirrorMu.Unlock()
 
 	s.mu.Lock()
 	path := s.sessionFile
-	mirrored := s.mirrored
+	mirror := s.mirror
 	ephemeral := s.ephemeral
 	s.mu.Unlock()
 
-	if path == "" || ephemeral {
+	if path == "" || ephemeral || mirror == nil {
 		return nil
 	}
 
-	rows, err := pi.ReadRows(path)
-	if err != nil {
-		return fmt.Errorf("read native session: %w", err)
-	}
-
-	if len(rows) < mirrored {
-		return fmt.Errorf("native log shrank from %d to %d rows", mirrored, len(rows))
-	}
-
-	commitCtx, finish := s.agent.observe.StartSessionStore(ctx, "replace")
-	err = sessionlog.Commit(commitCtx, s.agent.store, string(s.id), rows, s.record())
+	commitCtx, finish := s.agent.observe.StartSessionStore(ctx, "commit")
+	err := mirror.Commit(commitCtx, sessionlog.File(path), s.record())
 	finish(err)
-
-	if err == nil {
-		s.mu.Lock()
-		s.persisted = true
-		s.mu.Unlock()
-	}
 
 	if err != nil {
 		return fmt.Errorf("commit session mirror: %w", err)
 	}
 
 	s.mu.Lock()
-	s.mirrored = len(rows)
+	s.persisted = true
 	s.mu.Unlock()
 
 	return nil
@@ -126,14 +108,31 @@ func (a *Agent) loadStored(ctx context.Context, sessionID acp.SessionId) (stored
 	finish(err)
 
 	if err != nil {
-		return storedSession{}, a.restoreRefused(ctx, sessionID, err)
+		return storedSession{}, wire.RestoreRefused(ctx, a.log, vendor, sessionID, err)
 	}
 
 	return storedSession{rows: rows, record: record, found: found}, nil
 }
 
+// loadRecord reads only the configuration record of a stored session, as
+// listing needs no native rows.
+func (a *Agent) loadRecord(ctx context.Context, sessionID acp.SessionId) (sessionRecord, bool, error) {
+	loadCtx, finish := a.observe.StartSessionStore(ctx, "load")
+
+	var record sessionRecord
+
+	found, err := sessionlog.LoadRecord(loadCtx, a.store, string(sessionID), &record)
+	if err == nil && found {
+		err = record.validate(string(sessionID))
+	}
+
+	finish(err)
+
+	return record, found, err
+}
+
 func (r sessionRecord) validate(sessionID string) error {
-	if r.NativeSessionID == "" || r.SessionID != sessionID || !filepath.IsAbs(r.Cwd) || !filepath.IsAbs(r.SessionFile) || r.UpdatedAtUnixMilli <= 0 {
+	if r.NativeSessionID == "" || r.SessionID != sessionID || !filepath.IsAbs(r.Cwd) || !filepath.IsAbs(r.NativePath) {
 		return fmt.Errorf("invalid session record identity or location")
 	}
 
@@ -150,43 +149,21 @@ func (r sessionRecord) validate(sessionID string) error {
 	return nil
 }
 
-// hydrate reconciles the store with pi's own file before a load or resume. An
-// existing native file at least as long as the store wins and its newer rows
-// are adopted; a missing or shorter one is materialized from the store. A
-// disagreement at a shared position, or a row the adapter cannot decode, fails
-// the restore. It returns the native path and the rows the session now holds.
-func (a *Agent) hydrate(ctx context.Context, sessionID acp.SessionId, stored storedSession, cwd string, agentDir string) (string, [][]byte, error) {
-	path, err := a.nativePath(ctx, sessionID, stored, cwd, agentDir)
+// hydrate reconciles the store with pi's own file before a load or resume
+// through the session's mirror. An existing native file at least as long as
+// the store wins and its newer rows are adopted; a missing or shorter one is
+// materialized from the store. A disagreement at a shared position, or a row
+// the adapter cannot decode, fails the restore. It returns the native path and
+// the rows the session now holds.
+func (a *Agent) hydrate(ctx context.Context, s *session, stored storedSession, cwd string) (string, [][]byte, error) {
+	path, err := a.nativePath(ctx, s.id, stored, cwd, s.agentDir)
 	if err != nil {
 		return "", nil, err
 	}
 
-	native, err := pi.ReadRows(path)
+	rows, err := s.mirror.Hydrate(ctx, path, stored.rows, stored.record, validateRows)
 	if err != nil {
-		return "", nil, a.restoreRefused(ctx, sessionID, err)
-	}
-
-	rows, nativeWins, err := sessionlog.Reconcile(native, stored.rows)
-	if err != nil {
-		return "", nil, a.restoreRefused(ctx, sessionID, err)
-	}
-
-	if err := validateRows(rows); err != nil {
-		return "", nil, a.restoreRefused(ctx, sessionID, err)
-	}
-
-	if nativeWins {
-		if len(native) > len(stored.rows) {
-			if err := sessionlog.Commit(ctx, a.store, string(sessionID), rows, stored.record); err != nil {
-				return "", nil, a.restoreRefused(ctx, sessionID, err)
-			}
-		}
-
-		return path, rows, nil
-	}
-
-	if err := pi.WriteRows(path, rows); err != nil {
-		return "", nil, a.restoreRefused(ctx, sessionID, err)
+		return "", nil, wire.RestoreRefused(ctx, a.log, vendor, s.id, err)
 	}
 
 	return path, rows, nil
@@ -198,7 +175,7 @@ func (a *Agent) hydrate(ctx context.Context, sessionID acp.SessionId, stored sto
 // conversation with no native history carries no header row, so the recorded
 // path is the only identity it has.
 func (a *Agent) nativePath(ctx context.Context, sessionID acp.SessionId, stored storedSession, cwd string, agentDir string) (string, error) {
-	path := stored.record.SessionFile
+	path := stored.record.NativePath
 
 	if len(stored.rows) == 0 {
 		return path, nil
@@ -206,12 +183,12 @@ func (a *Agent) nativePath(ctx context.Context, sessionID acp.SessionId, stored 
 
 	header, ok := pi.ParseHeader(stored.rows[0])
 	if !ok || header.ID != stored.record.NativeSessionID || filepath.Base(header.ID) != header.ID {
-		return "", a.restoreRefused(ctx, sessionID, errors.New("invalid native session identity"))
+		return "", wire.RestoreRefused(ctx, a.log, vendor, sessionID, errors.New("invalid native session identity"))
 	}
 
 	stamp, err := time.Parse(time.RFC3339Nano, header.Timestamp)
 	if err != nil {
-		return "", a.restoreRefused(ctx, sessionID, err)
+		return "", wire.RestoreRefused(ctx, a.log, vendor, sessionID, err)
 	}
 
 	relative, pathErr := filepath.Rel(agentDir, path)
@@ -226,34 +203,4 @@ func fileExists(path string) bool {
 	info, err := os.Stat(path)
 
 	return err == nil && !info.IsDir()
-}
-
-func (a *Agent) restoreRefused(ctx context.Context, sessionID acp.SessionId, err error) error {
-	a.log.ErrorContext(ctx, "pi session restore failed",
-		slog.String("session_id", string(sessionID)), slog.String("reason", err.Error()))
-
-	return wire.RestoreFailed(vendor)
-}
-
-// storedTitle derives a listing title: the first user message text, else the
-// session id.
-func storedTitle(sessionID string, rows [][]byte) string {
-	for _, row := range rows {
-		message, blocks, ok, err := messageRow(row)
-		if err != nil || !ok || message.Role != messageRoleUser {
-			continue
-		}
-
-		for index := range blocks {
-			if blocks[index].Type != contentBlockTypeText {
-				continue
-			}
-
-			if title := wire.NormalizeTitle(blocks[index].Text); title != "" {
-				return title
-			}
-		}
-	}
-
-	return sessionID
 }

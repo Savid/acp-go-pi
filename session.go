@@ -17,6 +17,7 @@ import (
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/process"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
@@ -61,9 +62,11 @@ type session struct {
 	// change, or a restore.
 	gate chan struct{}
 
-	mu            sync.Mutex
-	runtime       *runtime
-	mirrored      int
+	mu      sync.Mutex
+	runtime *runtime
+	// mirror publishes this session's store generation; nil until the
+	// session has an id.
+	mirror        *sessionlog.Mirror
 	model         string
 	contextWindow int64
 	models        []pi.Model
@@ -71,7 +74,8 @@ type session struct {
 	commands      []acp.AvailableCommand
 	title         string
 	updatedAt     string
-	// persisted marks a successfully committed mirror.
+	// persisted marks a mirror commit this session made, after which its
+	// establishment no longer owns the gate.
 	persisted bool
 	closing   bool
 	closeDone chan struct{}
@@ -261,7 +265,7 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 	cancelReady()
 
 	if readyErr != nil {
-		readyErr = launchFailure(proc, readyErr)
+		readyErr = process.LaunchFailure(proc, "pi", readyErr)
 
 		s.stopRuntime(context.WithoutCancel(ctx), rt)
 
@@ -269,16 +273,6 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 	}
 
 	return rt, nil
-}
-
-// launchFailure names why a launch ended with pi's stderr tail, where a dying
-// harness states its reason and a stalled one may have warned.
-func launchFailure(proc *process.Process, err error) error {
-	if tail := proc.StderrTail(); tail != "" {
-		return fmt.Errorf("%w: %s", err, tail)
-	}
-
-	return err
 }
 
 // launchEnvironment builds the merged environment for this session's pi
@@ -317,7 +311,7 @@ func (s *session) startFailure(ctx context.Context, err error) error {
 		slog.String("reason", err.Error()),
 	)
 
-	return wire.InternalFailure(vendor, internalClassNativeStart)
+	return wire.InternalFailure(vendor, wire.ClassNativeStart)
 }
 
 // configureRuntime drives the post-spawn command sequence: retry posture,

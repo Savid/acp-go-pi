@@ -233,7 +233,7 @@ func runFakePi(args []string) int {
 		_ = os.WriteFile(f.sessionFile, append(header, '\n'), 0o600)
 		f.entries = 1
 	} else {
-		rows, err := pi.ReadRows(f.sessionFile)
+		rows, err := readNativeRows(f.sessionFile)
 		if err != nil || len(rows) == 0 {
 			fmt.Fprintln(os.Stderr, "fake pi: session file unreadable")
 

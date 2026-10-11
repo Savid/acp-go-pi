@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"slices"
-	"strings"
 	"sync"
 
 	"github.com/coder/acp-go-sdk"
@@ -39,7 +38,7 @@ const (
 	// SessionStoreFormat identifies the store layout this package writes: raw
 	// pi session JSONL rows under the main subpath plus the adapter's session
 	// record under the config subpath.
-	SessionStoreFormat = "pi-session-jsonl-v1"
+	SessionStoreFormat = "pi-session-jsonl-v2"
 
 	vendor = "pi"
 
@@ -176,19 +175,17 @@ func validateOptionalModel(model string) error {
 	return err
 }
 
+// validateConfiguredModels applies the shared model-list rules, then requires
+// every id to name a pi provider and model.
 func validateConfiguredModels(ids []string) error {
-	seen := make(map[string]struct{}, len(ids))
+	if err := wire.ValidateConfiguredModels(ids); err != nil {
+		return err
+	}
 
 	for index, id := range ids {
-		if _, err := pi.ParseModelRef(id); err != nil || id != strings.TrimSpace(id) {
+		if _, err := pi.ParseModelRef(id); err != nil {
 			return fmt.Errorf("configured model %d %q is not a model id", index, id)
 		}
-
-		if _, duplicate := seen[id]; duplicate {
-			return fmt.Errorf("configured model %q is listed twice", id)
-		}
-
-		seen[id] = struct{}{}
 	}
 
 	return nil
@@ -378,11 +375,7 @@ func (a *Agent) Authenticate(_ context.Context, params acp.AuthenticateRequest) 
 		return acp.AuthenticateResponse{}, openErr
 	}
 
-	if refusal := lifecycle.RejectKey(params.Meta); refusal != nil {
-		return acp.AuthenticateResponse{}, wire.ParamRefusal(refusal)
-	}
-
-	return acp.AuthenticateResponse{}, acp.NewInvalidParams(map[string]any{"methodId": params.MethodId})
+	return acp.AuthenticateResponse{}, wire.AuthenticateRefused(params)
 }
 
 // Logout exists because the SDK interface requires it.
@@ -486,7 +479,7 @@ func (a *Agent) ensureExecutable(ctx context.Context) (string, error) {
 
 	a.log.ErrorContext(ctx, "pi executable resolution failed", slog.String("reason", err.Error()))
 
-	return "", wire.InternalFailure(vendor, internalClassNativeStart)
+	return "", wire.InternalFailure(vendor, wire.ClassNativeStart)
 }
 
 // ensureExtensions publishes the wrapper extensions once per agent.
@@ -524,7 +517,3 @@ func (a *Agent) environment(sessionEnv map[string]string, owned map[string]strin
 		InternalPrefix: pi.InternalEnvPrefix,
 	}
 }
-
-// internalClassNativeStart is the pi_internal_failure class of a native pi
-// process that could not be started or configured for a session.
-const internalClassNativeStart = "native_start"

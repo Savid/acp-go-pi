@@ -8,6 +8,7 @@ import (
 	"github.com/coder/acp-go-sdk"
 
 	"github.com/savid/acp-go-core/image"
+	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
 
@@ -62,7 +63,7 @@ func (s *session) replay(ctx context.Context, rows [][]byte) error {
 	for _, row := range rows {
 		message, blocks, ok, err := messageRow(row)
 		if err != nil {
-			return s.agent.restoreRefused(ctx, s.id, err)
+			return wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, err)
 		}
 
 		if !ok {
@@ -71,7 +72,7 @@ func (s *session) replay(ctx context.Context, rows [][]byte) error {
 
 		updates, failure := replayUpdates(message, blocks, limits)
 		if failure != nil {
-			return s.agent.restoreRefused(ctx, s.id, failure)
+			return wire.RestoreRefused(ctx, s.agent.log, vendor, s.id, failure)
 		}
 
 		if err := s.emit(ctx, updates...); err != nil {

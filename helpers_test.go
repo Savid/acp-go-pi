@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	acpcore "github.com/savid/acp-go-core"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 )
 
@@ -516,4 +517,37 @@ func (w *requestWriter) cancelPrompt() error {
 	_, err = w.Writer.Write(append(data, '\n'))
 
 	return err
+}
+
+// readNativeRows reads every row of a native session file.
+func readNativeRows(path string) ([][]byte, error) {
+	tail, err := sessionlog.ReadJSONL(path, sessionlog.Cursor{})
+
+	return tail.Rows, err
+}
+
+// writeNativeRows replaces a native session file with rows.
+func writeNativeRows(path string, rows [][]byte) error {
+	_, err := sessionlog.WriteJSONL(path, rows)
+
+	return err
+}
+
+// appendNativeRow appends row to the native session file the store records
+// for sessionID, as pi appends to it.
+func appendNativeRow(t *testing.T, store acpcore.SessionStore, sessionID acp.SessionId, row string) {
+	t.Helper()
+
+	var record sessionRecord
+
+	found, err := sessionlog.LoadRecord(t.Context(), store, string(sessionID), &record)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	file, err := os.OpenFile(record.NativePath, os.O_APPEND|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+
+	_, err = file.WriteString(row + "\n")
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
 }

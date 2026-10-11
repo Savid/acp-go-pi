@@ -20,6 +20,7 @@ import (
 	"github.com/savid/acp-go-core/lifecycle"
 	"github.com/savid/acp-go-core/observer"
 	"github.com/savid/acp-go-core/process"
+	"github.com/savid/acp-go-core/sessionlog"
 	"github.com/savid/acp-go-core/wire"
 	"github.com/savid/acp-go-pi/internal/pi"
 )
@@ -132,7 +133,7 @@ func (a *Agent) install(ctx context.Context, s *session) error {
 	case a.deleted[s.id]:
 		refusal = wire.UnknownSession()
 	case a.sessions[s.id] != nil:
-		refusal = wire.InternalFailure(vendor, internalClassNativeStart)
+		refusal = wire.InternalFailure(vendor, wire.ClassNativeStart)
 	}
 
 	if refusal == nil {
@@ -250,6 +251,7 @@ func (a *Agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (r
 
 	s.mu.Lock()
 	s.rawEvents = wire.NewRawEvents(vendor, string(s.id), vendor, start.meta.rawEvents)
+	s.mirror = sessionlog.NewMirror(a.store, string(s.id))
 	s.mu.Unlock()
 
 	release := wire.HoldSessionGate(s.gate)
@@ -428,15 +430,15 @@ func (a *Agent) restore(
 	s.id = sessionID
 	s.nativeID = stored.record.NativeSessionID
 	s.rawEvents = wire.NewRawEvents(vendor, string(sessionID), vendor, start.meta.rawEvents)
-	s.title = storedTitle(stored.record.NativeSessionID, stored.rows)
+	s.title = stored.record.Title
+	s.mirror = sessionlog.NewMirror(a.store, string(sessionID))
 
-	path, rows, err := a.hydrate(ctx, sessionID, stored, start.cwd, s.agentDir)
+	path, rows, err := a.hydrate(ctx, s, stored, start.cwd)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	s.sessionFile = path
-	s.mirrored = len(rows)
 
 	rt, err := s.launch(ctx, path)
 	if err != nil {
@@ -474,7 +476,7 @@ func (a *Agent) restore(
 		_ = s.close(context.WithoutCancel(ctx))
 		a.detach(ctx, s)
 
-		return nil, nil, a.restoreRefused(ctx, sessionID, err)
+		return nil, nil, wire.RestoreRefused(ctx, a.log, vendor, sessionID, err)
 	}
 
 	if replay {
@@ -644,25 +646,27 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 			continue
 		}
 
-		stored, loadErr := a.loadStored(ctx, id)
+		record, found, loadErr := a.loadRecord(ctx, id)
 		if loadErr != nil {
 			return acp.ListSessionsResponse{}, wire.InternalFailure(vendor, "")
 		}
 
-		cwd := stored.record.Cwd
-
-		if filter != "" && cwd != filter {
+		if !found || (filter != "" && record.Cwd != filter) {
 			continue
 		}
 
-		title := storedTitle(stored.record.NativeSessionID, stored.rows)
+		title := record.Title
+		if title == "" {
+			title = string(id)
+		}
+
 		updatedAt := time.UnixMilli(summary.UpdatedAtUnixMilli).UTC().Format(time.RFC3339)
 
 		sessions = append(sessions, acp.SessionInfo{
-			Meta:                  wire.NativeSessionMeta(vendor, stored.record.NativeSessionID),
+			Meta:                  wire.NativeSessionMeta(vendor, record.NativeSessionID),
 			SessionId:             id,
-			Cwd:                   cwd,
-			AdditionalDirectories: slices.Clone(stored.record.AdditionalDirectories),
+			Cwd:                   record.Cwd,
+			AdditionalDirectories: record.AdditionalDirectories,
 			Title:                 &title,
 			UpdatedAt:             &updatedAt,
 		})
