@@ -36,10 +36,10 @@ const (
 	// and how long a cancelled turn then has to settle before its process is
 	// stopped.
 	sessionAbortTimeout = 5 * time.Second
-	// sessionCompactionWait bounds how long an interrupt waits for a
-	// compaction in progress to end. pi bounds a compaction only by its
-	// summarization calls, and a process stopped mid-compaction loses the
-	// summary it was paying for.
+	// sessionCompactionWait bounds how long one interrupt, through its cancel,
+	// abort, and close, waits in total for a compaction in progress to end.
+	// pi bounds a compaction only by its summarization calls, and a process
+	// stopped mid-compaction loses the summary it was paying for.
 	sessionCompactionWait = 5 * time.Minute
 	// sessionSettleTimeout bounds one turn's settlement after the native run
 	// ended: the stats read, the mirror commit, and the terminal lifecycle
@@ -81,6 +81,9 @@ type session struct {
 	commands      []acp.AvailableCommand
 	title         string
 	updatedAt     string
+	// interruptDeadline ends every compaction wait of the current interrupt;
+	// zero until one waits, and cleared when a new foreground starts.
+	interruptDeadline time.Time
 	// persisted marks a mirror commit this session made, after which its
 	// establishment no longer owns the gate.
 	persisted bool
@@ -617,6 +620,7 @@ func (s *session) openAgentCycle(ctx context.Context, rt *runtime) {
 	}
 
 	s.cycle = c
+	s.interruptDeadline = time.Time{}
 	s.mu.Unlock()
 	s.recordFailure(c, s.lc.OpenAgentCycle(ctx, c.Cycle))
 }
@@ -795,7 +799,7 @@ func (s *session) stopRuntime(ctx context.Context, rt *runtime) {
 // abort interrupts the native run under a bounded context detached from the
 // caller's cancellation, once any compaction in progress has ended.
 func (s *session) abort(ctx context.Context, rt *runtime) {
-	s.awaitCompaction(rt, nil)
+	s.awaitCompaction(ctx, rt, nil)
 
 	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionAbortTimeout)
 	defer cancel()
@@ -805,26 +809,44 @@ func (s *session) abort(ctx context.Context, rt *runtime) {
 	}
 }
 
-// awaitCompaction waits, up to sessionCompactionWait, for a compaction in
-// progress on rt to end, so an interrupt never lands mid-compaction. It
-// returns early when stop closes or rt's pump ends.
-func (s *session) awaitCompaction(rt *runtime, stop <-chan struct{}) {
+// awaitCompaction waits for a compaction in progress on rt to end, so an
+// interrupt never lands mid-compaction. Every wait of one interrupt shares a
+// single deadline, so the cancel, abort, and close of one interrupt together
+// wait no longer than the agent's compaction wait. It returns early when ctx
+// ends, stop closes, or rt's pump ends.
+func (s *session) awaitCompaction(ctx context.Context, rt *runtime, stop <-chan struct{}) {
 	s.mu.Lock()
 	compacting := rt.compacting
+
+	if compacting != nil && s.interruptDeadline.IsZero() {
+		s.interruptDeadline = time.Now().Add(s.agent.compactionWait)
+	}
+
+	deadline := s.interruptDeadline
 	s.mu.Unlock()
 
 	if compacting == nil {
 		return
 	}
 
-	timer := time.NewTimer(sessionCompactionWait)
+	remaining := max(time.Until(deadline), 0)
+	log := s.agent.log.With(slog.String("session_id", string(s.id)))
+	log.InfoContext(ctx, "pi interrupt waiting for compaction", slog.Duration("remaining", remaining))
+
+	timer := time.NewTimer(remaining)
 	defer timer.Stop()
 
 	select {
 	case <-compacting:
+		log.InfoContext(ctx, "pi compaction ended before interrupt")
 	case <-stop:
+		log.InfoContext(ctx, "pi turn settled during compaction wait")
 	case <-rt.done:
+		log.WarnContext(ctx, "pi process ended during compaction wait")
+	case <-ctx.Done():
+		log.WarnContext(ctx, "pi compaction wait abandoned", slog.String("reason", context.Cause(ctx).Error()))
 	case <-timer.C:
+		log.WarnContext(ctx, "pi compaction outlasted the interrupt deadline; interrupting it")
 	}
 }
 
@@ -896,10 +918,14 @@ func (s *session) cancel(ctx context.Context) {
 	s.cancelDialogs()
 
 	if interrupt {
+		// The cancel notification's context ends when its handler returns, so
+		// the interrupt runs detached and is bounded by its shared deadline.
+		abortCtx := context.WithoutCancel(ctx)
+
 		go func() {
 			defer s.callbacks.Done()
 
-			s.abort(ctx, rt)
+			s.abort(abortCtx, rt)
 		}()
 	}
 }
@@ -1064,7 +1090,7 @@ func (s *session) close(ctx context.Context) error {
 	}
 
 	if rt != nil {
-		s.awaitCompaction(rt, nil)
+		s.awaitCompaction(ctx, rt, nil)
 		s.stopRuntime(ctx, rt)
 	}
 

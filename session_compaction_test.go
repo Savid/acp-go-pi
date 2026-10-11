@@ -1,10 +1,14 @@
 package piacp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/savid/acp-go-pi/internal/pi"
 
@@ -238,4 +242,52 @@ func TestInterruptWaitsForCompaction(t *testing.T) {
 			require.Equal(t, before, streams(), "the same pi process served the next prompt")
 		})
 	}
+}
+
+// Every compaction wait of one interrupt shares a single deadline, ends with
+// its context, and is logged; a new foreground starts a fresh deadline.
+func TestInterruptCompactionWaitsShareOneDeadline(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+
+	agent := NewAgent(WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	agent.compactionWait = 200 * time.Millisecond
+	s := agent.newSession(sessionStart{cwd: t.TempDir()})
+	rt := &runtime{done: make(chan struct{})}
+	s.trackCompaction(rt, true)
+
+	start := time.Now()
+
+	for range 3 {
+		s.awaitCompaction(t.Context(), rt, nil)
+	}
+
+	elapsed := time.Since(start)
+	require.GreaterOrEqual(t, elapsed, agent.compactionWait)
+	require.Less(t, elapsed, 2*agent.compactionWait, "the waits of one interrupt do not stack")
+	require.Equal(t, 3, strings.Count(logs.String(), "pi interrupt waiting for compaction"))
+	require.Equal(t, 3, strings.Count(logs.String(), "outlasted the interrupt deadline"))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	s.mu.Lock()
+	s.interruptDeadline = time.Time{}
+	s.mu.Unlock()
+
+	start = time.Now()
+	s.awaitCompaction(ctx, rt, nil)
+	require.Less(t, time.Since(start), agent.compactionWait, "an ended context ends the wait")
+	require.Contains(t, logs.String(), "pi compaction wait abandoned")
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		s.trackCompaction(rt, false)
+	}()
+
+	start = time.Now()
+	s.awaitCompaction(t.Context(), rt, nil)
+	require.Less(t, time.Since(start), agent.compactionWait)
+	require.Contains(t, logs.String(), "pi compaction ended before interrupt")
 }

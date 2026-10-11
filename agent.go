@@ -13,6 +13,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 
@@ -64,6 +65,9 @@ type Agent struct {
 	// processEnv is the adapter's own environment, read once at construction.
 	processEnv []string
 	store      acpcore.SessionStore
+	// compactionWait is how long one interrupt may wait in total for pi to
+	// finish a compaction.
+	compactionWait time.Duration
 
 	mu                 sync.Mutex
 	conn               client
@@ -121,12 +125,13 @@ func NewAgent(opts ...Option) *Agent {
 			TracerProvider: options.TracerProvider,
 			Version:        options.AgentVersion,
 		}),
-		processEnv:  os.Environ(),
-		store:       store,
-		sessions:    make(map[acp.SessionId]*session),
-		deleted:     make(map[acp.SessionId]bool),
-		ephemeral:   make(map[acp.SessionId]bool),
-		clientCalls: make(chan struct{}, max(0, options.ConcurrencyLimits.MaxConcurrentClientCalls)),
+		processEnv:     os.Environ(),
+		store:          store,
+		compactionWait: sessionCompactionWait,
+		sessions:       make(map[acp.SessionId]*session),
+		deleted:        make(map[acp.SessionId]bool),
+		ephemeral:      make(map[acp.SessionId]bool),
+		clientCalls:    make(chan struct{}, max(0, options.ConcurrencyLimits.MaxConcurrentClientCalls)),
 	}
 	agent.optionErr = agent.validateOptions()
 

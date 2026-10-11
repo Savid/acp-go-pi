@@ -185,6 +185,7 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	}
 
 	s.turn = t
+	s.interruptDeadline = time.Time{}
 	s.mu.Unlock()
 
 	defer func() {
@@ -238,8 +239,10 @@ func (s *session) prompt(ctx context.Context, params acp.PromptRequest, raw json
 	case <-t.settled:
 	case <-turnCtx.Done():
 		// The abort waits for a compaction in progress to end, so the grace
-		// for the turn to settle runs from then.
-		s.awaitCompaction(rt, t.settled)
+		// for the turn to settle runs from then. A session/cancel also ends
+		// this request's context, so the wait runs detached from it, bounded
+		// by the interrupt's shared deadline.
+		s.awaitCompaction(context.WithoutCancel(ctx), rt, t.settled)
 
 		select {
 		case <-t.settled:
