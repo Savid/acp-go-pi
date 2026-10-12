@@ -28,10 +28,10 @@ const (
 	sessionShutdownGrace = 2 * time.Second
 	// sessionShutdownTimeout bounds one shutdown rung.
 	sessionShutdownTimeout = 10 * time.Second
-	// sessionUsageStartTimeout bounds the extension's endpoint announcement.
-	// pi announces only after every extension factory has resolved, and a
-	// configured extension may wait on the network before it does.
-	sessionUsageStartTimeout = 60 * time.Second
+	// sessionStartTimeout bounds pi's startup. pi answers no command until
+	// every extension's session_start handler has resolved, and a configured
+	// extension may wait on the network before it does.
+	sessionStartTimeout = 60 * time.Second
 	// sessionAbortTimeout bounds the native abort a cancel or close sends,
 	// and how long a cancelled turn then has to settle before its process is
 	// stopped.
@@ -272,21 +272,6 @@ func (s *session) launch(ctx context.Context, sessionPath string) (*runtime, err
 
 	go s.pump(context.WithoutCancel(ctx), rt)
 
-	// Earlier native startup handlers may wait for UI replies before the
-	// usage extension runs, so the pump must drain throughout readiness.
-	readyCtx, cancelReady := context.WithTimeout(ctx, sessionUsageStartTimeout)
-	readyErr := rt.usage.Wait(readyCtx, proc.Done())
-
-	cancelReady()
-
-	if readyErr != nil {
-		readyErr = process.LaunchFailure(proc, "pi", readyErr)
-
-		s.stopRuntime(context.WithoutCancel(ctx), rt)
-
-		return nil, s.startFailure(ctx, readyErr)
-	}
-
 	return rt, nil
 }
 
@@ -334,8 +319,15 @@ func (s *session) startFailure(ctx context.Context, err error) error {
 func (s *session) configureRuntime(ctx context.Context, rt *runtime, model string, expectID string) error {
 	client := rt.client
 
-	if err := client.SetAutoRetry(ctx, s.options.AutoRetry); err != nil {
-		return s.startFailure(ctx, err)
+	// The first reply comes once pi's startup handlers have resolved, so it
+	// bounds startup. The pump drains the dialogs those handlers open.
+	startCtx, cancelStart := context.WithTimeout(ctx, s.agent.startTimeout)
+	err := client.SetAutoRetry(startCtx, s.options.AutoRetry)
+
+	cancelStart()
+
+	if err != nil {
+		return s.startFailure(ctx, process.LaunchFailure(rt.proc, "pi", fmt.Errorf("pi did not answer its first command: %w", err)))
 	}
 
 	state, err := client.GetState(ctx)

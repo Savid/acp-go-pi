@@ -19,7 +19,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestUsageEndpointReadiness(t *testing.T) {
+// announce publishes address as the extension does: staged, then renamed
+// into place.
+func announce(t *testing.T, endpoint UsageEndpoint, address string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(endpoint.File+".tmp", []byte(address), 0o600))
+	require.NoError(t, os.Rename(endpoint.File+".tmp", endpoint.File))
+}
+
+func TestUsageEndpointAddress(t *testing.T) {
 	t.Parallel()
 	for _, address := range []string{"http://127.0.0.1:43210", "http://127.0.0.1:0", "http://example.com:1234", "http://127.0.0.1:1234/access", "http://127.0.0.1:1234?secret=x"} {
 		t.Run(address, func(t *testing.T) {
@@ -29,55 +37,77 @@ func TestUsageEndpointReadiness(t *testing.T) {
 			defer endpoint.Close()
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
-			ready := make(chan error, 1)
-			go func() { ready <- endpoint.Wait(ctx, nil) }()
+			type result struct {
+				address string
+				err     error
+			}
+			resolved := make(chan result, 1)
+			go func() {
+				got, resolveErr := endpoint.address(ctx)
+				resolved <- result{got, resolveErr}
+			}()
 			require.NoError(t, os.WriteFile(endpoint.File+".tmp", []byte(address), 0o600))
 			select {
-			case readyErr := <-ready:
-				t.Fatalf("readiness accepted an unpublished address: %v", readyErr)
+			case got := <-resolved:
+				t.Fatalf("resolution accepted an unpublished address: %v", got.err)
 			default:
 			}
 			require.NoError(t, os.Rename(endpoint.File+".tmp", endpoint.File))
-			err = <-ready
+			got := <-resolved
 			if address == "http://127.0.0.1:43210" {
-				require.NoError(t, err)
-				require.Equal(t, address, endpoint.URL)
+				require.NoError(t, got.err)
+				require.Equal(t, address, got.address)
 			} else {
-				require.Error(t, err)
-				require.Empty(t, endpoint.URL)
+				require.Error(t, got.err)
+				require.Empty(t, got.address)
 			}
 		})
 	}
 }
 
-func TestUsageEndpointWaitEndsWithoutAnnouncement(t *testing.T) {
+// A read against an endpoint the extension never announced fails when its
+// context ends, and the endpoint still releases its directory.
+func TestUsageEndpointUnannouncedReadEndsWithContext(t *testing.T) {
 	t.Parallel()
-	for _, state := range []string{"cancelled", "process exited"} {
-		t.Run(state, func(t *testing.T) {
-			t.Parallel()
-			endpoint, err := NewUsageEndpoint(filepath.Join(t.TempDir(), "usage"))
-			require.NoError(t, err)
-			defer endpoint.Close()
-			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-			defer cancel()
-			exited := make(chan struct{})
-			if state == "cancelled" {
-				cancel()
-			} else {
-				close(exited)
+	endpoint, err := NewUsageEndpoint(filepath.Join(t.TempDir(), "usage"))
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, err = endpoint.Access(ctx, "openrouter", "")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.NoError(t, endpoint.Close())
+	require.NoDirExists(t, endpoint.dir)
+}
+
+// The extension announces a new address when pi reloads its session; the next
+// read follows it.
+func TestUsageEndpointFollowsReannouncement(t *testing.T) {
+	t.Parallel()
+	endpoint, err := NewUsageEndpoint(filepath.Join(t.TempDir(), "usage"))
+	require.NoError(t, err)
+	defer endpoint.Close()
+	serve := func(key string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer "+endpoint.Token {
+				w.WriteHeader(http.StatusForbidden)
+
+				return
 			}
-			err = endpoint.Wait(ctx, exited)
-			require.Error(t, err)
-			if state == "cancelled" {
-				require.ErrorIs(t, err, context.Canceled)
-			} else {
-				require.NoError(t, ctx.Err(), "process exit must end readiness before the caller expires")
-			}
-			require.Empty(t, endpoint.URL)
-			require.NoError(t, endpoint.Close())
-			require.NoDirExists(t, endpoint.dir)
-		})
+			_ = json.NewEncoder(w).Encode(map[string]any{"configured": true, "custom": false, "routes": []usageRoute{{API: usageAPICompletions, BaseURL: "https://openrouter.ai/api/v1", APIKey: key}}})
+		}))
 	}
+	first := serve("first-key")
+	announce(t, endpoint, first.URL)
+	access, err := endpoint.Access(t.Context(), "openrouter", "")
+	require.NoError(t, err)
+	require.Equal(t, "first-key", access.APIKey)
+	first.Close()
+	second := serve("second-key")
+	defer second.Close()
+	announce(t, endpoint, second.URL)
+	access, err = endpoint.Access(t.Context(), "openrouter", "")
+	require.NoError(t, err)
+	require.Equal(t, "second-key", access.APIKey)
 }
 
 func TestUsageAccessVerifiesNativeRoutes(t *testing.T) {
@@ -111,7 +141,12 @@ func TestUsageAccessVerifiesNativeRoutes(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(map[string]any{"configured": true, "custom": tc.custom, "routes": []usageRoute{{API: tc.api, BaseURL: tc.endpoint, APIKey: "native-key", AccountID: tc.account, Headers: tc.headers}}})
 			}))
 			defer server.Close()
-			access, err := (UsageEndpoint{URL: server.URL, Token: "local-token"}).Access(t.Context(), tc.provider, "")
+			endpoint, err := NewUsageEndpoint(filepath.Join(t.TempDir(), "usage"))
+			require.NoError(t, err)
+			defer endpoint.Close()
+			endpoint.Token = "local-token"
+			announce(t, endpoint, server.URL)
+			access, err := endpoint.Access(t.Context(), tc.provider, "")
 			require.NoError(t, err)
 			require.Equal(t, tc.reason, access.Reason)
 			if tc.reason == "" {
@@ -154,10 +189,11 @@ func TestUsageExtensionOwnsEndpoint(t *testing.T) {
 		t.Cleanup(func() { _ = proc.Kill(); _ = proc.Close() })
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 		defer cancel()
-		require.NoError(t, endpoint.Wait(ctx, proc.Done()), proc.StderrTail())
-		require.NotEqual(t, previous, endpoint.URL, "live extensions must own distinct ports")
-		previous = endpoint.URL
-		listener, err := net.Listen("tcp", strings.TrimPrefix(endpoint.URL, "http://"))
+		address, err := endpoint.address(ctx)
+		require.NoError(t, err, proc.StderrTail())
+		require.NotEqual(t, previous, address, "live extensions must own distinct ports")
+		previous = address
+		listener, err := net.Listen("tcp", strings.TrimPrefix(address, "http://"))
 		if listener != nil {
 			_ = listener.Close()
 		}

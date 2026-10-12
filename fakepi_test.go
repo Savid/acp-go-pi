@@ -26,10 +26,16 @@ const (
 	fakePiEnv              = "ACP_GO_PI_TEST_FAKE"
 	fakePiEnvDump          = "ACP_GO_PI_TEST_ENV_DUMP"
 	fakePiEnvNoModel       = "ACP_GO_PI_TEST_NO_MODEL"
-	fakePiEnvUsageHold     = "ACP_GO_PI_TEST_USAGE_HOLD"
 	fakePiEnvStartupDialog = "ACP_GO_PI_TEST_STARTUP_DIALOG"
 	fakePiEnvStartupDeath  = "ACP_GO_PI_TEST_STARTUP_DEATH"
 	fakePiEnvUsageGateways = "ACP_GO_PI_TEST_USAGE_GATEWAYS"
+	// fakePiEnvStartupHold names a file the fake creates, after stating on
+	// stderr that it holds, before it stalls its startup without answering any
+	// command.
+	fakePiEnvStartupHold = "ACP_GO_PI_TEST_STARTUP_HOLD"
+	// fakePiEnvUsageSilent makes the fake serve without ever announcing its
+	// account-usage endpoint.
+	fakePiEnvUsageSilent = "ACP_GO_PI_TEST_USAGE_SILENT"
 	// fakePiEnvZeroEstimate makes get_session_stats estimate a context of
 	// zero tokens.
 	fakePiEnvZeroEstimate = "ACP_GO_PI_TEST_ZERO_ESTIMATE"
@@ -143,14 +149,32 @@ func runFakePi(args []string) int {
 		_ = file.Close()
 	}
 
+	input := bufio.NewReader(os.Stdin)
+
+	// Commands the adapter sends during startup wait until the startup
+	// dialog's answer arrives.
+	var early [][]byte
 	if os.Getenv(fakePiEnvStartupDialog) != "" {
 		request := map[string]any{"type": "extension_ui_request", "id": "startup", "method": "input", "title": "Startup input"}
 		if err := json.NewEncoder(os.Stdout).Encode(request); err != nil {
 			return 1
 		}
-		var response pi.UIResponse
-		if err := json.NewDecoder(os.Stdin).Decode(&response); err != nil || !response.Cancelled {
-			return 1
+		for {
+			line, err := input.ReadBytes('\n')
+			if err != nil {
+				return 1
+			}
+			var response pi.UIResponse
+			if json.Unmarshal(line, &response) != nil || response.Type != "extension_ui_response" {
+				early = append(early, line)
+
+				continue
+			}
+			if response.ID != "startup" || !response.Cancelled {
+				return 1
+			}
+
+			break
 		}
 	}
 
@@ -160,7 +184,8 @@ func runFakePi(args []string) int {
 		return 1
 	}
 
-	if marker := os.Getenv(fakePiEnvUsageHold); marker != "" {
+	if marker := os.Getenv(fakePiEnvStartupHold); marker != "" {
+		fmt.Fprintln(os.Stderr, "fake pi: startup held")
 		if err := os.WriteFile(marker, nil, 0o600); err != nil {
 			return 1
 		}
@@ -169,19 +194,12 @@ func runFakePi(args []string) int {
 		return 1
 	}
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 1
-	}
-	usageServer := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(fakeUsageAccess)}
-	go func() { _ = usageServer.Serve(listener) }()
-	defer func() { _ = usageServer.Close() }()
-	endpointFile := os.Getenv(pi.EnvUsageFile)
-	if err := os.WriteFile(endpointFile+".tmp", []byte("http://"+listener.Addr().String()), 0o600); err != nil {
-		return 1
-	}
-	if err := os.Rename(endpointFile+".tmp", endpointFile); err != nil {
-		return 1
+	if os.Getenv(fakePiEnvUsageSilent) == "" {
+		closeUsage, err := announceFakeUsage()
+		if err != nil {
+			return 1
+		}
+		defer closeUsage()
 	}
 	if dump := os.Getenv(fakePiEnvDump); dump != "" {
 		_ = os.WriteFile(dump, []byte(strings.Join(os.Environ(), "\n")+"\n"), 0o600)
@@ -247,7 +265,36 @@ func runFakePi(args []string) int {
 		time.Sleep(fakePiResumeHold)
 	}
 
-	return f.serve(os.Stdin)
+	for _, line := range early {
+		f.dispatch(line)
+	}
+
+	return f.serve(input)
+}
+
+// announceFakeUsage serves the account-usage endpoint and publishes its
+// address as the usage extension does.
+func announceFakeUsage() (func(), error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	usageServer := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(fakeUsageAccess)}
+	go func() { _ = usageServer.Serve(listener) }()
+	closeUsage := func() { _ = usageServer.Close() }
+	endpointFile := os.Getenv(pi.EnvUsageFile)
+	if err := os.WriteFile(endpointFile+".tmp", []byte("http://"+listener.Addr().String()), 0o600); err != nil {
+		closeUsage()
+
+		return nil, err
+	}
+	if err := os.Rename(endpointFile+".tmp", endpointFile); err != nil {
+		closeUsage()
+
+		return nil, err
+	}
+
+	return closeUsage, nil
 }
 
 func fakeUUID() string {

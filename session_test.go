@@ -1,7 +1,6 @@
 package piacp
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -466,6 +465,22 @@ func TestRuntimeDrainCompletesBeforeReplacement(t *testing.T) {
 	}
 }
 
+// startSession launches and configures a session's pi as an establishment
+// does, stopping a generation whose configuration fails.
+func startSession(ctx context.Context, s *session) (*runtime, error) {
+	rt, err := s.launch(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.configureRuntime(ctx, rt, "", ""); err != nil {
+		s.stopRuntime(context.WithoutCancel(ctx), rt)
+
+		return nil, err
+	}
+
+	return rt, nil
+}
+
 func TestUsageEndpointDirectoryRemovedAfterLaunchFailure(t *testing.T) {
 	t.Parallel()
 	for _, failure := range []string{"start", "exit", "cancel"} {
@@ -478,7 +493,7 @@ func TestUsageEndpointDirectoryRemovedAfterLaunchFailure(t *testing.T) {
 			case "exit":
 				options = append(options, WithExecutablePath("/usr/bin/true"))
 			case "cancel":
-				options = append(options, WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvUsageHold: marker}))
+				options = append(options, WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvStartupHold: marker}))
 			}
 			a := NewAgent(testOptions(t, options...)...)
 			s := a.newSession(sessionStart{cwd: t.TempDir()})
@@ -489,7 +504,7 @@ func TestUsageEndpointDirectoryRemovedAfterLaunchFailure(t *testing.T) {
 			defer cancel()
 			done := make(chan error, 1)
 			go func() {
-				_, err := s.launch(ctx, "")
+				_, err := startSession(ctx, s)
 				done <- err
 			}()
 			if failure == "cancel" {
@@ -515,39 +530,60 @@ func TestUsageEndpointDirectoryRemovedAfterLaunchFailure(t *testing.T) {
 
 func TestLaunchFailureLogsNativeStderr(t *testing.T) {
 	t.Parallel()
-	var logs bytes.Buffer
+	var logs logBuffer
 	a := NewAgent(testOptions(t,
 		WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvStartupDeath: "Error: Failed to load extension"}),
 		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
 	)...)
 	s := a.newSession(sessionStart{cwd: t.TempDir()})
-	_, err := s.launch(t.Context(), "")
+	_, err := startSession(t.Context(), s)
 	require.Equal(t, "pi_internal_failure", requestErrorData(t, err)["error"])
-	require.Contains(t, logs.String(), "exited before readiness: Error: Failed to load extension")
+	require.Contains(t, logs.String(), "pi exited before it was ready")
+	require.Contains(t, logs.String(), "Error: Failed to load extension")
+}
+
+// A pi that never answers its first command fails its start once the startup
+// bound passes, and the log carries what it wrote to stderr.
+func TestStartupBoundedByFirstReply(t *testing.T) {
+	t.Parallel()
+	var logs logBuffer
+	a := NewAgent(testOptions(t,
+		WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvStartupHold: filepath.Join(t.TempDir(), "held")}),
+		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+	)...)
+	a.startTimeout = 300 * time.Millisecond
+	s := a.newSession(sessionStart{cwd: t.TempDir()})
+	began := time.Now()
+	_, err := startSession(t.Context(), s)
+	elapsed := time.Since(began)
+	require.Equal(t, map[string]any{"error": "pi_internal_failure", "class": "native_start"}, requestErrorData(t, err))
+	require.GreaterOrEqual(t, elapsed, a.startTimeout)
+	require.Less(t, elapsed, a.startTimeout+sessionShutdownTimeout, "the start waited past its bound")
+	require.Contains(t, logs.String(), "pi did not answer its first command")
+	require.Contains(t, logs.String(), "fake pi: startup held")
 }
 
 func TestUsageEndpointDirectoryRemovedWhenRuntimeStops(t *testing.T) {
 	t.Parallel()
 	a := NewAgent(testOptions(t)...)
 	s := a.newSession(sessionStart{cwd: t.TempDir()})
-	rt, err := s.launch(t.Context(), "")
+	rt, err := startSession(t.Context(), s)
 	require.NoError(t, err)
 	dir := filepath.Dir(rt.usage.File)
 	require.DirExists(t, dir)
 	require.FileExists(t, rt.usage.File)
-	require.NotEmpty(t, rt.usage.URL)
 	s.stopRuntime(t.Context(), rt)
 	require.NoDirExists(t, dir)
 }
 
-func TestUsageEndpointReadinessDrainsStartupDialogs(t *testing.T) {
+func TestStartupDrainsStartupDialogs(t *testing.T) {
 	t.Parallel()
 	a := NewAgent(testOptions(t, WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvStartupDialog: "1"}))...)
 	s := a.newSession(sessionStart{cwd: t.TempDir()})
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	rt, err := s.launch(ctx, "")
-	require.NoError(t, err, "startup UI must receive its cancellation before usage readiness")
+	rt, err := startSession(ctx, s)
+	require.NoError(t, err, "startup UI must receive its cancellation before pi answers its first command")
 	s.stopRuntime(t.Context(), rt)
 	require.NoDirExists(t, filepath.Dir(rt.usage.File))
 }

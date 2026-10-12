@@ -68,6 +68,10 @@ type Agent struct {
 	// compactionWait is how long one interrupt may wait in total for pi to
 	// finish a compaction.
 	compactionWait time.Duration
+	// startTimeout is how long a launched pi has to answer its first command.
+	startTimeout time.Duration
+	// usageReadTimeout bounds the native reads behind one account-usage read.
+	usageReadTimeout time.Duration
 
 	mu                 sync.Mutex
 	conn               client
@@ -125,13 +129,15 @@ func NewAgent(opts ...Option) *Agent {
 			TracerProvider: options.TracerProvider,
 			Version:        options.AgentVersion,
 		}),
-		processEnv:     os.Environ(),
-		store:          store,
-		compactionWait: sessionCompactionWait,
-		sessions:       make(map[acp.SessionId]*session),
-		deleted:        make(map[acp.SessionId]bool),
-		ephemeral:      make(map[acp.SessionId]bool),
-		clientCalls:    make(chan struct{}, max(0, options.ConcurrencyLimits.MaxConcurrentClientCalls)),
+		processEnv:       os.Environ(),
+		store:            store,
+		compactionWait:   sessionCompactionWait,
+		startTimeout:     sessionStartTimeout,
+		usageReadTimeout: wire.AccountUsageReadTimeout,
+		sessions:         make(map[acp.SessionId]*session),
+		deleted:          make(map[acp.SessionId]bool),
+		ephemeral:        make(map[acp.SessionId]bool),
+		clientCalls:      make(chan struct{}, max(0, options.ConcurrencyLimits.MaxConcurrentClientCalls)),
 	}
 	agent.optionErr = agent.validateOptions()
 

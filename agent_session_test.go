@@ -490,7 +490,7 @@ func TestEstablishmentHoldsActiveSlot(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	hold := wire.WithSessionMetaValue(map[string]any{vendor: map[string]any{"options": map[string]any{"env": map[string]string{fakePiEnvUsageHold: held}}}})
+	hold := wire.WithSessionMetaValue(map[string]any{vendor: map[string]any{"options": map[string]any{"env": map[string]string{fakePiEnvStartupHold: held}}}})
 	first := make(chan error, 1)
 	go func() {
 		_, startErr := a.NewSession(ctx, wire.NewSessionRequest(t.TempDir(), hold))

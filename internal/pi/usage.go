@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -32,10 +33,12 @@ const (
 	EnvUsageToken       = InternalEnvPrefix + "USAGE_TOKEN"
 )
 
-// UsageEndpoint addresses the session extension's authenticated credential read.
+// UsageEndpoint addresses the session extension's authenticated credential
+// read. The extension publishes its address to File each time pi starts or
+// reloads its session, so every read resolves the address afresh.
 type UsageEndpoint struct {
-	URL, Token, File string
-	dir              string
+	Token, File string
+	dir         string
 }
 
 func NewUsageEndpoint(dir string) (UsageEndpoint, error) {
@@ -46,28 +49,21 @@ func NewUsageEndpoint(dir string) (UsageEndpoint, error) {
 	return UsageEndpoint{File: filepath.Join(dir, "endpoint"), Token: rand.Text(), dir: dir}, nil
 }
 
-// Wait reads the address atomically published by the listening extension.
-func (e *UsageEndpoint) Wait(ctx context.Context, exited <-chan struct{}) error {
+// address reads the address the listening extension last published
+// atomically, waiting for one while ctx allows.
+func (e UsageEndpoint) address(ctx context.Context) (string, error) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		address, err := readUsageAddress(e.File)
-		if err == nil {
-			e.URL = address
-
-			return nil
-		}
-
 		if !errors.Is(err, os.ErrNotExist) {
-			return err
+			return address, err
 		}
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-exited:
-			return errors.New("native account access extension exited before readiness")
+			return "", fmt.Errorf("native account access endpoint unannounced: %w", ctx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -143,7 +139,12 @@ func (e UsageEndpoint) Gateways(ctx context.Context) ([]gateway.Route, error) {
 }
 
 func (e UsageEndpoint) get(ctx context.Context, path string) ([]byte, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, e.URL+path, http.NoBody)
+	address, err := e.address(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address+path, http.NoBody)
 	if err != nil {
 		return nil, err
 	}

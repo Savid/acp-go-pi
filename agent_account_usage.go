@@ -59,7 +59,7 @@ func (a *Agent) accountUsage(ctx context.Context, params json.RawMessage) (respo
 	}
 	defer release()
 
-	readCtx, cancel := context.WithTimeout(ctx, wire.AccountUsageReadTimeout)
+	readCtx, cancel := context.WithTimeout(ctx, a.usageReadTimeout)
 	defer cancel()
 
 	rt, err := s.ensureRuntime(readCtx)

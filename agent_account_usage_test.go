@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/coder/acp-go-sdk"
 	"github.com/savid/acp-go-core/wire"
@@ -138,6 +139,34 @@ func TestAccountUsageReadsThroughGatewayRoutes(t *testing.T) {
 	response, err = a.accountUsage(t.Context(), params)
 	require.NoError(t, err)
 	require.Equal(t, wire.AccountUsageUnavailable(wire.AccountUsageNotAuthenticated), response, "a provider no gateway reports keeps the native answer")
+}
+
+// A session whose usage extension never announces its endpoint starts and
+// prompts normally; an account-usage read fails once its timeout passes.
+func TestAccountUsageWithoutAnnouncedEndpoint(t *testing.T) {
+	t.Parallel()
+	a := NewAgent(testOptions(t, WithEnv(map[string]string{fakePiEnv: "1", fakePiEnvUsageSilent: "1"}))...)
+	t.Cleanup(func() { require.NoError(t, a.Close()) })
+	a.usageReadTimeout = 300 * time.Millisecond
+	a.attach(newRecorder(), nil)
+	_, err := a.Initialize(t.Context(), acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber})
+	require.NoError(t, err)
+	session, err := a.NewSession(t.Context(), wire.NewSessionRequest(t.TempDir()))
+	require.NoError(t, err)
+
+	params, err := json.Marshal(map[string]any{usageSessionField: session.SessionId, "providerId": "openrouter"})
+	require.NoError(t, err)
+	began := time.Now()
+	response, err := a.accountUsage(t.Context(), params)
+	elapsed := time.Since(began)
+	require.Equal(t, map[string]any{"error": "pi_internal_failure", "class": "account_usage"}, requestErrorData(t, err))
+	require.False(t, response.Available)
+	require.GreaterOrEqual(t, elapsed, a.usageReadTimeout)
+	require.Less(t, elapsed, testTimeout)
+
+	prompted, err := a.Prompt(t.Context(), wire.TextPromptRequest(session.SessionId, "hello"))
+	require.NoError(t, err)
+	require.Equal(t, acp.StopReasonEndTurn, prompted.StopReason)
 }
 
 func TestAccountUsageRPCRefusals(t *testing.T) {
